@@ -2,18 +2,55 @@
 // automatic curriculum -> iterative code generation with env feedback -> self-verification critic -> skill library.
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
 import * as world from './library/world.js';
+import * as skills from './library/skills.js';
+import { getAllItems, getAllBlocks } from '../utils/mcdata.js';
 import { cosineSimilarity } from '../utils/math.js';
 
 const TOWN = { x: -1507, y: 63, z: 542 };
 const VILLAGE = { x: -800, z: 500 };
 const MAX_ATTEMPTS = 4;
 const PLAYER_QUIET_MS = 90 * 1000;   // pause after any player message
-const TASK_COOLDOWN_MS = 5 * 1000;
+const TASK_COOLDOWN_MS = 90 * 1000;  // gap between curriculum tasks (saves Gemini quota)
+const HUT = { x: -1503, y: 64, z: 547 };
 
-function parseJSON(text) {
-    const m = String(text).match(/\{[\s\S]*\}/);
-    if (!m) throw new Error('no JSON in model reply: ' + String(text).slice(0, 200));
-    return JSON.parse(m[0]);
+// tolerant JSON: strip fences, fix stray backslashes / trailing commas, then fall back to field regexes
+export function parseJSON(text) {
+    const raw = String(text).replace(/```(?:json)?/g, '');
+    const m = raw.match(/\{[\s\S]*\}/);
+    if (m) {
+        for (const cand of [m[0], m[0].replace(/\\(?!["\\/bfnrtu])/g, '\\\\').replace(/,\s*([}\]])/g, '$1').replace(/[\u0000-\u001f]+/g, ' ')]) {
+            try { return JSON.parse(cand); } catch (e) {}
+        }
+    }
+    const out = {};
+    for (const k of ['task', 'context', 'reasoning', 'critique']) {
+        const f = raw.match(new RegExp('"' + k + '"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"'));
+        if (f) out[k] = f[1];
+    }
+    const b = raw.match(/"success"\s*:\s*(true|false)/);
+    if (b) out.success = b[1] === 'true';
+    if (!Object.keys(out).length) throw new Error('no JSON in model reply: ' + raw.slice(0, 200));
+    return out;
+}
+let NAMES = null;
+function knownNames() {
+    if (!NAMES) NAMES = new Set([...getAllItems().map(i => i.name), ...getAllBlocks().map(b => b.name)]);
+    return NAMES;
+}
+// returns an error string if the task names things that do not exist / cannot be obtained
+export function validateTask(task) {
+    const t = task.toLowerCase();
+    if (/\b(cave_|void_)?air(_block)?\b/.test(t)) return 'air is not a block you can mine or collect';
+    if (!/^(mine|collect|gather|craft|smelt|obtain|get|chop|cook)\b/.test(t)) return null; // build/explore tasks: free text
+    const names = knownNames();
+    const bad = (t.match(/\b[a-z]+(?:_[a-z]+)+\b/g) || []).filter(n => !names.has(n));
+    if (bad.length) return `unknown item/block names: ${bad.join(', ')} (use exact Minecraft ids like oak_log, cobblestone, iron_ingot)`;
+    return null;
+}
+// "Mine 5 birch_log" / "Craft 1 stone_pickaxe" -> {item, count}
+function countGoal(task) {
+    const m = task.match(/^(?:mine|collect|gather|craft|smelt|obtain|get|chop|cook)\s+(\d+)\s+([a-z_]+)\s*$/i);
+    return m ? { count: parseInt(m[1]), item: m[2].toLowerCase() } : null;
 }
 function extractCode(text) {
     const m = String(text).match(/```(?:javascript|js)?\s*([\s\S]*?)```/);
@@ -56,6 +93,11 @@ export class Voyager {
         const now = Date.now();
         if (now - this.lastPlayerMsg < PLAYER_QUIET_MS || now - this.lastTaskEnd < TASK_COOLDOWN_MS) return;
         if (!this.agent.isIdle() || this.agent.self_prompter.isActive() || this.agent.prompter.awaiting_coding) return;
+        if (now < (this.agent.prompter.code_model.quotaUntil || 0)) {
+            if (!this._quotaNoted) { console.log('[voyager] paused: gemini quota cooldown (not running curriculum on the local model)'); this._quotaNoted = true; }
+            return;
+        }
+        this._quotaNoted = false;
         this.running = true; this.abort = false;
         this.step().catch(e => {
             console.error('[voyager] step failed: ' + (e?.message ?? e));
@@ -72,7 +114,7 @@ export class Voyager {
             distance_to_town: dTown,
             biome: world.getBiomeName(bot),
             time: t < 12000 ? `day (${t})` : `night (${t})`,
-            health: bot.health, food: bot.food,
+            health: `${Math.round(bot.health)}/20`, food: `${bot.food}/20`,
             inventory: world.getInventoryCounts(bot),
             equipped: bot.heldItem ? bot.heldItem.name : 'nothing',
             nearby_blocks: world.getNearbyBlockTypes(bot, 16),
@@ -137,11 +179,41 @@ Reply ONLY with JSON: {"reasoning": "...", "success": true|false, "critique": "h
     }
 
     // ---------- iterative prompting ----------
+    // deterministic survival step, no LLM: eat, then get to the hut / shelter at night or low health
+    async safety() {
+        const bot = this.agent.bot;
+        const night = bot.time.timeOfDay >= 12500 && bot.time.timeOfDay < 23500;
+        const p = bot.entity.position;
+        const far = Math.hypot(p.x - HUT.x, p.z - HUT.z) > 12 || Math.abs(p.y - HUT.y) > 4;
+        const needFood = bot.food < 14 && bot.inventory.items().some(i => i.foodPoints || /cooked|bread|apple|carrot|potato|beef|porkchop|mutton|chicken|cod|salmon|stew/.test(i.name));
+        const lowHealth = bot.health < 8;
+        if (!needFood && !(night && far) && !(lowHealth && far)) return false;
+        console.log(`[voyager] safety first: food=${bot.food} health=${Math.round(bot.health)} night=${night} far=${far}`);
+        await this.agent.actions.runAction('voyager:safety', async () => {
+            if (needFood) await skills.consume(bot);
+            if ((night || lowHealth) && far) {
+                await skills.goToPosition(bot, HUT.x, HUT.y, HUT.z, 1);
+                const q = bot.entity.position;
+                if (Math.hypot(q.x - HUT.x, q.z - HUT.z) > 6 && night) await skills.shelterNow(bot);
+            }
+        }, { timeout: 4 });
+        return true;
+    }
+
     async step() {
+        if (await this.safety()) return;
         const before = this.observe();
-        const proposal = await this.proposeTask(before);
-        const task = String(proposal.task || '').trim();
-        if (!task) throw new Error('curriculum returned no task');
+        let proposal = await this.proposeTask(before);
+        let task = String(proposal.task || '').trim();
+        let invalid = task ? validateTask(task) : 'empty task';
+        if (invalid) {
+            console.log(`[voyager] rejected task "${task}": ${invalid}`);
+            this.progress.failed.push(`${task} (invalid: ${invalid})`);
+            proposal = await this.proposeTask({ ...before, note: `Your last proposal "${task}" was rejected: ${invalid}` });
+            task = String(proposal.task || '').trim();
+            invalid = task ? validateTask(task) : 'empty task';
+            if (invalid) { console.log(`[voyager] rejected again "${task}": ${invalid}; skipping`); this._saveProgress(); return; }
+        }
         console.log(`[voyager] new task: ${task} (${proposal.reasoning})`);
         this.agent.openChat?.(`New goal: ${task}`);
         const related = await this.retrieveSkills(task + ' ' + (proposal.context || ''));
@@ -177,7 +249,12 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             if (this.abort || res.interrupted) { console.log('[voyager] task interrupted'); return; }
             const output = String(res.message || '').slice(-1500);
             const after = this.observe();
-            const verdict = await this.critique(task, before, after, output);
+            const goal = countGoal(task);
+            const gained = goal ? (after.inventory[goal.item] || 0) - (before.inventory[goal.item] || 0) : 0;
+            const verdict = (goal && gained >= goal.count)
+                ? { success: true, critique: '', reasoning: `inventory +${gained} ${goal.item}` }
+                : await this.critique(task, before, after, output);
+            if (goal && gained >= goal.count) console.log(`[voyager] verified from inventory (+${gained} ${goal.item}), critic skipped`);
             console.log(`[voyager] attempt ${i} critic: success=${verdict.success} ${verdict.critique || ''}`);
             if (verdict.success) {
                 await this.saveSkill(fn[1], desc.trim(), code.replace(/\n\s*await\s+\w+\(bot\);\s*$/, '').trim(), task);
