@@ -59,18 +59,13 @@ export class Prompter {
 
         let chat_model_profile = selectAPI(this.profile.model);
         this.chat_model = createModel(chat_model_profile);
-        if (this.profile.model_fallback) {
-            const cfb = createModel(selectAPI(this.profile.model_fallback));
-            this.chat_model = new CodeModelWithFallback(this.chat_model, cfb, 60 * 60 * 1000, 'chat-model');
-        }
+        // Gemini only: on 429/quota the wrapper pauses for 60 min and fails loudly (no local fallback).
+        this.chat_model = new CodeModelWithFallback(this.chat_model, null, 60 * 60 * 1000, 'chat-model');
 
         if (this.profile.code_model) {
             let code_model_profile = selectAPI(this.profile.code_model);
             this.code_model = createModel(code_model_profile);
-            if (this.profile.code_model_fallback) {
-                const fb = createModel(selectAPI(this.profile.code_model_fallback));
-                this.code_model = new CodeModelWithFallback(this.code_model, fb);
-            }
+            this.code_model = new CodeModelWithFallback(this.code_model, null);
         }
         else {
             this.code_model = this.chat_model;

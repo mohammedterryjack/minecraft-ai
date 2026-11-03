@@ -13,32 +13,6 @@
         "api": "google",
         "model": "gemini-3.6-flash"
     },
-    "code_model_fallback": {
-        "api": "ollama",
-        "model": "qwen3.5:4b",
-        "url": "http://192.168.1.215:11434",
-        "params": {
-            "think": false,
-            "keep_alive": "10m",
-            "options": {
-                "num_ctx": 8192,
-                "num_predict": 3000,
-                "temperature": 0.2
-            }
-        }
-    },
-    "model_fallback": {
-        "api": "ollama",
-        "model": "sweaterdog/andy-4:micro-q8_0",
-        "url": "http://192.168.1.215:11434",
-        "params": {
-            "keep_alive": "10m",
-            "options": {
-                "num_ctx": 8192,
-                "num_predict": 400
-            }
-        }
-    },
     "vision_model": {
         "api": "google",
         "model": "gemini-3.5-flash-lite"

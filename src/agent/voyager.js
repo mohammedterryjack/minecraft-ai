@@ -125,9 +125,9 @@ export class Voyager {
         return Object.entries(s).map(([k, v]) => `${k}: ${typeof v === 'object' ? JSON.stringify(v) : v}`).join('\n');
     }
     async _ask(system, user) {
-        // code model = gemini-3.6-flash (quota-only switch to local lives in CodeModelWithFallback)
+        // code model = gemini-3.6-flash (quota pause lives in CodeModelWithFallback; no local fallback)
         // Voyager only runs on Gemini: if the quota switch is (or becomes) active, abandon this step
-        // instead of letting the small local model plan/write/judge (chat replies still use the fallback).
+        // instead of letting the small local model plan/write/judge.
         const cm = this.agent.prompter.code_model;
         if (Date.now() < (cm.quotaUntil || 0)) throw new Error('gemini quota cooldown active; voyager step abandoned');
         const r = await cm.sendRequest([{ role: 'user', content: user }], system);
