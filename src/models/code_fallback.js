@@ -2,7 +2,7 @@
 // (A fallback model is only used if one is explicitly passed; mo_bot passes none.)
 export function isQuotaError(err) {
     const s = String(err?.status ?? err?.code ?? '') + ' ' + String(err?.message ?? err);
-    return /\b429\b|RESOURCE_EXHAUSTED|quota|rate.?limit/i.test(s);
+    return /\b429\b|RESOURCE_EXHAUSTED|quota|rate.?limit|usage limit/i.test(s);
 }
 export class CodeModelWithFallback {
     constructor(primary, fallback, cooldownMs = 60 * 60 * 1000, label = 'code-model') {
@@ -29,11 +29,11 @@ export class CodeModelWithFallback {
             if (isQuotaError(err)) {
                 this.quotaUntil = Date.now() + this.cooldownMs;
                 if (!this.fallback) {
-                    console.error(`[${this.label}] gemini quota exhausted - PAUSED for ${Math.round(this.cooldownMs/60000)} min (no local fallback)`);
+                    console.error(`[${this.label}] ${this.pName} quota/usage limit hit - PAUSED for ${Math.round(this.cooldownMs/60000)} min (no local fallback)`);
                     if (this.label === 'chat-model') return 'Gemini quota is used up, so I am paused for a while.';
                     throw err;
                 }
-                console.warn(`[${this.label}] gemini quota exhausted -> ${this.fName} (retry ${this.pName} after ${Math.round(this.cooldownMs/60000)} min)`);
+                console.warn(`[${this.label}] ${this.pName} quota exhausted -> ${this.fName} (retry ${this.pName} after ${Math.round(this.cooldownMs/60000)} min)`);
                 return await this.fallback.sendRequest(turns, systemMessage);
             }
             console.error(`[${this.label}] ${this.pName} FAILED (not quota, no switch): ${err?.message ?? err}`);

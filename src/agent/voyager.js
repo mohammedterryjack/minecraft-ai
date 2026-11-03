@@ -94,7 +94,7 @@ export class Voyager {
         if (now - this.lastPlayerMsg < PLAYER_QUIET_MS || now - this.lastTaskEnd < TASK_COOLDOWN_MS) return;
         if (!this.agent.isIdle() || this.agent.self_prompter.isActive() || this.agent.prompter.awaiting_coding) return;
         if (now < (this.agent.prompter.code_model.quotaUntil || 0)) {
-            if (!this._quotaNoted) { console.log('[voyager] paused: gemini quota cooldown (not running curriculum on the local model)'); this._quotaNoted = true; }
+            if (!this._quotaNoted) { console.log(`[voyager] paused: code model (${this.agent.prompter.code_model.pName}) quota/usage limit; retrying at ${new Date(this.agent.prompter.code_model.quotaUntil).toISOString()}`); this._quotaNoted = true; }
             return;
         }
         this._quotaNoted = false;
@@ -125,13 +125,12 @@ export class Voyager {
         return Object.entries(s).map(([k, v]) => `${k}: ${typeof v === 'object' ? JSON.stringify(v) : v}`).join('\n');
     }
     async _ask(system, user) {
-        // code model = gemini-3.6-flash (quota pause lives in CodeModelWithFallback; no local fallback)
-        // Voyager only runs on Gemini: if the quota switch is (or becomes) active, abandon this step
-        // instead of letting the small local model plan/write/judge.
+        // code model = Cursor CLI composer-2.5 (quota/usage-limit pause lives in CodeModelWithFallback; no fallback).
+        // If the limit is (or becomes) active, abandon this step.
         const cm = this.agent.prompter.code_model;
-        if (Date.now() < (cm.quotaUntil || 0)) throw new Error('gemini quota cooldown active; voyager step abandoned');
+        if (Date.now() < (cm.quotaUntil || 0)) throw new Error('code model quota/usage-limit pause active; voyager step abandoned');
         const r = await cm.sendRequest([{ role: 'user', content: user }], system);
-        if (Date.now() < (cm.quotaUntil || 0)) throw new Error('gemini quota hit; voyager step abandoned');
+        if (Date.now() < (cm.quotaUntil || 0)) throw new Error('code model quota/usage limit hit; voyager step abandoned');
         return r;
     }
 

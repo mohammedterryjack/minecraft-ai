@@ -65,7 +65,10 @@ export class Prompter {
         if (this.profile.code_model) {
             let code_model_profile = selectAPI(this.profile.code_model);
             this.code_model = createModel(code_model_profile);
-            this.code_model = new CodeModelWithFallback(this.code_model, null);
+            // cursor plan limit: pause and re-try every 6h until the plan resets; gemini: 60 min
+            const isCursor = code_model_profile.api === 'cursor';
+            this.code_model = new CodeModelWithFallback(this.code_model, null, (isCursor ? 6 * 60 : 60) * 60 * 1000, 'code-model');
+            this.code_model.timeoutMs = isCursor ? 180 * 1000 : this.code_model.timeoutMs;
         }
         else {
             this.code_model = this.chat_model;
