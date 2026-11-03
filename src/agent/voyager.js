@@ -126,7 +126,13 @@ export class Voyager {
     }
     async _ask(system, user) {
         // code model = gemini-3.6-flash (quota-only switch to local lives in CodeModelWithFallback)
-        return await this.agent.prompter.code_model.sendRequest([{ role: 'user', content: user }], system);
+        // Voyager only runs on Gemini: if the quota switch is (or becomes) active, abandon this step
+        // instead of letting the small local model plan/write/judge (chat replies still use the fallback).
+        const cm = this.agent.prompter.code_model;
+        if (Date.now() < (cm.quotaUntil || 0)) throw new Error('gemini quota cooldown active; voyager step abandoned');
+        const r = await cm.sendRequest([{ role: 'user', content: user }], system);
+        if (Date.now() < (cm.quotaUntil || 0)) throw new Error('gemini quota hit; voyager step abandoned');
+        return r;
     }
 
     // ---------- automatic curriculum ----------
