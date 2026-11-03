@@ -162,6 +162,13 @@ known_skills: ${JSON.stringify(this.skills.map(s => s.name))}`;
     async retrieveSkills(query, k = 5) {
         if (!this.skills.length) return [];
         const q = await this._embed(query);
+        if (q) {  // re-embed skills saved with a different embedding model (e.g. nomic -> gemini-embedding-001)
+            let changed = false;
+            for (const s of this.skills) {
+                if (!s.embedding || s.embedding.length !== q.length) { s.embedding = await this._embed(s.description); changed = true; }
+            }
+            if (changed) { this._saveSkills(); console.log('[voyager] re-embedded skill library with current embedding model'); }
+        }
         const scored = this.skills.map(s => ({ s, score: (q && s.embedding) ? cosineSimilarity(q, s.embedding) : 0 }));
         return scored.sort((a, b) => b.score - a.score).slice(0, k).map(x => x.s);
     }

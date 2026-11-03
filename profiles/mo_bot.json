@@ -5,9 +5,8 @@
         "model": "gemini-3.5-flash-lite"
     },
     "embedding": {
-        "api": "ollama",
-        "model": "nomic-embed-text",
-        "url": "http://192.168.1.215:11434"
+        "api": "google",
+        "model": "gemini-embedding-001"
     },
     "code_model": {
         "api": "cursor",
