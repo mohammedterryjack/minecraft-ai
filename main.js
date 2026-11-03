@@ -38,6 +38,9 @@ if (args.task_path) {
 }
 
 // these environment variables override certain settings
+if (process.env.MINECRAFT_HOST) {
+    settings.host = process.env.MINECRAFT_HOST;
+}
 if (process.env.MINECRAFT_PORT) {
     settings.port = process.env.MINECRAFT_PORT;
 }

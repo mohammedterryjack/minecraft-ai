@@ -42,9 +42,11 @@ export class AgentProcess {
             if (code !== 0 && signal !== 'SIGINT') {
                 // agent must run for at least 10 seconds before restarting
                 if (Date.now() - last_restart < 10000) {
-                    console.error(`Agent process exited too quickly and will not be restarted.`);
-                    return;
+                    console.error(`Agent process exited too quickly; exiting main so the container restarts it.`);
+                    process.exit(1);
                 }
+                console.log('Agent exited; exiting main so the container restarts it cleanly.');
+                process.exit(1);
                 console.log('Restarting agent...');
                 this.start(true, 'Agent process restarted.', count_id, this.port);
                 last_restart = Date.now();

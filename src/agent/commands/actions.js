@@ -1,3 +1,4 @@
+import * as world from '../library/world.js';
 import * as skills from '../library/skills.js';
 import settings from '../settings.js';
 import convoManager from '../conversation.js';
@@ -90,7 +91,7 @@ export const actionsList = [
     },
     {
         name: '!goToPlayer',
-        description: 'Go to the given player.',
+        description: 'Go to an online player by exact username. If they are out of view, ask them for coordinates and use !goToCoordinates.',
         params: {
             'player_name': {type: 'string', description: 'The name of the player to go to.'},
             'closeness': {type: 'float', description: 'How close to get to the player.', domain: [0, Infinity]}
@@ -125,7 +126,7 @@ export const actionsList = [
     },
     {
         name: '!searchForBlock',
-        description: 'Find and go to the nearest block of a given type in a given range.',
+        description: 'Find and go to the nearest block of a type. If it fails, retry at most once with a larger range, then do something else.',
         params: {
             'type': { type: 'BlockName', description: 'The block type to go to.' },
             'search_range': { type: 'float', description: 'The range to search for the block. Minimum 32.', domain: [10, 512] }
@@ -140,7 +141,7 @@ export const actionsList = [
     },
     {
         name: '!searchForEntity',
-        description: 'Find and go to the nearest entity of a given type in a given range.',
+        description: 'Find and go to the nearest mob/entity TYPE (e.g. cow, zombie, villager) - NOT player names (use !goToPlayer). If it fails, do not repeat it.',
         params: {
             'type': { type: 'string', description: 'The type of entity to go to.' },
             'search_range': { type: 'float', description: 'The range to search for the entity.', domain: [32, 512] }
@@ -152,7 +153,7 @@ export const actionsList = [
     {
         name: '!moveAway',
         description: 'Move away from the current location in any direction by a given distance.',
-        params: {'distance': { type: 'float', description: 'The distance to move away.', domain: [0, Infinity] }},
+        params: {'distance': { type: 'float', description: 'The distance to move away (max 256).', domain: [0, 257] }},
         perform: runAsAction(async (agent, distance) => {
             await skills.moveAway(agent.bot, distance);
         })
@@ -186,7 +187,7 @@ export const actionsList = [
         params: { 
             'player_name': { type: 'string', description: 'The name of the player to give the item to.' }, 
             'item_name': { type: 'ItemName', description: 'The name of the item to give.' },
-            'num': { type: 'int', description: 'The number of items to give.', domain: [1, Number.MAX_SAFE_INTEGER] }
+            'num': { type: 'int', description: 'The number of items to give.', domain: [1, 577] }
         },
         perform: runAsAction(async (agent, player_name, item_name, num) => {
             await skills.giveToPlayer(agent.bot, item_name, player_name, num);
@@ -213,7 +214,7 @@ export const actionsList = [
         description: 'Put the given item in the nearest chest.',
         params: {
             'item_name': { type: 'ItemName', description: 'The name of the item to put in the chest.' },
-            'num': { type: 'int', description: 'The number of items to put in the chest.', domain: [1, Number.MAX_SAFE_INTEGER] }
+            'num': { type: 'int', description: 'The number of items to put in the chest.', domain: [1, 2305] }
         },
         perform: runAsAction(async (agent, item_name, num) => {
             await skills.putInChest(agent.bot, item_name, num);
@@ -224,7 +225,7 @@ export const actionsList = [
         description: 'Take the given items from the nearest chest.',
         params: {
             'item_name': { type: 'ItemName', description: 'The name of the item to take.' },
-            'num': { type: 'int', description: 'The number of items to take.', domain: [1, Number.MAX_SAFE_INTEGER] }
+            'num': { type: 'int', description: 'The number of items to take.', domain: [1, 2305] }
         },
         perform: runAsAction(async (agent, item_name, num) => {
             await skills.takeFromChest(agent.bot, item_name, num);
@@ -243,7 +244,7 @@ export const actionsList = [
         description: 'Discard the given item from the inventory.',
         params: {
             'item_name': { type: 'ItemName', description: 'The name of the item to discard.' },
-            'num': { type: 'int', description: 'The number of items to discard.', domain: [1, Number.MAX_SAFE_INTEGER] }
+            'num': { type: 'int', description: 'The number of items to discard.', domain: [1, 2305] }
         },
         perform: runAsAction(async (agent, item_name, num) => {
             const start_loc = agent.bot.entity.position;
@@ -253,11 +254,47 @@ export const actionsList = [
         })
     },
     {
+        name: '!gatherUntil',
+        description: 'Collect a block until your inventory holds at least target of it (e.g. "birch_log", 16). Best way to get building materials. Reports progress or exactly why it stopped.',
+        params: {
+            'type': { type: 'BlockName', description: 'Block to collect, e.g. birch_log, dirt, cobblestone.' },
+            'target': { type: 'int', description: 'Total wanted in inventory (max 256).', domain: [1, 257] }
+        },
+        perform: runAsAction(async (agent, type, target) => {
+            await skills.gatherUntil(agent.bot, type, target);
+        }, false, 10)
+    },
+    {
+        name: '!buildStructure',
+        description: 'Build a simple shape from one material at coords (x,y,z = min/bottom corner). type: floor, wall, box (hollow walls), hut (box + roof + door gap on -z side), roof (flat layer at y), pillar. Checks materials first; rerun to finish partial builds.',
+        params: {
+            'type': { type: 'string', description: 'floor | wall | box | hut | roof | pillar' },
+            'x': { type: 'int', description: 'Min x corner.', domain: [-30000000, 30000000] },
+            'y': { type: 'int', description: 'Bottom y.', domain: [-64, 320] },
+            'z': { type: 'int', description: 'Min z corner.', domain: [-30000000, 30000000] },
+            'material': { type: 'BlockName', description: 'Block to build with, must be in inventory.' },
+            'width': { type: 'int', description: 'Size along x (1-16).', domain: [1, 17] },
+            'length': { type: 'int', description: 'Size along z (1-16).', domain: [1, 17] },
+            'height': { type: 'int', description: 'Size along y (1-8).', domain: [1, 9] }
+        },
+        perform: runAsAction(async (agent, type, x, y, z, material, width, length, height) => {
+            await skills.buildStructure(agent.bot, type, x, y, z, material, width, length, height);
+        }, false, 10)
+    },
+    {
+        name: '!shelterNow',
+        description: 'Get safe immediately (night, low health, hostile mobs): sleep in a nearby bed or wall/dig yourself in.',
+        params: {},
+        perform: runAsAction(async (agent) => {
+            await skills.shelterNow(agent.bot);
+        })
+    },
+    {
         name: '!collectBlocks',
-        description: 'Collect the nearest blocks of a given type.',
+        description: 'Mine/collect up to num of the nearest blocks of a type (needs the right tool, e.g. a pickaxe for stone). Reports how many it got.',
         params: {
             'type': { type: 'BlockName', description: 'The block type to collect.' },
-            'num': { type: 'int', description: 'The number of blocks to collect.', domain: [1, Number.MAX_SAFE_INTEGER] }
+            'num': { type: 'int', description: 'How many MORE blocks to collect (max 128). To reach a total in your inventory use !gatherUntil instead.', domain: [1, 129] }
         },
         perform: runAsAction(async (agent, type, num) => {
             await skills.collectBlock(agent.bot, type, num);
@@ -268,7 +305,7 @@ export const actionsList = [
         description: 'Craft the given recipe a given number of times.',
         params: {
             'recipe_name': { type: 'ItemName', description: 'The name of the output item to craft.' },
-            'num': { type: 'int', description: 'The number of times to craft the recipe. This is NOT the number of output items, as it may craft many more items depending on the recipe.', domain: [1, Number.MAX_SAFE_INTEGER] }
+            'num': { type: 'int', description: 'The number of times to craft the recipe. This is NOT the number of output items, as it may craft many more items depending on the recipe. Max 64.', domain: [1, 65] }
         },
         perform: runAsAction(async (agent, recipe_name, num) => {
             await skills.craftRecipe(agent.bot, recipe_name, num);
@@ -279,14 +316,16 @@ export const actionsList = [
         description: 'Smelt the given item the given number of times.',
         params: {
             'item_name': { type: 'ItemName', description: 'The name of the input item to smelt.' },
-            'num': { type: 'int', description: 'The number of times to smelt the item.', domain: [1, Number.MAX_SAFE_INTEGER] }
+            'num': { type: 'int', description: 'The number of times to smelt the item. Max 64.', domain: [1, 65] }
         },
         perform: runAsAction(async (agent, item_name, num) => {
             let success = await skills.smeltItem(agent.bot, item_name, num);
             if (success) {
-                setTimeout(() => {
-                    agent.cleanKill('Safely restarting to update inventory.');
-                }, 500);
+                // refresh inventory view instead of restarting the agent
+                await new Promise(r => setTimeout(r, 500));
+                agent.bot.updateHeldItem?.();
+                const inv = world.getInventoryCounts(agent.bot);
+                skills.log(agent.bot, `Inventory now: ${Object.entries(inv).map(([k,v]) => k+':'+v).join(', ')}`);
             }
         })
     },
@@ -338,7 +377,7 @@ export const actionsList = [
     {
         name: '!stay',
         description: 'Stay in the current location no matter what. Pauses all modes.',
-        params: {'type': { type: 'int', description: 'The number of seconds to stay. -1 for forever.', domain: [-1, Number.MAX_SAFE_INTEGER] }},
+        params: {'type': { type: 'int', description: 'The number of seconds to stay. -1 for forever. Max 600.', domain: [-1, 601] }},
         perform: runAsAction(async (agent, seconds) => {
             await skills.stay(agent.bot, seconds);
         })
@@ -358,6 +397,15 @@ export const actionsList = [
             return `Mode ${mode_name} is already ${on ? 'on' : 'off'}.`;
             modes.setOn(mode_name, on);
             return `Mode ${mode_name} is now ${on ? 'on' : 'off'}.`;
+        }
+    },
+    {
+        name: '!voyager',
+        description: 'Turn Voyager self-directed learning on or off (on = pick own goals, write code, verify, save skills when no player is talking).',
+        params: { 'on': { type: 'boolean', description: 'true to enable, false to disable.' } },
+        perform: async function (agent, on) {
+            agent.voyager.setEnabled(on);
+            return `Voyager mode ${on ? 'enabled' : 'disabled'}. Learned skills: ${agent.voyager.skills.length}.`;
         }
     },
     {
@@ -397,7 +445,7 @@ export const actionsList = [
         params: {
             'id': { type: 'int', description: 'The id number of the villager that you want to trade with.' },
             'index': { type: 'int', description: 'The index of the trade you want executed (1-indexed).', domain: [1, Number.MAX_SAFE_INTEGER] },
-            'count': { type: 'int', description: 'How many times that trade should be executed.', domain: [1, Number.MAX_SAFE_INTEGER] },
+            'count': { type: 'int', description: 'How many times that trade should be executed. Max 64.', domain: [1, 65] },
         },
         perform: runAsAction(async (agent, id, index, count) => {
             await skills.tradeWithVillager(agent.bot, id, index, count);
@@ -475,7 +523,7 @@ export const actionsList = [
     {
         name: '!digDown',
         description: 'Digs down a specified distance. Will stop if it reaches lava, water, or a fall of >=4 blocks below the bot.',
-        params: {'distance': { type: 'int', description: 'Distance to dig down', domain: [1, Number.MAX_SAFE_INTEGER] }},
+        params: {'distance': { type: 'int', description: 'Distance to dig down (max 64).', domain: [1, 65] }},
         perform: runAsAction(async (agent, distance) => {
             await skills.digDown(agent.bot, distance)
         })

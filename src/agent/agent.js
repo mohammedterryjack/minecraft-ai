@@ -9,6 +9,7 @@ import { ActionManager } from './action_manager.js';
 import { NPCContoller } from './npc/controller.js';
 import { MemoryBank } from './memory_bank.js';
 import { SelfPrompter } from './self_prompter.js';
+import { Voyager } from './voyager.js';
 import convoManager from './conversation.js';
 import { handleTranslation, handleEnglishTranslation } from '../utils/translator.js';
 import { addBrowserViewer } from './vision/browser_viewer.js';
@@ -44,6 +45,7 @@ export class Agent {
         this.npc = new NPCContoller(this);
         this.memory_bank = new MemoryBank();
         this.self_prompter = new SelfPrompter(this);
+        this.voyager = new Voyager(this);
         convoManager.initAgent(this);
         await this.prompter.initExamples();
 
@@ -269,6 +271,7 @@ export class Agent {
         const self_prompt = source === 'system' || source === this.name;
         const from_other_bot = convoManager.isOtherAgent(source);
 
+        if (!self_prompt && !from_other_bot) this.voyager.notePlayerMessage(); // players take priority
         if (!self_prompt && !from_other_bot) { // from user, check for forced commands
             const user_command_name = containsCommand(message);
             if (user_command_name) {
@@ -359,7 +362,23 @@ export class Agent {
                         this.routeResponse(source, pre_message);
                 }
 
+                // repeat-failure guard: same command+args with same result twice -> block it
+                if (this._lastFail && this._lastFail.cmd === res.trim() && this._lastFail.count >= 2) {
+                    console.warn('[loop-guard] blocked repeat of failing command:', res.trim());
+                    this.history.add('system', 'That command failed twice with the same result; do not repeat it. Tell the player and do something different.');
+                    continue;
+                }
                 let execute_res = await executeCommand(this, res);
+                {
+                    const r = String(execute_res ?? '');
+                    const failed = /could not|couldn't|cannot|can't|not found|no .* found|failed|error|unable|too far/i.test(r);
+                    if (failed && this._lastFail && this._lastFail.cmd === res.trim() && this._lastFail.out === r)
+                        this._lastFail.count++;
+                    else if (failed)
+                        this._lastFail = { cmd: res.trim(), out: r, count: 1 };
+                    else
+                        this._lastFail = null;
+                }
 
                 console.log('Agent executed:', command_name, 'and got:', execute_res);
                 used_command = true;
@@ -520,6 +539,7 @@ export class Agent {
     async update(delta) {
         await this.bot.modes.update();
         this.self_prompter.update(delta);
+        this.voyager.update();
         await this.checkTaskDone();
     }
 

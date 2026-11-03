@@ -1,3 +1,4 @@
+import { getAllBlocks as __gab, getAllItems as __gai } from '../../utils/mcdata.js';
 import { getBlockId, getItemId } from "../../utils/mcdata.js";
 import { actionsList } from './actions.js';
 import { queryList } from './queries.js';
@@ -110,8 +111,9 @@ export function parseCommandMessage(message) {
     const params = commandParams(command);
     const paramNames = commandParamNames(command);
     
+    const usage = `Usage: ${command.name}(${paramNames.map((n,j)=>n+':'+params[j].type).join(', ')})` + (params.length? ` e.g. ${command.name}(${paramNames.map((n,j)=>{const p=params[j]; if(p.type==='int'||p.type==='float') return p.domain? Math.max(p.domain[0],1):1; if(p.type==='boolean') return 'true'; return '"'+n+'"';}).join(', ')})` : '');
     if (args.length !== params.length)
-        return `Command ${command.name} was given ${args.length} args, but requires ${params.length} args.`;
+        return `Command ${command.name} was given ${args.length} args, but requires ${params.length} args. ${usage}`;
 
     
     for (let i = 0; i < args.length; i++) {
@@ -141,7 +143,7 @@ export function parseCommandMessage(message) {
                 throw new Error(`Command '${commandName}' parameter '${paramNames[i]}' has an unknown type: ${param.type}`);
         }
         if(arg === null || Number.isNaN(arg))
-            return `Error: Param '${paramNames[i]}' must be of type ${param.type}.`
+            return `Error: Param '${paramNames[i]}' must be of type ${param.type}. ${usage}`
 
         if(typeof arg === 'number') { //Check the domain of numbers
             const domain = param.domain;
@@ -152,8 +154,15 @@ export function parseCommandMessage(message) {
                  */
                 if (!domain[2]) domain[2] = '[)'; //By default, lower bound is included. Upper is not.
 
+                if(!checkInInterval(arg, ...domain) && (param.type === 'int' || param.type === 'float') && Number.isFinite(domain[0])) {
+                    // clamp to nearest valid value instead of failing
+                    const lo = domain[2][0]==='[' ? domain[0] : domain[0] + (param.type==='int'?1:1e-6);
+                    const hi = domain[2][1]===']' ? domain[1] : domain[1] - (param.type==='int'?1:1e-6);
+                    console.log(`Clamping ${paramNames[i]}=${arg} into [${lo}, ${hi}]`);
+                    arg = Math.min(Math.max(arg, lo), hi);
+                }
                 if(!checkInInterval(arg, ...domain)) {
-                    return `Error: Param '${paramNames[i]}' must be an element of ${domain[2][0]}${domain[0]}, ${domain[1]}${domain[2][1]}.`;
+                    return `Error: Param '${paramNames[i]}' must be an element of ${domain[2][0]}${domain[0]}, ${domain[1]}${domain[2][1]}. ${usage}`;
                     //Alternatively arg could be set to the nearest value in the domain.
                 }
             } else if (!suppressNoDomainWarning) {
@@ -161,11 +170,11 @@ export function parseCommandMessage(message) {
                 suppressNoDomainWarning = true; //Don't spam console. Only give the warning once.
             }
         } else if(param.type === 'BlockName') { //Check that there is a block with this name
-            if(getBlockId(arg) == null) return  `Invalid block type: ${arg}.`
+            if(getBlockId(arg) == null) return  `Error: '${arg}' is not a Minecraft block name. Closest real names: ${suggestNames(arg, true)}. Retry with one of those exact names.`
         } else if(param.type === 'ItemName') { //Check that there is an item with this name
-            if(getItemId(arg) == null) return `Invalid item type: ${arg}.`
+            if(getItemId(arg) == null) return `Error: '${arg}' is not a Minecraft item name. Closest real names: ${suggestNames(arg, false)}. Retry with one of those exact names.`
         } else if(param.type === 'BlockOrItemName') {
-            if(getBlockId(arg) == null && getItemId(arg) == null) return  `Invalid block or item type: ${arg}.`
+            if(getBlockId(arg) == null && getItemId(arg) == null) return  `Error: '${arg}' is not a block or item name. Closest real names: ${suggestNames(arg, null)}. Retry with one of those exact names.`
         }
         args[i] = arg;
     }
@@ -256,4 +265,22 @@ export function getCommandDocs(agent) {
         }
     }
     return docs + '*\n';
+}
+
+
+function _lev(a, b) {
+    const dp = Array.from({length: a.length+1}, (_, i) => [i]);
+    for (let j = 1; j <= b.length; j++) dp[0][j] = j;
+    for (let i = 1; i <= a.length; i++) for (let j = 1; j <= b.length; j++)
+        dp[i][j] = Math.min(dp[i-1][j]+1, dp[i][j-1]+1, dp[i-1][j-1] + (a[i-1]===b[j-1]?0:1));
+    return dp[a.length][b.length];
+}
+export function suggestNames(name, blocks) {
+    let pool = [];
+    if (blocks !== false) pool.push(...__gab().map(b => b.name));
+    if (blocks !== true) pool.push(...__gai().map(i => i.name));
+    pool = [...new Set(pool)];
+    const n = String(name).toLowerCase().replace(/ /g, '_');
+    return pool.map(x => [x, (x.includes(n) || n.includes(x) ? -5 : 0) + _lev(n, x)])
+        .sort((a, b) => a[1] - b[1]).slice(0, 5).map(x => x[0]).join(', ');
 }

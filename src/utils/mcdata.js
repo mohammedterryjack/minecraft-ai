@@ -53,6 +53,7 @@ export const WOOL_COLORS = [
 
 
 export function initBot(username) {
+    if (settings.minecraft_version && settings.minecraft_version !== "auto") mc_version = settings.minecraft_version;
     const options = {
         username: username,
         host: settings.host,
@@ -75,6 +76,12 @@ export function initBot(username) {
     const POSITION_THROTTLE_MS = 50;
     const originalWrite = bot._client.write.bind(bot._client);
     bot._client.write = function(name, data) {
+        // ViaProxy->26.x workaround: never send NaN coords (server kicks "invalid move"); reset to last good state
+        if ((name === "position" || name === "position_look") && data && (isNaN(data.x) || isNaN(data.y) || isNaN(data.z) || data.x === null)) {
+            const e = bot.entity; if (e) { if (bot._lastGoodPos) e.position = bot._lastGoodPos.clone(); e.velocity.x = 0; e.velocity.y = 0; e.velocity.z = 0; }
+            return;
+        }
+        if ((name === "position" || name === "position_look") && data && bot.entity) bot._lastGoodPos = bot.entity.position.clone();
         if (name === 'position' || name === 'position_look' || name === 'look') {
             const now = Date.now();
             if (now - lastPositionUpdate < POSITION_THROTTLE_MS) {
@@ -140,6 +147,8 @@ export function isHuntable(mob) {
 
 export function isHostile(mob) {
     if (!mob || !mob.name) return false;
+    // ViaVersion shows 1.21.4+ creakings as wardens named vb.entity.creaking; hitting can't kill them
+    if (JSON.stringify(mob.metadata?.[2] ?? '').includes('vb.entity.creaking')) return false;
     return  (mob.type === 'mob' || mob.type === 'hostile') && mob.name !== 'iron_golem' && mob.name !== 'snow_golem';
 }
 

@@ -127,7 +127,13 @@ export class Coder {
         const missingSkills = skills.filter(skill => !knownSkills.has(skill));
         if (missingSkills.length > 0) {
             result += 'These functions do not exist:\n';
-            result += missingSkills.join('\n');
+            const known = [...knownSkills];
+            result += missingSkills.map(m => {
+                const base = m.split('.').pop().toLowerCase();
+                const close = known.filter(k => k.split('.').pop().toLowerCase().includes(base.slice(0, 5)) || base.includes(k.split('.').pop().toLowerCase().slice(0, 6))).slice(0, 5);
+                return `${m}  -> did you mean: ${close.length ? close.join(', ') : '(none close)'}`;
+            }).join('\n');
+            result += '\nOnly these functions exist: ' + known.join(', ');
             console.log(result)
             return result;
         }

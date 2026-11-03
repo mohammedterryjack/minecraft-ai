@@ -1,0 +1,17 @@
+services:
+  icefox:
+    build: .
+    image: mindcraft-icefox:latest
+    container_name: mindcraft-icefox
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      MINECRAFT_HOST: host.docker.internal   # ViaProxy on the Mac Studio host
+      MINECRAFT_PORT: "25568"
+    ports: ["127.0.0.1:8080:8080"]          # MindServer (say.mjs)
+    volumes:
+      - ./bots:/app/bots                     # memory, histories, Voyager skill library
+      - ./logs:/app/logs                     # mindcraft.log for the Discord feed
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    logging: { driver: json-file, options: { max-size: "10m", max-file: "3" } }

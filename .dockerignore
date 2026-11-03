@@ -1,5 +1,11 @@
-.vscode
-node_modules
-bots/*/
-!bots/*
+.git
 keys.json
+.env
+*.bak*
+*.orig
+mindcraft.log
+logs
+bots/*/histories
+bots/*/action-code
+.start.pid
+Dockerfile*

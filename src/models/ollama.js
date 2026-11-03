@@ -31,6 +31,7 @@ export class Ollama {
                 });
                 if (apiResponse) {
                     res = apiResponse['message']['content'];
+                    console.log(`[ollama-timing] model=${this.model_name} prompt_tokens=${apiResponse.prompt_eval_count} prompt_ms=${Math.round((apiResponse.prompt_eval_duration||0)/1e6)} gen_tokens=${apiResponse.eval_count} total_ms=${Math.round((apiResponse.total_duration||0)/1e6)}`);
                 } else {
                     res = 'No response data.';
                 }

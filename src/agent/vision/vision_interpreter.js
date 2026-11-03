@@ -1,5 +1,5 @@
 import { Vec3 } from 'vec3';
-import { Camera } from "./camera.js";
+// Camera import made lazy (native canvas bindings unavailable)
 import fs from 'fs';
 
 export class VisionInterpreter {
@@ -8,7 +8,7 @@ export class VisionInterpreter {
         this.allow_vision = allow_vision;
         this.fp = './bots/'+agent.name+'/screenshots/';
         if (allow_vision) {
-            this.camera = new Camera(agent.bot, this.fp);
+            this.camera = null; console.warn("vision disabled: camera unavailable");
         }
     }
 

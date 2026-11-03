@@ -138,6 +138,23 @@ const modes_list = [
         }
     },
     {
+        name: 'night_shelter',
+        description: 'When idle at night outdoors with a hostile mob within 24 blocks, take shelter (bed or wall in).',
+        interrupts: [],
+        on: true,
+        active: false,
+        last: 0,
+        update: async function (agent) {
+            const t = agent.bot.time.timeOfDay;
+            if (t < 13000 || t > 23000 || Date.now() - this.last < 60000) return;
+            const enemy = world.getNearestEntityWhere(agent.bot, entity => mc.isHostile(entity), 24);
+            if (!enemy) return;
+            this.last = Date.now();
+            say(agent, `Night and a ${enemy.name} nearby, taking shelter.`);
+            execute(this, agent, async () => { await skills.shelterNow(agent.bot); });
+        }
+    },
+    {
         name: 'cowardice',
         description: 'Run away from enemies. Interrupts all actions.',
         interrupts: ['all'],

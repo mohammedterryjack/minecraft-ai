@@ -1,3 +1,4 @@
+import { CodeModelWithFallback } from './code_fallback.js';
 import { readFileSync, mkdirSync, writeFileSync} from 'fs';
 import { Examples } from '../utils/examples.js';
 import { getCommandDocs } from '../agent/commands/index.js';
@@ -58,10 +59,18 @@ export class Prompter {
 
         let chat_model_profile = selectAPI(this.profile.model);
         this.chat_model = createModel(chat_model_profile);
+        if (this.profile.model_fallback) {
+            const cfb = createModel(selectAPI(this.profile.model_fallback));
+            this.chat_model = new CodeModelWithFallback(this.chat_model, cfb, 60 * 60 * 1000, 'chat-model');
+        }
 
         if (this.profile.code_model) {
             let code_model_profile = selectAPI(this.profile.code_model);
             this.code_model = createModel(code_model_profile);
+            if (this.profile.code_model_fallback) {
+                const fb = createModel(selectAPI(this.profile.code_model_fallback));
+                this.code_model = new CodeModelWithFallback(this.code_model, fb);
+            }
         }
         else {
             this.code_model = this.chat_model;
@@ -134,6 +143,26 @@ export class Prompter {
         }
     }
 
+    _positionsText() {
+        // richer surroundings for Gemini: nearest coords of each block type + entities with positions
+        try {
+            const bot = this.agent.bot; const me = bot.entity.position;
+            const f = p => `(${Math.floor(p.x)}, ${Math.floor(p.y)}, ${Math.floor(p.z)})`;
+            let out = 'NEARBY_POSITIONS (nearest of each, within 16)';
+            const seen = new Set();
+            const blocks = bot.findBlocks({ matching: b => b && b.name !== 'air' && b.name !== 'cave_air', maxDistance: 16, count: 4000 });
+            for (const p of blocks) {
+                const b = bot.blockAt(p); if (!b || seen.has(b.name)) continue;
+                seen.add(b.name); out += `\n- ${b.name} at ${f(p)} (${Math.round(p.distanceTo(me))}m)`;
+                if (seen.size >= 25) break;
+            }
+            const ents = Object.values(bot.entities).filter(e => e !== bot.entity && e.position.distanceTo(me) <= 32)
+                .sort((a, b) => a.position.distanceTo(me) - b.position.distanceTo(me)).slice(0, 15);
+            for (const e of ents) out += `\n- ${e.username || e.name || e.type} at ${f(e.position)} (${Math.round(e.position.distanceTo(me))}m)`;
+            return out;
+        } catch (e) { return 'NEARBY_POSITIONS: unavailable (' + e.message + ')'; }
+    }
+
     async replaceStrings(prompt, messages, examples=null, to_summarize=[], last_goals=null) {
         prompt = prompt.replaceAll('$NAME', this.agent.name);
 
@@ -141,6 +170,7 @@ export class Prompter {
             let stats = await getCommand('!stats').perform(this.agent) + '\n';
             stats += await getCommand('!entities').perform(this.agent) + '\n';
             stats += await getCommand('!nearbyBlocks').perform(this.agent);
+            stats += '\n' + this._positionsText();
             prompt = prompt.replaceAll('$STATS', stats);
         }
         if (prompt.includes('$INVENTORY')) {
@@ -226,10 +256,15 @@ export class Prompter {
             let generation;
 
             try {
+                try { writeFileSync('/tmp/icefox_chat_prompt.txt', prompt); } catch (e) {}
                 generation = await this.chat_model.sendRequest(messages, prompt);
                 if (typeof generation !== 'string') {
                     console.error('Error: Generated response is not a string', generation);
                     throw new Error('Generated response is not a string');
+                }
+                // small model parrots the error string from history; strip it when real content follows
+                if (generation.trim() !== "My brain disconnected, try again." && generation.includes("My brain disconnected, try again.")) {
+                    generation = generation.replace(/My brain disconnected, try again\.\s*/g, "").trim();
                 }
                 console.log("Generated response:", generation);
                 await this._saveLog(prompt, messages, generation, 'conversation');
@@ -271,8 +306,13 @@ export class Prompter {
         let prompt = this.profile.coding;
         prompt = await this.replaceStrings(prompt, messages, this.coding_examples);
 
-        let resp = await this.code_model.sendRequest(messages, prompt);
-        this.awaiting_coding = false;
+        let resp;
+        try {
+            try { writeFileSync('/tmp/icefox_code_prompt.txt', prompt); } catch (e) {}
+            resp = await this.code_model.sendRequest(messages, prompt);
+        } finally {
+            this.awaiting_coding = false; // never leave coding locked after an error
+        }
         await this._saveLog(prompt, messages, resp, 'coding');
         return resp;
     }

@@ -1,16 +1,16 @@
 const settings = {
-    "minecraft_version": "auto", // or specific version like "1.21.6"
+    "minecraft_version": "1.20.4", // or specific version like "1.21.6"
     "host": "127.0.0.1", // or "localhost", "your.ip.address.here"
-    "port": 55916, // set to -1 to automatically scan for open ports
+    "port": 25568, // set to -1 to automatically scan for open ports
     "auth": "offline", // or "microsoft"
 
     // the mindserver manages all agents and hosts the UI
     "mindserver_port": 8080,
-    "auto_open_ui": true, // opens UI in browser on startup
+    "auto_open_ui": false, // opens UI in browser on startup
     
     "base_profile": "assistant", // survival, assistant, creative, or god_mode
     "profiles": [
-        "./andy.json",
+        "./profiles/mo_bot.json",
         // "./profiles/gpt.json",
         // "./profiles/claude.json",
         // "./profiles/gemini.json",
@@ -26,7 +26,7 @@ const settings = {
         // individual profiles override values from the base profile
     ],
 
-    "load_memory": false, // load memory from previous session
+    "load_memory": true, // load memory from previous session
     "init_message": "Respond with hello world and your name", // sends to all on spawn
     "only_chat_with": [], // users that the bots listen to and send general messages to. if empty it will chat publicly
 
@@ -40,17 +40,17 @@ const settings = {
     "language": "en", // translate to/from this language. Supports these language names: https://cloud.google.com/translate/docs/languages
     "render_bot_view": false, // show bot's view in browser at localhost:3000, 3001...
 
-    "allow_insecure_coding": false, // allows newAction command and model can write/run code on your computer. enable at own risk
+    "allow_insecure_coding": true, // allows newAction command and model can write/run code on your computer. enable at own risk
     "allow_vision": false, // allows vision model to interpret screenshots as inputs
-    "blocked_actions" : ["!checkBlueprint", "!checkBlueprintLevel", "!getBlueprint", "!getBlueprintLevel"] , // commands to disable and remove from docs. Ex: ["!setMode"]
+    "blocked_actions" : ["!startConversation", "!endConversation", "!restart", "!clearChat", "!stfu", "!placeHere", "!goToRememberedPlace"] , // commands to disable and remove from docs. Ex: ["!setMode"]
     "code_timeout_mins": -1, // minutes code is allowed to run. -1 for no timeout
     "relevant_docs_count": 5, // number of relevant code function docs to select for prompting. -1 for all
 
-    "max_messages": 15, // max number of messages to keep in context
+    "max_messages": 30, // max number of messages to keep in context
     "num_examples": 2, // number of examples to give to the model
     "max_commands": -1, // max number of commands that can be used in consecutive responses. -1 for no limit
-    "show_command_syntax": "full", // "full", "shortened", or "none"
-    "narrate_behavior": true, // chat simple automatic actions ('Picking up item!')
+    "show_command_syntax": "shortened", // "full", "shortened", or "none"
+    "narrate_behavior": false, // chat simple automatic actions ('Picking up item!')
     "chat_bot_messages": true, // publicly chat messages to other bots
 
     "spawn_timeout": 30, // num seconds allowed for the bot to spawn before throwing error. Increase when spawning takes a while.
