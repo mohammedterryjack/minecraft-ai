@@ -118,8 +118,9 @@ export class Prompter {
 
     async initExamples() {
         try {
-            this.convo_examples = new Examples(this.embedding_model, settings.num_examples);
-            this.coding_examples = new Examples(this.embedding_model, settings.num_examples);
+            // word-overlap example selection (no embedding call per message; saves Gemini quota)
+            this.convo_examples = new Examples(null, settings.num_examples);
+            this.coding_examples = new Examples(null, settings.num_examples);
             
             // Wait for both examples to load before proceeding
             await Promise.all([

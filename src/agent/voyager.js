@@ -1,3 +1,4 @@
+import { wordOverlapScore } from '../utils/text.js';
 // Voyager-style lifelong learning loop (after MineDojo/Voyager):
 // automatic curriculum -> iterative code generation with env feedback -> self-verification critic -> skill library.
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
@@ -169,7 +170,9 @@ known_skills: ${JSON.stringify(this.skills.map(s => s.name))}`;
             }
             if (changed) { this._saveSkills(); console.log('[voyager] re-embedded skill library with current embedding model'); }
         }
-        const scored = this.skills.map(s => ({ s, score: (q && s.embedding) ? cosineSimilarity(q, s.embedding) : 0 }));
+        // embeddings unavailable (e.g. Gemini 429) -> fall back to word overlap so retrieval still works
+        const scored = this.skills.map(s => ({ s, score: (q && s.embedding && s.embedding.length === q.length)
+            ? cosineSimilarity(q, s.embedding) : wordOverlapScore(query, `${s.name} ${s.description} ${s.task || ''}`) }));
         return scored.sort((a, b) => b.score - a.score).slice(0, k).map(x => x.s);
     }
     async saveSkill(name, description, code, task) {
