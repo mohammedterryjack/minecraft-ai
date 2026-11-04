@@ -55,8 +55,8 @@ export function gateLog(msg) { console.log('[gate] ' + msg); }
 // instrumentSrc: JS appended after the skill library inside the staged program; rebinds every skill to a wrapper that
 // records one trace record per call (name, args, parent, depth, own output span, inventory delta, return, error).
 export function instrumentSrc(names) {
-    // fix11 (B6): parent call tracked with AsyncLocalStorage (globalThis.__psnALS, set by voyager.js), so parallel calls get the right parent
-    const wrap = `const __T = bot.__psnTrace = []; const __als = globalThis.__psnALS; if (!__als) throw new Error('PSN trace: globalThis.__psnALS (AsyncLocalStorage) missing'); const __inv = () => { try { return world.getInventoryCounts(bot); } catch { return {}; } };
+    // fix11 (B6): parent call tracked with AsyncLocalStorage (bot.__psnALS, set by voyager.js before each run; fix12: SES compartments have their own globalThis), so parallel calls get the right parent
+    const wrap = `const __T = bot.__psnTrace = []; const __als = bot.__psnALS; if (!__als) throw new Error('PSN trace: bot.__psnALS (AsyncLocalStorage) missing'); const __inv = () => { try { return world.getInventoryCounts(bot); } catch { return {}; } };
 const __wrap = (n, f) => async function (...a) {
     if (__T.length >= 400) return await f.apply(this, a);
     const par = __als.getStore() ?? -1;

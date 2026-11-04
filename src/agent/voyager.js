@@ -367,7 +367,7 @@ export class Voyager {
         const full = this._libSrc(over) + '\n\n' + instrumentSrc(this.skills.filter(s => new RegExp(`async\\s+function\\s+${s.name}\\s*\\(`).test(over[s.name] ?? s.code)).map(s => s.name)) + '\n\nasync function __replay(bot) {\n    try { ' + r.call + ' } finally { bot.__psnOut = bot.output; }\n}\nawait __replay(bot);';
         const staged = await this.agent.coder._stageCode(full);
         if (!staged) return { ok: false };
-        const res = await this.agent.actions.runAction(`voyager:replay:${task}`, async () => { await staged.func.main(this.agent.bot); }, { timeout: 5 });
+        const res = await this.agent.actions.runAction(`voyager:replay:${task}`, async () => { this.agent.bot.__psnALS = globalThis.__psnALS; await staged.func.main(this.agent.bot); }, { timeout: 5 });
         if (this.abort || res.interrupted) return { ok: false, interrupted: true };
         const after = this.observe();
         let ok;
@@ -429,7 +429,7 @@ export class Voyager {
         gateLog(`regression rerun of candidate ${entry.name} on past task "${past}"`);
         const staged = await this.agent.coder._stageCode(this._libSrc({ [entry.name]: code }) + `\n\nawait ${entry.name}(bot);`);
         if (!staged) return false;
-        const res = await this.agent.actions.runAction(`voyager:gate:${entry.name}`, async () => { await staged.func.main(this.agent.bot); }, { timeout: 4 });
+        const res = await this.agent.actions.runAction(`voyager:gate:${entry.name}`, async () => { this.agent.bot.__psnALS = globalThis.__psnALS; await staged.func.main(this.agent.bot); }, { timeout: 4 });
         if (res.interrupted || this.abort) return null;
         return gainedFor(goal, before, this.observe()) >= goal.count;
     }
@@ -911,7 +911,7 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             if (lint) { console.log('[voyager] lint failed: ' + String(lint).slice(0, 300)); feedback = 'Lint error:\n' + lint; lastCode = code; continue; }
 
             const res = await this.agent.actions.runAction(`voyager:${task}`, async () => {
-                await staged.func.main(this.agent.bot);
+                this.agent.bot.__psnALS = globalThis.__psnALS; await staged.func.main(this.agent.bot);
             }, { timeout: 5 });
             if (this.abort || res.interrupted) { console.log('[voyager] task interrupted'); return; }
             const output = String(res.message || '').slice(-1500);
