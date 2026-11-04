@@ -57,14 +57,16 @@ export function gateLog(msg) { console.log('[gate] ' + msg); }
 export function instrumentSrc(names) {
     // fix11 (B6): parent call tracked with AsyncLocalStorage (bot.__psnALS, set by voyager.js before each run; fix12: SES compartments have their own globalThis), so parallel calls get the right parent
     const wrap = `const __T = bot.__psnTrace = []; const __als = bot.__psnALS; if (!__als) throw new Error('PSN trace: bot.__psnALS (AsyncLocalStorage) missing'); const __inv = () => { try { return world.getInventoryCounts(bot); } catch { return {}; } };
+const __st = () => { try { const p = bot.entity.position, b = bot.blockAt(p.floored().offset(0, 1, 0)); return { pos: { x: p.x, y: p.y, z: p.z }, hp: bot.health, food: bot.food, sky: b ? b.skyLight : null, alive: bot.health > 0, dim: String(bot.game?.dimension || ''), inv: __inv() }; } catch (e) { return { err: String(e?.message || e) }; } };
 const __wrap = (n, f) => async function (...a) {
     if (__T.length >= 1500) return await f.apply(this, a);
     const par = __als.getStore() ?? -1;
-    const rec = { name: n, args: (() => { try { return JSON.stringify(a.slice(1)).slice(0, 120); } catch { return '?'; } })(), parent: par, depth: par < 0 ? 0 : __T[par].depth + 1, o0: (bot.output || '').length, t0: Date.now(), pre: __inv() };
+    const rec = { name: n, args: (() => { try { return JSON.stringify(a.slice(1)).slice(0, 120); } catch { return '?'; } })(), parent: par, depth: par < 0 ? 0 : __T[par].depth + 1, o0: (bot.output || '').length, t0: Date.now(), pre: __inv(), argv: a.slice(1).map(x => x === null || typeof x !== 'object' ? x : null) };
+    if (!n.startsWith('skills.')) rec.s0 = __st();
     const id = __T.push(rec) - 1;
-    try { const r = await __als.run(id, () => f.apply(this, a)); rec.ret = r === undefined ? 'undefined' : String(JSON.stringify(r)).slice(0, 60); rec.fail = r === false || r === null || r === 0; return r; }
+    try { const r = await __als.run(id, () => f.apply(this, a)); rec.ret = r === undefined ? 'undefined' : String(JSON.stringify(r)).slice(0, 60); rec.rv = r === null || typeof r !== 'object' ? r : null; rec.fail = r === false || r === null || r === 0; return r; }
     catch (e) { rec.fail = true; rec.err = String(e?.message || e).slice(0, 200); throw e; }
-    finally { rec.t1 = Date.now(); rec.o1 = (bot.output || '').length; bot.__psnOut = bot.output; const post = __inv(); rec.delta = {}; for (const k of new Set([...Object.keys(rec.pre), ...Object.keys(post)])) { const d = (post[k] || 0) - (rec.pre[k] || 0); if (d) rec.delta[k] = d; } delete rec.pre; rec.intr = !!bot.interrupt_code; }
+    finally { rec.t1 = Date.now(); if (!n.startsWith('skills.')) rec.s1 = __st(); rec.o1 = (bot.output || '').length; bot.__psnOut = bot.output; const post = __inv(); rec.delta = {}; for (const k of new Set([...Object.keys(rec.pre), ...Object.keys(post)])) { const d = (post[k] || 0) - (rec.pre[k] || 0); if (d) rec.delta[k] = d; } delete rec.pre; rec.intr = !!bot.interrupt_code; }
 };`;
     // fix21: skills.* primitives are traced too (fixed leaves: name 'skills.<fn>', status/error/timing), so a failure or death
     // inside a primitive is attributed to the library skill that called it (PSN caller_fix). skills.log is not wrapped (it is the output channel).
@@ -123,7 +125,7 @@ export function blameAll(trace, isLeaf, isLearned) {
         const path = chain.map(k => trace[k].name);
         const evidence = (r.ownFail.join(' | ') || r.err || `returned ${r.ret}`).slice(0, 400);
         for (const k of chain) {
-            const n = trace[k].name; if (isLeaf(n) || !isLearned(n)) continue;
+            const n = trace[k].name; if (isLeaf(n) || !isLearned(n) || (k === i && trace[k].preFail)) continue;   // fix22: violated precondition -> caller's fault
             const kind = k === i ? 'callee_fix' : 'caller_fix';   // the failing call itself vs an ancestor that did not handle it
             const prev = out.get(n);
             if (!prev) out.set(n, { target: n, leaf: r.name, path, kind, swallowed, evidence, depth: trace[k].depth });

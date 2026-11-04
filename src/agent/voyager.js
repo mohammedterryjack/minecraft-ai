@@ -7,6 +7,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, renameS
 export function writeAtomic(fp, text) { const tmp = `${fp}.tmp-${process.pid}`; writeFileSync(tmp, text); renameSync(tmp, fp); }
 import * as world from './library/world.js';
 import * as skills from './library/skills.js';
+import { makeCompartment } from './library/lockdown.js';
 import { getAllItems, getAllBlocks, getItemCraftingRecipes, isHostile, isDatapackHostile } from '../utils/mcdata.js';
 import { cosineSimilarity } from '../utils/math.js';
 import minecraftData from 'minecraft-data';
@@ -216,6 +217,77 @@ export class Voyager {
     // fix20 (PSN repair memory): rolling buffer of the last 5 repair proposals per skill
     _noteProposal(e, p) { e.repairHistory = [...(e.repairHistory || []), { at: new Date().toISOString(), ...p }].slice(-5); this._saveSkills(); }
     _proposalOutcome(e, outcome) { const h = e.repairHistory; if (h?.length && !h[h.length - 1].outcome) { h[h.length - 1].outcome = outcome; } }
+    // ---------- fix22: learned skill contracts (PSN pre/postconditions) ----------
+    // Each library skill carries { pre, post, text }: JS predicates over c = { args, ret, pre, post, delta } learned by the code model
+    // from the skill's description, code and observed effects; evaluated after every traced call against real bot state.
+    static CONTRACT_SPEC = `A contract is two JavaScript arrow functions over one argument c, each returning true when satisfied:
+  c.args  = the call's arguments after bot (numbers/strings; objects are null)
+  c.ret   = the call's return value (primitive, or null for objects)
+  c.pre / c.post = bot state before / after the call: { pos:{x,y,z}, hp (0-20), food (0-20), sky (sky light 0-15 at head height; 0 = underground or enclosed), alive (bool), dim (dimension string), inv:{item:count} }
+  c.delta = inventory change {item: +n/-n}
+  c.dist(a, b) = euclidean distance between two {x,y,z}
+pre: what must hold before the call for it to be able to succeed (use "c => true" if nothing).
+post: what the call promises afterwards when it reports success (state the observable effect: arrived near target, item gained, still alive, not stranded underground, etc.). If the call returns false/null it already reported failure, so post may return true in that case.
+Use only c; no other globals.`;
+    _compileContract(src) { const f = makeCompartment({}).evaluate(`(${src})`); if (typeof f !== 'function') throw new Error('not a function'); return f; }
+    _validContract(ct) {
+        if (!ct || typeof ct.post !== 'string' || typeof ct.pre !== 'string') return 'missing pre/post string';
+        const s = { pos: { x: 0, y: 64, z: 0 }, hp: 20, food: 20, sky: 15, alive: true, dim: 'overworld', inv: {} };
+        const c = { args: [0, 64, 0, 'x', 1], ret: true, pre: s, post: s, delta: {}, dist: (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z) };
+        try { for (const k of ['pre', 'post']) { const r = this._compileContract(ct[k])(c); if (typeof r !== 'boolean') return `${k} returned ${typeof r}, not boolean`; } } catch (e) { return `throws: ${e.message}`; }
+        return null;
+    }
+    // evaluate contracts on every traced library call; violations become contract failures in the trace
+    _checkContracts(trace, taskOk) {
+        const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+        for (const r of trace) {
+            if (r.intr || !r.s0 || !r.s1) continue;
+            const e = this.skills.find(s => s.name === r.name);
+            if (!e?.contract) continue;
+            const c = { args: r.argv || [], ret: r.rv, pre: r.s0, post: r.s1, delta: r.delta || {}, dist };
+            for (const k of ['pre', 'post']) {
+                let ok;
+                try { ok = this._compileContract(e.contract[k])(c); }
+                catch (err) { console.log(`!!! [contract] ${e.name}.${k} THREW: ${err.message}; queued contract repair`); this._queueContractFix(e, `${k} threw: ${err.message}`); continue; }
+                if (ok !== false) continue;
+                r.ok = false; r.fail = true; if (k === 'pre') r.preFail = true;
+                r.ownFail = [...(r.ownFail || []), `${k === 'pre' ? 'PRECONDITION' : 'POSTCONDITION'} violated: ${e.contract.text || e.contract[k]} (post pos ${r.s1.pos ? [r.s1.pos.x, r.s1.pos.y, r.s1.pos.z].map(Math.round).join(',') : '?'}, sky ${r.s1.sky}, alive ${r.s1.alive})`];
+                console.log(`[contract] ${e.name}(${(r.argv || []).join(',')}) ${k}condition VIOLATED: ${e.contract[k].slice(0, 160)}`);
+                // the task outcome disagrees with the contract: the contract itself may be wrong -> it is repairable
+                if (taskOk && k === 'post' && r.parent < 0) this._queueContractFix(e, `postcondition failed but the task check passed`);
+            }
+        }
+    }
+    _queueContractFix(e, why) {
+        const rq = [...(this._repairQueue || [])];
+        if (rq.some(x => x.target === e.name && x.kind === 'contract_fix')) return;
+        rq.unshift({ target: e.name, leaf: e.name, path: [e.name], kind: 'contract_fix', swallowed: false, evidence: why, task: 'contract check', trace: '', depth: 99 });
+        this._repairQueue = rq;
+    }
+    // learn contracts for a batch of skills with one code-model call; invalid ones fail loudly (no default contract)
+    async _learnContracts(ents, why, fixNote = '') {
+        const system = `You write PSN skill contracts for a Minecraft mineflayer skill library.\n${Voyager.CONTRACT_SPEC}\nReply ONLY with JSON: {"<skillName>": {"pre": "c => ...", "post": "c => ...", "text": "<one-line contract summary>"}, ...} for exactly the skills given.`;
+        const user = ents.map(e => `--- ${e.name} ---\ndescription: ${e.description}\nobserved effects: ${JSON.stringify(e.effects || [])}\n${e.contract ? `current contract (${fixNote || 'to fix'}): ${JSON.stringify(e.contract)}\n` : ''}code:\n${String(e.code).slice(0, 1800)}`).join('\n');
+        console.log(`[contract] learning contracts for ${ents.length} skill(s) (${why}): ${ents.map(e => e.name).join(', ')}`);
+        let out; try { out = parseJSON(await this._ask(system, user)); } catch (err) { console.log(`[contract] learning FAILED: ${err.message}`); return 0; }
+        let n = 0;
+        for (const e of ents) {
+            const ct = out?.[e.name], bad = this._validContract(ct);
+            e.contractTried = Date.now();
+            if (bad) { console.log(`[contract] FAILED for ${e.name}: ${bad}`); continue; }
+            if (e.contract) e.contractPrev = e.contract;
+            e.contract = { pre: ct.pre, post: ct.post, text: String(ct.text || '').slice(0, 200), learned: new Date().toISOString(), why };
+            n++; console.log(`[contract] ${e.name}: pre ${ct.pre.slice(0, 80)} | post ${ct.post.slice(0, 120)}`);
+        }
+        this._saveSkills(); return n;
+    }
+    // backfill: skills without a contract, 12 per code-model call, retried at most every 30 min per skill
+    async _backfillContracts() {
+        if (this._cursorLimited()) return false;
+        const todo = this.skills.filter(s => !s.contract && !s.mergedInto && Date.now() - (s.contractTried || 0) > 30 * 60e3).slice(0, 12);
+        if (!todo.length) return false;
+        await this._learnContracts(todo, 'backfill'); return true;
+    }
     get enabled() { return this.progress.enabled !== false; }
     setEnabled(v) { this.progress.enabled = v; this._saveProgress(); if (!v) this.interrupt(); }
     _saveProgress() { writeAtomic(this.progressFile, JSON.stringify(this.progress, null, 2)); }
@@ -775,6 +847,7 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         bot.__psnTrace = null;
         if (!Array.isArray(trace) || !trace.length) { console.log('[psn] no execution trace recorded'); return; }
         annotateTrace(trace, bot.__psnOut || '');
+        this._checkContracts(trace, ok);   // fix22: learned pre/postconditions against real state
         // candidate children: their contract result in this run is a trial run (regression gate)
         for (const name of Object.keys(over)) {
             if (name === root) continue;
@@ -795,7 +868,7 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         const died = this._diedInRun();
         if (died) { let i = -1; for (let k = 0; k < trace.length; k++) if ((trace[k].t0 || 0) <= died.t && (trace[k].t1 ?? Infinity) >= died.t - 1500 && (i < 0 || trace[k].depth >= trace[i].depth)) i = k; if (i < 0) i = trace.length - 1; console.log(`[psn] death attributed to the call running at death time: ${trace[i].name} (depth ${trace[i].depth})`); trace[i].ownFail = [`DIED: ${died.message} at ${died.pos}`]; for (; i >= 0; i = trace[i].parent) { trace[i].intr = false; trace[i].ok = false; trace[i].fail = true; } ok = false; }
         // fix19 (5): an explicit FAILED line from a skill is a contract failure even if the task check passed (e.g. ensureChest inside a storage task)
-        const explicit = trace.some(r => !r.intr && (r.ownFail || []).some(l => /FAILED/.test(l)));
+        const explicit = trace.some(r => !r.intr && (r.ownFail || []).some(l => /FAILED|CONDITION violated/.test(l)));   // fix22: contract violations count
         if (ok && !revalFail && !explicit) return;
         if (ok && explicit) console.log(`[psn] task check passed but a skill reported FAILED; attributing that contract failure`);
         console.log(`[psn] execution trace of ${root} (${trace.length} calls):\n${traceText(trace)}`);
@@ -825,11 +898,18 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         if (Date.now() - (this._repairs[e.name] || 0) < 30 * 60e3) { console.log(`[psn] repair of ${e.name} skipped: already repaired in the last 30 min (cap)`); return false; }
         if (e.candidate) { console.log(`[psn] repair of ${e.name} skipped: a candidate is already under trial`); return false; }
         if (this._cursorLimited()) { console.log(`[psn] repair of ${e.name} skipped: code model at its limit`); return false; }
+        if (q.kind === 'contract_fix') {
+            this._repairs[e.name] = Date.now(); this._saveProgress();
+            console.log(`[psn] REPAIR contract of ${e.name} (${q.evidence})`);
+            const n = await this._learnContracts([e], 'contract repair', q.evidence);
+            this._noteProposal(e, { task: q.task, kind: q.kind, evidence: q.evidence.slice(0, 200), desc: n ? `contract -> ${e.contract.text}` : 'contract repair failed', outcome: n ? 'contract replaced' : 'failed' });
+            return n > 0;
+        }
         if (!this._updateAllowed(e, `repair after ${q.kind}`)) { console.log(`[psn] repair of ${e.name} skipped: maturity gate froze it`); return false; }
         this._repairs[e.name] = Date.now(); this._saveProgress();
         const kids = [...this._closure(e.name)].map(n => this.skills.find(s => s.name === n)).filter(Boolean);
         const system = `You repair ONE skill in a Minecraft mineflayer skill library (PSN-style targeted fix). Return a single \`\`\`javascript code block containing ONLY the fixed function, with the SAME name and a compatible signature. First line inside the block: // DESCRIPTION: <one sentence>. Call other library skills by name (they are in scope); never redefine them. Every loop must check bot.interrupt_code. If something still cannot be done, log(bot, 'FAILED: <reason>') and return a falsy value; no silent fallbacks.\nLIBRARY:\n${this.catalogue()}`;
-        const user = `Blamed skill: ${e.name} (${q.kind === 'caller_fix' ? 'it calls the leaf ' + q.leaf + ' in a situation where the leaf cannot succeed: fix how/when it calls it, e.g. obtain the missing prerequisite first' : 'its own logic failed'})\nTask that failed: ${q.task}\nFailure path: ${q.path.join(' > ')}\nEvidence: ${q.evidence}\n--- execution trace (indent = call depth) ---\n${q.trace}\n--- current code of ${e.name} ---\n${e.code}\n--- skills it uses ---\n${kids.map(k => '// ' + k.description + '\n' + signatureOf(k.code, k.name)).join('\n')}\n${(e.repairHistory || []).length ? `\n--- your last ${e.repairHistory.length} repair proposal(s) for ${e.name} (do not repeat what failed) ---\n` + e.repairHistory.map((h, i) => `${i + 1}. [${h.outcome || 'pending'}] ${h.kind}: ${h.evidence}\n   change: ${h.desc}`).join('\n') : ''}${q.peers?.length > 1 ? `\nOther skills blamed on the same failure (repaired children-first): ${q.peers.join(', ')}` : ''}\nWrite the fixed ${e.name}:`;
+        const user = `Blamed skill: ${e.name} (${q.kind === 'caller_fix' ? 'it calls the leaf ' + q.leaf + ' in a situation where the leaf cannot succeed: fix how/when it calls it, e.g. obtain the missing prerequisite first' : 'its own logic failed'})\nTask that failed: ${q.task}\nFailure path: ${q.path.join(' > ')}\nEvidence: ${q.evidence}\n--- execution trace (indent = call depth) ---\n${q.trace}\n${e.contract ? `--- learned contract of ${e.name} (must hold after your fix) ---\npre: ${e.contract.pre}\npost: ${e.contract.post}\n` : ''}--- current code of ${e.name} ---\n${e.code}\n--- skills it uses ---\n${kids.map(k => '// ' + k.description + '\n' + signatureOf(k.code, k.name)).join('\n')}\n${(e.repairHistory || []).length ? `\n--- your last ${e.repairHistory.length} repair proposal(s) for ${e.name} (do not repeat what failed) ---\n` + e.repairHistory.map((h, i) => `${i + 1}. [${h.outcome || 'pending'}] ${h.kind}: ${h.evidence}\n   change: ${h.desc}`).join('\n') : ''}${q.peers?.length > 1 ? `\nOther skills blamed on the same failure (repaired children-first): ${q.peers.join(', ')}` : ''}\nWrite the fixed ${e.name}:`;
         console.log(`[psn] repair memory for ${e.name}: ${(e.repairHistory || []).length} past proposal(s) in the prompt`);
         console.log(`[psn] REPAIR ${e.name} [${q.kind}] with the code model (evidence: ${q.evidence.slice(0, 160)})`);
         let code, body, desc, extra = '';
@@ -911,6 +991,7 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         if (await this._leash()) return;
         if (this._repairQueue?.length) { await this._repair(); return; }
         if (this._decomposeQueue) { const dq = this._decomposeQueue; this._decomposeQueue = null; await this._decompose(dq.task, dq.reason); return; }
+        if (await this._backfillContracts()) return;   // fix22
         if (await this._refactor()) return;
         const before = this.observe();
         this._curSub = null;
