@@ -12,7 +12,7 @@ import { cosineSimilarity } from '../utils/math.js';
 import minecraftData from 'minecraft-data';
 import { Ollama } from '../models/ollama.js';
 import { signatureOf, depsOf, missingCalls, findCycle, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, parentsOf } from './skill_graph.js';
-const LOCAL = { model: 'qwen3:4b-instruct-2507-q4_K_M', url: 'http://192.168.1.215:11434', params: { keep_alive: '5m', format: 'json', options: { num_ctx: 8192 } } };
+const LOCAL = { model: 'qwen3:4b-instruct-2507-q4_K_M', url: 'http://192.168.1.215:11434', params: { format: 'json', options: { num_ctx: 8192 } } };
 export const CALLS = { local: 0, code: 0, replay: 0 };
 
 globalThis.__psnALS ||= new AsyncLocalStorage();   // fix11 (B6): call-parent tracking for PSN traces
@@ -284,7 +284,7 @@ export class Voyager {
         return Object.entries(s).map(([k, v]) => `${k}: ${typeof v === 'object' ? JSON.stringify(v) : v}`).join('\n');
     }
     _local() {
-        if (!this.__local) this.__local = new Ollama(LOCAL.model, LOCAL.url, LOCAL.params);
+        if (!this.__local) this.__local = new Ollama(LOCAL.model, LOCAL.url, { ...LOCAL.params, keep_alive: this.agent.prompter.profile.model?.params?.keep_alive });
         return this.__local;
     }
     // small local model (Mac Studio Ollama) for curriculum + critic judgment; unloads after 5 min idle

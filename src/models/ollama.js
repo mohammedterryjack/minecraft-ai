@@ -27,7 +27,8 @@ export class Ollama {
                     model: model,
                     messages: messages,
                     stream: false,
-                    ...(this.params || {})
+                    ...(this.params || {}),
+                    keep_alive: this._keepAlive()
                 });
                 if (apiResponse) {
                     res = apiResponse['message']['content'];
@@ -67,6 +68,14 @@ export class Ollama {
             finalRes = 'I thought too hard, sorry, try again.';
         }
         return finalRes;
+    }
+
+    // fix17: chat requests always carry the profile's keep_alive (mo_bot: -1 = keep loaded); missing -> fail loudly
+    _keepAlive() {
+        const k = this.params?.keep_alive;
+        if (k === undefined) throw new Error(`[ollama] ${this.model_name}: profile params.keep_alive is not set`);
+        if (!this._kaLogged) { this._kaLogged = true; console.log(`[ollama] chat keep_alive=${k} for ${this.model_name}`); }
+        return k;
     }
 
     async embed(text) {
