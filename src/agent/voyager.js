@@ -1,10 +1,10 @@
 import { wordOverlapScore } from '../utils/text.js';
 // Voyager-style lifelong learning loop (after MineDojo/Voyager):
 // automatic curriculum -> iterative code generation with env feedback -> self-verification critic -> skill library.
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync } from 'fs';
 import * as world from './library/world.js';
 import * as skills from './library/skills.js';
-import { getAllItems, getAllBlocks, getItemCraftingRecipes } from '../utils/mcdata.js';
+import { getAllItems, getAllBlocks, getItemCraftingRecipes, isHostile, isDatapackHostile } from '../utils/mcdata.js';
 import { cosineSimilarity } from '../utils/math.js';
 import minecraftData from 'minecraft-data';
 import { Ollama } from '../models/ollama.js';
@@ -542,6 +542,12 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         const far = Math.hypot(p.x - HUT.x, p.z - HUT.z) > 12 || Math.abs(p.y - HUT.y) > 4;
         const needFood = bot.food < 14 && bot.inventory.items().some(i => i.foodPoints || /cooked|bread|apple|carrot|potato|beef|porkchop|mutton|chicken|cod|salmon|stew/.test(i.name));
         const lowHealth = bot.health < 8;
+        const fig = bot.nearestEntity(e => e !== bot.entity && isDatapackHostile(e) && e.position.distanceTo(bot.entity.position) < 24);
+        if (fig) {
+            console.log(`[voyager] safety: datapack hostile (${fig.name}${fig.username ? ' ' + fig.username : ''}) ${fig.position.distanceTo(bot.entity.position).toFixed(1)} blocks away; fleeing`);
+            await this.agent.actions.runAction('voyager:safety:flee', async () => { await skills.avoidEnemies(bot, 24); }, { timeout: 2 });
+            return true;
+        }
         if (!needFood && !(night && far) && !(lowHealth && far)) { this._safetyStuck = 0; return false; }
         // back off when safety keeps making no progress (e.g. stuck in a cave under the hut), so learning can continue
         if (Date.now() < (this._safetyBackoff || 0)) return false;
@@ -569,11 +575,11 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         const bot = this.agent.bot;
         if (this.abort || Date.now() < (this._houseNext || 0)) return;
         this._houseNext = Date.now() + 45 * 1000;
-        const hostile = bot.nearestEntity(e => e.type === 'hostile' || /zombie|skeleton|creeper|spider|witch|drowned|husk|stray|enderman|slime|phantom/.test(e.name || ''));
+        const hostile = bot.nearestEntity(e => e !== bot.entity && (isHostile(e) || e.type === 'hostile' || /zombie|skeleton|creeper|spider|witch|drowned|husk|stray|enderman|slime|phantom/.test(e.name || '')));
         const hd = hostile ? hostile.position.distanceTo(bot.entity.position) : Infinity;
         const roof = bot.blockAt(bot.entity.position.offset(0, 2, 0));
         const sheltered = roof && roof.boundingBox === 'block';
-        if (hd < 16 && !sheltered) { console.log(`[house] skipped: ${hostile.name} ${hd.toFixed(1)} blocks away and not sheltered`); return; }
+        if (hd < 16 && !sheltered) { console.log(`[house] skipped: ${isDatapackHostile(hostile) ? 'DATAPACK FIGURE ' : ''}${hostile.name} ${hd.toFixed(1)} blocks away and not sheltered`); return; }
         const inv = () => world.getInventoryCounts(bot);
         const empty = bot.inventory.emptySlotCount();
         if (empty < 6) {
@@ -619,7 +625,18 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         if (inv().wooden_pickaxe) console.log('[house] MILESTONE wooden_pickaxe crafted in place');
     }
 
+    // fix5: one-shot owner-approved commands, read once from ~/MinecraftBot/oneshot_cmds.txt, sent as chat, file deleted
+    _oneshot() {
+        const f = (process.env.HOME || '') + '/MinecraftBot/oneshot_cmds.txt';
+        if (this._oneshotDone || !existsSync(f)) return;
+        this._oneshotDone = true;
+        const lines = readFileSync(f, 'utf8').split('\n').map(l => l.trim()).filter(Boolean);
+        unlinkSync(f);
+        for (const l of lines) { console.log(`[oneshot] sending approved command: ${l}`); this.agent.bot.chat(l); }
+    }
+
     async step() {
+        this._oneshot();
         if (await this.safety()) { await this._housekeep(); return; }
         const before = this.observe();
         let proposal = this._milestoneTask(before) || await this.proposeTask(before);

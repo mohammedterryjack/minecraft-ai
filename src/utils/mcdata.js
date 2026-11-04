@@ -145,7 +145,21 @@ export function isHuntable(mob) {
     return animals.includes(mob.name.toLowerCase()) && !mob.metadata[16]; // metadata 16 is not baby
 }
 
+// fix5: 'A Breach Happened' datapack hostiles. They are 26.x mannequins (player-like, profile name "fd",
+// CustomName Black Figure / Red Figure / The Man, tags abh.black_figure_ai ...). Via ViaProxy they show up as
+// player entities, so match the mannequin type, the "fd" profile, or the custom name anywhere in the metadata.
+export const DATAPACK_HOSTILE_NAMES = /Black Figure|Red Figure|The Man\b|Shadowy Figure/i;
+export function isDatapackHostile(e) {
+    if (!e) return false;
+    if (e.name === 'mannequin') return true;
+    if (e.type === 'player' && (e.username === 'fd' || !e.username)) return true;
+    const txt = [e.customName, e.displayName, e.username, e.nametag].map(x => typeof x === 'string' ? x : JSON.stringify(x ?? '')).join(' ');
+    if (DATAPACK_HOSTILE_NAMES.test(txt)) return true;
+    try { if (DATAPACK_HOSTILE_NAMES.test(JSON.stringify(e.metadata ?? []))) return true; } catch {}
+    return false;
+}
 export function isHostile(mob) {
+    if (isDatapackHostile(mob)) return true;
     if (!mob || !mob.name) return false;
     // ViaVersion shows 1.21.4+ creakings as wardens named vb.entity.creaking; hitting can't kill them
     if (JSON.stringify(mob.metadata?.[2] ?? '').includes('vb.entity.creaking')) return false;

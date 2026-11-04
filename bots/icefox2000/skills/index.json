@@ -80352,10 +80352,12 @@
     "source": "ODYSSEY mineWoodLog/collectItem",
     "saved": "2026-11-04T13:31:27.921Z",
     "stats": {
-      "success": 0,
+      "success": 1,
       "fail": 1,
-      "streakFail": 1,
-      "tasks": []
+      "streakFail": 0,
+      "tasks": [
+        "Mine 1 birch_log"
+      ]
     },
     "deps": [
       "equipBestTool",
@@ -108211,7 +108213,7 @@
     "name": "killMonsters",
     "description": "Fight hostile mobs within range (max 48) until none are left or 10 fights; returns how many were killed.",
     "task": "Fight hostile mobs within range (max 48) until none are left or 10 fights; returns how many were killed.",
-    "code": "// DESCRIPTION: Fight hostile mobs within range (max 48) until none are left or 10 fights; returns how many were killed.\nasync function killMonsters(bot, range = 16) {\n    range = Math.min(range, 48);\n    const hostile = ['zombie', 'skeleton', 'spider', 'creeper', 'husk', 'drowned', 'witch', 'slime', 'cave_spider', 'enderman', 'pillager', 'zombie_villager', 'stray'];\n    let n = 0;\n    for (let i = 0; i < 10; i++) {\n        if (bot.interrupt_code) return n;\n        const e = bot.nearestEntity(en => hostile.includes(en.name) && en.position.distanceTo(bot.entity.position) <= range);\n        if (!e) break;\n        if (!(await equipBestTool(bot, 'sword'))) await equipBestTool(bot, 'axe');\n        if (await skills.attackEntity(bot, e, true)) n++;\n    }\n    return n;\n}",
+    "code": "// DESCRIPTION: Fight hostile mobs within range (max 48) until none are left or 10 fights; returns how many were killed.\nasync function killMonsters(bot, range = 16) {\n    range = Math.min(range, 48);\n    const hostile = ['zombie', 'skeleton', 'spider', 'creeper', 'husk', 'drowned', 'witch', 'slime', 'cave_spider', 'enderman', 'pillager', 'zombie_villager', 'stray'];\n    // fix5: 'A Breach Happened' figures (mannequins, profile \"fd\", 60 HP) are hostile but too strong; flee instead of fighting\n    const isFigure = en => en !== bot.entity && (en.name === 'mannequin' || (en.type === 'player' && (en.username === 'fd' || !en.username)) || /Black Figure|Red Figure|The Man\\b/i.test(JSON.stringify(en.metadata ?? '') + (en.customName ?? '')));\n    const fig = bot.nearestEntity(en => isFigure(en) && en.position.distanceTo(bot.entity.position) <= Math.max(range, 24));\n    if (fig) { console.log(`[killMonsters] datapack hostile ${fig.name} ${fig.position.distanceTo(bot.entity.position).toFixed(1)} blocks away; fleeing instead of fighting`); await skills.avoidEnemies(bot, 24); return 0; }\n    let n = 0;\n    for (let i = 0; i < 10; i++) {\n        if (bot.interrupt_code) return n;\n        const e = bot.nearestEntity(en => hostile.includes(en.name) && en.position.distanceTo(bot.entity.position) <= range);\n        if (!e) break;\n        if (!(await equipBestTool(bot, 'sword'))) await equipBestTool(bot, 'axe');\n        if (await skills.attackEntity(bot, e, true)) n++;\n    }\n    return n;\n}",
     "primitive": true,
     "handwritten": true,
     "source": "ODYSSEY killMonsters",
@@ -120619,10 +120621,12 @@
     "source": "ODYSSEY depositIntoChest (chestAPIs)",
     "saved": "2026-11-04T13:31:27.925Z",
     "stats": {
-      "success": 0,
+      "success": 4,
       "fail": 4,
-      "streakFail": 4,
-      "tasks": []
+      "streakFail": 0,
+      "tasks": [
+        "Store items in a chest to free inventory space"
+      ]
     },
     "deps": [
       "tossClutter",

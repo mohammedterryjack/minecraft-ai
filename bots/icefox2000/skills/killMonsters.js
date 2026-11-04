@@ -3,6 +3,10 @@
 async function killMonsters(bot, range = 16) {
     range = Math.min(range, 48);
     const hostile = ['zombie', 'skeleton', 'spider', 'creeper', 'husk', 'drowned', 'witch', 'slime', 'cave_spider', 'enderman', 'pillager', 'zombie_villager', 'stray'];
+    // fix5: 'A Breach Happened' figures (mannequins, profile "fd", 60 HP) are hostile but too strong; flee instead of fighting
+    const isFigure = en => en !== bot.entity && (en.name === 'mannequin' || (en.type === 'player' && (en.username === 'fd' || !en.username)) || /Black Figure|Red Figure|The Man\b/i.test(JSON.stringify(en.metadata ?? '') + (en.customName ?? '')));
+    const fig = bot.nearestEntity(en => isFigure(en) && en.position.distanceTo(bot.entity.position) <= Math.max(range, 24));
+    if (fig) { console.log(`[killMonsters] datapack hostile ${fig.name} ${fig.position.distanceTo(bot.entity.position).toFixed(1)} blocks away; fleeing instead of fighting`); await skills.avoidEnemies(bot, 24); return 0; }
     let n = 0;
     for (let i = 0; i < 10; i++) {
         if (bot.interrupt_code) return n;
