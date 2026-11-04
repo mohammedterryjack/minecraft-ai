@@ -684,8 +684,32 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         try { await bot.clickWindow(no.i, 0, 0); } catch (e) { console.log('[choice] click No FAILED: ' + e.message); }
     }
 
+    // fix8 (Mo-approved standing): leave A Breach Happened dimensions (abh:truth, abh:void, abh:deeper_void, abh:the_library).
+    // Pack's normal exit from abh:truth = sneak there (advancement abh:truth/leave -> function abh:truth/leave -> tp to stored overworld pos),
+    // blocked only while the pack freezes the player during a monologue. Other abh dims have no player action exit in the pack.
+    // If still in an abh dimension after 60s, send the ONE pre-approved command, at most once per 2 min.
+    _watchDimension() {
+        if (this._dimWatch) return; this._dimWatch = true;
+        const bot = this.agent.bot;
+        const TP = '/execute in minecraft:overworld run tp icefox2000 -1503 63 547';
+        this._dimTimer = setInterval(() => {
+            const dim = String(bot.game?.dimension || '');
+            if (dim !== this._lastDim) { this._lastDim = dim; console.log(`[dimension] now ${dim}`); }
+            if (!/abh:/.test(dim)) { if (this._abhSince) { console.log(`[dimension] back in ${dim} after ${Math.round((Date.now() - this._abhSince) / 1000)}s in abh dimension`); bot.setControlState('sneak', false); } this._abhSince = 0; return; }
+            if (!this._abhSince) { this._abhSince = Date.now(); console.log(`!!! [dimension] in datapack dimension ${dim}; trying normal exit${dim === 'abh:truth' ? ' (sneak)' : ' (none in pack; waiting 60s)'}`); }
+            if (dim === 'abh:truth') { bot.setControlState('sneak', true); setTimeout(() => bot.setControlState('sneak', false), 1500); }
+            const waited = Date.now() - this._abhSince;
+            if (waited > 60000 && Date.now() - (this._abhTpAt || 0) > 120000) {
+                this._abhTpAt = Date.now();
+                console.log(`!!! [dimension] still in ${dim} after ${Math.round(waited / 1000)}s; sending pre-approved command: ${TP}`);
+                bot.chat(TP);
+            }
+        }, 3000);
+    }
+
     async step() {
         this._watchWindows();
+        this._watchDimension();
         if (this.agent.bot.currentWindow) { const w = this.agent.bot.currentWindow; if (/CHOICE/.test(JSON.stringify(w.title))) { if (!this._choiceNoted) { this._choiceNoted = 1; console.log("[window] datapack dialog CHOICE (A Breach Happened multi_action dialog via ViaProxy) left open; not answering"); } } else console.log(`[window] STRAY ${w.type} id=${w.id} still open at step start (opened ${Math.round((Date.now() - (this._winOpenedAt || 0)) / 1000)}s ago); closing`); if (!/CHOICE/.test(JSON.stringify(w.title))) try { this.agent.bot.closeWindow(w); } catch (e) { console.log('[window] close failed: ' + e.message); } }
         this._oneshot();
         if (await this.safety()) { await this._housekeep(); return; }
