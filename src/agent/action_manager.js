@@ -86,6 +86,7 @@ export class ActionManager {
             // also tell agent.bot to stop various actions
             if (this.executing) {
                 console.log(`action "${actionLabel}" trying to interrupt current action "${this.currentActionLabel}"`);
+                this.lastInterruptBy = actionLabel;   // fix14: who cut the action off (voyager failure feedback)
             }
             await this.stop();
 

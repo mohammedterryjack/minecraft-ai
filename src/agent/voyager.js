@@ -2,7 +2,9 @@ import { wordOverlapScore } from '../utils/text.js';
 // Voyager-style lifelong learning loop (after MineDojo/Voyager):
 // automatic curriculum -> iterative code generation with env feedback -> self-verification critic -> skill library.
 import { AsyncLocalStorage } from 'async_hooks';
-import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync } from 'fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, renameSync } from 'fs';
+// fix14: crash-safe writes (tmp file + rename)
+export function writeAtomic(fp, text) { const tmp = `${fp}.tmp-${process.pid}`; writeFileSync(tmp, text); renameSync(tmp, fp); }
 import * as world from './library/world.js';
 import * as skills from './library/skills.js';
 import { getAllItems, getAllBlocks, getItemCraftingRecipes, isHostile, isDatapackHostile } from '../utils/mcdata.js';
@@ -17,13 +19,17 @@ globalThis.__psnALS ||= new AsyncLocalStorage();   // fix11 (B6): call-parent tr
 
 // fix12: HOME is the single source of truth for the bot's base (town centre, hut, leash, red-zone teleport).
 // Moved from the old base to the grove where the bot ended up; the hut there is built by the home_hut milestone.
-const HOME = { x: -177, y: 72, z: 104 };   // feet level at the hut centre
+// fix14: HOME lives in ONE file, bots/icefox2000/home.json ({x, y, z, groundVerified}); missing/invalid file = startup error (no fallback).
+// y is corrected once from the real ground height when the bot is near home (see _checkHomeGround) and saved back to the file.
+const HOME_FILE = './bots/icefox2000/home.json';
+const HOME = JSON.parse(readFileSync(HOME_FILE, 'utf8'));
+if (![HOME.x, HOME.y, HOME.z].every(Number.isFinite)) throw new Error(`[home] ${HOME_FILE} must hold numeric x, y, z`);
 const TOWN = HOME;
 const VILLAGE = { x: -800, z: 500 };
 const MAX_ATTEMPTS = 4;
 const PLAYER_QUIET_MS = 90 * 1000;   // pause after any player message
 const TASK_COOLDOWN_MS = 90 * 1000;  // gap between curriculum tasks (saves Gemini quota)
-const HUT = { x: HOME.x, y: HOME.y + 1, z: HOME.z };   // HUT.y - 1 = floor/feet level (interior HOME±2, walls at ±3)
+const HUT = { get x() { return HOME.x; }, get y() { return HOME.y + 1; }, get z() { return HOME.z; } };   // HUT.y - 1 = floor/feet level (interior HOME±2, walls at ±3)
 // PSN-style progression milestones (after skillnet/domains/minecraft/knowledge get_progression_milestones), extended for survival/town
 const MILESTONES = [
     { name: 'get_wood', items: { birch_log: 4 } },
@@ -201,8 +207,35 @@ export class Voyager {
 
     get enabled() { return this.progress.enabled !== false; }
     setEnabled(v) { this.progress.enabled = v; this._saveProgress(); if (!v) this.interrupt(); }
-    _saveProgress() { writeFileSync(this.progressFile, JSON.stringify(this.progress, null, 2)); }
-    _saveSkills() { writeFileSync(this.indexFile, JSON.stringify(this.skills, null, 2)); }
+    _saveProgress() { writeAtomic(this.progressFile, JSON.stringify(this.progress, null, 2)); }
+    _saveSkills() { writeAtomic(this.indexFile, JSON.stringify(this.skills, null, 2)); }
+    // fix14: highest solid (non-leaf, non-log) block in a loaded column; null if the column is not loaded
+    _surfaceY(x, z) {
+        const bot = this.agent.bot, V = bot.entity.position.constructor; x = Math.floor(x); z = Math.floor(z);
+        const top = bot.game?.height ? (bot.game.minY ?? -64) + bot.game.height - 1 : 319, bottom = bot.game?.minY ?? -64;
+        if (!bot.blockAt(new V(x, top, z))) return null;
+        for (let y = top; y >= bottom; y--) { const b = bot.blockAt(new V(x, y, z)); if (b && b.boundingBox === 'block' && !/leaves|_log$|_wood$/.test(b.name)) return y; }
+        return null;
+    }
+    // fix14: once, when near home's x/z, set HOME.y = ground + 1 and save it to home.json
+    _checkHomeGround() {
+        if (HOME.groundVerified) return;
+        const p = this.agent.bot.entity.position;
+        if (Math.hypot(p.x - HOME.x, p.z - HOME.z) > 32) return;
+        const g = this._surfaceY(HOME.x, HOME.z);
+        if (g === null) return;
+        const old = HOME.y; HOME.y = g + 1; HOME.groundVerified = true;
+        writeAtomic(HOME_FILE, JSON.stringify(HOME, null, 2) + '\n');
+        console.log(`[home] ground at home (${HOME.x}, ${HOME.z}) is y=${g}; HOME.y ${old} -> ${HOME.y} (saved to ${HOME_FILE})`);
+    }
+    // fix14: why an action was cut off, for failure feedback (critic, code writer, blame)
+    _interruptReason(output = '') {
+        const bot = this.agent.bot, p = bot.entity.position, by = this.agent.actions.lastInterruptBy || 'unknown';
+        const s = this._surfaceY(p.x, p.z), under = s !== null && p.y < s - 4;
+        const travelling = /travelTo|goToPosition|goToSurface|path|Moving|travell/i.test(String(output).slice(-800));
+        const what = by === 'mode:unstuck' ? 'stuck' : `cut off by ${by}`;
+        return `interrupted: ${what}${travelling ? ' while travelling' : ''}${under ? ` (underground: y=${Math.floor(p.y)}, surface y=${s})` : ''}`;
+    }
 
     // a real player spoke: they take priority
     notePlayerMessage() {
@@ -368,9 +401,11 @@ export class Voyager {
         const staged = await this.agent.coder._stageCode(full);
         if (!staged) return { ok: false };
         const res = await this.agent.actions.runAction(`voyager:replay:${task}`, async () => { this.agent.bot.__psnALS = globalThis.__psnALS; await staged.func.main(this.agent.bot); }, { timeout: 5 });
-        if (this.abort || res.interrupted) return { ok: false, interrupted: true };
+        if (this.abort) return { ok: false, interrupted: true };
         const after = this.observe();
         let ok;
+        const cut = res.interrupted ? this._interruptReason(res.message) : '';   // fix14: a cut-off replay is a failure
+        if (cut) { ok = false; console.log(`[voyager] replay ${r.name} ${cut}; counting as a failure`); } else
         if (r.free) { const e = this.agent.bot.inventory.emptySlotCount(); ok = e >= r.free; console.log(`[voyager] inventory check: ${e} empty slots (need ${r.free})`); }
         else if (r.at) { const p = this.agent.bot.entity.position; ok = Math.hypot(p.x - r.at.x, p.z - r.at.z) <= 8; }
         else if (goal && ['mine','collect','gather','chop','craft','smelt','cook','get','obtain'].includes(goal.verb)) ok = gainedFor(goal, before, after) >= goal.count;
@@ -386,7 +421,7 @@ export class Voyager {
         if (r.free) console.log(`[voyager] storage replay ${r.name} output: ${String(res.message || '(none)').split(/\n|\|/).filter(l => /\[(toss|chest)\]/.test(l)).join(' | ').slice(-800)}; inv now ${JSON.stringify(after.inventory)}`);
         if (!ok) console.log(`[voyager] replay ${r.name} inv: ${this.agent.bot.inventory.emptySlotCount()} empty slots; ${JSON.stringify(after.inventory)}`);
         if (!ok) console.log(`[voyager] replay ${r.name} output: ${String(res.message || '(none)').slice(-600).replace(/\n+/g, ' | ')}`);
-        return { ok, name: r.name, output: String(res.message || '') };
+        return { ok, name: r.name, output: String(res.message || ''), cut };
     }
     // library source with optional per-name code overrides (candidates under test)
     _libSrc(over = {}) { return this.skills.map(s => over[s.name] ?? s.code).join('\n\n'); }
@@ -412,7 +447,7 @@ export class Voyager {
         entry.prev = { code: entry.code, description: entry.description, deps: entry.deps, stats: entry.stats, saved: entry.saved };
         Object.assign(entry, { code: c.code, description: c.description, deps: c.deps, effects: c.effects, embedding: c.embedding, saved: new Date().toISOString(), stats: c.stats, demoted: false });
         delete entry.candidate;
-        writeFileSync(`${this.dir}/${entry.name}.js`, `// ${entry.description}\n${entry.code}\n`);
+        writeAtomic(`${this.dir}/${entry.name}.js`, `// ${entry.description}\n${entry.code}\n`);
         // fix11 (B4): parents are re-validated only once the new version is actually live
         const parents = parentsOf(entry.name, this._graph());
         for (const p of parents) { const pe = this.skills.find(s => s.name === p); if (pe) pe.revalidate = entry.name; }
@@ -447,6 +482,7 @@ export class Voyager {
     // ---------- automatic curriculum ----------
     // PSN goal planner: first unmet milestone -> deterministic "Get N item" task (obtainItem expands the prerequisite chain); LLM curriculum otherwise
     _milestoneTask(state) {
+        this._checkHomeGround();
         const done = this.progress.milestones ||= [];
         const inv = state.inventory || {};
         const empty = this.agent.bot.inventory.emptySlotCount();
@@ -531,7 +567,7 @@ replayable_tasks (cheap, no new code needed): ${JSON.stringify(this.skills.filte
         if (idx < 0) {
             const entry = { name, description, task, code, deps, embedding, effects: this._lastEffects || [], saved: new Date().toISOString(), stats: recordRun(newStats(), task, true) };
             this.skills.push(entry);
-            writeFileSync(`${this.dir}/${name}.js`, `// ${description}\n${code}\n`);
+            writeAtomic(`${this.dir}/${name}.js`, `// ${description}\n${code}\n`);
             this._saveSkills();
             gateLog(`NEW ${name} deps=[${deps.join(', ')}]`);
             this._extractShared();
@@ -557,7 +593,7 @@ replayable_tasks (cheap, no new code needed): ${JSON.stringify(this.skills.filte
         if (!e?.handwritten_original) return false;
         e.prev = { code: e.code, description: e.description, deps: e.deps, stats: e.stats };
         Object.assign(e, e.handwritten_original); delete e.candidate; e.demoted = false;
-        writeFileSync(`${this.dir}/${name}.js`, `// ${e.description}\n${e.code}\n`);
+        writeAtomic(`${this.dir}/${name}.js`, `// ${e.description}\n${e.code}\n`);
         this._saveSkills(); gateLog(`RESTORED handwritten original of ${name}`); return true;
     }
 
@@ -737,7 +773,7 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
     _watchDimension() {
         if (this._dimWatch) return; this._dimWatch = true;
         const bot = this.agent.bot;
-        const TP = `/execute in minecraft:overworld run tp icefox2000 ${HOME.x} ${HOME.y} ${HOME.z}`;
+        const tpCmd = () => `/execute in minecraft:overworld run tp icefox2000 ${HOME.x} ${HOME.y} ${HOME.z}`;
         this._dimTimer = setInterval(() => {
             const dim = String(bot.game?.dimension || '');
             if (dim !== this._lastDim) { this._lastDim = dim; console.log(`[dimension] now ${dim}`); }
@@ -747,8 +783,8 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
             const waited = Date.now() - this._abhSince;
             if (waited > 60000 && Date.now() - (this._abhTpAt || 0) > 120000) {
                 this._abhTpAt = Date.now();
-                console.log(`!!! [dimension] still in ${dim} after ${Math.round(waited / 1000)}s; sending pre-approved command: ${TP}`);
-                bot.chat(TP);
+                console.log(`!!! [dimension] still in ${dim} after ${Math.round(waited / 1000)}s; sending pre-approved command: ${tpCmd()}`);
+                bot.chat(tpCmd());
             }
         }, 3000);
     }
@@ -884,7 +920,7 @@ Interrupts: the bot may be interrupted at any time (danger, getting stuck, a pla
         const learnedSrc = this.skills.map(s => s.code).join('\n\n');
         const ctx = related.map(s => `// ${s.description}\n${s.code}`).join('\n\n');
 
-        let feedback = '';
+        let feedback = rp?.cut ? `Replay of ${rp.name} failed: ${rp.cut}\nExecution output:\n${String(rp.output).slice(-800)}` : '';
         let lastCode = '';
         for (let i = 1; i <= MAX_ATTEMPTS; i++) {
             if (this.abort) { console.log('[voyager] aborted for player'); return; }
@@ -912,12 +948,15 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             const res = await this.agent.actions.runAction(`voyager:${task}`, async () => {
                 this.agent.bot.__psnALS = globalThis.__psnALS; await staged.func.main(this.agent.bot);
             }, { timeout: 5 });
-            if (this.abort || res.interrupted) { console.log('[voyager] task interrupted'); return; }
-            const output = String(res.message || '').slice(-1500);
+            if (this.abort) { console.log('[voyager] task interrupted'); return; }
+            const cut = res.interrupted ? this._interruptReason(res.message) : '';   // fix14: cut-off code counts as a failed attempt
+            if (cut) console.log(`[voyager] attempt ${i} ${cut}; counting as a failure`);
+            const output = String(res.message || '').slice(-1500) + (cut ? `\n${cut}` : '');
             const after = this.observe();
             const goal = countGoal(task);
             const gained = goal ? gainedFor(goal, before, after) : 0;
-            const verdict = (goal && gained >= goal.count)
+            const verdict = cut ? { ...(await this.critique(task, before, after, output)), success: false }
+                : (goal && gained >= goal.count)
                 ? { success: true, critique: '', reasoning: `inventory +${gained} ${goal.item}` }
                 : await this.critique(task, before, after, output);
             if (goal && gained >= goal.count) console.log(`[voyager] verified from inventory (+${gained} ${goal.item}), critic skipped`);
@@ -933,7 +972,7 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
                 this.agent.openChat?.(`Done: ${task}. Learned skill ${fn[1]}.`);
                 return;
             }
-            feedback = `Execution output:\n${output}\nCritic: ${verdict.critique}\nChat/behaviour log: ${this.agent.bot.modes.flushBehaviorLog().slice(-400)}`;
+            feedback = `${cut ? `Attempt ${cut}\n` : ''}Execution output:\n${output}\nCritic: ${verdict.critique}\nChat/behaviour log: ${this.agent.bot.modes.flushBehaviorLog().slice(-400)}`;
             lastCode = code;
         }
         this.progress.failed.push(task);

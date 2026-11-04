@@ -48,7 +48,7 @@ export class History {
         if (this.full_history_fp === undefined) {
             const string_timestamp = new Date().toLocaleString().replace(/[/:]/g, '-').replace(/ /g, '').replace(/,/g, '_');
             this.full_history_fp = `./bots/${this.name}/histories/${string_timestamp}.json`;
-            writeFileSync(this.full_history_fp, '[]', 'utf8');
+            writeAtomic(this.full_history_fp, '[]');
         }
         try {
             const data = readFileSync(this.full_history_fp, 'utf8');
