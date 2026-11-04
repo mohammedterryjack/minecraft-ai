@@ -15,12 +15,15 @@ export const CALLS = { local: 0, code: 0, replay: 0 };
 
 globalThis.__psnALS ||= new AsyncLocalStorage();   // fix11 (B6): call-parent tracking for PSN traces
 
-const TOWN = { x: -1507, y: 63, z: 542 };
+// fix12: HOME is the single source of truth for the bot's base (town centre, hut, leash, red-zone teleport).
+// Moved from the old birch hut (-1503,63,547) to the grove where the bot ended up; the hut there is built by the home_hut milestone.
+const HOME = { x: -177, y: 72, z: 104 };   // feet level at the hut centre
+const TOWN = HOME;
 const VILLAGE = { x: -800, z: 500 };
 const MAX_ATTEMPTS = 4;
 const PLAYER_QUIET_MS = 90 * 1000;   // pause after any player message
 const TASK_COOLDOWN_MS = 90 * 1000;  // gap between curriculum tasks (saves Gemini quota)
-const HUT = { x: -1503, y: 64, z: 547 };
+const HUT = { x: HOME.x, y: HOME.y + 1, z: HOME.z };   // HUT.y - 1 = floor/feet level (interior HOME±2, walls at ±3)
 // PSN-style progression milestones (after skillnet/domains/minecraft/knowledge get_progression_milestones), extended for survival/town
 const MILESTONES = [
     { name: 'get_wood', items: { birch_log: 4 } },
@@ -451,6 +454,18 @@ export class Voyager {
             console.log(`[voyager] inventory nearly full (${empty} empty slots): storing items before anything else`);
             return { task: 'Store items in a chest to free inventory space', reasoning: `inventory has ${empty} empty slots`, context: 'depositToChest' };
         }
+        // fix12: a hut at HOME comes first (checked in-world, not by inventory)
+        if (!done.includes('home_hut')) {
+            if (this._hutBuilt()) { done.push('home_hut'); this._saveProgress(); console.log('[psn] milestone reached: home_hut'); }
+            else {
+                const task = `Build a 7x7 cobblestone hut at home (${HOME.x}, ${HOME.z})`;
+                const fails = this.progress.failed.slice(-20).filter(t => t === task).length;
+                if (fails >= 2) { console.log(`[psn] milestone home_hut blocked (${task} failed ${fails}x); asking LLM curriculum`); return null; }
+                console.log(`[psn] milestone home_hut: next ${task} (no curriculum model call)`);
+                return { task, reasoning: 'PSN milestone home_hut: the base moved and has no shelter yet',
+                    context: `await skills.travelTo(bot, ${HOME.x}, ${HOME.y}, ${HOME.z}); then find the ground level y (first solid block below +1) near there and call skills.buildStructure(bot, 'hut', ${HOME.x - 3}, y, ${HOME.z - 3}, 'cobblestone', 7, 7, 3)` };
+            }
+        }
         for (const m of MILESTONES) {
             if (done.includes(m.name)) continue;
             const missing = Object.entries(m.items).filter(([k, n]) => (inv[k] || 0) < n && !(m.block && world.getNearestBlock(this.agent.bot, m.block, 24)));
@@ -468,7 +483,7 @@ export class Voyager {
         const system = `You are the automatic curriculum for a Minecraft bot named ${this.agent.name} (Voyager-style).
 Goal: discover as many diverse things as possible and grow a small town of its own, progressing wood -> stone -> iron -> diamond tech.
 Rules:
-- The bot's town is at x=${TOWN.x}, y=${TOWN.y}, z=${TOWN.z} in a birch forest (a birch hut already exists at x -1505..-1501, z 545..549). Stay within ~150 blocks of town.
+- The bot's town is at x=${TOWN.x}, y=${TOWN.y}, z=${TOWN.z} (the bot's home base; ${this._hutBuilt() ? `its 7x7 cobblestone hut stands at x ${HOME.x-3}..${HOME.x+3}, z ${HOME.z-3}..${HOME.z+3}` : 'NO hut exists here yet; building one is a priority'}). Stay within ~150 blocks of town.
 - NEVER go near the players' village around x=${VILLAGE.x}, z=${VILLAGE.z}; never take or break player builds.
 - Propose ONE concrete, verifiable task achievable in a few minutes with the current inventory and surroundings (e.g. "Mine 5 birch_log", "Craft 1 stone_pickaxe", "Smelt 3 iron_ingot", "Build a 5x5 cobblestone floor next to the hut").
 - Do not repeat completed tasks unless needed for progress; avoid tasks that failed recently unless prerequisites are now met.
@@ -554,6 +569,15 @@ Be strict: success only if the evidence (inventory/position/output) shows the ta
 If the code hand-rolled a mining/collecting loop that timed out, got 0 items or failed pathfinding, say in the critique to switch to mineBlocks / gatherItem / collectDrops (custom code is otherwise fine).\nReply ONLY with JSON: {"reasoning": "...", "success": true|false, "critique": "how to fix it if failed, else empty"}`;
         const user = `task: ${task}\n${recipeFacts(task)}\n--- before ---\n${this._stateText(before)}\n--- after ---\n${this._stateText(after)}\n--- code output ---\n${output}`;
         return parseJSON(await this._askLocal(system, user));
+    }
+
+    // fix12: is there a hut at HOME? roof over the centre plus walls on both sides, at any floor level within HOME.y±4 (unloaded chunk = not built)
+    _hutBuilt() {
+        const bot = this.agent.bot, V = bot.entity.position.constructor;
+        const solid = (x, y, z) => { const b = bot.blockAt(new V(x, y, z)); return !!b && b.boundingBox === 'block'; };
+        for (let y = HOME.y - 4; y <= HOME.y + 4; y++)
+            if (solid(HOME.x, y + 3, HOME.z) && solid(HOME.x - 3, y, HOME.z) && solid(HOME.x + 3, y, HOME.z) && solid(HOME.x, y + 1, HOME.z + 3)) return true;
+        return false;
     }
 
     // ---------- iterative prompting ----------
@@ -714,7 +738,7 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
     _watchDimension() {
         if (this._dimWatch) return; this._dimWatch = true;
         const bot = this.agent.bot;
-        const TP = '/execute in minecraft:overworld run tp icefox2000 -1503 63 547';
+        const TP = `/execute in minecraft:overworld run tp icefox2000 ${HOME.x} ${HOME.y} ${HOME.z}`;
         this._dimTimer = setInterval(() => {
             const dim = String(bot.game?.dimension || '');
             if (dim !== this._lastDim) { this._lastDim = dim; console.log(`[dimension] now ${dim}`); }
