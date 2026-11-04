@@ -60,11 +60,11 @@ export function instrumentSrc(names) {
 const __wrap = (n, f) => async function (...a) {
     if (__T.length >= 400) return await f.apply(this, a);
     const par = __als.getStore() ?? -1;
-    const rec = { name: n, args: (() => { try { return JSON.stringify(a.slice(1)).slice(0, 120); } catch { return '?'; } })(), parent: par, depth: par < 0 ? 0 : __T[par].depth + 1, o0: (bot.output || '').length, pre: __inv() };
+    const rec = { name: n, args: (() => { try { return JSON.stringify(a.slice(1)).slice(0, 120); } catch { return '?'; } })(), parent: par, depth: par < 0 ? 0 : __T[par].depth + 1, o0: (bot.output || '').length, t0: Date.now(), pre: __inv() };
     const id = __T.push(rec) - 1;
     try { const r = await __als.run(id, () => f.apply(this, a)); rec.ret = r === undefined ? 'undefined' : String(JSON.stringify(r)).slice(0, 60); rec.fail = r === false || r === null || r === 0; return r; }
     catch (e) { rec.fail = true; rec.err = String(e?.message || e).slice(0, 200); throw e; }
-    finally { rec.o1 = (bot.output || '').length; bot.__psnOut = bot.output; const post = __inv(); rec.delta = {}; for (const k of new Set([...Object.keys(rec.pre), ...Object.keys(post)])) { const d = (post[k] || 0) - (rec.pre[k] || 0); if (d) rec.delta[k] = d; } delete rec.pre; rec.intr = !!bot.interrupt_code; }
+    finally { rec.t1 = Date.now(); rec.o1 = (bot.output || '').length; bot.__psnOut = bot.output; const post = __inv(); rec.delta = {}; for (const k of new Set([...Object.keys(rec.pre), ...Object.keys(post)])) { const d = (post[k] || 0) - (rec.pre[k] || 0); if (d) rec.delta[k] = d; } delete rec.pre; rec.intr = !!bot.interrupt_code; }
 };`;
     return wrap + '\n' + names.map(n => `${n} = __wrap(${JSON.stringify(n)}, ${n});`).join('\n');
 }
@@ -104,6 +104,29 @@ export function blame(trace, isLeaf) {
     const evidence = (best[0].ownFail.join(' | ') || best[0].err || `returned ${best[0].ret}`).slice(0, 400);
     if (t < 0) return { target: null, leaf: best[0].name, path, kind: 'leaf_only', swallowed, evidence };
     return { target: trace[t].name, leaf: best[0].name, path, kind, swallowed, evidence };
+}
+// fix20 (PSN credit assignment, top-down): every learned skill on a propagated failure path is responsible.
+// The deepest non-leaf on each path is callee_fix; its failing ancestors are caller_fix (they did not handle the child's
+// failure). Returned bottom-up (deepest first) so patches are applied children before parents.
+export function blameAll(trace, isLeaf, isLearned) {
+    const failed = trace.map((r, i) => [r, i]).filter(([r]) => !r.ok && !r.intr);
+    if (!failed.length) return [];
+    const prop = failed.filter(([r]) => { for (let c = r, p = r.parent; p >= 0; c = trace[p], p = trace[p].parent) if (trace[p].ok || (c.err && !trace[p].err)) return false; return true; });
+    const pool = prop.length ? prop : failed, swallowed = !prop.length;
+    const out = new Map();
+    // top-down: walk each failing call's ancestry from the root so a parent is credited before its children
+    for (const [r, i] of [...pool].sort((x, y) => y[0].depth - x[0].depth)) {   // deepest failure first: it defines each skill's role
+        const chain = []; for (let k = i; k >= 0; k = trace[k].parent) chain.unshift(k);
+        const path = chain.map(k => trace[k].name);
+        const evidence = (r.ownFail.join(' | ') || r.err || `returned ${r.ret}`).slice(0, 400);
+        for (const k of chain) {
+            const n = trace[k].name; if (isLeaf(n) || !isLearned(n)) continue;
+            const kind = k === i ? 'callee_fix' : 'caller_fix';   // the failing call itself vs an ancestor that did not handle it
+            const prev = out.get(n);
+            if (!prev) out.set(n, { target: n, leaf: r.name, path, kind, swallowed, evidence, depth: trace[k].depth });
+        }
+    }
+    return [...out.values()].sort((a, b) => b.depth - a.depth);
 }
 // all transitive parents (skills whose dependency closure contains name)
 export function parentsOf(name, graph) {

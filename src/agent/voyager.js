@@ -11,7 +11,7 @@ import { getAllItems, getAllBlocks, getItemCraftingRecipes, isHostile, isDatapac
 import { cosineSimilarity } from '../utils/math.js';
 import minecraftData from 'minecraft-data';
 import { Ollama } from '../models/ollama.js';
-import { signatureOf, depsOf, missingCalls, findCycle, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, parentsOf } from './skill_graph.js';
+import { signatureOf, depsOf, missingCalls, findCycle, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf } from './skill_graph.js';
 const LOCAL = { model: 'qwen3:4b-instruct-2507-q4_K_M', url: 'http://192.168.1.215:11434', params: { format: 'json', options: { num_ctx: 8192 } } };
 export const CALLS = { local: 0, code: 0, replay: 0 };
 
@@ -205,6 +205,17 @@ export class Voyager {
         if (!this.sharedHints.length) console.log('[lilo] no code fragment repeated across 3+ skills');
     }
 
+    // fix20: repair / decompose queues persisted in progress.json (survive restarts)
+    get _repairQueue() { return this.progress.repairQueue; }
+    set _repairQueue(q) { this.progress.repairQueue = q; this._saveProgress(); }
+    get _decomposeQueue() { return this.progress.decomposeQueue || null; }
+    set _decomposeQueue(q) { this.progress.decomposeQueue = q; this._saveProgress(); }
+    // fix20 (PSN maturity gating): V(s) = Laplace-smoothed success rate; P(update) = (1-eps)*sigmoid(gamma*(0.6-V)) + eps
+    _maturity(e) { const s = e.stats || newStats(), n = s.success + s.fail; const V = (s.success + 1) / (n + 2); const p = (1 - 0.1) / (1 + Math.exp(-10 * (0.6 - V))) + 0.1; return { V, p, n }; }
+    _updateAllowed(e, why) { const { V, p, n } = this._maturity(e), r = Math.random(), ok = r < p; gateLog(`maturity ${e.name}: V=${V.toFixed(2)} (${n} runs) P(update)=${p.toFixed(2)} draw=${r.toFixed(2)} -> ${ok ? 'UPDATE ALLOWED' : 'FROZEN (mature skill kept)'} [${why}]`); return ok; }
+    // fix20 (PSN repair memory): rolling buffer of the last 5 repair proposals per skill
+    _noteProposal(e, p) { e.repairHistory = [...(e.repairHistory || []), { at: new Date().toISOString(), ...p }].slice(-5); this._saveSkills(); }
+    _proposalOutcome(e, outcome) { const h = e.repairHistory; if (h?.length && !h[h.length - 1].outcome) { h[h.length - 1].outcome = outcome; } }
     get enabled() { return this.progress.enabled !== false; }
     setEnabled(v) { this.progress.enabled = v; this._saveProgress(); if (!v) this.interrupt(); }
     _saveProgress() { writeAtomic(this.progressFile, JSON.stringify(this.progress, null, 2)); }
@@ -462,7 +473,7 @@ export class Voyager {
         if (trial) {
             const c = entry.candidate; recordRun(c.stats, task, ok);
             const n = c.stats.success + c.stats.fail;
-            if (!ok && c.stats.fail >= 2) { gateLog(`REJECT candidate ${entry.name}: failed ${c.stats.fail}/${n} trial runs; keeping current version`); delete entry.candidate; }
+            if (!ok && c.stats.fail >= 2) { gateLog(`REJECT candidate ${entry.name}: failed ${c.stats.fail}/${n} trial runs; keeping current version`); this._proposalOutcome(entry, `rejected ${c.stats.success}/${n}`); const rf = c.refactor; delete entry.candidate; if (rf) this._rollbackRefactor(rf, entry.name); }
             else if (n >= 2 && rate(c.stats) >= rate(entry.stats || newStats())) { gateLog(`PROMOTE candidate ${entry.name}: trial ${c.stats.success}/${n} >= current rate ${rate(entry.stats || newStats()).toFixed(2)}`); this._promote(entry, c); }
             else gateLog(`candidate ${entry.name} trial ${ok ? 'passed' : 'failed'} (${c.stats.success}/${n}); waiting for more runs`);
         } else {
@@ -472,8 +483,10 @@ export class Voyager {
         this._saveSkills();
     }
     _promote(entry, c) {
+        this._proposalOutcome(entry, 'promoted');
         entry.prev = { code: entry.code, description: entry.description, deps: entry.deps, stats: entry.stats, saved: entry.saved };
         Object.assign(entry, { code: c.code, description: c.description, deps: c.deps, effects: c.effects, embedding: c.embedding, saved: new Date().toISOString(), stats: c.stats, demoted: false });
+        if (c.refactor) entry.refactorOf = c.refactor; else delete entry.refactorOf;
         delete entry.candidate;
         writeAtomic(`${this.dir}/${entry.name}.js`, `// ${entry.description}\n${entry.code}\n`);
         // fix11 (B4): parents are re-validated only once the new version is actually live
@@ -643,9 +656,11 @@ replayable_tasks (cheap, no new code needed): ${JSON.stringify(this.skills.filte
         const entry = this.skills[idx];
         if (entry.handwritten && !entry.handwritten_original) entry.handwritten_original = { code: entry.code, description: entry.description, deps: entry.deps };
         const cand = { code, description, deps, embedding, task, effects: this._lastEffects || entry.effects || [], stats: newStats() };   // fix11 (B2): no seeded success; trial runs only
+        if (!opts.repair && !opts.refactor && !this._updateAllowed(entry, 'new version from a task')) return false;
+        if (opts.refactor) cand.refactor = opts.refactor;
         const reg = await this._regressionRun(entry, code);
         if (reg === true) { gateLog(`PROMOTE ${name}: passed regression rerun on a past task`); this._promote(entry, cand); }
-        else if (reg === false) { gateLog(`REJECT update to ${name}: failed regression rerun on a past task; keeping current version`); }
+        else if (reg === false) { gateLog(`REJECT update to ${name}: failed regression rerun on a past task; keeping current version`); this._proposalOutcome(entry, 'failed regression rerun'); if (opts.refactor) this._rollbackRefactor(opts.refactor, name); }
         else if (opts.repair) { entry.candidate = cand; gateLog(`HOLD repair of ${name}: kept as candidate; needs 2+ trial runs with success rate >= current ${rate(entry.stats || newStats()).toFixed(2)}`); }   // fix11 (B3)
         else if (!(entry.stats?.success)) { gateLog(`PROMOTE ${name}: current version has no recorded successes`); this._promote(entry, cand); }
         else { entry.candidate = cand; gateLog(`HOLD ${name}: new version kept as candidate (1/1); needs 2+ trial runs with success rate >= current ${rate(entry.stats).toFixed(2)}`); }
@@ -777,27 +792,31 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         }
         // fix19 (6): a death is a failure of the call that was running (deepest open call) and all its ancestors
         const died = this._diedInRun();
-        if (died) { let i = trace.length - 1; trace[i].ownFail = [`DIED: ${died.message} at ${died.pos}`]; for (; i >= 0; i = trace[i].parent) { trace[i].intr = false; trace[i].ok = false; trace[i].fail = true; } ok = false; }
+        if (died) { let i = -1; for (let k = 0; k < trace.length; k++) if ((trace[k].t0 || 0) <= died.t && (trace[k].t1 ?? Infinity) >= died.t - 1500 && (i < 0 || trace[k].depth >= trace[i].depth)) i = k; if (i < 0) i = trace.length - 1; console.log(`[psn] death attributed to the call running at death time: ${trace[i].name} (depth ${trace[i].depth})`); trace[i].ownFail = [`DIED: ${died.message} at ${died.pos}`]; for (; i >= 0; i = trace[i].parent) { trace[i].intr = false; trace[i].ok = false; trace[i].fail = true; } ok = false; }
         // fix19 (5): an explicit FAILED line from a skill is a contract failure even if the task check passed (e.g. ensureChest inside a storage task)
         const explicit = trace.some(r => !r.intr && (r.ownFail || []).some(l => /FAILED/.test(l)));
         if (ok && !revalFail && !explicit) return;
         if (ok && explicit) console.log(`[psn] task check passed but a skill reported FAILED; attributing that contract failure`);
         console.log(`[psn] execution trace of ${root} (${trace.length} calls):\n${traceText(trace)}`);
-        let b = blame(trace, n => this._isLeaf(n));
         const learned = n => { const e = this.skills.find(s => s.name === n); return !!e && !e.primitive && !e.handwritten; };
-        // fix19 (2): every call met its contract (or only an unrepairable leaf failed): the root's own composition is at fault
-        if (!b || !b.target) {
-            const why = b ? `only the fixed leaf ${b.leaf} failed (${b.evidence})` : 'every call met its contract but the task outcome failed';
-            if (learned(root)) { b = { target: root, leaf: root, path: [root], kind: 'callee_fix', swallowed: false, evidence: why }; console.log(`[psn] blame: root learned skill ${root} [callee_fix]: ${why}`); }
+        let bs = blameAll(trace, n => this._isLeaf(n), learned).slice(0, 3);   // at most 3 patches per failure (deepest first)
+        // fix19 (2): no learned skill on a failure path: the root's own composition is at fault
+        if (!bs.length) {
+            const b0 = blame(trace, n => this._isLeaf(n));
+            const why = b0 ? (b0.target ? `failure only in non-library code ${b0.target} (${b0.evidence})` : `only the fixed leaf ${b0.leaf} failed (${b0.evidence})`) : 'every call met its contract but the task outcome failed';
+            if (learned(root)) { bs = [{ target: root, leaf: root, path: [root], kind: 'callee_fix', swallowed: false, evidence: why }]; console.log(`[psn] blame: root learned skill ${root} [callee_fix]: ${why}`); }
             else { console.log(`[psn] blame: ${why}; root ${root} is ${this.skills.some(s => s.name === root) ? 'primitive/hand-written' : 'freshly generated'} -> goal goes to decomposition`); this._decomposeQueue ||= { task, reason: why }; return; }
-        } else console.log(`[psn] blame: ${b.target} [${b.kind}${b.swallowed ? ', swallowed' : ''}] via ${b.path.join(' > ')}; deepest failure ${b.leaf}: ${b.evidence}`);
-        const rq = (this._repairQueue ||= []);
-        if (rq.some(x => x.target === b.target)) console.log(`[psn] repair of ${b.target} already queued`);
-        else { rq.push({ ...b, task, trace: traceText(trace, 60) }); console.log(`[psn] queued REPAIR of ${b.target} (${rq.length} in queue)`); }
+        } else console.log(`[psn] blame (top-down over ${bs.length} responsible skill(s), patched bottom-up): ${bs.map(b => `${b.target} [${b.kind}${b.swallowed ? ', swallowed' : ''}]`).join(', ')}; path ${bs[0].path.join(' > ')}; deepest failure ${bs[0].leaf}: ${bs[0].evidence}`);
+        const rq = [...(this._repairQueue || [])];
+        for (const b of bs) {
+            if (rq.some(x => x.target === b.target)) { console.log(`[psn] repair of ${b.target} already queued`); continue; }
+            rq.push({ ...b, task, trace: traceText(trace, 60), peers: bs.map(x => x.target) }); console.log(`[psn] queued REPAIR of ${b.target} (${rq.length} in queue)`);
+        }
+        rq.sort((a, b) => (b.depth ?? 0) - (a.depth ?? 0)); this._repairQueue = rq;
     }
     // targeted repair of the blamed skill via the code model, through the normal regression gate (saveSkill)
     async _repair() {
-        const q = (this._repairQueue || []).shift();
+        const rq = [...(this._repairQueue || [])], q = rq.shift(); this._repairQueue = rq;
         if (!q) return false;
         const e = this.skills.find(s => s.name === q.target);
         if (!e) { console.log(`[psn] repair FAILED: blamed skill ${q.target} not in library`); return false; }
@@ -805,10 +824,12 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         if (Date.now() - (this._repairs[e.name] || 0) < 30 * 60e3) { console.log(`[psn] repair of ${e.name} skipped: already repaired in the last 30 min (cap)`); return false; }
         if (e.candidate) { console.log(`[psn] repair of ${e.name} skipped: a candidate is already under trial`); return false; }
         if (this._cursorLimited()) { console.log(`[psn] repair of ${e.name} skipped: code model at its limit`); return false; }
+        if (!this._updateAllowed(e, `repair after ${q.kind}`)) { console.log(`[psn] repair of ${e.name} skipped: maturity gate froze it`); return false; }
         this._repairs[e.name] = Date.now(); this._saveProgress();
         const kids = [...this._closure(e.name)].map(n => this.skills.find(s => s.name === n)).filter(Boolean);
         const system = `You repair ONE skill in a Minecraft mineflayer skill library (PSN-style targeted fix). Return a single \`\`\`javascript code block containing ONLY the fixed function, with the SAME name and a compatible signature. First line inside the block: // DESCRIPTION: <one sentence>. Call other library skills by name (they are in scope); never redefine them. Every loop must check bot.interrupt_code. If something still cannot be done, log(bot, 'FAILED: <reason>') and return a falsy value; no silent fallbacks.\nLIBRARY:\n${this.catalogue()}`;
-        const user = `Blamed skill: ${e.name} (${q.kind === 'caller_fix' ? 'it calls the leaf ' + q.leaf + ' in a situation where the leaf cannot succeed: fix how/when it calls it, e.g. obtain the missing prerequisite first' : 'its own logic failed'})\nTask that failed: ${q.task}\nFailure path: ${q.path.join(' > ')}\nEvidence: ${q.evidence}\n--- execution trace (indent = call depth) ---\n${q.trace}\n--- current code of ${e.name} ---\n${e.code}\n--- skills it uses ---\n${kids.map(k => '// ' + k.description + '\n' + signatureOf(k.code, k.name)).join('\n')}\nWrite the fixed ${e.name}:`;
+        const user = `Blamed skill: ${e.name} (${q.kind === 'caller_fix' ? 'it calls the leaf ' + q.leaf + ' in a situation where the leaf cannot succeed: fix how/when it calls it, e.g. obtain the missing prerequisite first' : 'its own logic failed'})\nTask that failed: ${q.task}\nFailure path: ${q.path.join(' > ')}\nEvidence: ${q.evidence}\n--- execution trace (indent = call depth) ---\n${q.trace}\n--- current code of ${e.name} ---\n${e.code}\n--- skills it uses ---\n${kids.map(k => '// ' + k.description + '\n' + signatureOf(k.code, k.name)).join('\n')}\n${(e.repairHistory || []).length ? `\n--- your last ${e.repairHistory.length} repair proposal(s) for ${e.name} (do not repeat what failed) ---\n` + e.repairHistory.map((h, i) => `${i + 1}. [${h.outcome || 'pending'}] ${h.kind}: ${h.evidence}\n   change: ${h.desc}`).join('\n') : ''}${q.peers?.length > 1 ? `\nOther skills blamed on the same failure (repaired children-first): ${q.peers.join(', ')}` : ''}\nWrite the fixed ${e.name}:`;
+        console.log(`[psn] repair memory for ${e.name}: ${(e.repairHistory || []).length} past proposal(s) in the prompt`);
         console.log(`[psn] REPAIR ${e.name} [${q.kind}] with the code model (evidence: ${q.evidence.slice(0, 160)})`);
         let code, body, desc, extra = '';
         for (let att = 1; att <= 2; att++) {   // fix19 (3): one retry with the lint/format error fed back
@@ -827,14 +848,57 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
             }
             if (!err) break;
             console.log(`[psn] repair attempt ${att} FAILED for ${e.name}: ${err.slice(0, 300)}${att < 2 ? '; retrying with the error fed back' : ''}`);
-            if (att === 2) return false;
+            if (att === 2) { this._noteProposal(e, { task: q.task, kind: q.kind, evidence: q.evidence.slice(0, 200), desc: `invalid code: ${err.slice(0, 150)}`, outcome: 'lint failed' }); return false; }
             extra = `\n--- your previous reply was rejected ---\n${err}\n--- previous code ---\n${code || '(none)'}\nFix the error and write the fixed ${e.name} again:`;
         }
         this._lastEffects = e.effects || [];
+        this._noteProposal(e, { task: q.task, kind: q.kind, evidence: q.evidence.slice(0, 200), desc: desc.slice(0, 200) });
         const saved = await this.saveSkill(e.name, desc, body, `repair: ${q.task}`, { repair: true });
-        if (!saved) { console.log(`[psn] repair of ${e.name} rejected by the gate`); return false; }
+        if (!saved) { this._proposalOutcome(e, 'rejected at submit'); this._saveSkills(); console.log(`[psn] repair of ${e.name} rejected by the gate`); return false; }
         console.log(`[psn] repaired ${e.name}: submitted to the gate (parents are re-validated once it is promoted)`);
         return true;
+    }
+
+    // fix20 (PSN refactoring with rollback): merge a code fragment repeated in 3+ skills into one new helper skill;
+    // the rewritten skills enter the gate as candidates tagged with the refactor id. If any rewrite is rejected
+    // (trial runs or regression rerun), every candidate of that refactor is rolled back.
+    async _refactor() {
+        const h = (this.sharedHints || [])[0];
+        if (!h || this._cursorLimited()) return false;
+        const P = this.progress; if (Date.now() - (P.lastRefactor || 0) < 2 * 3600e3) return false;
+        P.lastRefactor = Date.now(); this._saveProgress();
+        const ents = h.skills.map(n => this.skills.find(s => s.name === n)).filter(e => e && !e.handwritten && !e.primitive && !e.candidate);
+        if (ents.length < 2) { console.log(`[psn] refactor skipped: fragment shared by ${h.skills.join(', ')} but <2 learned skills without a pending candidate`); return false; }
+        const id = `rf${Date.now()}`;
+        const system = `You refactor a Minecraft mineflayer skill library (PSN canonical refactor: extract shared subroutine). Return ONE \`\`\`javascript block with: first a NEW helper async function (bot, ...params) that implements the repeated fragment, preceded by // DESCRIPTION: <one sentence>; then each listed skill rewritten to call the helper, SAME names and signatures, behaviour unchanged. Every loop checks bot.interrupt_code. No other functions.\nLIBRARY:\n${this.catalogue()}`;
+        const user = `Repeated fragment:\n${h.fragment}\n${ents.map(e => `--- ${e.name} ---\n${e.code}`).join('\n')}\nWrite the helper then the rewritten skills:`;
+        console.log(`[psn] REFACTOR ${id}: extracting the fragment shared by ${ents.map(e => e.name).join(', ')}`);
+        let reply; try { reply = await this._ask(system, user); } catch (err) { console.log(`[psn] refactor FAILED: ${err.message}`); return false; }
+        const code = extractCode(reply) || '';
+        const fns = []; const re = /(?:^|\n)async\s+function\s+([A-Za-z_]\w*)\s*\(/g; let mm, idx = [];
+        while ((mm = re.exec(code))) idx.push([mm[1], mm.index]);
+        for (let i = 0; i < idx.length; i++) fns.push([idx[i][0], code.slice(idx[i][1], i + 1 < idx.length ? idx[i + 1][1] : code.length).trim()]);
+        const helper = fns.find(([n]) => !this.skills.some(s => s.name === n));
+        const rewrites = fns.filter(([n]) => ents.some(e => e.name === n));
+        if (!helper || rewrites.length < 2) { console.log(`[psn] refactor ${id} FAILED: reply had ${helper ? 'a' : 'no'} new helper and ${rewrites.length} rewritten skill(s)`); return false; }
+        const hdesc = ((code.match(/\/\/\s*DESCRIPTION:\s*(.+)/) || [])[1] || `shared helper extracted from ${rewrites.map(r => r[0]).join(', ')}`).trim();
+        const over = { [helper[0]]: helper[1] }; for (const [n, c] of rewrites) over[n] = c;
+        const staged = await this.agent.coder._stageCode(this._libSrc(over) + `\n\n${helper[1]}\n\nawait Promise.resolve();`);
+        const lint = staged ? await this.agent.coder._lintCode(staged.src_lint_copy) : 'staging failed';
+        if (lint) { console.log(`[psn] refactor ${id} FAILED lint: ${String(lint).slice(0, 300)}`); return false; }
+        this._lastEffects = [];
+        if (!(await this.saveSkill(helper[0], hdesc, helper[1], `refactor ${id}`))) { console.log(`[psn] refactor ${id} FAILED: helper rejected`); return false; }
+        P.refactors = { ...(P.refactors || {}), [id]: { helper: helper[0], skills: rewrites.map(r => r[0]), at: Date.now() } }; this._saveProgress();
+        for (const [n, c] of rewrites) { const e = this.skills.find(s => s.name === n); this._lastEffects = e.effects || []; await this.saveSkill(n, e.description, c, `refactor ${id}`, { refactor: id }); }
+        console.log(`[psn] refactor ${id}: helper ${helper[0]} added; ${rewrites.length} rewritten skill(s) under verification (all rolled back if any is rejected)`);
+        return true;
+    }
+    _rollbackRefactor(id, by) {
+        const rf = this.progress.refactors?.[id]; let n = 0;
+        for (const e of this.skills) if (e.candidate?.refactor === id) { delete e.candidate; n++; }
+        for (const e of this.skills) if (e.refactorOf === id && e.prev) { /* already promoted: restore the pre-refactor version */ Object.assign(e, { code: e.prev.code, description: e.prev.description, deps: e.prev.deps, stats: e.prev.stats }); writeAtomic(`${this.dir}/${e.name}.js`, `// ${e.description}\n${e.code}\n`); delete e.refactorOf; n++; }
+        if (rf) { const h = this.skills.find(s => s.name === rf.helper); if (h && !this.skills.some(s => !s.mergedInto && (s.deps || []).includes(rf.helper))) h.demoted = true; rf.rolledBack = by; this._saveProgress(); }
+        this._saveSkills(); gateLog(`ROLLBACK refactor ${id} (rejected: ${by}): ${n} rewritten skill(s) restored; helper ${rf?.helper || '?'} retired if unused`);
     }
 
     async step() {
@@ -846,6 +910,7 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         if (await this._leash()) return;
         if (this._repairQueue?.length) { await this._repair(); return; }
         if (this._decomposeQueue) { const dq = this._decomposeQueue; this._decomposeQueue = null; await this._decompose(dq.task, dq.reason); return; }
+        if (await this._refactor()) return;
         const before = this.observe();
         this._curSub = null;
         let proposal = this._subgoalTask() || this._milestoneTask(before) || await this.proposeTask(before);
