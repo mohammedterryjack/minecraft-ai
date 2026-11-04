@@ -501,23 +501,22 @@ replayable_tasks (cheap, no new code needed): ${JSON.stringify(this.skills.filte
     // ---------- skill library ----------
     async _embed(text) {
         const em = this.agent.prompter.embedding_model;
-        if (!em) return null;
-        try { const v = await em.embed(text); return Array.isArray(v?.[0]?.values) ? v[0].values : v; }
-        catch (e) { console.warn('[voyager] embedding failed: ' + e.message); return null; }
+        if (!em) throw new Error('[voyager] embedding model required (no fallback)');
+        const v = await em.embed(text);   // fix14: fail loudly, no word-overlap fallback
+        return Array.isArray(v?.[0]?.values) ? v[0].values : v;
     }
     async retrieveSkills(query, k = 5) {
         if (!this.skills.length) return [];
         const q = await this._embed(query);
-        if (q) {  // re-embed skills saved with a different embedding model (e.g. nomic -> gemini-embedding-001)
+        {  // re-embed skills saved with a different embedding model (e.g. nomic -> gemini-embedding-001)
             let changed = false;
             for (const s of this.skills) {
                 if (!s.embedding || s.embedding.length !== q.length) { s.embedding = await this._embed(s.description); changed = true; }
             }
             if (changed) { this._saveSkills(); console.log('[voyager] re-embedded skill library with current embedding model'); }
         }
-        // embeddings unavailable (e.g. Gemini 429) -> fall back to word overlap so retrieval still works
-        const scored = this.skills.map(s => ({ s, score: (q && s.embedding && s.embedding.length === q.length)
-            ? cosineSimilarity(q, s.embedding) : wordOverlapScore(query, `${s.name} ${s.description} ${s.task || ''}`) }));
+        const scored = this.skills.map(s => ({ s, score: cosineSimilarity(q, s.embedding) }));
+        console.log(`[voyager] skill search (embeddings) top: ${scored.slice().sort((a, b) => b.score - a.score).slice(0, 3).map(x => x.s.name + '=' + x.score.toFixed(2)).join(' ')}`);
         return scored.sort((a, b) => b.score - a.score).slice(0, k).map(x => x.s);
     }
     async saveSkill(name, description, code, task, opts = {}) {
