@@ -1,5 +1,5 @@
-// Craft one copper_block at the birch hut crafting table using nine copper_ingots in a 3x3 grid.
-// DESCRIPTION: Craft one copper_block at the birch hut crafting table using nine copper_ingots in a 3x3 grid.
+// Craft one copper_block at a nearby crafting table using nine copper_ingots in a 3x3 grid.
+// DESCRIPTION: Craft one copper_block at a nearby crafting table using nine copper_ingots in a 3x3 grid.
 async function craftCopperBlock(bot) {
     const countItem = (name) => {
         const stack = bot.inventory.items().find((i) => i.name === name);

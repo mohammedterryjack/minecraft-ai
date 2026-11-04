@@ -2269,7 +2269,7 @@ export async function buildStructure(bot, type, x, y, z, material, width=5, leng
      * @param {number} width, size along x (max 16). @param {number} length, size along z (max 16). @param {number} height, size along y (max 8).
      * @returns {Promise<boolean>} true if every block was placed.
      * @example
-     * await skills.buildStructure(bot, "hut", -1500, 63, 540, "oak_planks", 5, 5, 3);
+     * await skills.buildStructure(bot, "hut", 100, 64, 200, "oak_planks", 5, 5, 3);
      **/
     width = Math.min(Math.max(1, width|0), 16); length = Math.min(Math.max(1, length|0), 16); height = Math.min(Math.max(1, height|0), 8);
     x = Math.floor(x); y = Math.floor(y); z = Math.floor(z);
@@ -2357,7 +2357,7 @@ export async function travelTo(bot, x, y, z, maxHops = 120) {
      * @param {number} x, y, z target coordinates.
      * @returns {Promise<boolean>} true once within 4 blocks (horizontally) of the target.
      * @example
-     * await skills.travelTo(bot, -1507, 63, 542);
+     * await skills.travelTo(bot, 100, 64, 200);
      **/
     let fails = 0;
     for (let hop = 0; hop < maxHops; hop++) {

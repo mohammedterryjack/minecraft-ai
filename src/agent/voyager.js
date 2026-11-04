@@ -16,7 +16,7 @@ export const CALLS = { local: 0, code: 0, replay: 0 };
 globalThis.__psnALS ||= new AsyncLocalStorage();   // fix11 (B6): call-parent tracking for PSN traces
 
 // fix12: HOME is the single source of truth for the bot's base (town centre, hut, leash, red-zone teleport).
-// Moved from the old birch hut (-1503,63,547) to the grove where the bot ended up; the hut there is built by the home_hut milestone.
+// Moved from the old base to the grove where the bot ended up; the hut there is built by the home_hut milestone.
 const HOME = { x: -177, y: 72, z: 104 };   // feet level at the hut centre
 const TOWN = HOME;
 const VILLAGE = { x: -800, z: 500 };
