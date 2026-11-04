@@ -24,6 +24,7 @@ h4{margin:6px 0 3px;font-size:11px;letter-spacing:.06em;text-transform:uppercase
 const $=id=>document.getElementById(id),esc=s=>String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 const pretty=n=>String(n||'').replace(/^minecraft:/,'').replace(/_/g,' ');
 function bar(v,icon){let h='';for(let i=0;i<10;i++){const f=v-i*2;h+=`<span class="${f>0?'':'dim'}">${f===1?'◐':icon}</span>`}return h}
+function clock(t,l){if(t==null)return null;const m=Math.floor(((t+6000)%24000)*60/1000),hh=String(Math.floor(m/60)).padStart(2,'0'),mm=String(m%60).padStart(2,'0');const ph=t<12000?'☀ Day':t<13800?'🌅 Sunset':t<22200?'🌙 Night':'🌄 Sunrise';return `🕒 ${hh}:${mm} ${ph}${l?` (${l})`:''}`}
 function render(S){const st=S.state,g=st?.gameplay;
  $('conn').textContent=S.connected?(st?'● live':'● waiting for bot'):'○ mindserver offline';
  const hp=g?.health??S.safety?.health,fd=g?.hunger??S.safety?.food;
@@ -31,7 +32,7 @@ function render(S){const st=S.state,g=st?.gameplay;
  $('food').innerHTML=fd!=null?bar(fd,'🍗')+` <span class=mut>${fd}/20</span>`:'';
  let p=g?.position,d='';if(p&&S.hut){d=` · hut ${Math.round(Math.hypot(p.x-S.hut.x,p.z-S.hut.z))}m`}
  $('pos').textContent=p?`${Math.round(p.x)}, ${Math.round(p.y)}, ${Math.round(p.z)} · ${pretty(g.biome)}${d}`:'';
- const night=S.safety?.night;$('env').textContent=[g?.timeLabel,g?.weather,night!=null?(night?'🌙 night safety':'☀ day'):null].filter(Boolean).join(' · ');
+ const night=S.safety?.night;$('env').textContent=[clock(g?.timeOfDay,g?.timeLabel),g?.weather,night!=null?(night?'🌙 night safety':'☀ day'):null].filter(Boolean).join(' · ');
  $('act').textContent=st?.action?.current||'—';
  $('held').textContent=pretty(st?.inventory?.equipment?.mainHand)||'empty hand';
  const c=st?.inventory?.counts||{};$('inv').innerHTML=Object.entries(c).sort((a,b)=>b[1]-a[1]).slice(0,15).map(([k,v])=>`<span>${esc(pretty(k))} <b>${v}</b></span>`).join('')||'<span class=mut>—</span>';
