@@ -376,10 +376,17 @@ Use only c; no other globals.`;
         const hs = Object.values(this.progress.deathSpots || {}).filter(c => c.n >= 2).sort((a, b) => b.n - a.n).slice(0, 3);
         return hs.length ? hs.map(c => `${c.n} deaths near ${c.pos} (${c.causes.slice(-2).join('; ')}) during "${c.tasks.slice(-1)[0] || 'idle'}"`).join(' | ') + ' -> propose a task that learns to survive/avoid this' : 'none';
     }
+    // fix23: a curriculum task aimed at a cell with 3+ deaths (latest within 30 min) is rejected with the reason fed back to the curriculum
+    _hotspotOf(task) {
+        const m = String(task).match(/(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)/); if (!m) return null;
+        const c = (this.progress.deathSpots || {})[`${Math.floor(+m[1] / 16)},${Math.floor(+m[3] / 16)}`];
+        if (!c || c.n < 3 || Date.now() - (c.last ?? Date.now()) > 30 * 60e3) return null;
+        return `it targets a death hotspot (${c.n} deaths near ${c.pos}: ${c.causes.slice(-2).join('; ')}); choose a goal away from there or one that first learns to survive it from a safe distance`;
+    }
     _noteDeath(d, task) {
         const [x, y, z] = d.pos.split(',').map(Number), k = `${Math.floor(x / 16)},${Math.floor(z / 16)}`;
         const c = ((this.progress.deathSpots ||= {})[k] ||= { n: 0, pos: d.pos, causes: [], tasks: [] });
-        c.n++; c.pos = d.pos; c.causes = [...c.causes, d.message].slice(-5); c.tasks = [...c.tasks, task].slice(-5); this._saveProgress();
+        c.n++; c.last = Date.now(); c.pos = d.pos; c.causes = [...c.causes, d.message].slice(-5); c.tasks = [...c.tasks, task].slice(-5); this._saveProgress();
         console.log(`[psn] death during "${task}": ${d.message} at ${d.pos} (death #${c.n} in this area)${c.n >= 2 ? '; surfaced to the curriculum as a death hotspot' : ''}`);
     }
     // fix18: perception only (no policy): hostiles within 32 blocks, nearest first
@@ -995,15 +1002,16 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         if (await this._refactor()) return;
         const before = this.observe();
         this._curSub = null;
-        let proposal = this._subgoalTask() || this._milestoneTask(before) || await this.proposeTask(before);
+        const sub = this._subgoalTask(), ms = sub ? null : this._milestoneTask(before), fromCurr = !sub && !ms;
+        let proposal = sub || ms || await this.proposeTask(before);
         let task = String(proposal.task || '').trim();
-        let invalid = task ? validateTask(task) : 'empty task';
+        let invalid = task ? (validateTask(task) || (fromCurr && this._hotspotOf(task))) : 'empty task';
         if (invalid) {
             console.log(`[voyager] rejected task "${task}": ${invalid}`);
             this.progress.failed.push(`${task} (invalid: ${invalid})`);
             proposal = await this.proposeTask({ ...before, note: `Your last proposal "${task}" was rejected: ${invalid}` });
             task = String(proposal.task || '').trim();
-            invalid = task ? validateTask(task) : 'empty task';
+            invalid = task ? (validateTask(task) || this._hotspotOf(task)) : 'empty task';
             if (invalid) { console.log(`[voyager] rejected again "${task}": ${invalid}; skipping`); this._saveProgress(); return; }
         }
         console.log(`[voyager] new task: ${task} (${proposal.reasoning})`);
@@ -1066,6 +1074,7 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             const res = await this.agent.actions.runAction(`voyager:${task}`, async () => {
                 this.agent.bot.__psnALS = globalThis.__psnALS; await staged.func.main(this.agent.bot);
             }, { timeout: 5 });
+            console.log(`[timing] game action attempt ${i} took ${Date.now() - this._runStart}ms`);   // fix23: measurement
             if (this.abort) { console.log('[voyager] task interrupted'); return; }
             const cut = res.interrupted || this._diedInRun() ? this._interruptReason(res.message) : '';   // fix14: cut-off code counts as a failed attempt
             if (this._diedInRun()) this._noteDeath(this._diedInRun(), task);
@@ -1075,7 +1084,7 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             const after = this.observe();
             const goal = countGoal(task);
             const gained = goal ? gainedFor(goal, before, after) : 0;
-            const verdict = cut ? { ...(await this.critique(task, before, after, output)), success: false }
+            const verdict = cut ? { success: false, critique: `the attempt was ${cut}; it did not finish`, reasoning: 'cut off (critic skipped)' }   // fix23: a cut-off run is already a failure
                 : (goal && gained >= goal.count)
                 ? { success: true, critique: '', reasoning: `inventory +${gained} ${goal.item}` }
                 : await this.critique(task, before, after, output);
@@ -1083,7 +1092,8 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             console.log(`[voyager] attempt ${i} critic: success=${verdict.success} ${verdict.critique || ''}`);
             this._attribute(own, task, !!verdict.success, {});   // fix11 (B7)
             if (this._repairQueue?.some(x => x.target === own)) { console.log(`[psn] blame lands on the generated ${own} itself; the critic feedback loop fixes it (no library repair)`); this._repairQueue = this._repairQueue.filter(x => x.target !== own); }
-            if (this._decomposeQueue?.task === task && i < MAX_ATTEMPTS) this._decomposeQueue = null;   // still iterating; decomposition decided after the last attempt
+            const lastTry = i >= MAX_ATTEMPTS || (!verdict.success && /travel|underground|died/.test(cut) && i >= 2);   // fix23: repeated travel cut-offs -> stop at 2 and decompose
+            if (this._decomposeQueue?.task === task && !lastTry) this._decomposeQueue = null;   // still iterating; decomposition decided after the last attempt
             if (verdict.success) {
                 this._lastEffects = Object.keys(after.inventory).filter(k => (after.inventory[k] || 0) > (before.inventory[k] || 0)).slice(0, 8);
                 await this.saveSkill(fn[1], desc.trim(), code.replace(/\n\s*await\s+\w+\(bot\);\s*$/, '').trim(), task);
@@ -1096,6 +1106,7 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             }
             feedback = `${cut ? `Attempt ${cut}\n` : ''}Execution output:\n${output}\nCritic: ${verdict.critique}\nChat/behaviour log: ${this.agent.bot.modes.flushBehaviorLog().slice(-400)}`;
             lastCode = code;
+            if (lastTry) { if (i < MAX_ATTEMPTS) console.log(`[voyager] stopping after attempt ${i}: ${cut} (travel/death cut-off)`); break; }
         }
         this.progress.failed.push(task);
         this._saveProgress();

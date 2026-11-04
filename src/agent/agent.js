@@ -272,6 +272,11 @@ export class Agent {
 
         const self_prompt = source === 'system' || source === this.name;
         const from_other_bot = convoManager.isOtherAgent(source);
+        if (self_prompt && this.voyager?.enabled) {   // fix23: in voyager mode the curriculum drives behaviour; system events go to history, no chat-model call
+            await this.history.add(source, message);
+            console.log(`[fix23] system message kept in history, chat model skipped: ${String(message).slice(0, 80)}`);
+            return false;
+        }
 
         if (!self_prompt && !from_other_bot) this.voyager.notePlayerMessage(); // players take priority
         if (!self_prompt && !from_other_bot) { // from user, check for forced commands
