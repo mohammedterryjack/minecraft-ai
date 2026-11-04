@@ -195,6 +195,7 @@ export class Agent {
             startAt: 14,
             bannedFood: ["rotten_flesh", "spider_eye", "poisonous_potato", "pufferfish", "chicken"]
         };
+        this.bot.autoEat.disable();   // fix18: eating is a learned skill, not a reflex
 
         if (save_data?.self_prompt) {
             if (init_message) {

@@ -272,13 +272,22 @@ export class Voyager {
             position: `${p.x.toFixed(0)}, ${p.y.toFixed(0)}, ${p.z.toFixed(0)}`,
             distance_to_town: dTown,
             biome: world.getBiomeName(bot),
-            time: t < 12000 ? `day (${t})` : `night (${t})`,
+            time: t < 12000 ? `day (${t})` : t < 13000 ? `dusk (${t}, hostiles about to spawn)` : t < 23000 ? `night (${t}, hostiles spawn outdoors)` : `dawn (${t})`,
             health: `${Math.round(bot.health)}/20`, food: `${bot.food}/20`,
             inventory: world.getInventoryCounts(bot),
             equipped: bot.heldItem ? bot.heldItem.name : 'nothing',
             nearby_blocks: world.getNearbyBlockTypes(bot, 16),
             nearby_entities: world.getNearbyEntityTypes(bot),
+            empty_inventory_slots: bot.inventory.emptySlotCount(),
+            threats: this._threats(),
         };
+    }
+    // fix18: perception only (no policy): hostiles within 32 blocks, nearest first
+    _threats() {
+        const bot = this.agent.bot, p = bot.entity.position;
+        const hs = Object.values(bot.entities).filter(e => e !== bot.entity && (isHostile(e) || isDatapackHostile(e)) && e.position.distanceTo(p) < 32)
+            .map(e => `${isDatapackHostile(e) ? 'DATAPACK ' : ''}${e.name || e.username} ${e.position.distanceTo(p).toFixed(0)}m`);
+        return hs.length ? hs.slice(0, 6).join(', ') : 'none';
     }
     _stateText(s) {
         return Object.entries(s).map(([k, v]) => `${k}: ${typeof v === 'object' ? JSON.stringify(v) : v}`).join('\n');
@@ -486,10 +495,7 @@ export class Voyager {
         const done = this.progress.milestones ||= [];
         const inv = state.inventory || {};
         const empty = this.agent.bot.inventory.emptySlotCount();
-        if (empty < 3 && this.skills.some(s => s.name === 'depositToChest' && !s.demoted)) {
-            console.log(`[voyager] inventory nearly full (${empty} empty slots): storing items before anything else`);
-            return { task: 'Store items in a chest to free inventory space', reasoning: `inventory has ${empty} empty slots`, context: 'depositToChest' };
-        }
+        void empty;   // fix18: full-inventory handling is learned, not forced
         // fix12: a hut at HOME comes first (checked in-world, not by inventory)
         if (!done.includes('home_hut')) {
             if (this._hutBuilt()) { done.push('home_hut'); this._saveProgress(); console.log('[psn] milestone reached: home_hut'); }
@@ -523,7 +529,7 @@ Rules:
 - NEVER go near the players' village around x=${VILLAGE.x}, z=${VILLAGE.z}; never take or break player builds.
 - Propose ONE concrete, verifiable task achievable in a few minutes with the current inventory and surroundings (e.g. "Mine 5 birch_log", "Craft 1 stone_pickaxe", "Smelt 3 iron_ingot", "Build a 5x5 cobblestone floor next to the hut").
 - Do not repeat completed tasks unless needed for progress; avoid tasks that failed recently unless prerequisites are now met.
-- If it is night and the bot is far from town or low health, propose returning to the hut / staying safe.
+- The bot must survive: dying loses its inventory. Nothing keeps it alive automatically (no eating, fleeing, fighting or sheltering reflexes), so survival is your job too: read time, health, food, threats and inventory space in the state and decide.
 Reply ONLY with JSON: {"reasoning": "...", "task": "...", "context": "short hint how to do it"}`;
         const user = `${this._stateText(state)}
 completed_tasks: ${JSON.stringify(this.progress.completed.slice(-30))}
@@ -616,128 +622,7 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
     }
 
     // ---------- iterative prompting ----------
-    // deterministic survival step, no LLM: eat, then get to the hut / shelter at night or low health
-    async safety() {
-        const bot = this.agent.bot;
-        const night = bot.time.timeOfDay >= 12500 && bot.time.timeOfDay < 23500;
-        const p = bot.entity.position;
-        const far = Math.hypot(p.x - HUT.x, p.z - HUT.z) > 12 || Math.abs(p.y - HUT.y) > 4;
-        const needFood = bot.food < 14 && bot.inventory.items().some(i => i.foodPoints || /cooked|bread|apple|carrot|potato|beef|porkchop|mutton|chicken|cod|salmon|stew/.test(i.name));
-        const lowHealth = bot.health < 8;
-        // fix6: long-range figure scan (48 blocks, all entities incl. mannequins); shelter in hut early
-        const inHut = q => q.x >= HUT.x - 2 && q.x <= HUT.x + 3 && q.z >= HUT.z - 2 && q.z <= HUT.z + 3 && Math.abs(q.y - (HUT.y - 1)) <= 2;
-        const fig = bot.nearestEntity(e => e !== bot.entity && isDatapackHostile(e) && e.position.distanceTo(p) < 48);
-        if (fig) {
-            const fd = fig.position.distanceTo(p);
-            console.log(`[voyager] safety: datapack hostile (${fig.name}${fig.username ? ' ' + fig.username : ''}) ${fd.toFixed(1)} blocks away at ${fig.position.floored()}; inHut=${inHut(p)} night=${night}`);
-            await this.agent.actions.runAction('voyager:safety:figure', async () => {
-                if (inHut(p)) { await this._sealHut(); return; }
-                const hutD = Math.hypot(p.x - HUT.x, p.z - HUT.z);
-                const figHutD = Math.hypot(fig.position.x - HUT.x, fig.position.z - HUT.z);
-                if (hutD < 64 && figHutD > 6) { await skills.goToPosition(bot, HUT.x, HUT.y - 1, HUT.z, 1); if (!bot.interrupt_code) await this._sealHut(); }
-                else { await skills.avoidEnemies(bot, 48); if (night && !bot.interrupt_code) await skills.shelterNow(bot); }
-            }, { timeout: 2 });
-            return true;
-        }
-        if (night && inHut(p)) {   // fix6: stay inside at night, door shut
-            if (!this._sealedAt || Date.now() - this._sealedAt > 60000) { console.log('[voyager] safety: night, staying in hut'); await this.agent.actions.runAction('voyager:safety:seal', async () => { await this._sealHut(); }, { timeout: 1 }); this._sealedAt = Date.now(); }
-            return true;
-        }
-        if (!needFood && !(night && far) && !(lowHealth && far)) { this._safetyStuck = 0; return false; }
-        // back off when safety keeps making no progress (e.g. stuck in a cave under the hut), so learning can continue
-        if (Date.now() < (this._safetyBackoff || 0)) return false;
-        const key = `${Math.round(p.x)},${Math.round(p.y)},${Math.round(p.z)}`;
-        this._safetyStuck = key === this._safetyLastPos ? (this._safetyStuck || 0) + 1 : 0;
-        this._safetyLastPos = key;
-        if (this._safetyStuck >= 3) { console.log(`[voyager] safety made no progress 3x at ${key}; pausing safety for 5 min`); this._safetyBackoff = Date.now() + 5 * 60 * 1000; this._safetyStuck = 0; return false; }
-        console.log(`[voyager] safety first: food=${bot.food} health=${Math.round(bot.health)} night=${night} far=${far}`);
-        await this.agent.actions.runAction('voyager:safety', async () => {
-            if (needFood) await skills.consume(bot);
-            if ((night || lowHealth) && far) {
-                if (Math.hypot(p.x - HUT.x, p.z - HUT.z) <= 24 && p.y < HUT.y - 4) await skills.goToSurface(bot);   // underground below the hut
-                if (bot.interrupt_code) return;
-                await skills.travelTo(bot, HUT.x, HUT.y, HUT.z);
-                const q = bot.entity.position;
-                if (Math.hypot(q.x - HUT.x, q.z - HUT.z) > 6 && night) await skills.shelterNow(bot);
-            }
-        }, { timeout: 4 });
-        return true;
-    }
-
-    // fix4: in-place inventory housekeeping during night safety / shelter (no walking): toss clutter, then
-    // craft planks -> sticks -> crafting_table (placed adjacent) -> wooden_pickaxe from inventory
-    async _housekeep() {
-        const bot = this.agent.bot;
-        if (this.abort || Date.now() < (this._houseNext || 0)) return;
-        this._houseNext = Date.now() + 45 * 1000;
-        const hostile = bot.nearestEntity(e => e !== bot.entity && (isHostile(e) || e.type === 'hostile' || /zombie|skeleton|creeper|spider|witch|drowned|husk|stray|enderman|slime|phantom/.test(e.name || '')));
-        const hd = hostile ? hostile.position.distanceTo(bot.entity.position) : Infinity;
-        const roof = bot.blockAt(bot.entity.position.offset(0, 2, 0));
-        const sheltered = roof && roof.boundingBox === 'block';
-        if (hd < 16 && !sheltered) { console.log(`[house] skipped: ${isDatapackHostile(hostile) ? 'DATAPACK FIGURE ' : ''}${hostile.name} ${hd.toFixed(1)} blocks away and not sheltered`); return; }
-        const inv = () => world.getInventoryCounts(bot);
-        const empty = bot.inventory.emptySlotCount();
-        if (empty < 6) {
-            console.log(`[house] ${empty} empty slots; tossing clutter in place (sheltered=${!!sheltered}, nearest hostile ${hd === Infinity ? 'none' : hd.toFixed(1)})`);
-            const staged = await this.agent.coder._stageCode(this._libSrc() + '\n\nasync function __house(bot) { await tossClutter(bot, 6); }\nawait __house(bot);');
-            if (!staged) { console.log('[house] FAILED to stage tossClutter'); return; }
-            const hr = await this.agent.actions.runAction('voyager:housekeeping:toss', async () => { await staged.func.main(bot); }, { timeout: 2 });
-            console.log(`[house] toss output: ${String(hr?.message || '(none)').split(/\n|\|/).filter(l => /\[toss\]/.test(l)).join(' | ').slice(-800)}`);
-            console.log(`[house] after toss: ${bot.inventory.emptySlotCount()} empty slots`);
-            return;
-        }
-        const c = inv();
-        if (c.wooden_pickaxe || c.stone_pickaxe || c.iron_pickaxe || c.diamond_pickaxe) return;
-        const log = Object.keys(c).find(n => /_log$/.test(n) && !/stripped/.test(n));
-        const planks = () => Object.entries(inv()).filter(([n]) => /_planks$/.test(n)).reduce((a, [, v]) => a + v, 0);
-        await this.agent.actions.runAction('voyager:housekeeping:craft', async () => {
-            const step = async (what, fn) => { const ok = await fn(); console.log(`[house] craft ${what}: ${ok ? 'ok' : 'FAILED'}`); return ok; };
-            const needPlanks = (c.crafting_table ? 0 : 4) + 3 + ((c.stick || 0) >= 2 ? 0 : 2);
-            if (planks() < needPlanks && log) await step(`planks from ${log}`, () => skills.craftRecipe(bot, log.replace(/_log$/, '_planks'), 2));
-            if (bot.interrupt_code) return;
-            if ((inv().stick || 0) < 2 && planks() >= 2) {
-                const pl = Object.keys(inv()).find(n => /_planks$/.test(n));
-                await step('sticks', () => skills.craftRecipe(bot, 'stick', 1)); void pl;
-            }
-            if (bot.interrupt_code) return;
-            if (!world.getNearestBlock(bot, 'crafting_table', 4)) {
-                if (!inv().crafting_table && planks() >= 4) await step('crafting_table', () => skills.craftRecipe(bot, 'crafting_table', 1));
-                if (inv().crafting_table) {
-                    const me = bot.entity.position.floored();
-                    let placed = false;
-                    for (const [dx, dz] of [[1,0],[-1,0],[0,1],[0,-1],[1,1],[-1,-1],[1,-1],[-1,1]]) {
-                        const t = me.offset(dx, 0, dz), b = bot.blockAt(t), below = bot.blockAt(t.offset(0, -1, 0));
-                        if (b?.name === 'air' && below?.boundingBox === 'block') { placed = await skills.placeBlock(bot, 'crafting_table', t.x, t.y, t.z); if (placed) break; }
-                    }
-                    console.log(`[house] place crafting_table adjacent: ${placed ? 'ok' : 'FAILED (no free adjacent spot)'}`);
-                }
-            }
-            if (bot.interrupt_code) return;
-            if (world.getNearestBlock(bot, 'crafting_table', 4) && planks() >= 3 && (inv().stick || 0) >= 2)
-                await step('wooden_pickaxe', () => skills.craftRecipe(bot, 'wooden_pickaxe', 1));
-            else console.log(`[house] wooden_pickaxe not yet possible: planks=${planks()} sticks=${inv().stick || 0} log=${log || 'none'} table=${!!world.getNearestBlock(bot, 'crafting_table', 4)}`);
-        }, { timeout: 2 });
-        if (inv().wooden_pickaxe) console.log('[house] MILESTONE wooden_pickaxe crafted in place');
-    }
-
-    // fix6: close any open doors in/around the hut and fill open air gaps in the wall at feet/head level if we carry blocks
-    async _sealHut() {
-        const bot = this.agent.bot; const V = bot.entity.position.constructor;
-        let closed = 0, filled = 0;
-        for (let x = HUT.x - 3; x <= HUT.x + 3; x++) for (let z = HUT.z - 3; z <= HUT.z + 3; z++) for (let y = HUT.y - 2; y <= HUT.y + 1; y++) {
-            const bl = bot.blockAt(new V(x, y, z)); if (!bl || !/_door$/.test(bl.name)) continue;
-            const pr = bl.getProperties(); if (pr.half === 'upper' || !pr.open) continue;
-            try { await bot.activateBlock(bl); closed++; } catch (e) { console.log(`[seal] could not close door at ${bl.position}: ${e.message}`); }
-        }
-        const filler = bot.inventory.items().find(i => /cobblestone|dirt|planks|stone$|deepslate/.test(i.name));
-        if (filler) for (let x = HUT.x - 3; x <= HUT.x + 3; x++) for (let z = HUT.z - 3; z <= HUT.z + 3; z++) {
-            if (!(x === HUT.x - 3 || x === HUT.x + 3 || z === HUT.z - 3 || z === HUT.z + 3)) continue;
-            for (const y of [HUT.y - 1, HUT.y]) { const bl = bot.blockAt(new V(x, y, z)); const inner = bot.blockAt(new V(Math.max(HUT.x - 2, Math.min(HUT.x + 2, x)), y, Math.max(HUT.z - 2, Math.min(HUT.z + 2, z))));
-                if (bl && bl.name === 'air' && inner && inner.name === 'air') { try { await skills.placeBlock(bot, filler.name, x, y, z, 'bottom', true); filled++; } catch (e) {} } }
-        }
-        console.log(`[seal] hut: closed ${closed} door(s), filled ${filled} gap(s)${filler ? '' : ' (no filler blocks carried)'}`);
-    }
-
+    // fix18: safety() and _housekeep() removed (hard-coded survival/inventory policy); see .bak-fix18
     // fix5: one-shot owner-approved commands, read once from ~/MinecraftBot/oneshot_cmds.txt, sent as chat, file deleted
     _oneshot() {
         const f = (process.env.HOME || '') + '/MinecraftBot/oneshot_cmds.txt';
@@ -875,7 +760,7 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         this._watchDimension();
         if (this.agent.bot.currentWindow) { const w = this.agent.bot.currentWindow; if (/CHOICE/.test(JSON.stringify(w.title))) { if (!this._choiceNoted) { this._choiceNoted = 1; console.log("[window] datapack dialog CHOICE (A Breach Happened multi_action dialog via ViaProxy) left open; not answering"); } } else console.log(`[window] STRAY ${w.type} id=${w.id} still open at step start (opened ${Math.round((Date.now() - (this._winOpenedAt || 0)) / 1000)}s ago); closing`); if (!/CHOICE/.test(JSON.stringify(w.title))) try { this.agent.bot.closeWindow(w); } catch (e) { console.log('[window] close failed: ' + e.message); } }
         this._oneshot();
-        if (await this.safety()) { await this._housekeep(); return; }
+        // fix18: no hard-coded survival/housekeeping policy; the curriculum proposes it and the PSN learns it
         if (await this._leash()) return;
         if (this._repairQueue) { await this._repair(); return; }
         const before = this.observe();
