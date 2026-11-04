@@ -542,10 +542,23 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         const far = Math.hypot(p.x - HUT.x, p.z - HUT.z) > 12 || Math.abs(p.y - HUT.y) > 4;
         const needFood = bot.food < 14 && bot.inventory.items().some(i => i.foodPoints || /cooked|bread|apple|carrot|potato|beef|porkchop|mutton|chicken|cod|salmon|stew/.test(i.name));
         const lowHealth = bot.health < 8;
-        const fig = bot.nearestEntity(e => e !== bot.entity && isDatapackHostile(e) && e.position.distanceTo(bot.entity.position) < 24);
+        // fix6: long-range figure scan (48 blocks, all entities incl. mannequins); shelter in hut early
+        const inHut = q => q.x >= HUT.x - 2 && q.x <= HUT.x + 3 && q.z >= HUT.z - 2 && q.z <= HUT.z + 3 && Math.abs(q.y - (HUT.y - 1)) <= 2;
+        const fig = bot.nearestEntity(e => e !== bot.entity && isDatapackHostile(e) && e.position.distanceTo(p) < 48);
         if (fig) {
-            console.log(`[voyager] safety: datapack hostile (${fig.name}${fig.username ? ' ' + fig.username : ''}) ${fig.position.distanceTo(bot.entity.position).toFixed(1)} blocks away; fleeing`);
-            await this.agent.actions.runAction('voyager:safety:flee', async () => { await skills.avoidEnemies(bot, 24); }, { timeout: 2 });
+            const fd = fig.position.distanceTo(p);
+            console.log(`[voyager] safety: datapack hostile (${fig.name}${fig.username ? ' ' + fig.username : ''}) ${fd.toFixed(1)} blocks away at ${fig.position.floored()}; inHut=${inHut(p)} night=${night}`);
+            await this.agent.actions.runAction('voyager:safety:figure', async () => {
+                if (inHut(p)) { await this._sealHut(); return; }
+                const hutD = Math.hypot(p.x - HUT.x, p.z - HUT.z);
+                const figHutD = Math.hypot(fig.position.x - HUT.x, fig.position.z - HUT.z);
+                if (hutD < 64 && figHutD > 6) { await skills.goToPosition(bot, HUT.x, HUT.y - 1, HUT.z, 1); if (!bot.interrupt_code) await this._sealHut(); }
+                else { await skills.avoidEnemies(bot, 48); if (night && !bot.interrupt_code) await skills.shelterNow(bot); }
+            }, { timeout: 2 });
+            return true;
+        }
+        if (night && inHut(p)) {   // fix6: stay inside at night, door shut
+            if (!this._sealedAt || Date.now() - this._sealedAt > 60000) { console.log('[voyager] safety: night, staying in hut'); await this.agent.actions.runAction('voyager:safety:seal', async () => { await this._sealHut(); }, { timeout: 1 }); this._sealedAt = Date.now(); }
             return true;
         }
         if (!needFood && !(night && far) && !(lowHealth && far)) { this._safetyStuck = 0; return false; }
@@ -625,6 +638,24 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         if (inv().wooden_pickaxe) console.log('[house] MILESTONE wooden_pickaxe crafted in place');
     }
 
+    // fix6: close any open doors in/around the hut and fill open air gaps in the wall at feet/head level if we carry blocks
+    async _sealHut() {
+        const bot = this.agent.bot; const V = bot.entity.position.constructor;
+        let closed = 0, filled = 0;
+        for (let x = HUT.x - 3; x <= HUT.x + 3; x++) for (let z = HUT.z - 3; z <= HUT.z + 3; z++) for (let y = HUT.y - 2; y <= HUT.y + 1; y++) {
+            const bl = bot.blockAt(new V(x, y, z)); if (!bl || !/_door$/.test(bl.name)) continue;
+            const pr = bl.getProperties(); if (pr.half === 'upper' || !pr.open) continue;
+            try { await bot.activateBlock(bl); closed++; } catch (e) { console.log(`[seal] could not close door at ${bl.position}: ${e.message}`); }
+        }
+        const filler = bot.inventory.items().find(i => /cobblestone|dirt|planks|stone$|deepslate/.test(i.name));
+        if (filler) for (let x = HUT.x - 3; x <= HUT.x + 3; x++) for (let z = HUT.z - 3; z <= HUT.z + 3; z++) {
+            if (!(x === HUT.x - 3 || x === HUT.x + 3 || z === HUT.z - 3 || z === HUT.z + 3)) continue;
+            for (const y of [HUT.y - 1, HUT.y]) { const bl = bot.blockAt(new V(x, y, z)); const inner = bot.blockAt(new V(Math.max(HUT.x - 2, Math.min(HUT.x + 2, x)), y, Math.max(HUT.z - 2, Math.min(HUT.z + 2, z))));
+                if (bl && bl.name === 'air' && inner && inner.name === 'air') { try { await skills.placeBlock(bot, filler.name, x, y, z, 'bottom', true); filled++; } catch (e) {} } }
+        }
+        console.log(`[seal] hut: closed ${closed} door(s), filled ${filled} gap(s)${filler ? '' : ' (no filler blocks carried)'}`);
+    }
+
     // fix5: one-shot owner-approved commands, read once from ~/MinecraftBot/oneshot_cmds.txt, sent as chat, file deleted
     _oneshot() {
         const f = (process.env.HOME || '') + '/MinecraftBot/oneshot_cmds.txt';
@@ -635,7 +666,14 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         for (const l of lines) { console.log(`[oneshot] sending approved command: ${l}`); this.agent.bot.chat(l); }
     }
 
+    _watchWindows() {
+        const bot = this.agent.bot; if (this._winWatch) return; this._winWatch = true;
+        bot.on('windowOpen', w => { this._winOpenedAt = Date.now(); const t = JSON.stringify(w.title); if (/CHOICE/.test(t)) { this._choiceCount = (this._choiceCount || 0) + 1; if (this._choiceCount === 1) console.log("[window] datapack CHOICE dialog shown (re-prompts every tick until answered); leaving it open, not answering"); return; } this._winSeen = this._winSeen || {}; if ((this._winSeen[t] = (this._winSeen[t] || 0) + 1) > 1) return; console.log(`[window] opened ${w.type} "${typeof w.title === 'string' ? w.title.slice(0, 60) : JSON.stringify(w.title).slice(0, 60)}" id=${w.id} during action=${this.agent.actions.currentActionLabel || 'none'}`); });
+    }
+
     async step() {
+        this._watchWindows();
+        if (this.agent.bot.currentWindow) { const w = this.agent.bot.currentWindow; if (/CHOICE/.test(JSON.stringify(w.title))) { if (!this._choiceNoted) { this._choiceNoted = 1; console.log("[window] datapack dialog CHOICE (A Breach Happened multi_action dialog via ViaProxy) left open; not answering"); } } else console.log(`[window] STRAY ${w.type} id=${w.id} still open at step start (opened ${Math.round((Date.now() - (this._winOpenedAt || 0)) / 1000)}s ago); closing`); if (!/CHOICE/.test(JSON.stringify(w.title))) try { this.agent.bot.closeWindow(w); } catch (e) { console.log('[window] close failed: ' + e.message); } }
         this._oneshot();
         if (await this.safety()) { await this._housekeep(); return; }
         const before = this.observe();
