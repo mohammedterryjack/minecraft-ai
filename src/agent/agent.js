@@ -498,6 +498,7 @@ export class Agent {
                 console.log('Agent died: ', message);
                 let death_pos = this.bot.entity.position;
                 (this.recentDeaths ||= []).push(`${message} at ${death_pos.x.toFixed(0)},${death_pos.y.toFixed(0)},${death_pos.z.toFixed(0)}`); this.recentDeaths = this.recentDeaths.slice(-3);   // fix18: perception for the curriculum
+                this.lastDeath = { t: Date.now(), message, pos: `${death_pos.x.toFixed(0)},${death_pos.y.toFixed(0)},${death_pos.z.toFixed(0)}` };   // fix19: traced failure of the running task
                 this.memory_bank.rememberPlace('last_death_position', death_pos.x, death_pos.y, death_pos.z);
                 let death_pos_text = null;
                 if (death_pos) {

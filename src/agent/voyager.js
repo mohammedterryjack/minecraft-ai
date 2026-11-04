@@ -229,7 +229,11 @@ export class Voyager {
         console.log(`[home] ground at home (${HOME.x}, ${HOME.z}) is y=${g}; HOME.y ${old} -> ${HOME.y} (saved to ${HOME_FILE})`);
     }
     // fix14: why an action was cut off, for failure feedback (critic, code writer, blame)
+    // fix19 (6): did the bot die during the current run? (agent.lastDeath set by the death message handler)
+    _diedInRun() { const d = this.agent.lastDeath; return d && d.t >= (this._runStart || Infinity) ? d : null; }
     _interruptReason(output = '') {
+        const died = this._diedInRun();
+        if (died) return `died: ${died.message} at ${died.pos}`;
         const bot = this.agent.bot, p = bot.entity.position, by = this.agent.actions.lastInterruptBy || 'unknown';
         const s = this._surfaceY(p.x, p.z), under = s !== null && p.y < s - 4;
         const travelling = /travelTo|goToPosition|goToSurface|path|Moving|travell/i.test(String(output).slice(-800));
@@ -281,7 +285,19 @@ export class Voyager {
             empty_inventory_slots: bot.inventory.emptySlotCount(),
             threats: this._threats(),
             recent_deaths: (this.agent.recentDeaths || []).join('; ') || 'none',
+            death_hotspots: this._deathHotspots(),
         };
+    }
+    // fix19 (6): places where the bot died 2+ times (16-block cells): a problem for the curriculum to learn to handle, no reflex
+    _deathHotspots() {
+        const hs = Object.values(this.progress.deathSpots || {}).filter(c => c.n >= 2).sort((a, b) => b.n - a.n).slice(0, 3);
+        return hs.length ? hs.map(c => `${c.n} deaths near ${c.pos} (${c.causes.slice(-2).join('; ')}) during "${c.tasks.slice(-1)[0] || 'idle'}"`).join(' | ') + ' -> propose a task that learns to survive/avoid this' : 'none';
+    }
+    _noteDeath(d, task) {
+        const [x, y, z] = d.pos.split(',').map(Number), k = `${Math.floor(x / 16)},${Math.floor(z / 16)}`;
+        const c = ((this.progress.deathSpots ||= {})[k] ||= { n: 0, pos: d.pos, causes: [], tasks: [] });
+        c.n++; c.pos = d.pos; c.causes = [...c.causes, d.message].slice(-5); c.tasks = [...c.tasks, task].slice(-5); this._saveProgress();
+        console.log(`[psn] death during "${task}": ${d.message} at ${d.pos} (death #${c.n} in this area)${c.n >= 2 ? '; surfaced to the curriculum as a death hotspot' : ''}`);
     }
     // fix18: perception only (no policy): hostiles within 32 blocks, nearest first
     _threats() {
@@ -410,11 +426,13 @@ export class Voyager {
         const full = this._libSrc(over) + '\n\n' + instrumentSrc(this.skills.filter(s => new RegExp(`async\\s+function\\s+${s.name}\\s*\\(`).test(over[s.name] ?? s.code)).map(s => s.name)) + '\n\nasync function __replay(bot) {\n    try { ' + r.call + ' } finally { bot.__psnOut = bot.output; }\n}\nawait __replay(bot);';
         const staged = await this.agent.coder._stageCode(full);
         if (!staged) return { ok: false };
+        this._runStart = Date.now();
         const res = await this.agent.actions.runAction(`voyager:replay:${task}`, async () => { this.agent.bot.__psnALS = globalThis.__psnALS; await staged.func.main(this.agent.bot); }, { timeout: 5 });
         if (this.abort) return { ok: false, interrupted: true };
         const after = this.observe();
         let ok;
-        const cut = res.interrupted ? this._interruptReason(res.message) : '';   // fix14: a cut-off replay is a failure
+        const cut = res.interrupted || this._diedInRun() ? this._interruptReason(res.message) : '';   // fix14: a cut-off replay is a failure
+        if (this._diedInRun()) this._noteDeath(this._diedInRun(), task);
         if (cut) { ok = false; console.log(`[voyager] replay ${r.name} ${cut}; counting as a failure`); } else
         if (r.free) { const e = this.agent.bot.inventory.emptySlotCount(); ok = e >= r.free; console.log(`[voyager] inventory check: ${e} empty slots (need ${r.free})`); }
         else if (r.at) { const p = this.agent.bot.entity.position; ok = Math.hypot(p.x - r.at.x, p.z - r.at.z) <= 8; }
@@ -503,10 +521,14 @@ export class Voyager {
             else {
                 const task = `Build a 7x7 cobblestone hut at home (${HOME.x}, ${HOME.z})`;
                 const fails = this.progress.failed.slice(-20).filter(t => t === task).length;
-                if (fails >= 2) { console.log(`[psn] milestone home_hut blocked (${task} failed ${fails}x); asking LLM curriculum`); return null; }
+                const bo = (this.progress.milestoneBackoff ||= {});
+                if (Date.now() < (bo.home_hut || 0)) { console.log(`[psn] milestone home_hut backed off for ${Math.round((bo.home_hut - Date.now()) / 60e3)} more min; asking LLM curriculum`); }
+                else if (fails >= 2) { bo.home_hut = Date.now() + 30 * 60e3; this._saveProgress(); this._decomposeQueue ||= { task, reason: `milestone failed ${fails}x` }; console.log(`[psn] milestone home_hut blocked (${task} failed ${fails}x); backing off 30 min and decomposing it`); }
+                else {
                 console.log(`[psn] milestone home_hut: next ${task} (no curriculum model call)`);
                 return { task, reasoning: 'PSN milestone home_hut: the base moved and has no shelter yet',
                     context: `await skills.travelTo(bot, ${HOME.x}, ${HOME.y}, ${HOME.z}); then find the ground level y (first solid block below +1) near there and call skills.buildStructure(bot, 'hut', ${HOME.x - 3}, y, ${HOME.z - 3}, 'cobblestone', 7, 7, 3)` };
+                }
             }
         }
         for (const m of MILESTONES) {
@@ -522,6 +544,41 @@ export class Voyager {
         }
         return null;
     }
+    // fix19 (1): split a goal that keeps failing into 2-4 subgoals with the local model; each subgoal is learned as a skill,
+    // then the parent is retried with those skills in the hint (its code calls them -> deps recorded by saveSkill)
+    async _decompose(task, reason) {
+        const d = (this.progress.decomposed ||= {}), q = (this.progress.subgoals ||= []);
+        const depth = (this._curSub?.task === task ? this._curSub.depth : 0);
+        if (depth >= 2) { console.log(`[psn] decompose skipped for "${task}": already a depth-${depth} subgoal`); return false; }
+        if (d[task] && Date.now() - d[task].at < 30 * 60e3) { console.log(`[psn] decompose skipped for "${task}": decomposed ${Math.round((Date.now() - d[task].at) / 60e3)} min ago`); return false; }
+        const system = `You break a Minecraft bot's failing goal into smaller steps (Voyager/PSN-style task decomposition).
+Return 2-4 concrete, verifiable subgoals, in order, that together achieve the goal; each must be doable in a few minutes by ONE small reusable skill (e.g. "Mine 20 cobblestone", "Clear and flatten a 7x7 area at x=.., z=..", "Place a 7x7 cobblestone floor at ..."). Use the failure reason. Do not repeat the goal itself.
+Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
+        const user = `goal: ${task}\nwhy it failed: ${String(reason).slice(0, 600)}\n${this._stateText(this.observe())}\nknown_skills: ${JSON.stringify(this.skills.filter(s => !s.demoted).map(s => s.name))}`;
+        let subs = [];
+        try { subs = (parseJSON(await this._askLocal(system, user)).subgoals || []).map(t => String(t).trim()).filter(t => t && t !== task && !validateTask(t)).slice(0, 4); }
+        catch (e) { console.log(`[psn] decompose FAILED for "${task}": ${e.message}`); return false; }
+        if (subs.length < 2) { console.log(`[psn] decompose FAILED for "${task}": model gave ${subs.length} valid subgoal(s)`); d[task] = { subs, skills: [], at: Date.now(), reason }; this._saveProgress(); return false; }
+        d[task] = { subs, skills: [], at: Date.now(), reason: String(reason).slice(0, 200) };
+        q.unshift(...subs.map(t => ({ task: t, parent: task, depth: depth + 1 })), { task, retry: true, depth });
+        this._saveProgress();
+        console.log(`[psn] DECOMPOSE "${task}" (${String(reason).slice(0, 120)}) -> ${subs.map((t, i) => `${i + 1}) ${t}`).join(' ')}; then retry the parent with the learned skills`);
+        return true;
+    }
+    _subgoalTask() {
+        const q = this.progress.subgoals || []; if (!q.length) return null;
+        const it = q.shift(); this._saveProgress(); this._curSub = it;
+        if (it.retry) { const sk = this.progress.decomposed?.[it.task]?.skills || []; console.log(`[psn] retrying decomposed goal "${it.task}" with learned subgoal skills [${sk.join(', ')}]`);
+            return { task: it.task, reasoning: 'PSN: retry after decomposition', context: sk.length ? `compose these learned skills (call them in order): ${sk.join(', ')}` : 'subgoals did not produce skills; try a smaller approach' }; }
+        console.log(`[psn] subgoal of "${it.parent}": ${it.task}`);
+        return { task: it.task, reasoning: `PSN subgoal of "${it.parent}"`, context: '' };
+    }
+    _subgoalDone(name) {
+        const c = this._curSub; if (!c?.parent || !name) return;
+        const d = this.progress.decomposed?.[c.parent]; if (!d) return;
+        if (!d.skills.includes(name)) d.skills.push(name); this._saveProgress();
+        console.log(`[psn] subgoal "${c.task}" done with skill ${name} (for parent "${c.parent}")`);
+    }
     async proposeTask(state) {
         const system = `You are the automatic curriculum for a Minecraft bot named ${this.agent.name} (Voyager-style).
 Goal: discover as many diverse things as possible and grow a small town of its own, progressing wood -> stone -> iron -> diamond tech.
@@ -530,6 +587,7 @@ Rules:
 - NEVER go near the players' village around x=${VILLAGE.x}, z=${VILLAGE.z}; never take or break player builds.
 - Propose ONE concrete, verifiable task achievable in a few minutes with the current inventory and surroundings (e.g. "Mine 5 birch_log", "Craft 1 stone_pickaxe", "Smelt 3 iron_ingot", "Build a 5x5 cobblestone floor next to the hut").
 - Do not repeat completed tasks unless needed for progress; avoid tasks that failed recently unless prerequisites are now met.
+- death_hotspots lists places it keeps dying: when not 'none', propose a task that teaches it to survive or avoid that (it learns this as a skill).
 - The bot must survive: dying loses its inventory. Nothing keeps it alive automatically (no eating, fleeing, fighting or sheltering reflexes), so survival is your job too: read time, health, food, threats and inventory space in the state and decide.
 Reply ONLY with JSON: {"reasoning": "...", "task": "...", "context": "short hint how to do it"}`;
         const user = `${this._stateText(state)}
@@ -717,16 +775,29 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
             else { console.log(`[psn] re-validation of ${e.name} after repair of ${e.revalidate}: still failing -> blaming its trace`); revalFail ||= e.name; }
             this._saveSkills();
         }
-        if (ok && !revalFail) return;
+        // fix19 (6): a death is a failure of the call that was running (deepest open call) and all its ancestors
+        const died = this._diedInRun();
+        if (died) { let i = trace.length - 1; trace[i].ownFail = [`DIED: ${died.message} at ${died.pos}`]; for (; i >= 0; i = trace[i].parent) { trace[i].intr = false; trace[i].ok = false; trace[i].fail = true; } ok = false; }
+        // fix19 (5): an explicit FAILED line from a skill is a contract failure even if the task check passed (e.g. ensureChest inside a storage task)
+        const explicit = trace.some(r => !r.intr && (r.ownFail || []).some(l => /FAILED/.test(l)));
+        if (ok && !revalFail && !explicit) return;
+        if (ok && explicit) console.log(`[psn] task check passed but a skill reported FAILED; attributing that contract failure`);
         console.log(`[psn] execution trace of ${root} (${trace.length} calls):\n${traceText(trace)}`);
-        const b = blame(trace, n => this._isLeaf(n));
-        if (!b) { console.log(`[psn] blame: every call met its contract; failure is in the task outcome, not a dependency`); return; }
-        console.log(`[psn] blame: ${b.target || '(none editable)'} [${b.kind}${b.swallowed ? ', swallowed' : ''}] via ${b.path.join(' > ')}; deepest failure ${b.leaf}: ${b.evidence}`);
-        if (b.target) this._repairQueue = { ...b, task, trace: traceText(trace, 60) };
+        let b = blame(trace, n => this._isLeaf(n));
+        const learned = n => { const e = this.skills.find(s => s.name === n); return !!e && !e.primitive && !e.handwritten; };
+        // fix19 (2): every call met its contract (or only an unrepairable leaf failed): the root's own composition is at fault
+        if (!b || !b.target) {
+            const why = b ? `only the fixed leaf ${b.leaf} failed (${b.evidence})` : 'every call met its contract but the task outcome failed';
+            if (learned(root)) { b = { target: root, leaf: root, path: [root], kind: 'callee_fix', swallowed: false, evidence: why }; console.log(`[psn] blame: root learned skill ${root} [callee_fix]: ${why}`); }
+            else { console.log(`[psn] blame: ${why}; root ${root} is ${this.skills.some(s => s.name === root) ? 'primitive/hand-written' : 'freshly generated'} -> goal goes to decomposition`); this._decomposeQueue ||= { task, reason: why }; return; }
+        } else console.log(`[psn] blame: ${b.target} [${b.kind}${b.swallowed ? ', swallowed' : ''}] via ${b.path.join(' > ')}; deepest failure ${b.leaf}: ${b.evidence}`);
+        const rq = (this._repairQueue ||= []);
+        if (rq.some(x => x.target === b.target)) console.log(`[psn] repair of ${b.target} already queued`);
+        else { rq.push({ ...b, task, trace: traceText(trace, 60) }); console.log(`[psn] queued REPAIR of ${b.target} (${rq.length} in queue)`); }
     }
     // targeted repair of the blamed skill via the code model, through the normal regression gate (saveSkill)
     async _repair() {
-        const q = this._repairQueue; this._repairQueue = null;
+        const q = (this._repairQueue || []).shift();
         if (!q) return false;
         const e = this.skills.find(s => s.name === q.target);
         if (!e) { console.log(`[psn] repair FAILED: blamed skill ${q.target} not in library`); return false; }
@@ -739,16 +810,26 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         const system = `You repair ONE skill in a Minecraft mineflayer skill library (PSN-style targeted fix). Return a single \`\`\`javascript code block containing ONLY the fixed function, with the SAME name and a compatible signature. First line inside the block: // DESCRIPTION: <one sentence>. Call other library skills by name (they are in scope); never redefine them. Every loop must check bot.interrupt_code. If something still cannot be done, log(bot, 'FAILED: <reason>') and return a falsy value; no silent fallbacks.\nLIBRARY:\n${this.catalogue()}`;
         const user = `Blamed skill: ${e.name} (${q.kind === 'caller_fix' ? 'it calls the leaf ' + q.leaf + ' in a situation where the leaf cannot succeed: fix how/when it calls it, e.g. obtain the missing prerequisite first' : 'its own logic failed'})\nTask that failed: ${q.task}\nFailure path: ${q.path.join(' > ')}\nEvidence: ${q.evidence}\n--- execution trace (indent = call depth) ---\n${q.trace}\n--- current code of ${e.name} ---\n${e.code}\n--- skills it uses ---\n${kids.map(k => '// ' + k.description + '\n' + signatureOf(k.code, k.name)).join('\n')}\nWrite the fixed ${e.name}:`;
         console.log(`[psn] REPAIR ${e.name} [${q.kind}] with the code model (evidence: ${q.evidence.slice(0, 160)})`);
-        let reply;
-        try { reply = await this._ask(system, user); } catch (err) { console.log(`[psn] repair FAILED for ${e.name}: ${err.message}`); return false; }
-        const code = extractCode(reply);
-        const fn = code && code.match(/async\s+function\s+([A-Za-z_]\w*)\s*\(/);
-        if (!fn || fn[1] !== e.name) { console.log(`[psn] repair FAILED for ${e.name}: reply did not define async function ${e.name}`); return false; }
-        const desc = ((code.match(/\/\/\s*DESCRIPTION:\s*(.+)/) || [])[1] || e.description).trim();
-        const body = code.replace(/\n\s*await\s+\w+\(bot[^)]*\);\s*$/, '').trim();
-        const staged = await this.agent.coder._stageCode(this._libSrc({ [e.name]: body }));
-        const lint = staged ? await this.agent.coder._lintCode(staged.src_lint_copy) : 'staging failed';
-        if (lint) { console.log(`[psn] repair FAILED for ${e.name}: lint: ${String(lint).slice(0, 300)}`); return false; }
+        let code, body, desc, extra = '';
+        for (let att = 1; att <= 2; att++) {   // fix19 (3): one retry with the lint/format error fed back
+            let reply;
+            try { reply = await this._ask(system, user + extra); } catch (err) { console.log(`[psn] repair FAILED for ${e.name}: ${err.message}`); return false; }
+            code = extractCode(reply);
+            const fn = code && code.match(/async\s+function\s+([A-Za-z_]\w*)\s*\(/);
+            let err = null;
+            if (!fn || fn[1] !== e.name) err = `reply did not define async function ${e.name}`;
+            else {
+                desc = ((code.match(/\/\/\s*DESCRIPTION:\s*(.+)/) || [])[1] || e.description).trim();
+                body = code.replace(/\n\s*await\s+\w+\(bot[^)]*\);\s*$/, '').trim();
+                const staged = await this.agent.coder._stageCode(this._libSrc({ [e.name]: body }) + '\n\nawait Promise.resolve();');   // fix19: lint needs an await in main (library-only source always failed lint)
+                const lint = staged ? await this.agent.coder._lintCode(staged.src_lint_copy) : 'staging failed';
+                if (lint) err = `lint: ${String(lint).slice(0, 600)}`;
+            }
+            if (!err) break;
+            console.log(`[psn] repair attempt ${att} FAILED for ${e.name}: ${err.slice(0, 300)}${att < 2 ? '; retrying with the error fed back' : ''}`);
+            if (att === 2) return false;
+            extra = `\n--- your previous reply was rejected ---\n${err}\n--- previous code ---\n${code || '(none)'}\nFix the error and write the fixed ${e.name} again:`;
+        }
         this._lastEffects = e.effects || [];
         const saved = await this.saveSkill(e.name, desc, body, `repair: ${q.task}`, { repair: true });
         if (!saved) { console.log(`[psn] repair of ${e.name} rejected by the gate`); return false; }
@@ -763,9 +844,11 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         this._oneshot();
         // fix18: no hard-coded survival/housekeeping policy; the curriculum proposes it and the PSN learns it
         if (await this._leash()) return;
-        if (this._repairQueue) { await this._repair(); return; }
+        if (this._repairQueue?.length) { await this._repair(); return; }
+        if (this._decomposeQueue) { const dq = this._decomposeQueue; this._decomposeQueue = null; await this._decompose(dq.task, dq.reason); return; }
         const before = this.observe();
-        let proposal = this._milestoneTask(before) || await this.proposeTask(before);
+        this._curSub = null;
+        let proposal = this._subgoalTask() || this._milestoneTask(before) || await this.proposeTask(before);
         let task = String(proposal.task || '').trim();
         let invalid = task ? validateTask(task) : 'empty task';
         if (invalid) {
@@ -783,6 +866,7 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         if (rp?.interrupted) { console.log('[voyager] task interrupted'); return; }
         if (rp?.ok) {
             this.progress.completed.push(task); this.progress.failed = this.progress.failed.filter(t => t !== task); this._saveProgress();
+            this._subgoalDone(rp.name);
             this.agent.openChat?.(`Done: ${task} (replayed ${rp.name}).`);
             return;
         }
@@ -807,7 +891,7 @@ Interrupts: the bot may be interrupted at any time (danger, getting stuck, a pla
         const ctx = related.map(s => `// ${s.description}\n${s.code}`).join('\n\n');
 
         let feedback = rp?.cut ? `Replay of ${rp.name} failed: ${rp.cut}\nExecution output:\n${String(rp.output).slice(-800)}` : '';
-        let lastCode = '';
+        let lastCode = '', anyCut = rp?.cut || '';
         for (let i = 1; i <= MAX_ATTEMPTS; i++) {
             if (this.abort) { console.log('[voyager] aborted for player'); return; }
             const user = `Task: ${task}\nHint: ${proposal.context || ''}\n${recipeFacts(task)}\n--- state ---\n${this._stateText(this.observe())}
@@ -831,11 +915,14 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             if (!lint && !staged) throw new Error('[psn] staging of traced generated code failed');
             if (lint) { console.log('[voyager] lint failed: ' + String(lint).slice(0, 300)); feedback = 'Lint error:\n' + lint; lastCode = code; continue; }
 
+            this._runStart = Date.now();
             const res = await this.agent.actions.runAction(`voyager:${task}`, async () => {
                 this.agent.bot.__psnALS = globalThis.__psnALS; await staged.func.main(this.agent.bot);
             }, { timeout: 5 });
             if (this.abort) { console.log('[voyager] task interrupted'); return; }
-            const cut = res.interrupted ? this._interruptReason(res.message) : '';   // fix14: cut-off code counts as a failed attempt
+            const cut = res.interrupted || this._diedInRun() ? this._interruptReason(res.message) : '';   // fix14: cut-off code counts as a failed attempt
+            if (this._diedInRun()) this._noteDeath(this._diedInRun(), task);
+            if (cut) anyCut = cut;
             if (cut) console.log(`[voyager] attempt ${i} ${cut}; counting as a failure`);
             const output = String(res.message || '').slice(-1500) + (cut ? `\n${cut}` : '');
             const after = this.observe();
@@ -848,13 +935,15 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             if (goal && gained >= goal.count) console.log(`[voyager] verified from inventory (+${gained} ${goal.item}), critic skipped`);
             console.log(`[voyager] attempt ${i} critic: success=${verdict.success} ${verdict.critique || ''}`);
             this._attribute(own, task, !!verdict.success, {});   // fix11 (B7)
-            if (this._repairQueue?.target === own) { console.log(`[psn] blame lands on the generated ${own} itself; the critic feedback loop fixes it (no library repair)`); this._repairQueue = null; }
+            if (this._repairQueue?.some(x => x.target === own)) { console.log(`[psn] blame lands on the generated ${own} itself; the critic feedback loop fixes it (no library repair)`); this._repairQueue = this._repairQueue.filter(x => x.target !== own); }
+            if (this._decomposeQueue?.task === task && i < MAX_ATTEMPTS) this._decomposeQueue = null;   // still iterating; decomposition decided after the last attempt
             if (verdict.success) {
                 this._lastEffects = Object.keys(after.inventory).filter(k => (after.inventory[k] || 0) > (before.inventory[k] || 0)).slice(0, 8);
                 await this.saveSkill(fn[1], desc.trim(), code.replace(/\n\s*await\s+\w+\(bot\);\s*$/, '').trim(), task);
                 this.progress.completed.push(task);
                 this.progress.failed = this.progress.failed.filter(t => t !== task);
                 this._saveProgress();
+                this._subgoalDone(fn[1]);
                 this.agent.openChat?.(`Done: ${task}. Learned skill ${fn[1]}.`);
                 return;
             }
@@ -864,5 +953,9 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
         this.progress.failed.push(task);
         this._saveProgress();
         console.log(`[voyager] task failed after ${MAX_ATTEMPTS} attempts: ${task}`);
+        // fix19 (1): failed twice (recently) or cut off -> decompose
+        const fails = this.progress.failed.slice(-20).filter(t => t === task).length;
+        if (fails >= 2 || anyCut || this._decomposeQueue?.task === task) { if (this._decomposeQueue?.task === task) this._decomposeQueue = null; await this._decompose(task, anyCut || `failed ${fails}x; last critic: ${String(feedback).slice(-300)}`); }
+        else if (this._curSub?.parent) console.log(`[psn] subgoal "${task}" failed; moving on`);
     }
 }
