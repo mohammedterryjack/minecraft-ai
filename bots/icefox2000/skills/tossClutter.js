@@ -3,6 +3,7 @@
 async function tossClutter(bot, minFree = 6) {
     const always = /^(pink_petals|dandelion|poppy|blue_orchid|allium|azure_bluet|oxeye_daisy|cornflower|lily_of_the_valley|[a-z]+_tulip|sunflower|lilac|rose_bush|peony|short_grass|grass|fern|dead_bush|[a-z]+_seeds|spider_eye|rotten_flesh|poisonous_potato|bamboo_mosaic|phantom_membrane)$/;
     const excess = { sweet_berries: 16, dirt: 16, gravel: 8, snowball: 4, kelp: 4, egg: 0, cherry_door: 0, acacia_boat: 0, prismarine_shard: 0, prismarine_crystals: 0 };
+    const start = bot.entity.position.clone(); let tossed = 0;
     for (let i = 0; i < 40 && bot.inventory.emptySlotCount() < minFree; i++) {
         if (bot.interrupt_code) break;
         const counts = world.getInventoryCounts(bot);
@@ -13,8 +14,11 @@ async function tossClutter(bot, minFree = 6) {
         const it = bot.inventory.items().find(x => x.name === pick);
         if (bot.currentWindow) { console.log(`[toss] closing open ${bot.currentWindow.type} window first`); bot.closeWindow(bot.currentWindow); await skills.wait(bot, 500); }
         if (n >= it.count) await bot.tossStack(it); else await bot.toss(it.type, null, n);
+        tossed++;
         console.log(`[toss] tossed ${Math.min(n, it.count)} ${pick} (empty slots now ${bot.inventory.emptySlotCount()})`);
     }
+    // fix9: walk away from the dropped stacks so auto-pickup doesn't immediately re-collect them (caused an endless store loop)
+    if (tossed && !bot.interrupt_code) { await skills.moveAway(bot, 6); console.log(`[toss] moved ${bot.entity.position.distanceTo(start).toFixed(1)} blocks away from ${tossed} dropped stack(s) to avoid re-pickup`); }
     if (bot.inventory.emptySlotCount() < minFree) console.log(`[toss] FAILED to free ${minFree} slots; only ${bot.inventory.emptySlotCount()} empty (nothing tossable left)`);
     return bot.inventory.emptySlotCount();
 }

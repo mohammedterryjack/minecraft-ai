@@ -341,6 +341,7 @@ async function execute(mode, agent, func, timeout=-1) {
 
     let should_reprompt = 
         interrupted_action && // it interrupted a previous action
+        !String(interrupted_action).startsWith("voyager:") && // fix9: the voyager loop resumes its own actions; an LLM reprompt here made qwen reply "Hello world" in chat
         !agent.actions.resume_func && // there is no resume function
         !agent.self_prompter.isActive() && // self prompting is not on
         !code_return.interrupted; // this mode action was not interrupted by something else

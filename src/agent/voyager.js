@@ -254,7 +254,7 @@ export class Voyager {
             // keep what the milestones need (wood, stone, coal, ores/ingots, tools, armor, food we eat); store the rest
             const keep = /(_log|_planks|^stick|^cobblestone|^coal|^raw_|_ingot|^diamond|pickaxe|_axe|sword|shovel|helmet|chestplate|leggings|boots|^torch|^crafting_table|^furnace|^bread|^shield)$|^cooked_/;
             const junk = [...new Set(this.agent.bot.inventory.items().map(i => i.name).filter(n => !keep.test(n)))];
-            return { name: 'depositToChest', call: `await depositToChest(bot, ${JSON.stringify(junk)});`, free: 3 };
+            return { name: 'depositToChest', call: `await depositToChest(bot, ${JSON.stringify(junk)});`, free: 6 };
         }
         const harv = task.match(/^harvest\s+(\d+)\s+([a-z_]+)/i);
         if (harv && has('harvestCrop')) return { name: 'harvestCrop', call: `await harvestCrop(bot, ${JSON.stringify(harv[2].toLowerCase())}, ${harv[1]});`, check: 'output' };
