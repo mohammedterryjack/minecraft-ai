@@ -237,6 +237,7 @@ export class Agent {
         this.bot.stopDigging();
         this.bot.collectBlock.cancelTask();
         this.bot.pathfinder.stop();
+        this.bot.pathfinder.setGoal(null); // rejects a pending goto at once (stop() waits for the next node)
         this.bot.pvp.stop();
     }
 

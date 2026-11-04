@@ -270,7 +270,8 @@ export function getInventoryCounts(bot) {
      * let hasWoodenPickaxe = inventory['wooden_pickaxe'] > 0;
      **/
     let inventory = {};
-    for (const slot of bot.inventory.slots) {
+    // skip slots 0-4 (crafting result + 2x2 grid): items there are not usable inventory and made failed crafts look successful
+    for (const slot of bot.inventory.slots.slice(5)) {
         if (slot != null && slot.name) {
             if (inventory[slot.name] == null) {
                 inventory[slot.name] = 0;
@@ -427,5 +428,5 @@ export function getBiomeName(bot) {
      * let biome = world.getBiomeName(bot);
      **/
     const biomeId = bot.world.getBiome(bot.entity.position);
-    return mc.getAllBiomes()[biomeId].name;
+    const biome = mc.getAllBiomes()[biomeId]; return biome ? biome.name : `unknown_biome_${biomeId}`;
 }

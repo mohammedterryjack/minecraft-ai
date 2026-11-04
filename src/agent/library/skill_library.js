@@ -53,7 +53,7 @@ export class SkillLibrary {
             skill_doc_similarities = Object.keys(this.skill_docs_embeddings)
                 .map(doc_key => ({
                     doc_key,
-                    similarity_score: wordOverlapScore(message, this.skill_docs_embeddings[doc_key])
+                    similarity_score: wordOverlapScore(message, doc_key)
                 }))
                 .sort((a, b) => b.similarity_score - a.similarity_score);
         }

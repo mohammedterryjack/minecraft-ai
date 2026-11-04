@@ -34,3 +34,10 @@ logs/
 bots/
 *.bak*
 mindcraft.log
+
+# icefox
+.env
+.env.*
+*.bak-*
+logs/
+*.log

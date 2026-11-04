@@ -27,7 +27,7 @@ export function toSinglePrompt(turns, system=null, stop_seq='***', model_nicknam
 }
 
 function _getWords(text) {
-    return text.replace(/[^a-zA-Z ]/g, '').toLowerCase().split(' ');
+    return String(text ?? "").replace(/[^a-zA-Z ]/g, '').toLowerCase().split(' ');
 }
 
 export function wordOverlapScore(text1, text2) {

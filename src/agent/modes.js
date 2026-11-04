@@ -123,9 +123,12 @@ const modes_list = [
                 say(agent, 'I\'m stuck!');
                 this.stuck_time = 0;
                 execute(this, agent, async () => {
-                    const crashTimeout = setTimeout(() => { agent.cleanKill("Got stuck and couldn't get unstuck") }, 10000);
-                    await skills.moveAway(bot, 5);
-                    clearTimeout(crashTimeout);
+                    // after 10 s stop the unstuck move cleanly; only kill if it ignores the stop for 20 s more
+                    const stopTimer = setTimeout(() => { console.log('[unstuck] moveAway over 10 s, interrupting it'); agent.requestInterrupt(); }, 10000);
+                    const crashTimeout = setTimeout(() => { agent.cleanKill("Got stuck and couldn't get unstuck") }, 30000);
+                    try { await skills.moveAway(bot, 5); }
+                    finally { clearTimeout(stopTimer); clearTimeout(crashTimeout); }
+                    if (bot.interrupt_code) { say(agent, 'Still stuck, giving up on unsticking for now.'); return; }
                     say(agent, 'I\'m free.');
                 });
             }

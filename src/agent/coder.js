@@ -173,6 +173,9 @@ export class Coder {
         // this may cause problems in callback functions
         code = code.replaceAll(';\n', '; if(bot.interrupt_code) {log(bot, "Code interrupted.");return;}\n');
         for (let line of code.split('\n')) {
+            // every loop iteration checks for an interrupt
+            line = line.replace(/^(\s*(?:\}\s*)?(?:for|while)\s*\(.*\)\s*\{)\s*$/, '$1 if (bot.interrupt_code) {log(bot, "Code interrupted.");return;}');
+            line = line.replace(/^(\s*do\s*\{)\s*$/, '$1 if (bot.interrupt_code) {log(bot, "Code interrupted.");return;}');
             src += `    ${line}\n`;
         }
         let src_lint_copy = this.code_lint_template.replace('/* CODE HERE */', src);
@@ -192,8 +195,12 @@ export class Coder {
         // This is where we determine the environment the agent's code should be exposed to.
         // It will only have access to these things, (in addition to basic javascript objects like Array, Object, etc.)
         // Note that the code may be able to modify the exposed objects.
+        // generated code gets interrupt-aware skills: once an interrupt is requested every skill call returns false at once
+        const guardedSkills = {};
+        for (const [k, f] of Object.entries(skills))
+            guardedSkills[k] = typeof f === 'function' ? (...a) => (a[0]?.interrupt_code ? Promise.resolve(false) : f(...a)) : f;
         const compartment = makeCompartment({
-            skills,
+            skills: guardedSkills,
             log: skills.log,
             world,
             Vec3,

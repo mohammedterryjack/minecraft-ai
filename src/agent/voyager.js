@@ -4,8 +4,13 @@ import { wordOverlapScore } from '../utils/text.js';
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
 import * as world from './library/world.js';
 import * as skills from './library/skills.js';
-import { getAllItems, getAllBlocks } from '../utils/mcdata.js';
+import { getAllItems, getAllBlocks, getItemCraftingRecipes } from '../utils/mcdata.js';
 import { cosineSimilarity } from '../utils/math.js';
+import minecraftData from 'minecraft-data';
+import { Ollama } from '../models/ollama.js';
+import { signatureOf, depsOf, missingCalls, findCycle, newStats, recordRun, rate, gateLog } from './skill_graph.js';
+const LOCAL = { model: 'qwen3:4b-instruct-2507-q4_K_M', url: 'http://192.168.1.215:11434', params: { keep_alive: '5m', format: 'json', options: { num_ctx: 8192 } } };
+export const CALLS = { local: 0, code: 0, replay: 0 };
 
 const TOWN = { x: -1507, y: 63, z: 542 };
 const VILLAGE = { x: -800, z: 500 };
@@ -13,6 +18,20 @@ const MAX_ATTEMPTS = 4;
 const PLAYER_QUIET_MS = 90 * 1000;   // pause after any player message
 const TASK_COOLDOWN_MS = 90 * 1000;  // gap between curriculum tasks (saves Gemini quota)
 const HUT = { x: -1503, y: 64, z: 547 };
+// PSN-style progression milestones (after skillnet/domains/minecraft/knowledge get_progression_milestones), extended for survival/town
+const MILESTONES = [
+    { name: 'get_wood', items: { birch_log: 4 } },
+    { name: 'wooden_tools', items: { wooden_pickaxe: 1, wooden_axe: 1 } },
+    { name: 'stone_tools', items: { stone_pickaxe: 1, stone_axe: 1, stone_sword: 1, cobblestone: 16 } },
+    { name: 'furnace', items: { furnace: 1 }, block: 'furnace' },
+    { name: 'coal_torches', items: { coal: 8, torch: 8 } },
+    { name: 'iron_ready', items: { raw_iron: 8 } },
+    { name: 'iron_tools', items: { iron_pickaxe: 1, iron_sword: 1 } },
+    { name: 'iron_armor', items: { iron_helmet: 1, iron_chestplate: 1, iron_leggings: 1, iron_boots: 1 } },
+    { name: 'bucket', items: { bucket: 1 } },
+    { name: 'diamond_found', items: { diamond: 3 } },
+    { name: 'diamond_tools', items: { diamond_pickaxe: 1 } },
+];
 
 // tolerant JSON: strip fences, fix stray backslashes / trailing commas, then fall back to field regexes
 export function parseJSON(text) {
@@ -49,9 +68,46 @@ export function validateTask(task) {
     return null;
 }
 // "Mine 5 birch_log" / "Craft 1 stone_pickaxe" -> {item, count}
+// real crafting recipes (from minecraft-data) for every item id named in a text, so the local models stop inventing them
+function recipeFacts(text) {
+    const ids = [...new Set((String(text).toLowerCase().match(/\b[a-z]+(?:_[a-z]+)*\b/g) || []))];
+    const out = [];
+    for (let id of ids) {
+        if (id.endsWith('es') && id !== 'glasses') { const t = id === 'torches' ? 'torch' : id.slice(0, -1); if (getItemCraftingRecipes(t)) id = t; }
+        else if (id.endsWith('s') && getItemCraftingRecipes(id.slice(0, -1))) id = id.slice(0, -1);
+        let rs = null; try { rs = getItemCraftingRecipes(id); } catch (e) {}
+        if (!rs?.length) continue;
+        const forms = [...new Set(rs.map(([ing, r]) => Object.entries(ing).map(([k, v]) => `${v} ${k}`).join(' + ') + ` -> ${r.craftedCount} ${id}`))];
+        // collapse wood variants: any *_planks/_log works
+        const generic = forms.some(f => /oak_planks|oak_log/.test(f)) ? ' (any wood type works: birch/spruce/oak... planks are interchangeable)' : '';
+        out.push(`${id}: ${forms.slice(0, 3).join(' | ')}${forms.length > 3 ? ` | ...${forms.length - 3} more` : ''}${generic}`);
+        if (out.length >= 6) break;
+    }
+    return out.length ? 'RECIPES (from minecraft-data, authoritative):\n' + out.join('\n') : '';
+}
 function countGoal(task) {
-    const m = task.match(/^(?:mine|collect|gather|craft|smelt|obtain|get|chop|cook)\s+(\d+)\s+([a-z_]+)\s*$/i);
-    return m ? { count: parseInt(m[1]), item: m[2].toLowerCase() } : null;
+    const m = task.match(/^(mine|collect|gather|craft|smelt|obtain|get|chop|cook)\s+(\d+)\s+([a-z_]+)\b/i);
+    if (!m) return null;
+    const verb = m[1].toLowerCase();
+    let item = m[3].toLowerCase();
+    // plural item names from the curriculum ("torches", "sticks") -> registry id
+    { const irr = { torches: 'torch' }; if (irr[item]) item = irr[item];
+      else { try { const md = minecraftData(VERSION || '1.20.4'); if (!md.itemsByName[item] && item.endsWith('s') && md.itemsByName[item.slice(0, -1)]) item = item.slice(0, -1); } catch (e) {} } }
+    // mining a block counts its loot drops too (iron_ore -> raw_iron, coal_ore -> coal, stone -> cobblestone)
+    let items = [item];
+    if (['mine', 'collect', 'gather', 'chop', 'get', 'obtain'].includes(verb)) {
+        try { const md = minecraftData(VERSION || '1.20.4'); for (const d of (md.blockLoot?.[item]?.drops || [])) if (!items.includes(d.item)) items.push(d.item); } catch (e) {}
+    }
+    return { count: parseInt(m[2]), item, items, verb };
+}
+let VERSION = null;
+// "Smelt 6 raw_iron into 6 iron_ingot" -> verify by output gained
+function smeltGoal(task) {
+    const m = task.match(/^(?:smelt|cook)\s+(\d+)\s+([a-z_]+)\s+into\s+(\d+)\s+([a-z_]+)/i);
+    return m ? { count: parseInt(m[1]), input: m[2].toLowerCase(), verb: 'smelt', item: m[4].toLowerCase(), items: [m[4].toLowerCase()] } : null;
+}
+function gainedFor(goal, before, after) {
+    return goal.items.reduce((a, it) => a + (after.inventory[it] || 0) - (before.inventory[it] || 0), 0);
 }
 function extractCode(text) {
     const m = String(text).match(/```(?:javascript|js)?\s*([\s\S]*?)```/);
@@ -72,6 +128,57 @@ export class Voyager {
         this.abort = false;
         this.lastPlayerMsg = 0;
         this.lastTaskEnd = 0;
+        if (!globalThis.__voyagerGuard) {
+            globalThis.__voyagerGuard = true;
+            const onErr = (kind) => (err) => {
+                const t = this.currentTask || '(no task)';
+                console.error(`[voyager] !!! ${kind} during task "${t}" - counted as FAILED, process kept alive: ${err?.stack || err}`);
+                if (this.currentTask) { this.progress.failed.push(this.currentTask); this._saveProgress(); }
+                try { this.agent.bot.interrupt_code = true; this.agent.actions.stop?.(); } catch (e) {}
+            };
+            process.on('uncaughtException', onErr('UNCAUGHT EXCEPTION'));
+            process.on('unhandledRejection', onErr('UNHANDLED REJECTION'));
+        }
+        this._polyMerge();
+        this._extractShared();
+    }
+    // PolySkill-style: a learned skill whose task is covered by a parameterised skill becomes a variant of it
+    // (code kept on disk for rollback; hidden from the catalogue/fuzzy replay so the parameterised one is used)
+    _polyMerge() {
+        let n = 0;
+        for (const s of this.skills) {
+            if (s.primitive || s.handwritten || s.mergedInto || !s.task) continue;
+            const r = this._findReplay(s.task);
+            const tgt = r && this.skills.find(x => x.name === r.name);
+            if (!tgt || tgt.name === s.name || !(tgt.handwritten || tgt.primitive)) continue;
+            // only pure variants: a real item id, and no extra behaviour in the name (e.g. craftAndPlaceChestInHut stays its own skill)
+            const g = countGoal(s.task);
+            let valid = true; try { valid = !g || !!minecraftData(VERSION || '1.20.4').itemsByName[g.item] || !!minecraftData(VERSION || '1.20.4').blocksByName[g.item]; } catch (e) {}
+            const extra = s.name.split(/(?=[A-Z])/).map(w => w.toLowerCase()).filter(w => !['craft','mine','get','obtain','collect','gather','smelt','one','two','three','four','five','six','seven','eight'].includes(w) && !(g?.item || '').split('_').some(p => p.startsWith(w) || w.startsWith(p)));
+            if (!valid || extra.length) continue;
+            s.mergedInto = tgt.name; s.variantCall = r.call; n++;
+            (tgt.variants ||= []).includes(s.name) || tgt.variants.push(s.name);
+            gateLog(`MERGE variant ${s.name} ("${s.task.slice(0, 60)}") -> ${r.call.replace(/^await /, '')}`);
+        }
+        if (n) this._saveSkills();
+    }
+    // LILO/ASI-style: find code fragments (5 normalised lines) repeated across >=3 skills; offered to the code model as
+    // candidates for a shared skill (which then goes through the normal saveSkill gate)
+    _extractShared() {
+        const norm = c => c.split('\n').map(l => l.replace(/\/\/.*$/, '').trim()).filter(l => l.length > 3 && !/^[{}()\];,]*$/.test(l));
+        const seen = new Map();
+        for (const s of this.skills) {
+            if (s.mergedInto || s.demoted) continue;
+            const L = norm(s.code || ''), local = new Set();
+            for (let i = 0; i + 5 <= L.length; i++) local.add(L.slice(i, i + 5).join('\n'));
+            for (const f of local) { if (!seen.has(f)) seen.set(f, new Set()); seen.get(f).add(s.name); }
+        }
+        const groups = new Map();   // collapse overlapping windows that share the same skill set
+        for (const [f, set] of seen) if (set.size >= 3) { const k = [...set].sort().join(','); if (!groups.has(k)) groups.set(k, f); }
+        this.sharedHints = [...groups.entries()].sort((a, b) => b[0].split(',').length - a[0].split(',').length).slice(0, 3)
+            .map(([k, f]) => ({ skills: k.split(','), fragment: f }));
+        for (const h of this.sharedHints) console.log(`[lilo] repeated fragment in ${h.skills.length} skills (${h.skills.join(', ')}): ${h.fragment.split('\n')[0].slice(0, 80)}`);
+        if (!this.sharedHints.length) console.log('[lilo] no code fragment repeated across 3+ skills');
     }
 
     get enabled() { return this.progress.enabled !== false; }
@@ -94,7 +201,7 @@ export class Voyager {
         const now = Date.now();
         if (now - this.lastPlayerMsg < PLAYER_QUIET_MS || now - this.lastTaskEnd < TASK_COOLDOWN_MS) return;
         if (!this.agent.isIdle() || this.agent.self_prompter.isActive() || this.agent.prompter.awaiting_coding) return;
-        if (now < (this.agent.prompter.code_model.quotaUntil || 0)) {
+        if (false && now < (this.agent.prompter.code_model.quotaUntil || 0)) {
             if (!this._quotaNoted) { console.log(`[voyager] paused: code model (${this.agent.prompter.code_model.pName}) quota/usage limit; retrying at ${new Date(this.agent.prompter.code_model.quotaUntil).toISOString()}`); this._quotaNoted = true; }
             return;
         }
@@ -125,7 +232,183 @@ export class Voyager {
     _stateText(s) {
         return Object.entries(s).map(([k, v]) => `${k}: ${typeof v === 'object' ? JSON.stringify(v) : v}`).join('\n');
     }
+    _local() {
+        if (!this.__local) this.__local = new Ollama(LOCAL.model, LOCAL.url, LOCAL.params);
+        return this.__local;
+    }
+    // small local model (Mac Studio Ollama) for curriculum + critic judgment; unloads after 5 min idle
+    async _askLocal(system, user) {
+        CALLS.local++;
+        const r = await this._local().sendRequest([{ role: 'user', content: user }], system);
+        console.log(`[voyager] local model call #${CALLS.local}`);
+        return r;
+    }
+    _cursorLimited() { return Date.now() < (this.agent.prompter.code_model.quotaUntil || 0); }
+    // find a saved skill that can be replayed without any model call
+    _findReplay(task) {
+        const goal = countGoal(task);
+        const has = n => this.skills.some(s => s.name === n && !s.demoted);
+        const kill = task.match(/^(?:kill|hunt|slay|fight)\s+(\d+)\s+([a-z_]+?)s?\b/i);
+        if (kill && has('killMob')) return { name: 'killMob', call: `await killMob(bot, ${JSON.stringify(kill[2].toLowerCase())}, ${kill[1]});`, check: 'output' };
+        if (/^(store|deposit)\b.*\bchest\b/i.test(task) && has('depositToChest')) {
+            // keep what the milestones need (wood, stone, coal, ores/ingots, tools, armor, food we eat); store the rest
+            const keep = /(_log|_planks|^stick|^cobblestone|^coal|^raw_|_ingot|^diamond|pickaxe|_axe|sword|shovel|helmet|chestplate|leggings|boots|^torch|^crafting_table|^furnace|^bread|^shield)$|^cooked_/;
+            const junk = [...new Set(this.agent.bot.inventory.items().map(i => i.name).filter(n => !keep.test(n)))];
+            return { name: 'depositToChest', call: `await depositToChest(bot, ${JSON.stringify(junk)});`, free: 3 };
+        }
+        const harv = task.match(/^harvest\s+(\d+)\s+([a-z_]+)/i);
+        if (harv && has('harvestCrop')) return { name: 'harvestCrop', call: `await harvestCrop(bot, ${JSON.stringify(harv[2].toLowerCase())}, ${harv[1]});`, check: 'output' };
+        if (goal && ['mine', 'collect', 'gather', 'chop'].includes(goal.verb) && /(_ore|^stone|^cobblestone|^deepslate)$/.test(goal.item) && has('mineOre'))
+            return { name: 'mineOre', call: `await mineOre(bot, ${JSON.stringify(goal.item)}, ${goal.count});` };
+        if (goal && ['mine', 'collect', 'gather', 'chop'].includes(goal.verb) && goal.item.endsWith('_log') && has('collectLogs'))
+            return { name: 'collectLogs', call: `await collectLogs(bot, ${goal.count}, ${JSON.stringify(goal.item)});` };
+        if (goal && ['get', 'obtain'].includes(goal.verb) && has('obtainItem'))
+            return { name: 'obtainItem', call: `await obtainItem(bot, ${JSON.stringify(goal.item)}, ${goal.count});` };
+        if (goal && ['mine', 'collect', 'gather', 'chop'].includes(goal.verb) && this.skills.some(s => s.name === 'mineBlocks'))
+            return { name: 'mineBlocks', call: `await mineBlocks(bot, ${JSON.stringify(goal.item)}, ${goal.count});` };
+        if (goal && ['craft', 'get', 'make'].includes(goal.verb) && goal.item === 'torch' && has('craftTorches'))
+            return { name: 'craftTorches', call: `await craftTorches(bot, ${goal.count});` };
+        if (goal && goal.verb === 'craft' && this.skills.some(s => s.name === 'craftItem'))
+            return { name: 'craftItem', call: `await craftItem(bot, ${JSON.stringify(goal.item)}, ${goal.count});` };
+        const go = task.match(/^(?:go|return|travel|walk|head)\b[^(]*?x\s*=\s*(-?\d+)[,\s]+y\s*=\s*(-?\d+)[,\s]+z\s*=\s*(-?\d+)/i);
+        if (go && this.skills.some(s => s.name === 'travelTo'))
+            return { name: 'travelTo', call: `await travelTo(bot, ${go[1]}, ${go[2]}, ${go[3]});`, at: { x: +go[1], z: +go[3] } };
+        const sm = smeltGoal(task);
+        if (sm && has('smeltWithFuel'))
+            return { name: 'smeltWithFuel', call: `await smeltWithFuel(bot, ${JSON.stringify(sm.input)}, ${sm.count});` };
+        if (sm && this.skills.some(s => s.name === 'smeltItems'))
+            return { name: 'smeltItems', call: `await smeltItems(bot, ${JSON.stringify(sm.input)}, ${sm.count});` };
+        const nums = t => (t.match(/\d+/g) || []).join(',');
+        const ids = t => (t.toLowerCase().match(/\b[a-z]+(?:_[a-z]+)+\b/g) || []).sort().join(',');
+        const head = t => t.split(/\s+(?:within|at|in|on|using|from|near|and)\b/i)[0].trim().toLowerCase();
+        let best = null, bestScore = 0;
+        for (const s of this.skills) {
+            if (s.primitive || s.demoted || s.mergedInto || !s.task) continue;
+            if (head(s.task) !== head(task) && !(nums(head(s.task)) === nums(head(task)) && ids(head(s.task)) === ids(head(task)))) continue;
+            const nameHit = s.name.toLowerCase().split(/(?=[a-z])/).length && task.toLowerCase().replace(/[^a-z]/g, '').includes(s.name.toLowerCase().replace(/^(craft|mine|get|make)/, '')) ? 0.3 : 0;
+            const sc = wordOverlapScore(task, s.task) + nameHit + 0.3 * rate(s.stats || newStats());
+            if (sc > bestScore) { best = s; bestScore = sc; }
+        }
+        return best ? { name: best.name, call: `await ${best.name}(bot);` } : null;
+    }
+    // SkillCompiler-style effect contract for a route: what must hold before (pre) and what must change after (post)
+    _contract(r) {
+        let args = []; try { args = JSON.parse('[' + (r.call.match(/\(bot(?:,\s*(.*))?\);?$/)?.[1] || '') + ']'); } catch (e) {}
+        const [a0, a1] = args;
+        switch (r.name) {
+            case 'craftItem': case 'craftTorches': { const item = r.name === 'craftTorches' ? 'torch' : a0; return { item, count: (r.name === 'craftTorches' ? a0 : a1) || 1, pre: 'recipe' }; }
+            case 'mineOre': case 'collectLogs': return { item: r.name === 'collectLogs' ? (a1 || 'any _log') : a0, count: r.name === 'collectLogs' ? a0 : a1, pre: 'block' };
+            case 'killMob': return { mob: a0, count: a1 || 1, pre: 'mob' };
+            case 'smeltWithFuel': return { input: a0, count: a1 || 1, pre: 'input' };
+            default: return null;
+        }
+    }
+    // Skill-V-style applicability precheck: is the route even runnable from the current state?
+    _precheck(r) {
+        const c = this._contract(r); if (!c) return { ok: true };
+        const bot = this.agent.bot, inv = this.observe().inventory;
+        try {
+            if (c.pre === 'recipe') {
+                const md = minecraftData(VERSION || '1.20.4'); const it = md.itemsByName[c.item];
+                if (!it) return { ok: false, why: `unknown item ${c.item}` };
+                const table = bot.findBlock({ matching: md.blocksByName.crafting_table.id, maxDistance: 32 });
+                const can = bot.recipesFor(it.id, null, 1, table).length > 0;
+                return can ? { ok: true } : { ok: false, why: `missing ingredients for ${c.item}${table ? '' : ' (no crafting table within 32)'}` , reroute: 'obtainItem', item: c.item, count: c.count };
+            }
+            if (c.pre === 'block') {
+                if (c.item.startsWith('any')) return { ok: true };
+                const md = minecraftData(VERSION || '1.20.4'); const b = md.blocksByName[c.item];
+                if (!b) return { ok: false, why: `unknown block ${c.item}` };
+                const ids = [b.id, md.blocksByName['deepslate_' + c.item]?.id].filter(x => x !== undefined);
+                return bot.findBlock({ matching: ids, maxDistance: 64 }) ? { ok: true } : { ok: false, why: `no ${c.item} within 64 blocks` };
+            }
+            if (c.pre === 'mob') return Object.values(bot.entities).some(e => e.name === c.mob && e.position.distanceTo(bot.entity.position) <= 48) ? { ok: true } : { ok: false, why: `no ${c.mob} within 48 blocks` };
+            if (c.pre === 'input') return (inv[c.input] || 0) > 0 ? { ok: true } : { ok: false, why: `no ${c.input} in inventory` };
+        } catch (e) { return { ok: false, why: `precheck error ${e.message}` }; }
+        return { ok: true };
+    }
+    async _replay(task, before) {
+        let r = this._findReplay(task);
+        if (!r) return null;
+        const pc = this._precheck(r);
+        const ct = this._contract(r);
+        if (ct) console.log(`[contract] ${r.name}: pre=${ct.pre} post=${ct.item ? '+' + (ct.count || 1) + ' ' + ct.item : ct.mob ? 'killed ' + ct.mob : 'smelted ' + ct.input}`);
+        if (!pc.ok) {
+            if (pc.reroute && r.name !== pc.reroute && this.skills.some(s => s.name === pc.reroute && !s.demoted)) {
+                console.log(`[skillv] precheck ${r.name}: not applicable (${pc.why}); rerouting to ${pc.reroute} to fetch prerequisites`);
+                r = { name: pc.reroute, call: `await ${pc.reroute}(bot, ${JSON.stringify(pc.item)}, ${pc.count});` };
+            } else { console.log(`[skillv] precheck ${r.name}: not applicable (${pc.why}); skipping replay, writing code instead`); return null; }
+        } else if (ct) console.log(`[skillv] precheck ${r.name}: applicable`);
+        const goal = smeltGoal(task) || countGoal(task);
+        CALLS.replay++;
+        console.log(`[voyager] REPLAY skill ${r.name} for "${task}" (no code model)`);
+        const entry = this.skills.find(s => s.name === r.name);
+        const trial = entry?.candidate ? true : false;   // gate: a pending candidate gets trial runs before promotion
+        if (trial) gateLog(`trial run of candidate ${r.name} (candidate ${entry.candidate.stats.success}/${entry.candidate.stats.success + entry.candidate.stats.fail}, current ${entry.stats?.success || 0}/${(entry.stats?.success || 0) + (entry.stats?.fail || 0)})`);
+        const full = this._libSrc(trial ? { [r.name]: entry.candidate.code } : {}) + '\n\nasync function __replay(bot) {\n    ' + r.call + '\n}\nawait __replay(bot);';
+        const staged = await this.agent.coder._stageCode(full);
+        if (!staged) return { ok: false };
+        const res = await this.agent.actions.runAction(`voyager:replay:${task}`, async () => { await staged.func.main(this.agent.bot); }, { timeout: 5 });
+        if (this.abort || res.interrupted) return { ok: false, interrupted: true };
+        const after = this.observe();
+        let ok;
+        if (r.free) { const e = this.agent.bot.inventory.emptySlotCount(); ok = e >= r.free; console.log(`[voyager] inventory check: ${e} empty slots (need ${r.free})`); }
+        else if (r.at) { const p = this.agent.bot.entity.position; ok = Math.hypot(p.x - r.at.x, p.z - r.at.z) <= 8; }
+        else if (goal && ['mine','collect','gather','chop','craft','smelt','cook','get','obtain'].includes(goal.verb)) ok = gainedFor(goal, before, after) >= goal.count;
+        else if (entry?.effects?.length) {   // PSN rule-based effect check: the skill's recorded expected effects must show up again
+            const gotten = entry.effects.filter(it => (after.inventory[it] || 0) > (before.inventory[it] || 0));
+            ok = gotten.length > 0;
+            console.log(`[psn] effect check ${r.name}: expected +[${entry.effects.join(', ')}], got +[${gotten.join(', ')}] -> ${ok}`);
+        }
+        else { const v = await this.critique(task, before, after, String(res.message || '').slice(-1500)); ok = !!v.success; }
+        if (entry) this._recordRun(entry, task, ok, trial);
+        console.log(`[voyager] replay ${r.name}: ${ok ? 'PASSED' : 'failed'}${goal ? ` (+${gainedFor(goal, before, after)} ${goal.items.join('/')})` : ''}`);
+        if (!ok) console.log(`[voyager] replay ${r.name} inv: ${this.agent.bot.inventory.emptySlotCount()} empty slots; ${JSON.stringify(after.inventory)}`);
+        if (!ok) console.log(`[voyager] replay ${r.name} output: ${String(res.message || '(none)').slice(-600).replace(/\n+/g, ' | ')}`);
+        return { ok, name: r.name, output: String(res.message || '') };
+    }
+    // library source with optional per-name code overrides (candidates under test)
+    _libSrc(over = {}) { return this.skills.map(s => over[s.name] ?? s.code).join('\n\n'); }
+    _graph(exclude) { const g = {}; for (const s of this.skills) if (s.name !== exclude) g[s.name] = s.deps || []; return g; }
+    // PSN-style catalogue: every skill with its signature, one line each
+    catalogue() {
+        return this.skills.filter(s => !s.demoted && !s.mergedInto).map(s => `- ${signatureOf(s.code, s.name)}${s.handwritten ? ' [handwritten]' : ''}: ${s.description}`).join('\n');
+    }
+    _recordRun(entry, task, ok, trial) {
+        if (trial) {
+            const c = entry.candidate; recordRun(c.stats, task, ok);
+            const n = c.stats.success + c.stats.fail;
+            if (!ok && c.stats.fail >= 2) { gateLog(`REJECT candidate ${entry.name}: failed ${c.stats.fail}/${n} trial runs; keeping current version`); delete entry.candidate; }
+            else if (n >= 2 && rate(c.stats) >= rate(entry.stats || newStats())) { gateLog(`PROMOTE candidate ${entry.name}: trial ${c.stats.success}/${n} >= current rate ${rate(entry.stats || newStats()).toFixed(2)}`); this._promote(entry, c); }
+            else gateLog(`candidate ${entry.name} trial ${ok ? 'passed' : 'failed'} (${c.stats.success}/${n}); waiting for more runs`);
+        } else {
+            entry.stats = recordRun(entry.stats || newStats(), task, ok);
+            if (!ok && entry.stats.streakFail >= 3 && !entry.primitive && !entry.demoted) { entry.demoted = true; gateLog(`DEMOTE ${entry.name}: failed 3 times in a row (kept on disk, not replayed)`); }
+        }
+        this._saveSkills();
+    }
+    _promote(entry, c) {
+        entry.prev = { code: entry.code, description: entry.description, deps: entry.deps, stats: entry.stats, saved: entry.saved };
+        Object.assign(entry, { code: c.code, description: c.description, deps: c.deps, effects: c.effects, embedding: c.embedding, saved: new Date().toISOString(), stats: c.stats, demoted: false });
+        delete entry.candidate;
+        writeFileSync(`${this.dir}/${entry.name}.js`, `// ${entry.description}\n${entry.code}\n`);
+    }
+    // Skill-V style regression check: rerun a candidate on one recorded past task that has a deterministic inventory check
+    async _regressionRun(entry, code) {
+        if (!/async\s+function\s+\w+\s*\(\s*bot\s*\)/.test(code)) return null;   // parameterised: can't rerun blindly -> trial runs instead
+        const past = (entry.stats?.tasks || []).slice().reverse().find(t => countGoal(t) || smeltGoal(t));
+        if (!past) return null;
+        const goal = smeltGoal(past) || countGoal(past);
+        const before = this.observe();
+        gateLog(`regression rerun of candidate ${entry.name} on past task "${past}"`);
+        const staged = await this.agent.coder._stageCode(this._libSrc({ [entry.name]: code }) + `\n\nawait ${entry.name}(bot);`);
+        if (!staged) return false;
+        const res = await this.agent.actions.runAction(`voyager:gate:${entry.name}`, async () => { await staged.func.main(this.agent.bot); }, { timeout: 4 });
+        if (res.interrupted || this.abort) return null;
+        return gainedFor(goal, before, this.observe()) >= goal.count;
+    }
     async _ask(system, user) {
+        CALLS.code++;
         // code model = Cursor CLI composer-2.5 (quota/usage-limit pause lives in CodeModelWithFallback; no fallback).
         // If the limit is (or becomes) active, abandon this step.
         const cm = this.agent.prompter.code_model;
@@ -136,6 +419,28 @@ export class Voyager {
     }
 
     // ---------- automatic curriculum ----------
+    // PSN goal planner: first unmet milestone -> deterministic "Get N item" task (obtainItem expands the prerequisite chain); LLM curriculum otherwise
+    _milestoneTask(state) {
+        const done = this.progress.milestones ||= [];
+        const inv = state.inventory || {};
+        const empty = this.agent.bot.inventory.emptySlotCount();
+        if (empty < 3 && this.skills.some(s => s.name === 'depositToChest' && !s.demoted)) {
+            console.log(`[voyager] inventory nearly full (${empty} empty slots): storing items before anything else`);
+            return { task: 'Store items in a chest to free inventory space', reasoning: `inventory has ${empty} empty slots`, context: 'depositToChest' };
+        }
+        for (const m of MILESTONES) {
+            if (done.includes(m.name)) continue;
+            const missing = Object.entries(m.items).filter(([k, n]) => (inv[k] || 0) < n && !(m.block && world.getNearestBlock(this.agent.bot, m.block, 24)));
+            if (!missing.length) { done.push(m.name); this._saveProgress(); console.log(`[psn] milestone reached: ${m.name}`); continue; }
+            const [item, n] = missing[0];
+            const task = `Get ${n} ${item}`;
+            const fails = this.progress.failed.slice(-20).filter(t => t === task).length;
+            if (fails >= 2) { console.log(`[psn] milestone ${m.name} blocked (${task} failed ${fails}x); asking LLM curriculum`); return null; }
+            console.log(`[psn] milestone ${m.name}: next ${task} (no curriculum model call)`);
+            return { task, reasoning: `PSN milestone ${m.name}`, context: `use obtainItem(bot, '${item}', ${n})` };
+        }
+        return null;
+    }
     async proposeTask(state) {
         const system = `You are the automatic curriculum for a Minecraft bot named ${this.agent.name} (Voyager-style).
 Goal: discover as many diverse things as possible and grow a small town of its own, progressing wood -> stone -> iron -> diamond tech.
@@ -149,8 +454,10 @@ Reply ONLY with JSON: {"reasoning": "...", "task": "...", "context": "short hint
         const user = `${this._stateText(state)}
 completed_tasks: ${JSON.stringify(this.progress.completed.slice(-30))}
 failed_tasks: ${JSON.stringify(this.progress.failed.slice(-15))}
-known_skills: ${JSON.stringify(this.skills.map(s => s.name))}`;
-        return parseJSON(await this._ask(system, user));
+known_skills: ${JSON.stringify(this.skills.map(s => s.name))}
+replayable_tasks (cheap, no new code needed): ${JSON.stringify(this.skills.filter(s => s.task && !s.primitive).map(s => s.task.split(/\s+(?:within|at|using|from)\b/i)[0]).slice(-25))} plus any "Mine N <block or ore>", "Collect N <log>", "Get N <item>", "Smelt N <raw> into N <out>", "Kill N <mob>", "Harvest N <crop>"${this._cursorLimited() ? '\nIMPORTANT: the code-writing model is unavailable right now, so ONLY propose a task from replayable_tasks or "Mine N <block>".' : ''}`;
+        const facts = recipeFacts(this.progress.failed.slice(-5).join(' '));
+        return parseJSON(await this._askLocal(system, facts ? user + '\n' + facts : user));
     }
 
     // ---------- skill library ----------
@@ -176,21 +483,53 @@ known_skills: ${JSON.stringify(this.skills.map(s => s.name))}`;
         return scored.sort((a, b) => b.score - a.score).slice(0, k).map(x => x.s);
     }
     async saveSkill(name, description, code, task) {
-        const existing = this.skills.findIndex(s => s.name === name);
-        const entry = { name, description, task, code, embedding: await this._embed(description), saved: new Date().toISOString() };
-        if (existing >= 0) this.skills[existing] = entry; else this.skills.push(entry);
-        writeFileSync(`${this.dir}/${name}.js`, `// ${description}\n${code}\n`);
+        const names = new Set(this.skills.map(s => s.name));
+        const deps = depsOf(code, name, names);
+        const missing = missingCalls(code, name, names);
+        if (missing.length) { gateLog(`REJECT ${name}: calls unknown skills ${missing.join(', ')}`); return false; }
+        const cyc = findCycle(name, deps, this._graph(name));
+        if (cyc) { gateLog(`REJECT ${name}: dependency cycle ${cyc.join(' -> ')}`); return false; }
+        const embedding = await this._embed(description);
+        const idx = this.skills.findIndex(s => s.name === name);
+        if (idx < 0) {
+            const entry = { name, description, task, code, deps, embedding, effects: this._lastEffects || [], saved: new Date().toISOString(), stats: recordRun(newStats(), task, true) };
+            this.skills.push(entry);
+            writeFileSync(`${this.dir}/${name}.js`, `// ${description}\n${code}\n`);
+            this._saveSkills();
+            gateLog(`NEW ${name} deps=[${deps.join(', ')}]`);
+            this._extractShared();
+            console.log(`[voyager] saved skill ${name}: ${description}`);
+            return true;
+        }
+        // updating an existing skill (learned or handwritten): never overwrite directly
+        const entry = this.skills[idx];
+        if (entry.handwritten && !entry.handwritten_original) entry.handwritten_original = { code: entry.code, description: entry.description, deps: entry.deps };
+        const cand = { code, description, deps, embedding, task, effects: this._lastEffects || entry.effects || [], stats: recordRun(newStats(), task, true) };
+        const reg = await this._regressionRun(entry, code);
+        if (reg === true) { gateLog(`PROMOTE ${name}: passed regression rerun on a past task`); this._promote(entry, cand); }
+        else if (reg === false) { gateLog(`REJECT update to ${name}: failed regression rerun on a past task; keeping current version`); }
+        else if (!(entry.stats?.success)) { gateLog(`PROMOTE ${name}: current version has no recorded successes`); this._promote(entry, cand); }
+        else { entry.candidate = cand; gateLog(`HOLD ${name}: new version kept as candidate (1/1); needs 2+ trial runs with success rate >= current ${rate(entry.stats).toFixed(2)}`); }
         this._saveSkills();
-        console.log(`[voyager] saved skill ${name}: ${description}`);
+        return true;
+    }
+    // restore a handwritten skill to its original code
+    restoreHandwritten(name) {
+        const e = this.skills.find(s => s.name === name);
+        if (!e?.handwritten_original) return false;
+        e.prev = { code: e.code, description: e.description, deps: e.deps, stats: e.stats };
+        Object.assign(e, e.handwritten_original); delete e.candidate; e.demoted = false;
+        writeFileSync(`${this.dir}/${name}.js`, `// ${e.description}\n${e.code}\n`);
+        this._saveSkills(); gateLog(`RESTORED handwritten original of ${name}`); return true;
     }
 
     // ---------- critic ----------
     async critique(task, before, after, output) {
         const system = `You are an assistant that checks whether a Minecraft bot completed its task, using its state before and after and the code output.
 Be strict: success only if the evidence (inventory/position/output) shows the task is done.
-Reply ONLY with JSON: {"reasoning": "...", "success": true|false, "critique": "how to fix it if failed, else empty"}`;
-        const user = `task: ${task}\n--- before ---\n${this._stateText(before)}\n--- after ---\n${this._stateText(after)}\n--- code output ---\n${output}`;
-        return parseJSON(await this._ask(system, user));
+If the code hand-rolled a mining/collecting loop that timed out, got 0 items or failed pathfinding, say in the critique to switch to mineBlocks / gatherItem / collectDrops (custom code is otherwise fine).\nReply ONLY with JSON: {"reasoning": "...", "success": true|false, "critique": "how to fix it if failed, else empty"}`;
+        const user = `task: ${task}\n${recipeFacts(task)}\n--- before ---\n${this._stateText(before)}\n--- after ---\n${this._stateText(after)}\n--- code output ---\n${output}`;
+        return parseJSON(await this._askLocal(system, user));
     }
 
     // ---------- iterative prompting ----------
@@ -202,12 +541,20 @@ Reply ONLY with JSON: {"reasoning": "...", "success": true|false, "critique": "h
         const far = Math.hypot(p.x - HUT.x, p.z - HUT.z) > 12 || Math.abs(p.y - HUT.y) > 4;
         const needFood = bot.food < 14 && bot.inventory.items().some(i => i.foodPoints || /cooked|bread|apple|carrot|potato|beef|porkchop|mutton|chicken|cod|salmon|stew/.test(i.name));
         const lowHealth = bot.health < 8;
-        if (!needFood && !(night && far) && !(lowHealth && far)) return false;
+        if (!needFood && !(night && far) && !(lowHealth && far)) { this._safetyStuck = 0; return false; }
+        // back off when safety keeps making no progress (e.g. stuck in a cave under the hut), so learning can continue
+        if (Date.now() < (this._safetyBackoff || 0)) return false;
+        const key = `${Math.round(p.x)},${Math.round(p.y)},${Math.round(p.z)}`;
+        this._safetyStuck = key === this._safetyLastPos ? (this._safetyStuck || 0) + 1 : 0;
+        this._safetyLastPos = key;
+        if (this._safetyStuck >= 3) { console.log(`[voyager] safety made no progress 3x at ${key}; pausing safety for 5 min`); this._safetyBackoff = Date.now() + 5 * 60 * 1000; this._safetyStuck = 0; return false; }
         console.log(`[voyager] safety first: food=${bot.food} health=${Math.round(bot.health)} night=${night} far=${far}`);
         await this.agent.actions.runAction('voyager:safety', async () => {
             if (needFood) await skills.consume(bot);
             if ((night || lowHealth) && far) {
-                await skills.goToPosition(bot, HUT.x, HUT.y, HUT.z, 1);
+                if (Math.hypot(p.x - HUT.x, p.z - HUT.z) <= 24 && p.y < HUT.y - 4) await skills.goToSurface(bot);   // underground below the hut
+                if (bot.interrupt_code) return;
+                await skills.travelTo(bot, HUT.x, HUT.y, HUT.z);
                 const q = bot.entity.position;
                 if (Math.hypot(q.x - HUT.x, q.z - HUT.z) > 6 && night) await skills.shelterNow(bot);
             }
@@ -218,7 +565,7 @@ Reply ONLY with JSON: {"reasoning": "...", "success": true|false, "critique": "h
     async step() {
         if (await this.safety()) return;
         const before = this.observe();
-        let proposal = await this.proposeTask(before);
+        let proposal = this._milestoneTask(before) || await this.proposeTask(before);
         let task = String(proposal.task || '').trim();
         let invalid = task ? validateTask(task) : 'empty task';
         if (invalid) {
@@ -230,33 +577,54 @@ Reply ONLY with JSON: {"reasoning": "...", "success": true|false, "critique": "h
             if (invalid) { console.log(`[voyager] rejected again "${task}": ${invalid}; skipping`); this._saveProgress(); return; }
         }
         console.log(`[voyager] new task: ${task} (${proposal.reasoning})`);
+        this.currentTask = task;
+        VERSION = this.agent.bot.version;
+        const rp = await this._replay(task, before);
+        if (rp?.interrupted) { console.log('[voyager] task interrupted'); return; }
+        if (rp?.ok) {
+            this.progress.completed.push(task); this.progress.failed = this.progress.failed.filter(t => t !== task); this._saveProgress();
+            this.agent.openChat?.(`Done: ${task} (replayed ${rp.name}).`);
+            return;
+        }
+        if (rp && !rp.ok && !rp.interrupted && this._findReplay(task)) { this.progress.failed.push(task); this._saveProgress(); }
+        if (this._cursorLimited()) { console.log(`[voyager] skipped "${task}": needs new code but Cursor is at its limit (replay-only mode)`); return; }
         this.agent.openChat?.(`New goal: ${task}`);
         const related = await this.retrieveSkills(task + ' ' + (proposal.context || ''));
+        for (const p of this.skills.filter(s => s.primitive)) if (!related.includes(p)) related.push(p);
         const prompter = this.agent.prompter;
         let system = await prompter.replaceStrings(prompter.profile.coding, [{ role: "user", content: `!newAction(${task})` }], prompter.coding_examples);
         system += `\n\nVOYAGER MODE: write ONE reusable async function \`async function camelCaseName(bot) {...}\` that completes the task, then call it at the end with \`await camelCaseName(bot);\`.
 The first line of the code block must be a comment: // DESCRIPTION: <one sentence of what the function does>.
-You may call these previously learned skills (already defined, do not redefine them): ${related.map(s => s.name).join(', ') || '(none yet)'}.`;
-        const learnedSrc = related.map(s => s.code).join('\n\n');
+SKILL LIBRARY (already defined as plain async functions in scope; call them directly by name, e.g. \`await mineOre(bot, 'iron_ore', 3)\`; do NOT redefine or copy them, and do not invent other bare function names):
+${this.catalogue()}
+COMPOSE: build your function out of these skills (they can take arguments). Your new skill may take extra parameters with defaults, e.g. \`async function makeIronTools(bot, count = 1)\`. Prefer obtainItem / mineOre / collectLogs / smeltWithFuel / killMob / ensureCraftingTable / ensureFurnace over hand-rolled loops. Do not create call cycles between skills.${this.sharedHints?.length ? `
+SHARED CODE: these fragments are repeated in several skills; if you need this logic, put it in its own small reusable async function skill (named, with parameters) and call it, instead of inlining it again:
+${this.sharedHints.map(h => '// used in ' + h.skills.join(', ') + '\n' + h.fragment).join('\n')}` : ''}
+Recommended building blocks (robust, already handle pathfinding, full inventory and drop pickup; compose them inside your own function rather than hand-rolling dig/findBlocks loops): mineBlocks(bot, blockName, count) mines ores/stone/logs and picks up drops; gatherItem(bot, itemName, target) gathers until the inventory has target; collectDrops(bot) picks up nearby items; goToBlockAndInteract(bot, blockName, range) walks to and uses a chest/furnace/table.
+Interrupts: the bot may be interrupted at any time (danger, getting stuck, a player talking). Every loop must start with \`if (bot.interrupt_code) return;\` and you must return immediately after any await when bot.interrupt_code is true. Every async function must contain an await. Never catch an error and keep looping; no unbounded loops (always cap attempts).`;
+        // define every library skill so calls to any known skill lint/run; only `related` are shown as context
+        const learnedSrc = this.skills.map(s => s.code).join('\n\n');
         const ctx = related.map(s => `// ${s.description}\n${s.code}`).join('\n\n');
 
         let feedback = '';
         let lastCode = '';
         for (let i = 1; i <= MAX_ATTEMPTS; i++) {
             if (this.abort) { console.log('[voyager] aborted for player'); return; }
-            const user = `Task: ${task}\nHint: ${proposal.context || ''}\n--- state ---\n${this._stateText(this.observe())}
+            const user = `Task: ${task}\nHint: ${proposal.context || ''}\n${recipeFacts(task)}\n--- state ---\n${this._stateText(this.observe())}
 --- learned skills you can call ---\n${ctx || '(none)'}
 ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- feedback from last attempt ---\n${feedback}\n` : ''}Attempt ${i}/${MAX_ATTEMPTS}. Write the code block:`;
+            if (i === 1) console.log(`[voyager] code prompt includes skill catalogue (${this.skills.filter(s => !s.demoted).length} skills)`);
             const reply = await this._ask(system, user);
             const code = extractCode(reply);
             if (!code) { feedback = 'Error: no code block. Reply with a ```javascript``` code block.'; continue; }
             const fn = code.match(/async\s+function\s+([A-Za-z_]\w*)\s*\(/);
             if (!fn) { feedback = 'Error: code must define `async function name(bot)` and call it.'; lastCode = code; continue; }
             const desc = (code.match(/\/\/\s*DESCRIPTION:\s*(.+)/) || [])[1] || task;
-            const full = (learnedSrc ? learnedSrc + '\n\n' : '') + code;
+            const own = fn[1];
+            const full = this.skills.filter(s => s.name !== own).map(s => s.code).join('\n\n') + '\n\n' + code;
             const staged = await this.agent.coder._stageCode(full);
             const lint = staged ? await this.agent.coder._lintCode(staged.src_lint_copy) : 'staging failed';
-            if (lint) { feedback = 'Lint error:\n' + lint; lastCode = code; continue; }
+            if (lint) { console.log('[voyager] lint failed: ' + String(lint).slice(0, 300)); feedback = 'Lint error:\n' + lint; lastCode = code; continue; }
 
             const res = await this.agent.actions.runAction(`voyager:${task}`, async () => {
                 await staged.func.main(this.agent.bot);
@@ -265,13 +633,14 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             const output = String(res.message || '').slice(-1500);
             const after = this.observe();
             const goal = countGoal(task);
-            const gained = goal ? (after.inventory[goal.item] || 0) - (before.inventory[goal.item] || 0) : 0;
+            const gained = goal ? gainedFor(goal, before, after) : 0;
             const verdict = (goal && gained >= goal.count)
                 ? { success: true, critique: '', reasoning: `inventory +${gained} ${goal.item}` }
                 : await this.critique(task, before, after, output);
             if (goal && gained >= goal.count) console.log(`[voyager] verified from inventory (+${gained} ${goal.item}), critic skipped`);
             console.log(`[voyager] attempt ${i} critic: success=${verdict.success} ${verdict.critique || ''}`);
             if (verdict.success) {
+                this._lastEffects = Object.keys(after.inventory).filter(k => (after.inventory[k] || 0) > (before.inventory[k] || 0)).slice(0, 8);
                 await this.saveSkill(fn[1], desc.trim(), code.replace(/\n\s*await\s+\w+\(bot\);\s*$/, '').trim(), task);
                 this.progress.completed.push(task);
                 this.progress.failed = this.progress.failed.filter(t => t !== task);

@@ -74,7 +74,8 @@ export class History {
             while (this.turns.length > 0 && this.turns[0].role === 'assistant')
                 chunk.push(this.turns.shift()); // remove until turns starts with system/user message
 
-            await this.summarizeMemories(chunk);
+            try { await this.summarizeMemories(chunk); }
+            catch (e) { console.error('[history] memory summary FAILED (kept previous memory): ' + String(e?.message ?? e).slice(0, 160)); }
             await this.appendFullHistory(chunk);
         }
     }
