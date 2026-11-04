@@ -363,6 +363,7 @@ export class Voyager {
         else { const v = await this.critique(task, before, after, String(res.message || '').slice(-1500)); ok = !!v.success; }
         if (entry) this._recordRun(entry, task, ok, trial);
         console.log(`[voyager] replay ${r.name}: ${ok ? 'PASSED' : 'failed'}${goal ? ` (+${gainedFor(goal, before, after)} ${goal.items.join('/')})` : ''}`);
+        if (r.free) console.log(`[voyager] storage replay ${r.name} output: ${String(res.message || '(none)').split(/\n|\|/).filter(l => /\[(toss|chest)\]/.test(l)).join(' | ').slice(-800)}; inv now ${JSON.stringify(after.inventory)}`);
         if (!ok) console.log(`[voyager] replay ${r.name} inv: ${this.agent.bot.inventory.emptySlotCount()} empty slots; ${JSON.stringify(after.inventory)}`);
         if (!ok) console.log(`[voyager] replay ${r.name} output: ${String(res.message || '(none)').slice(-600).replace(/\n+/g, ' | ')}`);
         return { ok, name: r.name, output: String(res.message || '') };
@@ -562,8 +563,64 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         return true;
     }
 
+    // fix4: in-place inventory housekeeping during night safety / shelter (no walking): toss clutter, then
+    // craft planks -> sticks -> crafting_table (placed adjacent) -> wooden_pickaxe from inventory
+    async _housekeep() {
+        const bot = this.agent.bot;
+        if (this.abort || Date.now() < (this._houseNext || 0)) return;
+        this._houseNext = Date.now() + 45 * 1000;
+        const hostile = bot.nearestEntity(e => e.type === 'hostile' || /zombie|skeleton|creeper|spider|witch|drowned|husk|stray|enderman|slime|phantom/.test(e.name || ''));
+        const hd = hostile ? hostile.position.distanceTo(bot.entity.position) : Infinity;
+        const roof = bot.blockAt(bot.entity.position.offset(0, 2, 0));
+        const sheltered = roof && roof.boundingBox === 'block';
+        if (hd < 16 && !sheltered) { console.log(`[house] skipped: ${hostile.name} ${hd.toFixed(1)} blocks away and not sheltered`); return; }
+        const inv = () => world.getInventoryCounts(bot);
+        const empty = bot.inventory.emptySlotCount();
+        if (empty < 6) {
+            console.log(`[house] ${empty} empty slots; tossing clutter in place (sheltered=${!!sheltered}, nearest hostile ${hd === Infinity ? 'none' : hd.toFixed(1)})`);
+            const staged = await this.agent.coder._stageCode(this._libSrc() + '\n\nasync function __house(bot) { await tossClutter(bot, 6); }\nawait __house(bot);');
+            if (!staged) { console.log('[house] FAILED to stage tossClutter'); return; }
+            const hr = await this.agent.actions.runAction('voyager:housekeeping:toss', async () => { await staged.func.main(bot); }, { timeout: 2 });
+            console.log(`[house] toss output: ${String(hr?.message || '(none)').split(/\n|\|/).filter(l => /\[toss\]/.test(l)).join(' | ').slice(-800)}`);
+            console.log(`[house] after toss: ${bot.inventory.emptySlotCount()} empty slots`);
+            return;
+        }
+        const c = inv();
+        if (c.wooden_pickaxe || c.stone_pickaxe || c.iron_pickaxe || c.diamond_pickaxe) return;
+        const log = Object.keys(c).find(n => /_log$/.test(n) && !/stripped/.test(n));
+        const planks = () => Object.entries(inv()).filter(([n]) => /_planks$/.test(n)).reduce((a, [, v]) => a + v, 0);
+        await this.agent.actions.runAction('voyager:housekeeping:craft', async () => {
+            const step = async (what, fn) => { const ok = await fn(); console.log(`[house] craft ${what}: ${ok ? 'ok' : 'FAILED'}`); return ok; };
+            const needPlanks = (c.crafting_table ? 0 : 4) + 3 + ((c.stick || 0) >= 2 ? 0 : 2);
+            if (planks() < needPlanks && log) await step(`planks from ${log}`, () => skills.craftRecipe(bot, log.replace(/_log$/, '_planks'), 2));
+            if (bot.interrupt_code) return;
+            if ((inv().stick || 0) < 2 && planks() >= 2) {
+                const pl = Object.keys(inv()).find(n => /_planks$/.test(n));
+                await step('sticks', () => skills.craftRecipe(bot, 'stick', 1)); void pl;
+            }
+            if (bot.interrupt_code) return;
+            if (!world.getNearestBlock(bot, 'crafting_table', 4)) {
+                if (!inv().crafting_table && planks() >= 4) await step('crafting_table', () => skills.craftRecipe(bot, 'crafting_table', 1));
+                if (inv().crafting_table) {
+                    const me = bot.entity.position.floored();
+                    let placed = false;
+                    for (const [dx, dz] of [[1,0],[-1,0],[0,1],[0,-1],[1,1],[-1,-1],[1,-1],[-1,1]]) {
+                        const t = me.offset(dx, 0, dz), b = bot.blockAt(t), below = bot.blockAt(t.offset(0, -1, 0));
+                        if (b?.name === 'air' && below?.boundingBox === 'block') { placed = await skills.placeBlock(bot, 'crafting_table', t.x, t.y, t.z); if (placed) break; }
+                    }
+                    console.log(`[house] place crafting_table adjacent: ${placed ? 'ok' : 'FAILED (no free adjacent spot)'}`);
+                }
+            }
+            if (bot.interrupt_code) return;
+            if (world.getNearestBlock(bot, 'crafting_table', 4) && planks() >= 3 && (inv().stick || 0) >= 2)
+                await step('wooden_pickaxe', () => skills.craftRecipe(bot, 'wooden_pickaxe', 1));
+            else console.log(`[house] wooden_pickaxe not yet possible: planks=${planks()} sticks=${inv().stick || 0} log=${log || 'none'} table=${!!world.getNearestBlock(bot, 'crafting_table', 4)}`);
+        }, { timeout: 2 });
+        if (inv().wooden_pickaxe) console.log('[house] MILESTONE wooden_pickaxe crafted in place');
+    }
+
     async step() {
-        if (await this.safety()) return;
+        if (await this.safety()) { await this._housekeep(); return; }
         const before = this.observe();
         let proposal = this._milestoneTask(before) || await this.proposeTask(before);
         let task = String(proposal.task || '').trim();
