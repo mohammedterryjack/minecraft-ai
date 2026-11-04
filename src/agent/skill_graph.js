@@ -55,14 +55,16 @@ export function gateLog(msg) { console.log('[gate] ' + msg); }
 // instrumentSrc: JS appended after the skill library inside the staged program; rebinds every skill to a wrapper that
 // records one trace record per call (name, args, parent, depth, own output span, inventory delta, return, error).
 export function instrumentSrc(names) {
-    const wrap = `const __T = bot.__psnTrace = []; const __S = []; const __inv = () => { try { return world.getInventoryCounts(bot); } catch { return {}; } };
+    // fix11 (B6): parent call tracked with AsyncLocalStorage (globalThis.__psnALS, set by voyager.js), so parallel calls get the right parent
+    const wrap = `const __T = bot.__psnTrace = []; const __als = globalThis.__psnALS; if (!__als) throw new Error('PSN trace: globalThis.__psnALS (AsyncLocalStorage) missing'); const __inv = () => { try { return world.getInventoryCounts(bot); } catch { return {}; } };
 const __wrap = (n, f) => async function (...a) {
     if (__T.length >= 400) return await f.apply(this, a);
-    const rec = { name: n, args: (() => { try { return JSON.stringify(a.slice(1)).slice(0, 120); } catch { return '?'; } })(), parent: __S.length ? __S[__S.length - 1] : -1, depth: __S.length, o0: (bot.output || '').length, pre: __inv() };
-    const id = __T.push(rec) - 1; __S.push(id);
-    try { const r = await f.apply(this, a); rec.ret = r === undefined ? 'undefined' : String(JSON.stringify(r)).slice(0, 60); rec.fail = r === false || r === null || r === 0; return r; }
+    const par = __als.getStore() ?? -1;
+    const rec = { name: n, args: (() => { try { return JSON.stringify(a.slice(1)).slice(0, 120); } catch { return '?'; } })(), parent: par, depth: par < 0 ? 0 : __T[par].depth + 1, o0: (bot.output || '').length, pre: __inv() };
+    const id = __T.push(rec) - 1;
+    try { const r = await __als.run(id, () => f.apply(this, a)); rec.ret = r === undefined ? 'undefined' : String(JSON.stringify(r)).slice(0, 60); rec.fail = r === false || r === null || r === 0; return r; }
     catch (e) { rec.fail = true; rec.err = String(e?.message || e).slice(0, 200); throw e; }
-    finally { __S.pop(); rec.o1 = (bot.output || '').length; const post = __inv(); rec.delta = {}; for (const k of new Set([...Object.keys(rec.pre), ...Object.keys(post)])) { const d = (post[k] || 0) - (rec.pre[k] || 0); if (d) rec.delta[k] = d; } delete rec.pre; rec.intr = !!bot.interrupt_code; }
+    finally { rec.o1 = (bot.output || '').length; bot.__psnOut = bot.output; const post = __inv(); rec.delta = {}; for (const k of new Set([...Object.keys(rec.pre), ...Object.keys(post)])) { const d = (post[k] || 0) - (rec.pre[k] || 0); if (d) rec.delta[k] = d; } delete rec.pre; rec.intr = !!bot.interrupt_code; }
 };`;
     return wrap + '\n' + names.map(n => `${n} = __wrap(${JSON.stringify(n)}, ${n});`).join('\n');
 }
@@ -85,16 +87,23 @@ export function traceText(trace, max = 40) {
 }
 // credit assignment: blame the deepest failing call; a failing leaf (hand-written primitive, no skill deps) is never edited,
 // so responsibility moves to its caller (PSN calling_pattern_issues -> caller_fix); otherwise the callee itself (callee_fix).
+// fix11 (B5): prefer failures that propagated (every ancestor up to a root also failed); failures a caller caught and
+// recovered from are only considered when no propagated failure exists, and are labelled 'swallowed'.
 export function blame(trace, isLeaf) {
     const failed = trace.map((r, i) => [r, i]).filter(([r]) => !r.ok && !r.intr);
     if (!failed.length) return null;
-    let best = failed[0];
-    for (const f of failed) if (f[0].depth > best[0].depth) best = f;
+    // a step child -> parent propagates if the parent also failed and did not catch the child's exception (child threw, parent returned normally)
+    const propagated = failed.filter(([r]) => { for (let c = r, p = r.parent; p >= 0; c = trace[p], p = trace[p].parent) if (trace[p].ok || (c.err && !trace[p].err)) return false; return true; });
+    const pool = propagated.length ? propagated : failed;
+    let best = pool[0];
+    for (const f of pool) if (f[0].depth > best[0].depth) best = f;
     const path = []; for (let i = best[1]; i >= 0; i = trace[i].parent) path.unshift(trace[i].name);
     let t = best[1], kind = 'callee_fix';
     while (t >= 0 && isLeaf(trace[t].name)) { t = trace[t].parent; kind = 'caller_fix'; }
-    if (t < 0) return { target: null, leaf: best[0].name, path, kind: 'leaf_only', evidence: best[0].ownFail.join(' | ') || best[0].err || `returned ${best[0].ret}` };
-    return { target: trace[t].name, leaf: best[0].name, path, kind, evidence: (best[0].ownFail.join(' | ') || best[0].err || `returned ${best[0].ret}`).slice(0, 400) };
+    const swallowed = !propagated.length;
+    const evidence = (best[0].ownFail.join(' | ') || best[0].err || `returned ${best[0].ret}`).slice(0, 400);
+    if (t < 0) return { target: null, leaf: best[0].name, path, kind: 'leaf_only', swallowed, evidence };
+    return { target: trace[t].name, leaf: best[0].name, path, kind, swallowed, evidence };
 }
 // all transitive parents (skills whose dependency closure contains name)
 export function parentsOf(name, graph) {
