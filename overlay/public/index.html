@@ -1,0 +1,47 @@
+<!doctype html><html><head><meta charset="utf-8"><title>icefox overlay</title>
+<style>
+html,body{margin:0;width:1280px;height:720px;background:transparent;overflow:hidden;font:13px/1.35 "Helvetica Neue",Arial,sans-serif;color:#eee}
+.p{position:absolute;background:rgba(10,12,16,.58);border-radius:8px;padding:8px 10px;box-shadow:0 1px 4px rgba(0,0,0,.4);text-shadow:0 1px 2px #000}
+#tl{left:12px;top:12px;width:300px}#bl{left:12px;bottom:12px;width:470px}#tr{right:12px;top:12px;width:300px;max-height:470px;overflow:hidden}
+h4{margin:6px 0 3px;font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:#9ab}
+.bar{display:flex;gap:1px;font-size:14px}.dim{opacity:.25}.mut{color:#aab;font-size:12px}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:2px 6px;font-size:12px}.grid span b{color:#ffd76a}
+.feed div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;transition:opacity 1s}
+.ok{color:#7ee07e}.bad{color:#ff8a7a}.chat{color:#cfe6ff}.psn{color:#ffd76a}.skill{color:#b9a6ff}
+.row{display:flex;justify-content:space-between}
+</style></head><body>
+<div class="p" id="tl"><div class="row"><b id="nm">icefox2000</b><span class="mut" id="conn"></span></div>
+<div class="bar" id="hp"></div><div class="bar" id="food"></div>
+<div class="mut" id="pos"></div><div class="mut" id="env"></div>
+<h4>Doing</h4><div id="act"></div>
+<h4>Holding</h4><div id="held"></div><h4>Inventory</h4><div class="grid" id="inv"></div></div>
+<div class="p" id="tr"><h4>Task</h4><div id="task"></div>
+<h4>PSN milestone</h4><div id="ms"></div><h4>Last critic</h4><div id="critic"></div>
+<h4>Skills</h4><div id="sk"></div><h4>Results</h4><div id="res"></div>
+<h4>Deaths</h4><div class="mut" id="deaths"></div><div class="mut" id="model" style="margin-top:6px"></div></div>
+<div class="p feed" id="bl"></div>
+<script src="/socket.io/socket.io.js"></script><script>
+const $=id=>document.getElementById(id),esc=s=>String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const pretty=n=>String(n||'').replace(/^minecraft:/,'').replace(/_/g,' ');
+function bar(v,icon){let h='';for(let i=0;i<10;i++){const f=v-i*2;h+=`<span class="${f>0?'':'dim'}">${f===1?'◐':icon}</span>`}return h}
+function render(S){const st=S.state,g=st?.gameplay;
+ $('conn').textContent=S.connected?(st?'● live':'● waiting for bot'):'○ mindserver offline';
+ const hp=g?.health??S.safety?.health,fd=g?.hunger??S.safety?.food;
+ $('hp').innerHTML=hp!=null?bar(hp,'❤')+` <span class=mut>${hp}/20</span>`:'';
+ $('food').innerHTML=fd!=null?bar(fd,'🍗')+` <span class=mut>${fd}/20</span>`:'';
+ let p=g?.position,d='';if(p&&S.hut){d=` · hut ${Math.round(Math.hypot(p.x-S.hut.x,p.z-S.hut.z))}m`}
+ $('pos').textContent=p?`${Math.round(p.x)}, ${Math.round(p.y)}, ${Math.round(p.z)} · ${pretty(g.biome)}${d}`:'';
+ const night=S.safety?.night;$('env').textContent=[g?.timeLabel,g?.weather,night!=null?(night?'🌙 night safety':'☀ day'):null].filter(Boolean).join(' · ');
+ $('act').textContent=st?.action?.current||'—';
+ $('held').textContent=pretty(st?.inventory?.equipment?.mainHand)||'empty hand';
+ const c=st?.inventory?.counts||{};$('inv').innerHTML=Object.entries(c).sort((a,b)=>b[1]-a[1]).slice(0,15).map(([k,v])=>`<span>${esc(pretty(k))} <b>${v}</b></span>`).join('')||'<span class=mut>—</span>';
+ $('task').textContent=S.task||'—';
+ $('ms').innerHTML=S.milestone?`<b>${esc(pretty(S.milestone.name))}</b> <span class=mut>→ ${esc(S.milestone.next)}</span><br><span class=mut>reached: ${S.milestonesReached.map(pretty).join(', ')||'—'}</span>`:'—';
+ $('critic').innerHTML=S.critic?`<span class="${S.critic.ok?'ok':'bad'}">${S.critic.ok?'✔ success':'✘ fail'}</span> <span class=mut>(try ${S.critic.attempt}) ${esc(S.critic.text.slice(0,110))}</span>`:'—';
+ $('sk').innerHTML=`${S.skills.count??'?'} in library<br><span class=mut>new: ${S.skills.recent.slice(-3).join(', ')||'—'}</span>`+(S.gate.length?`<br><span class=mut>gate: ${S.gate.slice(-2).map(x=>esc(x.op+' '+x.text.split(/[ (]/)[x.op==='MERGE'?1:0])).join(' · ')}</span>`:'');
+ $('res').innerHTML=`<span class=ok>✔ ${S.success}</span> &nbsp; <span class=bad>✘ ${S.fail}</span> <span class=mut>(recent)</span>`;
+ $('deaths').textContent=S.deaths.slice(-2).join(' | ')||'none recorded';
+ $('model').textContent=S.model?`model: ${S.model}${S.timing?` · ${(S.timing/1000).toFixed(1)}s`:''}`:'';
+ const now=Date.now();$('bl').innerHTML=S.feed.slice(-6).map((f,i,a)=>`<div class="${f.kind==='critic'?(f.text.startsWith('✔')?'ok':'bad'):f.kind==='fail'?'bad':f.kind}" style="opacity:${Math.max(.35,1-(a.length-1-i)*.12)}">${esc(f.text)}</div>`).join('')||'<div class=mut>waiting for thoughts…</div>';}
+io().on('s',render);fetch('/state.json').then(r=>r.json()).then(render);
+</script></body></html>
