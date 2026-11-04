@@ -280,6 +280,7 @@ export class Voyager {
             nearby_entities: world.getNearbyEntityTypes(bot),
             empty_inventory_slots: bot.inventory.emptySlotCount(),
             threats: this._threats(),
+            recent_deaths: (this.agent.recentDeaths || []).join('; ') || 'none',
         };
     }
     // fix18: perception only (no policy): hostiles within 32 blocks, nearest first
