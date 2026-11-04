@@ -67,12 +67,12 @@ export class Prompter {
         if (this.profile.code_model) {
             let code_model_profile = selectAPI(this.profile.code_model);
             this.code_model = createModel(code_model_profile);
-            // cursor plan limit: pause and re-try every 6h until the plan resets; gemini: 60 min
+            // usage limit: pause and re-check every 60 min (no fallback; OpenAI backup disabled by Mo)
             const isCursor = code_model_profile.api === 'cursor';
             // cursor usage limit -> OpenAI backup (profile.code_backup) if configured; retry cursor hourly while on backup
             const bk = this.profile.code_backup;
             const backup = (isCursor && bk && hasKey('OPENAI_API_KEY')) ? new OpenAIStrict(bk.model, bk.params || {}) : null;
-            this.code_model = new CodeModelWithFallback(this.code_model, backup, (backup ? 60 : isCursor ? 6 * 60 : 60) * 60 * 1000, 'code-model');
+            this.code_model = new CodeModelWithFallback(this.code_model, backup, 60 * 60 * 1000, 'code-model');
             if (backup) { this.code_model.switchOn = /usage limit|limit reached|quota/i; console.log(`[code-model] backup on cursor usage limit: openai ${bk.model}`); }
             this.code_model.timeoutMs = isCursor ? 180 * 1000 : this.code_model.timeoutMs;
         }

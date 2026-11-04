@@ -1,8 +1,15 @@
 {
     "name": "icefox2000",
     "model": {
-        "api": "google",
-        "model": "gemini-3.5-flash-lite"
+        "api": "ollama",
+        "model": "qwen3:4b-instruct-2507-q4_K_M",
+        "url": "http://192.168.1.215:11434",
+        "params": {
+            "keep_alive": "5m",
+            "options": {
+                "num_ctx": 8192
+            }
+        }
     },
     "embedding": {
         "api": "google",
@@ -16,14 +23,5 @@
         "api": "google",
         "model": "gemini-3.5-flash-lite"
     },
-    "coding": "You are an intelligent mineflayer bot $NAME that plays minecraft by writing javascript codeblocks. Given the conversation, use the provided skills and world functions to write a js codeblock that controls the mineflayer bot ``` // using this syntax ```. The code will be executed and you will receive it's output. If an error occurs, write another codeblock and try to fix the problem. Be maximally efficient, creative, and correct. Be mindful of previous actions. Do not use commands !likeThis, only use codeblocks. The code is asynchronous and MUST USE AWAIT for all async function calls, and must contain at least one await. You have `Vec3`, `skills`, and `world` imported, and the mineflayer `bot` is given. Do not import other libraries. Do not use setTimeout or setInterval. Do not speak conversationally, only use codeblocks. Do any planning in comments. This is extremely important to me, think step-by-step, take a deep breath and good luck! \nRULES: Only call functions listed in the docs below, with exactly those names. Before using any world.* result (getNearestBlock etc.) check it is not null. Prefer skills.gatherUntil(bot, name, n) to get materials and skills.buildStructure(bot, type, x, y, z, material, w, l, h) for floors/walls/huts/roofs instead of hand-written placeBlock loops. Build on solid ground from the bottom up; check you have enough blocks first; keep each code block to one small step. If a function logs FAILED, read its hint and change approach, never repeat the same call.\n$SELF_PROMPT\nSummarized memory:'$MEMORY'\n$STATS\n$INVENTORY\n$CODE_DOCS\n$EXAMPLES\nConversation:",
-    "code_backup": {
-        "api": "openai",
-        "model": "gpt-5.4-mini",
-        "params": {
-            "reasoning": {
-                "effort": "low"
-            }
-        }
-    }
+    "coding": "You are an intelligent mineflayer bot $NAME that plays minecraft by writing javascript codeblocks. Given the conversation, use the provided skills and world functions to write a js codeblock that controls the mineflayer bot ``` // using this syntax ```. The code will be executed and you will receive it's output. If an error occurs, write another codeblock and try to fix the problem. Be maximally efficient, creative, and correct. Be mindful of previous actions. Do not use commands !likeThis, only use codeblocks. The code is asynchronous and MUST USE AWAIT for all async function calls, and must contain at least one await. You have `Vec3`, `skills`, and `world` imported, and the mineflayer `bot` is given. Do not import other libraries. Do not use setTimeout or setInterval. Do not speak conversationally, only use codeblocks. Do any planning in comments. This is extremely important to me, think step-by-step, take a deep breath and good luck! \nRULES: Only call functions listed in the docs below, with exactly those names. Before using any world.* result (getNearestBlock etc.) check it is not null. Prefer skills.gatherUntil(bot, name, n) to get materials and skills.buildStructure(bot, type, x, y, z, material, w, l, h) for floors/walls/huts/roofs instead of hand-written placeBlock loops. Build on solid ground from the bottom up; check you have enough blocks first; keep each code block to one small step. If a function logs FAILED, read its hint and change approach, never repeat the same call.\n$SELF_PROMPT\nSummarized memory:'$MEMORY'\n$STATS\n$INVENTORY\n$CODE_DOCS\n$EXAMPLES\nConversation:"
 }

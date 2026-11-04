@@ -120611,9 +120611,9 @@
   },
   {
     "name": "depositToChest",
-    "description": "Store the given item names (or all non-essential items) in the nearest chest within 32 blocks (placing one if needed); if storage fails, toss low-value clutter to free at least 6 slots; returns how many stacks were stored.",
+    "description": "Free inventory space: if fewer than 3 slots are empty, first toss low-value clutter on the spot (no walking); then store the given item names (or all non-essential items) in the nearest chest within 32 blocks (placing one if needed), tossing clutter again if still under 6 empty slots; returns how many stacks were stored.",
     "task": "Walk to the nearest chest (placing one if none) and store the given item names (or all non-tool, non-food items if empty); returns how many stacks were stored.",
-    "code": "async function depositToChest(bot, itemNames = []) {\n    const keep = /pickaxe|axe|sword|shovel|hoe|helmet|chestplate|leggings|boots|torch|cooked_|bread|crafting_table|shield/;\n    const names = itemNames.length ? itemNames : [...new Set(bot.inventory.items().map(i => i.name))].filter(n => !keep.test(n));\n    let n = 0;\n    if (await ensureChest(bot) && !bot.interrupt_code) {\n        await skills.goToNearestBlock(bot, 'chest', 2, 32);\n        for (const name of names.slice(0, 27)) {\n            if (bot.interrupt_code) return n;\n            if (await skills.putInChest(bot, name)) n++;\n        }\n    }\n    if (bot.inventory.emptySlotCount() < 6 && !bot.interrupt_code) {\n        console.log(`[toss] storage left only ${bot.inventory.emptySlotCount()} empty slots (stored ${n} stacks); tossing clutter`);\n        await tossClutter(bot, 6);\n    }\n    return n;\n}",
+    "code": "async function depositToChest(bot, itemNames = []) {\n    if (bot.inventory.emptySlotCount() < 3) {\n        console.log(`[toss] only ${bot.inventory.emptySlotCount()} empty slots; tossing clutter first (no walking)`);\n        await tossClutter(bot, 6);\n        if (bot.interrupt_code) return 0;\n    }\n    const keep = /pickaxe|axe|sword|shovel|hoe|helmet|chestplate|leggings|boots|torch|cooked_|bread|crafting_table|shield/;\n    const names = itemNames.length ? itemNames : [...new Set(bot.inventory.items().map(i => i.name))].filter(n => !keep.test(n));\n    let n = 0;\n    if (await ensureChest(bot) && !bot.interrupt_code) {\n        await skills.goToNearestBlock(bot, 'chest', 2, 32);\n        for (const name of names.slice(0, 27)) {\n            if (bot.interrupt_code) return n;\n            if (await skills.putInChest(bot, name)) n++;\n        }\n        console.log(`[chest] stored ${n} stacks; empty slots now ${bot.inventory.emptySlotCount()}`);\n    }\n    if (bot.inventory.emptySlotCount() < 6 && !bot.interrupt_code) {\n        console.log(`[toss] storage left only ${bot.inventory.emptySlotCount()} empty slots (stored ${n} stacks); tossing clutter`);\n        await tossClutter(bot, 6);\n    }\n    return n;\n}",
     "primitive": true,
     "handwritten": true,
     "source": "ODYSSEY depositIntoChest (chestAPIs)",
@@ -120625,8 +120625,8 @@
       "tasks": []
     },
     "deps": [
-      "ensureChest",
-      "tossClutter"
+      "tossClutter",
+      "ensureChest"
     ],
     "embedding": [
       -0.016931552,
@@ -123703,18 +123703,19 @@
       -0.009133316
     ],
     "prev": {
-      "code": "// DESCRIPTION: Walk to the nearest chest (placing one if none) and store the given item names (or all non-tool, non-food items if empty); returns how many stacks were stored.\nasync function depositToChest(bot, itemNames = []) {\n    if (!(await ensureChest(bot)) || bot.interrupt_code) return 0;\n    await skills.goToNearestBlock(bot, 'chest', 2, 32);\n    const keep = /pickaxe|axe|sword|shovel|hoe|helmet|chestplate|leggings|boots|torch|cooked_|bread|crafting_table|shield/;\n    const names = itemNames.length ? itemNames : [...new Set(bot.inventory.items().map(i => i.name))].filter(n => !keep.test(n));\n    let n = 0;\n    for (const name of names.slice(0, 27)) {\n        if (bot.interrupt_code) return n;\n        if (await skills.putInChest(bot, name)) n++;\n    }\n    return n;\n}",
-      "description": "Walk to the nearest chest (placing one if none) and store the given item names (or all non-tool, non-food items if empty); returns how many stacks were stored.",
-      "deps": [
-        "ensureChest"
-      ]
-    },
-    "handwritten_original": {
       "code": "async function depositToChest(bot, itemNames = []) {\n    const keep = /pickaxe|axe|sword|shovel|hoe|helmet|chestplate|leggings|boots|torch|cooked_|bread|crafting_table|shield/;\n    const names = itemNames.length ? itemNames : [...new Set(bot.inventory.items().map(i => i.name))].filter(n => !keep.test(n));\n    let n = 0;\n    if (await ensureChest(bot) && !bot.interrupt_code) {\n        await skills.goToNearestBlock(bot, 'chest', 2, 32);\n        for (const name of names.slice(0, 27)) {\n            if (bot.interrupt_code) return n;\n            if (await skills.putInChest(bot, name)) n++;\n        }\n    }\n    if (bot.inventory.emptySlotCount() < 6 && !bot.interrupt_code) {\n        console.log(`[toss] storage left only ${bot.inventory.emptySlotCount()} empty slots (stored ${n} stacks); tossing clutter`);\n        await tossClutter(bot, 6);\n    }\n    return n;\n}",
       "description": "Store the given item names (or all non-essential items) in the nearest chest within 32 blocks (placing one if needed); if storage fails, toss low-value clutter to free at least 6 slots; returns how many stacks were stored.",
       "deps": [
         "ensureChest",
         "tossClutter"
+      ]
+    },
+    "handwritten_original": {
+      "code": "async function depositToChest(bot, itemNames = []) {\n    if (bot.inventory.emptySlotCount() < 3) {\n        console.log(`[toss] only ${bot.inventory.emptySlotCount()} empty slots; tossing clutter first (no walking)`);\n        await tossClutter(bot, 6);\n        if (bot.interrupt_code) return 0;\n    }\n    const keep = /pickaxe|axe|sword|shovel|hoe|helmet|chestplate|leggings|boots|torch|cooked_|bread|crafting_table|shield/;\n    const names = itemNames.length ? itemNames : [...new Set(bot.inventory.items().map(i => i.name))].filter(n => !keep.test(n));\n    let n = 0;\n    if (await ensureChest(bot) && !bot.interrupt_code) {\n        await skills.goToNearestBlock(bot, 'chest', 2, 32);\n        for (const name of names.slice(0, 27)) {\n            if (bot.interrupt_code) return n;\n            if (await skills.putInChest(bot, name)) n++;\n        }\n        console.log(`[chest] stored ${n} stacks; empty slots now ${bot.inventory.emptySlotCount()}`);\n    }\n    if (bot.inventory.emptySlotCount() < 6 && !bot.interrupt_code) {\n        console.log(`[toss] storage left only ${bot.inventory.emptySlotCount()} empty slots (stored ${n} stacks); tossing clutter`);\n        await tossClutter(bot, 6);\n    }\n    return n;\n}",
+      "description": "Free inventory space: if fewer than 3 slots are empty, first toss low-value clutter on the spot (no walking); then store the given item names (or all non-essential items) in the nearest chest within 32 blocks (placing one if needed), tossing clutter again if still under 6 empty slots; returns how many stacks were stored.",
+      "deps": [
+        "tossClutter",
+        "ensureChest"
       ]
     }
   },

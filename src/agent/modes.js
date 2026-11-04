@@ -118,7 +118,12 @@ const modes_list = [
                 this.stuck_time = 0;
                 this.prev_dig_block = null;
             }
-            const max_stuck_time = cur_dig_block?.name === 'obsidian' ? this.max_stuck_time * 2 : this.max_stuck_time;
+            const label = agent.actions?.currentActionLabel || '';
+            const storing = /Store items|deposit|toss|clutter|chest/i.test(label);   // fix3: storage work stands still on purpose
+            let max_stuck_time = cur_dig_block?.name === 'obsidian' ? this.max_stuck_time * 2 : this.max_stuck_time;
+            if (storing) max_stuck_time = Math.max(max_stuck_time, 120);
+            if (storing && this.stuck_time > this.max_stuck_time && !this._warnedStoring) { console.log(`[unstuck] not interrupting storage action "${label}" until ${max_stuck_time}s`); this._warnedStoring = true; }
+            if (!storing) this._warnedStoring = false;
             if (this.stuck_time > max_stuck_time) {
                 say(agent, 'I\'m stuck!');
                 this.stuck_time = 0;
