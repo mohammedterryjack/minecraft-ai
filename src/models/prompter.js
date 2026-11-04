@@ -91,18 +91,11 @@ export class Prompter {
         
         let embedding_model_profile = null;
         if (this.profile.embedding) {
-            try {
-                embedding_model_profile = selectAPI(this.profile.embedding);
-            } catch (e) {
-                embedding_model_profile = null;
-            }
+            embedding_model_profile = selectAPI(this.profile.embedding);
         }
-        if (embedding_model_profile) {
-            this.embedding_model = createModel(embedding_model_profile);
-        }
-        else {
-            this.embedding_model = createModel({api: chat_model_profile.api});
-        }
+        // fix14: embeddings are the only skill/example search path; no fallback
+        if (!embedding_model_profile) throw new Error('profile.embedding is required (no fallback)');
+        this.embedding_model = createModel(embedding_model_profile);
 
         this.skill_libary = new SkillLibrary(agent, this.embedding_model);
         mkdirSync(`./bots/${name}`, { recursive: true });
@@ -124,9 +117,9 @@ export class Prompter {
 
     async initExamples() {
         try {
-            // word-overlap example selection (no embedding call per message; saves Gemini quota)
-            this.convo_examples = new Examples(null, settings.num_examples);
-            this.coding_examples = new Examples(null, settings.num_examples);
+            // fix14: embedding-based example selection (local nomic-embed-text)
+            this.convo_examples = new Examples(this.embedding_model, settings.num_examples);
+            this.coding_examples = new Examples(this.embedding_model, settings.num_examples);
             
             // Wait for both examples to load before proceeding
             await Promise.all([

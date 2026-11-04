@@ -70,10 +70,12 @@ export class Ollama {
     }
 
     async embed(text) {
-        let model = this.model_name || 'embeddinggemma';
-        let body = { model: model, input: text };
-        let res = await this.send(this.embedding_endpoint, body);
-        return res['embedding'];
+        // fix14: /api/embed, model pinned in memory (keep_alive -1); no fallback, fail loudly
+        if (!this.model_name) throw new Error('[embed] no embedding model configured');
+        const res = await this.send('/api/embed', { model: this.model_name, input: text, keep_alive: -1 });
+        const v = res?.embeddings?.[0];
+        if (!Array.isArray(v) || !v.length) throw new Error(`[embed] ${this.model_name} returned no embedding`);
+        return v;
     }
 
     async send(endpoint, body) {

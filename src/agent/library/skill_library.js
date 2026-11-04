@@ -1,6 +1,5 @@
 import { cosineSimilarity } from '../../utils/math.js';
 import { getSkillDocs } from './index.js';
-import { wordOverlapScore } from '../../utils/text.js';
 
 export class SkillLibrary {
     constructor(agent,embedding_model) {
@@ -13,20 +12,12 @@ export class SkillLibrary {
     async initSkillLibrary() {
         const skillDocs = getSkillDocs();
         this.skill_docs = skillDocs;
-        if (this.embedding_model) {
-            try {
-                const embeddingPromises = skillDocs.map((doc) => {
-                    return (async () => {
-                        let func_name_desc = doc.split('\n').slice(0, 2).join('');
-                        this.skill_docs_embeddings[doc] = await this.embedding_model.embed(func_name_desc);
-                    })();
-                });
-                await Promise.all(embeddingPromises);
-            } catch (error) {
-                console.warn('Error with embedding model, using word-overlap instead.');
-                this.embedding_model = null;
-            }
-        }
+        if (!this.embedding_model) throw new Error('[skill_library] embedding model required (no fallback)');
+        await Promise.all(skillDocs.map(async (doc) => {
+            const func_name_desc = doc.split('\n').slice(0, 2).join('');
+            this.skill_docs_embeddings[doc] = await this.embedding_model.embed(func_name_desc);
+        }));
+        console.log(`[skill_library] embedded ${skillDocs.length} skill docs`);
         this.always_show_skills_docs = {};
         for (const skillName of this.always_show_skills) {
             this.always_show_skills_docs[skillName] = this.skill_docs.find(doc => doc.includes(skillName));
@@ -48,14 +39,6 @@ export class SkillLibrary {
                 doc_key,
                 similarity_score: 0
             }));
-        }
-        else if (!this.embedding_model) {
-            skill_doc_similarities = Object.keys(this.skill_docs_embeddings)
-                .map(doc_key => ({
-                    doc_key,
-                    similarity_score: wordOverlapScore(message, doc_key)
-                }))
-                .sort((a, b) => b.similarity_score - a.similarity_score);
         }
         else {
             let latest_message_embedding = await this.embedding_model.embed(message);

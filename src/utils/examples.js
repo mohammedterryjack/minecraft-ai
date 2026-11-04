@@ -1,5 +1,5 @@
 import { cosineSimilarity } from './math.js';
-import { stringifyTurns, wordOverlapScore } from './text.js';
+import { stringifyTurns } from './text.js';
 
 export class Examples {
     constructor(model, select_num=2) {
@@ -20,7 +20,7 @@ export class Examples {
 
     async load(examples) {
         this.examples = examples;
-        if (!this.model) return; // Early return if no embedding model
+        if (!this.model) throw new Error('[examples] embedding model required (no fallback)');
         
         if (this.select_num === 0)
             return;
@@ -38,8 +38,7 @@ export class Examples {
             // Wait for all embeddings to complete
             await Promise.all(embeddingPromises);
         } catch (err) {
-            console.warn('Error with embedding model, using word-overlap instead.');
-            this.model = null;
+            throw new Error('[examples] embedding failed (no fallback): ' + err.message);
         }
     }
 
@@ -48,19 +47,11 @@ export class Examples {
             return [];
 
         let turn_text = this.turnsToText(turns);
-        if (this.model !== null) {
-            let embedding = await this.model.embed(turn_text);
-            this.examples.sort((a, b) => 
-                cosineSimilarity(embedding, this.embeddings[this.turnsToText(b)]) -
-                cosineSimilarity(embedding, this.embeddings[this.turnsToText(a)])
-            );
-        }
-        else {
-            this.examples.sort((a, b) => 
-                wordOverlapScore(turn_text, this.turnsToText(b)) -
-                wordOverlapScore(turn_text, this.turnsToText(a))
-            );
-        }
+        let embedding = await this.model.embed(turn_text);
+        this.examples.sort((a, b) =>
+            cosineSimilarity(embedding, this.embeddings[this.turnsToText(b)]) -
+            cosineSimilarity(embedding, this.embeddings[this.turnsToText(a)])
+        );
         let selected = this.examples.slice(0, this.select_num);
         return JSON.parse(JSON.stringify(selected)); // deep copy
     }
