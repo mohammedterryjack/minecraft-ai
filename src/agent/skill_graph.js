@@ -58,7 +58,7 @@ export function instrumentSrc(names) {
     // fix11 (B6): parent call tracked with AsyncLocalStorage (bot.__psnALS, set by voyager.js before each run; fix12: SES compartments have their own globalThis), so parallel calls get the right parent
     const wrap = `const __T = bot.__psnTrace = []; const __als = bot.__psnALS; if (!__als) throw new Error('PSN trace: bot.__psnALS (AsyncLocalStorage) missing'); const __inv = () => { try { return world.getInventoryCounts(bot); } catch { return {}; } };
 const __wrap = (n, f) => async function (...a) {
-    if (__T.length >= 400) return await f.apply(this, a);
+    if (__T.length >= 1500) return await f.apply(this, a);
     const par = __als.getStore() ?? -1;
     const rec = { name: n, args: (() => { try { return JSON.stringify(a.slice(1)).slice(0, 120); } catch { return '?'; } })(), parent: par, depth: par < 0 ? 0 : __T[par].depth + 1, o0: (bot.output || '').length, t0: Date.now(), pre: __inv() };
     const id = __T.push(rec) - 1;
@@ -66,7 +66,10 @@ const __wrap = (n, f) => async function (...a) {
     catch (e) { rec.fail = true; rec.err = String(e?.message || e).slice(0, 200); throw e; }
     finally { rec.t1 = Date.now(); rec.o1 = (bot.output || '').length; bot.__psnOut = bot.output; const post = __inv(); rec.delta = {}; for (const k of new Set([...Object.keys(rec.pre), ...Object.keys(post)])) { const d = (post[k] || 0) - (rec.pre[k] || 0); if (d) rec.delta[k] = d; } delete rec.pre; rec.intr = !!bot.interrupt_code; }
 };`;
-    return wrap + '\n' + names.map(n => `${n} = __wrap(${JSON.stringify(n)}, ${n});`).join('\n');
+    // fix21: skills.* primitives are traced too (fixed leaves: name 'skills.<fn>', status/error/timing), so a failure or death
+    // inside a primitive is attributed to the library skill that called it (PSN caller_fix). skills.log is not wrapped (it is the output channel).
+    const prim = `for (const __k of Object.keys(skills)) if (typeof skills[__k] === 'function' && __k !== 'log') skills[__k] = __wrap('skills.' + __k, skills[__k]);`;
+    return wrap + '\n' + prim + '\n' + names.map(n => `${n} = __wrap(${JSON.stringify(n)}, ${n});`).join('\n');
 }
 const FAIL_LINE = /FAILED|\bfailed\b|\bneed (?:a |an )?\w+_\w+|\bno \w+ within\b|cannot|can't|not enough/i;
 // per-call contract result: failed return/exception, or a failure line emitted by the call itself (not by its children)

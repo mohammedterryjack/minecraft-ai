@@ -768,7 +768,8 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
     _closure(name) { const g = this._graph(), seen = new Set(), st = [...(g[name] || [])]; while (st.length) { const n = st.pop(); if (seen.has(n)) continue; seen.add(n); st.push(...(g[n] || [])); } return seen; }
     // fix11 (B1): only hand-written/primitive skills with no skill deps are fixed leaves; learned skills stay repairable.
     // Names outside the library (freshly generated code) are not leaves.
-    _isLeaf(name) { const e = this.skills.find(s => s.name === name); return !!e && !!(e.primitive || e.handwritten) && !(e.deps || []).length; }
+    _isLeaf(name) { if (name.startsWith('skills.')) return true;   // fix21: traced primitives are fixed leaves
+        const e = this.skills.find(s => s.name === name); return !!e && !!(e.primitive || e.handwritten) && !(e.deps || []).length; }
     _attribute(root, task, ok, over) {
         const bot = this.agent.bot, trace = bot.__psnTrace;
         bot.__psnTrace = null;
