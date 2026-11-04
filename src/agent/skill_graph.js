@@ -48,3 +48,57 @@ export function recordRun(stats, task, ok) {
 }
 export function rate(stats) { const n = stats.success + stats.fail; return n ? stats.success / n : 0; }
 export function gateLog(msg) { console.log('[gate] ' + msg); }
+
+// ---------- fix10: PSN execution tracing + failure attribution ----------
+// After PSN skill_graph/models/execution.py SkillExecutionTrace (call_stack, call_depth, pre/post state, execution_status)
+// and optimizer/phases/reflection_chain.py (failure propagated down the executed invocation trace; caller_fix vs callee_fix).
+// instrumentSrc: JS appended after the skill library inside the staged program; rebinds every skill to a wrapper that
+// records one trace record per call (name, args, parent, depth, own output span, inventory delta, return, error).
+export function instrumentSrc(names) {
+    const wrap = `const __T = bot.__psnTrace = []; const __S = []; const __inv = () => { try { return world.getInventoryCounts(bot); } catch { return {}; } };
+const __wrap = (n, f) => async function (...a) {
+    if (__T.length >= 400) return await f.apply(this, a);
+    const rec = { name: n, args: (() => { try { return JSON.stringify(a.slice(1)).slice(0, 120); } catch { return '?'; } })(), parent: __S.length ? __S[__S.length - 1] : -1, depth: __S.length, o0: (bot.output || '').length, pre: __inv() };
+    const id = __T.push(rec) - 1; __S.push(id);
+    try { const r = await f.apply(this, a); rec.ret = r === undefined ? 'undefined' : String(JSON.stringify(r)).slice(0, 60); rec.fail = r === false || r === null || r === 0; return r; }
+    catch (e) { rec.fail = true; rec.err = String(e?.message || e).slice(0, 200); throw e; }
+    finally { __S.pop(); rec.o1 = (bot.output || '').length; const post = __inv(); rec.delta = {}; for (const k of new Set([...Object.keys(rec.pre), ...Object.keys(post)])) { const d = (post[k] || 0) - (rec.pre[k] || 0); if (d) rec.delta[k] = d; } delete rec.pre; rec.intr = !!bot.interrupt_code; }
+};`;
+    return wrap + '\n' + names.map(n => `${n} = __wrap(${JSON.stringify(n)}, ${n});`).join('\n');
+}
+const FAIL_LINE = /FAILED|\bfailed\b|\bneed (?:a |an )?\w+_\w+|\bno \w+ within\b|cannot|can't|not enough/i;
+// per-call contract result: failed return/exception, or a failure line emitted by the call itself (not by its children)
+export function annotateTrace(trace, output) {
+    const out = String(output || '');
+    trace.forEach((r, i) => {
+        const kids = trace.map((c, j) => [c, j]).filter(([c]) => c.parent === i).map(([c]) => [c.o0, c.o1 ?? c.o0]);
+        let own = '', p = r.o0;
+        for (const [a, b] of kids) { own += out.slice(p, a); p = Math.max(p, b); }
+        own += out.slice(p, r.o1 ?? out.length);
+        r.ownFail = own.split('\n').filter(l => FAIL_LINE.test(l)).slice(0, 4);
+        r.ok = !r.intr && !r.fail && !r.ownFail.length;
+    });
+    return trace;
+}
+export function traceText(trace, max = 40) {
+    return trace.slice(0, max).map(r => `${'  '.repeat(r.depth)}${r.name}(${r.args.replace(/^\[|\]$/g, '')}) -> ${r.err ? 'threw ' + r.err : r.ret}${r.ok ? '' : ' FAIL'}${Object.keys(r.delta || {}).length ? ' inv' + JSON.stringify(r.delta) : ''}${r.ownFail?.length ? ' | ' + r.ownFail.join(' | ').slice(0, 200) : ''}`).join('\n');
+}
+// credit assignment: blame the deepest failing call; a failing leaf (hand-written primitive, no skill deps) is never edited,
+// so responsibility moves to its caller (PSN calling_pattern_issues -> caller_fix); otherwise the callee itself (callee_fix).
+export function blame(trace, isLeaf) {
+    const failed = trace.map((r, i) => [r, i]).filter(([r]) => !r.ok && !r.intr);
+    if (!failed.length) return null;
+    let best = failed[0];
+    for (const f of failed) if (f[0].depth > best[0].depth) best = f;
+    const path = []; for (let i = best[1]; i >= 0; i = trace[i].parent) path.unshift(trace[i].name);
+    let t = best[1], kind = 'callee_fix';
+    while (t >= 0 && isLeaf(trace[t].name)) { t = trace[t].parent; kind = 'caller_fix'; }
+    if (t < 0) return { target: null, leaf: best[0].name, path, kind: 'leaf_only', evidence: best[0].ownFail.join(' | ') || best[0].err || `returned ${best[0].ret}` };
+    return { target: trace[t].name, leaf: best[0].name, path, kind, evidence: (best[0].ownFail.join(' | ') || best[0].err || `returned ${best[0].ret}`).slice(0, 400) };
+}
+// all transitive parents (skills whose dependency closure contains name)
+export function parentsOf(name, graph) {
+    const out = new Set(); let frontier = [name];
+    while (frontier.length) { const next = []; for (const [k, deps] of Object.entries(graph)) if (!out.has(k) && deps.some(d => frontier.includes(d))) { out.add(k); next.push(k); } frontier = next; }
+    out.delete(name); return [...out];
+}

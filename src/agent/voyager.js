@@ -8,7 +8,7 @@ import { getAllItems, getAllBlocks, getItemCraftingRecipes, isHostile, isDatapac
 import { cosineSimilarity } from '../utils/math.js';
 import minecraftData from 'minecraft-data';
 import { Ollama } from '../models/ollama.js';
-import { signatureOf, depsOf, missingCalls, findCycle, newStats, recordRun, rate, gateLog } from './skill_graph.js';
+import { signatureOf, depsOf, missingCalls, findCycle, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, parentsOf } from './skill_graph.js';
 const LOCAL = { model: 'qwen3:4b-instruct-2507-q4_K_M', url: 'http://192.168.1.215:11434', params: { keep_alive: '5m', format: 'json', options: { num_ctx: 8192 } } };
 export const CALLS = { local: 0, code: 0, replay: 0 };
 
@@ -345,7 +345,8 @@ export class Voyager {
         const entry = this.skills.find(s => s.name === r.name);
         const trial = entry?.candidate ? true : false;   // gate: a pending candidate gets trial runs before promotion
         if (trial) gateLog(`trial run of candidate ${r.name} (candidate ${entry.candidate.stats.success}/${entry.candidate.stats.success + entry.candidate.stats.fail}, current ${entry.stats?.success || 0}/${(entry.stats?.success || 0) + (entry.stats?.fail || 0)})`);
-        const full = this._libSrc(trial ? { [r.name]: entry.candidate.code } : {}) + '\n\nasync function __replay(bot) {\n    ' + r.call + '\n}\nawait __replay(bot);';
+        const over = {}; for (const s of this.skills) if (s.candidate && (s.name === r.name || this._closure(r.name).has(s.name))) over[s.name] = s.candidate.code;   // fix10: candidates of children are trialled in place too
+        const full = this._libSrc(over) + '\n\n' + instrumentSrc(this.skills.filter(s => new RegExp(`async\\s+function\\s+${s.name}\\s*\\(`).test(over[s.name] ?? s.code)).map(s => s.name)) + '\n\nasync function __replay(bot) {\n    try { ' + r.call + ' } finally { bot.__psnOut = bot.output; }\n}\nawait __replay(bot);';
         const staged = await this.agent.coder._stageCode(full);
         if (!staged) return { ok: false };
         const res = await this.agent.actions.runAction(`voyager:replay:${task}`, async () => { await staged.func.main(this.agent.bot); }, { timeout: 5 });
@@ -362,6 +363,7 @@ export class Voyager {
         }
         else { const v = await this.critique(task, before, after, String(res.message || '').slice(-1500)); ok = !!v.success; }
         if (entry) this._recordRun(entry, task, ok, trial);
+        this._attribute(r.name, task, ok, over);   // fix10: per-call trace -> contract results -> blame -> targeted repair
         console.log(`[voyager] replay ${r.name}: ${ok ? 'PASSED' : 'failed'}${goal ? ` (+${gainedFor(goal, before, after)} ${goal.items.join('/')})` : ''}`);
         if (r.free) console.log(`[voyager] storage replay ${r.name} output: ${String(res.message || '(none)').split(/\n|\|/).filter(l => /\[(toss|chest)\]/.test(l)).join(' | ').slice(-800)}; inv now ${JSON.stringify(after.inventory)}`);
         if (!ok) console.log(`[voyager] replay ${r.name} inv: ${this.agent.bot.inventory.emptySlotCount()} empty slots; ${JSON.stringify(after.inventory)}`);
@@ -707,12 +709,95 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         }, 3000);
     }
 
+    // fix10: keep the bot within LEASH blocks of town: travel home before picking the next task (max 3 failed tries, then 30 min pause, logged loudly)
+    async _leash() {
+        const bot = this.agent.bot, p = bot.entity.position, LEASH = 300;
+        if (String(bot.game.dimension || "").startsWith("abh")) return false;
+        const d = Math.hypot(p.x - TOWN.x, p.z - TOWN.z);
+        if (d <= LEASH || Date.now() < (this._leashPause || 0)) return false;
+        console.log(`[voyager] leash: ${d.toFixed(0)} blocks from town (> ${LEASH}); travelling home before the next task`);
+        const res = await this.agent.actions.runAction("voyager:leash", async () => { await skills.travelTo(bot, TOWN.x, TOWN.y, TOWN.z); }, { timeout: 15 });
+        const q = bot.entity.position, d2 = Math.hypot(q.x - TOWN.x, q.z - TOWN.z);
+        if (d2 <= LEASH) { this._leashFails = 0; console.log(`[voyager] leash: back within ${d2.toFixed(0)} blocks of town`); }
+        else if (!res?.interrupted && (this._leashFails = (this._leashFails || 0) + 1) >= 3) { this._leashFails = 0; this._leashPause = Date.now() + 30 * 60e3; console.log(`[voyager] leash FAILED 3 times (still ${d2.toFixed(0)} blocks away); pausing the leash for 30 min`); }
+        else console.log(`[voyager] leash: still ${d2.toFixed(0)} blocks from town`);
+        return true;
+    }
+
+    // ---------- fix10: PSN failure attribution and targeted repair ----------
+    // dependency closure of a skill (all skills it can reach through deps)
+    _closure(name) { const g = this._graph(), seen = new Set(), st = [...(g[name] || [])]; while (st.length) { const n = st.pop(); if (seen.has(n)) continue; seen.add(n); st.push(...(g[n] || [])); } return seen; }
+    _isLeaf(name) { const e = this.skills.find(s => s.name === name); return !e || !(e.deps || []).length; }
+    _attribute(root, task, ok, over) {
+        const bot = this.agent.bot, trace = bot.__psnTrace;
+        bot.__psnTrace = null;
+        if (!Array.isArray(trace) || !trace.length) { console.log('[psn] no execution trace recorded'); return; }
+        annotateTrace(trace, bot.__psnOut || '');
+        // candidate children: their contract result in this run is a trial run (regression gate)
+        for (const name of Object.keys(over)) {
+            if (name === root) continue;
+            const rec = trace.find(t => t.name === name);
+            const e = this.skills.find(s => s.name === name);
+            if (rec && e?.candidate && !rec.intr) { gateLog(`trial run of candidate ${name} inside ${root}: contract ${rec.ok ? 'ok' : 'FAILED'}`); this._recordRun(e, task, rec.ok, true); }
+        }
+        // re-validation of parents marked after a child repair
+        for (const e of this.skills.filter(s => s.revalidate)) {
+            const rec = trace.find(t => t.name === e.name);
+            if (!rec || rec.intr) continue;
+            if (rec.ok) { console.log(`[psn] re-validated ${e.name} after repair of ${e.revalidate}: contract ok`); delete e.revalidate; }
+            else console.log(`[psn] re-validation of ${e.name} after repair of ${e.revalidate}: still failing`);
+            this._saveSkills();
+        }
+        if (ok) return;
+        console.log(`[psn] execution trace of ${root} (${trace.length} calls):\n${traceText(trace)}`);
+        const b = blame(trace, n => this._isLeaf(n));
+        if (!b) { console.log(`[psn] blame: every call met its contract; failure is in the task outcome, not a dependency`); return; }
+        console.log(`[psn] blame: ${b.target || '(none editable)'} [${b.kind}] via ${b.path.join(' > ')}; deepest failure ${b.leaf}: ${b.evidence}`);
+        if (b.target) this._repairQueue = { ...b, task, trace: traceText(trace, 60) };
+    }
+    // targeted repair of the blamed skill via the code model, through the normal regression gate (saveSkill)
+    async _repair() {
+        const q = this._repairQueue; this._repairQueue = null;
+        if (!q) return false;
+        const e = this.skills.find(s => s.name === q.target);
+        if (!e) { console.log(`[psn] repair FAILED: blamed skill ${q.target} not in library`); return false; }
+        this._repairs ||= {};
+        if (Date.now() - (this._repairs[e.name] || 0) < 30 * 60e3) { console.log(`[psn] repair of ${e.name} skipped: already repaired in the last 30 min (cap)`); return false; }
+        if (e.candidate) { console.log(`[psn] repair of ${e.name} skipped: a candidate is already under trial`); return false; }
+        if (this._cursorLimited()) { console.log(`[psn] repair of ${e.name} skipped: code model at its limit`); return false; }
+        this._repairs[e.name] = Date.now();
+        const kids = [...this._closure(e.name)].map(n => this.skills.find(s => s.name === n)).filter(Boolean);
+        const system = `You repair ONE skill in a Minecraft mineflayer skill library (PSN-style targeted fix). Return a single \`\`\`javascript code block containing ONLY the fixed function, with the SAME name and a compatible signature. First line inside the block: // DESCRIPTION: <one sentence>. Call other library skills by name (they are in scope); never redefine them. Every loop must check bot.interrupt_code. If something still cannot be done, log(bot, 'FAILED: <reason>') and return a falsy value; no silent fallbacks.\nLIBRARY:\n${this.catalogue()}`;
+        const user = `Blamed skill: ${e.name} (${q.kind === 'caller_fix' ? 'it calls the leaf ' + q.leaf + ' in a situation where the leaf cannot succeed: fix how/when it calls it, e.g. obtain the missing prerequisite first' : 'its own logic failed'})\nTask that failed: ${q.task}\nFailure path: ${q.path.join(' > ')}\nEvidence: ${q.evidence}\n--- execution trace (indent = call depth) ---\n${q.trace}\n--- current code of ${e.name} ---\n${e.code}\n--- skills it uses ---\n${kids.map(k => '// ' + k.description + '\n' + signatureOf(k.code, k.name)).join('\n')}\nWrite the fixed ${e.name}:`;
+        console.log(`[psn] REPAIR ${e.name} [${q.kind}] with the code model (evidence: ${q.evidence.slice(0, 160)})`);
+        let reply;
+        try { reply = await this._ask(system, user); } catch (err) { console.log(`[psn] repair FAILED for ${e.name}: ${err.message}`); return false; }
+        const code = extractCode(reply);
+        const fn = code && code.match(/async\s+function\s+([A-Za-z_]\w*)\s*\(/);
+        if (!fn || fn[1] !== e.name) { console.log(`[psn] repair FAILED for ${e.name}: reply did not define async function ${e.name}`); return false; }
+        const desc = ((code.match(/\/\/\s*DESCRIPTION:\s*(.+)/) || [])[1] || e.description).trim();
+        const body = code.replace(/\n\s*await\s+\w+\(bot[^)]*\);\s*$/, '').trim();
+        const staged = await this.agent.coder._stageCode(this._libSrc({ [e.name]: body }));
+        const lint = staged ? await this.agent.coder._lintCode(staged.src_lint_copy) : 'staging failed';
+        if (lint) { console.log(`[psn] repair FAILED for ${e.name}: lint: ${String(lint).slice(0, 300)}`); return false; }
+        this._lastEffects = e.effects || [];
+        const saved = await this.saveSkill(e.name, desc, body, `repair: ${q.task}`);
+        if (!saved) { console.log(`[psn] repair of ${e.name} rejected by the gate`); return false; }
+        const parents = parentsOf(e.name, this._graph());
+        for (const p of parents) { const pe = this.skills.find(s => s.name === p); if (pe) pe.revalidate = e.name; }
+        this._saveSkills();
+        console.log(`[psn] repaired ${e.name}; marked ${parents.length} parent(s) for re-validation: ${parents.join(', ') || '(none)'}`);
+        return true;
+    }
+
     async step() {
         this._watchWindows();
         this._watchDimension();
         if (this.agent.bot.currentWindow) { const w = this.agent.bot.currentWindow; if (/CHOICE/.test(JSON.stringify(w.title))) { if (!this._choiceNoted) { this._choiceNoted = 1; console.log("[window] datapack dialog CHOICE (A Breach Happened multi_action dialog via ViaProxy) left open; not answering"); } } else console.log(`[window] STRAY ${w.type} id=${w.id} still open at step start (opened ${Math.round((Date.now() - (this._winOpenedAt || 0)) / 1000)}s ago); closing`); if (!/CHOICE/.test(JSON.stringify(w.title))) try { this.agent.bot.closeWindow(w); } catch (e) { console.log('[window] close failed: ' + e.message); } }
         this._oneshot();
         if (await this.safety()) { await this._housekeep(); return; }
+        if (await this._leash()) return;
+        if (this._repairQueue) { await this._repair(); return; }
         const before = this.observe();
         let proposal = this._milestoneTask(before) || await this.proposeTask(before);
         let task = String(proposal.task || '').trim();
