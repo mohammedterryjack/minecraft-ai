@@ -1,4 +1,6 @@
-import { writeFileSync, readFileSync, mkdirSync, existsSync } from 'fs';
+import { writeFileSync, readFileSync, mkdirSync, existsSync, renameSync } from 'fs';
+// fix7: atomic JSON writes (temp file + rename) so a kill mid-write can never leave an empty/truncated file
+function writeAtomic(fp, text) { const tmp = `${fp}.tmp-${process.pid}`; writeFileSync(tmp, text, 'utf8'); renameSync(tmp, fp); }
 import { NPCData } from './npc/data.js';
 import settings from './settings.js';
 
@@ -52,7 +54,7 @@ export class History {
             const data = readFileSync(this.full_history_fp, 'utf8');
             let full_history = JSON.parse(data);
             full_history.push(...to_store);
-            writeFileSync(this.full_history_fp, JSON.stringify(full_history, null, 4), 'utf8');
+            writeAtomic(this.full_history_fp, JSON.stringify(full_history, null, 4));
         } catch (err) {
             console.error(`Error reading ${this.name}'s full history file: ${err.message}`);
         }
@@ -90,7 +92,7 @@ export class History {
                 taskStart: this.agent.task.taskStartTime,
                 last_sender: this.agent.last_sender
             };
-            writeFileSync(this.memory_fp, JSON.stringify(data, null, 2));
+            writeAtomic(this.memory_fp, JSON.stringify(data, null, 2));
             console.log('Saved memory to:', this.memory_fp);
         } catch (error) {
             console.error('Failed to save history:', error);
@@ -104,7 +106,15 @@ export class History {
                 console.log('No memory file found.');
                 return null;
             }
-            const data = JSON.parse(readFileSync(this.memory_fp, 'utf8'));
+            const raw = readFileSync(this.memory_fp, 'utf8');
+            let data;
+            try { data = JSON.parse(raw); }
+            catch (e) {   // fix7: quarantine corrupt memory loudly instead of crash-looping on every restart
+                const q = `${this.memory_fp}.corrupt-${Date.now()}`;
+                renameSync(this.memory_fp, q);
+                console.error(`!!! [memory] CORRUPT memory file (${raw.length} bytes, ${e.message}); moved to ${q}; starting with EMPTY memory`);
+                return null;
+            }
             this.memory = data.memory || '';
             this.turns = data.turns || [];
             console.log('Loaded memory:', this.memory);
