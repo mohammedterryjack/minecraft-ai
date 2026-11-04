@@ -1,7 +1,7 @@
 import { CodeModelWithFallback } from './code_fallback.js';
 import { OpenAIStrict } from './openai_strict.js';
 import { hasKey } from '../utils/keys.js';
-import { readFileSync, mkdirSync, writeFileSync} from 'fs';
+import { readFileSync, mkdirSync, writeFileSync, renameSync} from 'fs';
 import { Examples } from '../utils/examples.js';
 import { getCommandDocs } from '../agent/commands/index.js';
 import { SkillLibrary } from "../agent/library/skill_library.js";
@@ -99,12 +99,7 @@ export class Prompter {
 
         this.skill_libary = new SkillLibrary(agent, this.embedding_model);
         mkdirSync(`./bots/${name}`, { recursive: true });
-        writeFileSync(`./bots/${name}/last_profile.json`, JSON.stringify(this.profile, null, 4), (err) => {
-            if (err) {
-                throw new Error('Failed to save profile:', err);
-            }
-            console.log("Copy profile saved.");
-        });
+        { const lp = `./bots/${name}/last_profile.json`; writeFileSync(lp + ".tmp", JSON.stringify(this.profile, null, 4)); renameSync(lp + ".tmp", lp); }
     }
 
     getName() {
