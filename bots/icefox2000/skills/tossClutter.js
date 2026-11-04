@@ -11,7 +11,8 @@ async function tossClutter(bot, minFree = 6) {
         if (!pick) { pick = Object.keys(excess).find(k => (counts[k] || 0) > excess[k]); n = pick ? counts[pick] - excess[pick] : 0; }
         if (!pick) break;
         const it = bot.inventory.items().find(x => x.name === pick);
-        await bot.toss(it.type, null, Math.min(n, it.count));
+        if (bot.currentWindow) { console.log(`[toss] closing open ${bot.currentWindow.type} window first`); bot.closeWindow(bot.currentWindow); await skills.wait(bot, 500); }
+        if (n >= it.count) await bot.tossStack(it); else await bot.toss(it.type, null, n);
         console.log(`[toss] tossed ${Math.min(n, it.count)} ${pick} (empty slots now ${bot.inventory.emptySlotCount()})`);
     }
     if (bot.inventory.emptySlotCount() < minFree) console.log(`[toss] FAILED to free ${minFree} slots; only ${bot.inventory.emptySlotCount()} empty (nothing tossable left)`);
