@@ -79,6 +79,7 @@ ms.on('bot-output', (name, msg) => { if (name === AGENT) feed('chat', '💬 ' + 
 
 const app = express();
 app.use(express.static(path.join(__dir, 'public')));
+app.get('/beacon', (q, r) => { console.log('[beacon]', String(q.query.m||'').slice(0,300)); r.set('Access-Control-Allow-Origin','*').end(); });
 app.get('/state.json', (q, r) => r.json(S));
 const http = createServer(app); const out = new Server(http);
 setInterval(() => out.emit('s', S), 1000);
