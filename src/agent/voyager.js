@@ -1218,58 +1218,41 @@ Use only c; no other globals.`;
         catch (err) { this._queueContractFix(e, `post threw: ${err.message}`); return false; }
     }
 
-    // fix47: compute what can be produced from current inventory via smelting or learned producers
-    // Uses minecraft-data for smelting relationships (raw_iron -> iron_ingot) and learned producers
-    // Returns { count, sources: [{type, item, count}] } where count is total producible
+    // fix47: compute what can be produced from current inventory via learned producers ONLY
+    // NO hard-coded name patterns (e.g., _ingot -> raw_X) - uses only learned skill consumes/effects
+    // Returns { count, sources: [{type, item, count, ratio, producer}] } where count is total producible
     _computeProducibleFromInventory(targetItem, inv) {
         const sources = [];
         let total = inv[targetItem] || 0;
         sources.push({ type: 'inventory', item: targetItem, count: total });
         
-        // 1) Check minecraft-data smelting: raw_X -> X_ingot pattern (e.g., raw_iron -> iron_ingot)
-        // This is a learned-from-game-mechanics relationship, not hard-coded item tables
-        if (VERSION) {
-            try {
-                const md = minecraftData(VERSION);
-                // Common smelting patterns: raw_X -> X_ingot (1:1 ratio)
-                if (targetItem.endsWith('_ingot')) {
-                    const baseType = targetItem.replace('_ingot', '');
-                    const rawItem = `raw_${baseType}`;
-                    if (md.itemsByName[rawItem] && (inv[rawItem] || 0) > 0) {
-                        const rawCount = inv[rawItem] || 0;
-                        sources.push({ type: 'smelt', item: rawItem, count: rawCount });
-                        total += rawCount;
-                    }
-                }
-                // Also check ore -> ingot via smelting (legacy: iron_ore -> iron_ingot)
-                if (targetItem.endsWith('_ingot')) {
-                    const baseType = targetItem.replace('_ingot', '');
-                    const oreItem = `${baseType}_ore`;
-                    if (md.itemsByName[oreItem] && (inv[oreItem] || 0) > 0) {
-                        const oreCount = inv[oreItem] || 0;
-                        sources.push({ type: 'smelt', item: oreItem, count: oreCount });
-                        total += oreCount;
-                    }
-                }
-            } catch (e) {
-                console.log(`[fix47] minecraft-data lookup failed for ${targetItem}: ${e.message}`);
-            }
-        }
-        
-        // 2) Check learned producers from NeedsProducesGraph
-        if (this.npGraph) {
-            const producers = this.npGraph.getProducersOf(targetItem);
-            for (const producerKey of producers) {
-                // Find what this producer consumes and if we have it
-                const needs = this.npGraph.getRequirementsOf(producerKey) || [];
-                for (const need of needs) {
-                    if ((inv[need] || 0) > 0 && !sources.some(s => s.item === need)) {
-                        sources.push({ type: 'learned_producer', item: need, count: inv[need] || 0, producer: producerKey });
-                        // Don't double-count if it's the same item we'd smelt
-                        if (!sources.some(s => s.type === 'smelt' && s.item === need)) {
-                            total += inv[need] || 0;
-                        }
-                    }
+        // Use ONLY learned producers from skills with effects containing targetItem
+        // Get ratio from skill's learned .consumes, determine type from skill name/task
+        const producers = this._producers(targetItem);
+        for (const { s: skill } of producers) {
+            const consumes = skill.consumes || {};
+            // Determine producer type from skill name/task (smelt, craft, etc.)
+            const taskLower = (skill.task || skill.name || '').toLowerCase();
+            let prodType = 'learned_producer';
+            if (/smelt|cook|furnace/.test(taskLower)) prodType = 'smelt';
+            else if (/craft|make|create/.test(taskLower)) prodType = 'craft';
+            
+            // For each consumed item, check if we have it in inventory
+            for (const [consumeItem, consumeCount] of Object.entries(consumes)) {
+                const haveCount = inv[consumeItem] || 0;
+                if (haveCount > 0 && !sources.some(s => s.item === consumeItem && s.producer === skill.name)) {
+                    // Ratio: how many target items per consume (from learned delta)
+                    // Default to 1:1 if consumeCount is 0 or missing (shouldn't happen)
+                    const ratio = consumeCount > 0 ? 1 / consumeCount : 1;
+                    const producibleFromThis = Math.floor(haveCount * ratio);
+                    sources.push({ 
+                        type: prodType, 
+                        item: consumeItem, 
+                        count: producibleFromThis,
+                        ratio,
+                        producer: skill.name
+                    });
+                    total += producibleFromThis;
                 }
             }
         }
@@ -1278,7 +1261,7 @@ Use only c; no other globals.`;
     }
 
     // fix47: compute the real shortfall after considering inventory + producible items
-    // Returns { shortfall, plan } where plan describes what to do (smelt, nothing, or gather)
+    // Returns { shortfall, plan, produceItems } where plan comes from learned producer type
     _computeShortfall(goal, inv) {
         const targetItem = goal.item;
         const targetCount = goal.count;
@@ -1286,14 +1269,17 @@ Use only c; no other globals.`;
         const producible = this._computeProducibleFromInventory(targetItem, inv);
         const shortfall = Math.max(0, targetCount - producible.count);
         
-        // Determine what plan to use
+        // Determine what plan to use - plan type comes from learned producer, not hard-coded
         if (shortfall === 0) {
             // Can satisfy from inventory + producing
-            const smeltSources = producible.sources.filter(s => s.type === 'smelt' && s.count > 0);
-            if (smeltSources.length > 0) {
-                return { shortfall: 0, plan: 'smelt', smeltItems: smeltSources };
+            // Filter to sources that can actually produce (not inventory itself)
+            const produceSources = producible.sources.filter(s => s.type !== 'inventory' && s.count > 0);
+            if (produceSources.length > 0) {
+                // Plan type comes from the first producer's type (smelt, craft, or learned_producer)
+                const planType = produceSources[0].type;
+                return { shortfall: 0, plan: planType, produceItems: produceSources, producible };
             }
-            return { shortfall: 0, plan: 'none' };
+            return { shortfall: 0, plan: 'none', producible };
         }
         
         return { shortfall, plan: 'gather', producible };
@@ -1311,9 +1297,9 @@ Use only c; no other globals.`;
 
         const inv = state.inventory || {};
         
-        // fix47: compute what we have + can produce
+        // fix47: compute what we have + can produce (no fallback - producible is the single source)
         const shortfallInfo = this._computeShortfall(goal, inv);
-        const have = shortfallInfo.producible?.count || (goal.items ? goal.items.reduce((a, it) => a + (inv[it] || 0), 0) : (inv[goal.item] || 0));
+        const have = shortfallInfo.producible.count;
 
         // 1) Check inventory against learned skill contracts that produce the goal item
         // Find skills whose learned effects include the goal item and have a postcondition
@@ -1363,12 +1349,12 @@ Use only c; no other globals.`;
             return { satisfied: true, reason: `already have ${have}/${goal.count} ${goal.item} (inventory check; no learned producer)` };
         }
 
-        // fix47: check if we can produce enough via smelting (inventory-first planning)
-        if (shortfallInfo.shortfall === 0 && shortfallInfo.plan === 'smelt') {
-            const smeltItems = shortfallInfo.smeltItems.map(s => `${s.count} ${s.item}`).join(', ');
+        // fix47: check if we can produce enough via learned producers (inventory-first planning)
+        if (shortfallInfo.shortfall === 0 && shortfallInfo.produceItems?.length > 0) {
+            const produceDesc = shortfallInfo.produceItems.map(s => `${s.count} ${s.item} via ${s.producer || s.type}`).join(', ');
             return {
                 satisfied: false,
-                reason: `need ${goal.count} ${goal.item}, can produce by smelting: ${smeltItems}`,
+                reason: `need ${goal.count} ${goal.item}, can produce: ${produceDesc}`,
                 plan: shortfallInfo,
                 goal
             };
@@ -2100,24 +2086,25 @@ Use only c; no other globals.`;
         if (depth >= 2) { console.log(`[psn] decompose skipped for "${task}": already a depth-${depth} subgoal`); return false; }
         if (d[task] && Date.now() - d[task].at < 30 * 60e3) { console.log(`[psn] decompose skipped for "${task}": decomposed ${Math.round((Date.now() - d[task].at) / 60e3)} min ago`); return false; }
         
-        // fix47: inventory-first planning - before queuing gather/mine subgoals, check if we can smelt
+        // fix47: inventory-first planning - before queuing gather/mine subgoals, check if we can produce
         const goal = smeltGoal(task) || countGoal(task) || parseVerboseGoal(task);
         if (goal) {
             const state = this.observe();
             const inv = state.inventory || {};
             const shortfallInfo = this._computeShortfall(goal, inv);
             
-            // If shortfall is 0 and we can produce via smelting, queue smelt subgoal instead of asking LLM
-            if (shortfallInfo.shortfall === 0 && shortfallInfo.plan === 'smelt' && shortfallInfo.smeltItems?.length > 0) {
-                const smeltSubs = shortfallInfo.smeltItems.map(s => {
-                    // Queue a smelt subgoal for each smeltable item
+            // If shortfall is 0 and we can produce via learned producers, queue produce subgoal instead of asking LLM
+            if (shortfallInfo.shortfall === 0 && shortfallInfo.produceItems?.length > 0) {
+                const produceSubs = shortfallInfo.produceItems.map(s => {
+                    // Queue a produce subgoal - type comes from learned producer (smelt, craft, etc.)
                     const needed = Math.min(s.count, goal.count - (inv[goal.item] || 0));
-                    return `Smelt ${needed} ${s.item} into ${needed} ${goal.item}`;
+                    const verb = s.type === 'smelt' ? 'Smelt' : s.type === 'craft' ? 'Craft' : 'Produce';
+                    return `${verb} ${needed} ${s.item} into ${needed} ${goal.item}`;
                 });
-                d[task] = { subs: smeltSubs, skills: [], at: Date.now(), reason: `inventory-first: can produce ${goal.item} by smelting` };
-                q.unshift(...smeltSubs.map(t => ({ task: t, parent: task, depth: depth + 1 })), { task, retry: true, depth });
+                d[task] = { subs: produceSubs, skills: [], at: Date.now(), reason: `inventory-first: can produce ${goal.item} via ${shortfallInfo.plan}` };
+                q.unshift(...produceSubs.map(t => ({ task: t, parent: task, depth: depth + 1 })), { task, retry: true, depth });
                 this._saveProgress();
-                console.log(`[psn] DECOMPOSE (inventory-first) "${task}" -> smelt: ${smeltSubs.join(', ')}; no mine/gather needed`);
+                console.log(`[psn] DECOMPOSE (inventory-first) "${task}" -> ${shortfallInfo.plan}: ${produceSubs.join(', ')}; no mine/gather needed`);
                 return true;
             }
         }
@@ -3684,26 +3671,26 @@ Voyager.SEEDED_PRIMITIVES = [
 }`,
         deps: ['moveAway', 'depositToChest'],
     },
-    // fix43: ensureCraftingTable with multi-cell retry AND inline 2x2 crafting (no craftRecipe dep to avoid cycle)
-    // The 2x2 crafting of a crafting_table does NOT need a table, so it's done inline here via bot.recipesFor/bot.craft.
-    // Plank type is derived from recipe ingredients in inventory, not hard-coded.
+    // fix43/47: ensureCraftingTable with multi-cell retry AND inline 2x2 crafting (no craftRecipe dep)
+    // Generic: for each missing ingredient, find a 2x2 recipe from recipesAll and craft it
+    // NO hard-coded item names, ratios, or patterns - all derived from mineflayer recipe data
     {
         name: 'ensureCraftingTable',
-        description: 'Ensure a crafting table is placed nearby for 3x3 recipes. If not in inventory, crafts one inline from planks (2x2, no table needed). Uses multi-cell retry if first placement fails. Returns true if a table is available.',
+        description: 'Ensure a crafting table is placed nearby for 3x3 recipes. If not in inventory, crafts one inline (2x2, no table needed). For missing ingredients, finds and crafts from available recipes. Uses multi-cell retry. Returns true if a table is available.',
         task: 'ensure a crafting table is placed nearby',
         code: `async function ensureCraftingTable(bot) {
     let table = getNearestBlock(bot, 'crafting_table', 16);
     if (table) { log(bot, \`Crafting table already nearby at \${table.position}.\`); return true; }
     let hasTable = (getInventoryCounts(bot)['crafting_table'] || 0) > 0;
     
-    // fix43/47: if no table in inventory, craft one INLINE (2x2, no table needed) - avoids craftRecipe dep cycle
-    // fix47: use recipesAll (no inventory filter) to check if recipe EXISTS, then check ingredients
     if (!hasTable) {
         console.log('[ensureCraftingTable] no crafting_table in inventory, attempting inline 2x2 craft...');
         const tableId = bot.registry.itemsByName['crafting_table']?.id;
-        // recipesAll returns all recipes regardless of inventory; recipesFor filters by inventory
-        let recipes = tableId ? bot.recipesFor(tableId, null, 1, null) : [];
-        const allRecipes = tableId ? bot.recipesAll(tableId, null, null) : [];
+        if (!tableId) throw new Error('[ensureCraftingTable] FAILED: crafting_table not in registry');
+        
+        let recipes = bot.recipesFor(tableId, null, 1, null);
+        const allRecipes = bot.recipesAll(tableId, null, null);
+        if (!allRecipes.length) throw new Error('[ensureCraftingTable] FAILED: no recipe for crafting_table in registry');
         let inv = getInventoryCounts(bot);
         let canCraft = false;
         
@@ -3731,97 +3718,87 @@ Voyager.SEEDED_PRIMITIVES = [
             }
         }
         
-        // fix47: if planks missing, try to craft planks from logs first (also 2x2, no table needed)
+        // fix47: if can't craft, try to craft missing ingredients (generic: no hard-coded names/ratios)
         if (!canCraft && !hasTable && allRecipes.length) {
             const tableRecipe = allRecipes[0];
-            const plankIngredients = (tableRecipe.delta?.filter(d => d.count < 0) || [])
-                .map(d => bot.registry.items[d.id])
-                .filter(item => item && item.name.endsWith('_planks'));
+            const ingredients = tableRecipe.delta?.filter(d => d.count < 0) || [];
             
-            for (const plankItem of plankIngredients) {
-                const plankName = plankItem.name;
-                const have = inv[plankName] || 0;
-                const need = 4; // crafting_table needs 4 planks
-                if (have < need) {
-                    // Find logs that can produce this plank type
-                    const logType = plankName.replace('_planks', '_log');
-                    const altLogType = plankName.replace('_planks', '_wood');
-                    const strippedLogType = 'stripped_' + logType;
-                    const logsInInv = [logType, altLogType, strippedLogType].filter(l => (inv[l] || 0) > 0);
+            for (const ing of ingredients) {
+                const ingItem = bot.registry.items[ing.id];
+                if (!ingItem) continue;
+                const have = inv[ingItem.name] || 0;
+                const need = Math.abs(ing.count);
+                if (have >= need) continue;
+                
+                const shortfall = need - have;
+                // Find a 2x2 recipe (no table) that produces this ingredient
+                const ingRecipes = bot.recipesAll(ingItem.id, null, null);
+                let crafted = false;
+                
+                for (const ingRecipe of ingRecipes) {
+                    // Check if we have the ingredients for this recipe
+                    const subIngs = ingRecipe.delta?.filter(d => d.count < 0) || [];
+                    const canCraftIng = subIngs.every(sub => {
+                        const subItem = bot.registry.items[sub.id];
+                        return subItem && (inv[subItem.name] || 0) >= Math.abs(sub.count);
+                    });
                     
-                    if (logsInInv.length) {
-                        const logName = logsInInv[0];
-                        const logsNeeded = Math.ceil((need - have) / 4); // 1 log = 4 planks
-                        const logsAvailable = inv[logName] || 0;
+                    if (canCraftIng) {
+                        // Compute how many times to craft based on recipe output
+                        const resultCount = ingRecipe.result?.count || 1;
+                        const craftTimes = Math.ceil(shortfall / resultCount);
                         
-                        if (logsAvailable >= logsNeeded) {
-                            // Craft planks from logs (2x2, no table)
-                            const plankId = plankItem.id;
-                            const plankRecipes = bot.recipesFor(plankId, null, 1, null);
-                            for (const pr of plankRecipes) {
-                                try {
-                                    console.log(\`[ensureCraftingTable] crafting \${plankName} from \${logName}...\`);
-                                    await bot.craft(pr, logsNeeded, null);
-                                    inv = getInventoryCounts(bot); // refresh inventory
-                                    break;
-                                } catch (e) {
-                                    console.log(\`[ensureCraftingTable] plank craft failed: \${e.message}\`);
-                                }
-                            }
-                        }
+                        console.log(\`[ensureCraftingTable] crafting \${craftTimes}x \${ingItem.name} (produces \${resultCount} each)...\`);
+                        await bot.craft(ingRecipe, craftTimes, null);
+                        inv = getInventoryCounts(bot);
+                        crafted = true;
+                        break;
                     }
+                }
+                
+                if (!crafted && shortfall > 0) {
+                    throw new Error(\`[ensureCraftingTable] FAILED: cannot craft \${ingItem.name} - no 2x2 recipe with available ingredients\`);
                 }
             }
             
-            // Retry table craft after planks
+            // Retry table craft after ingredients
             recipes = tableId ? bot.recipesFor(tableId, null, 1, null) : [];
             for (const recipe of recipes) {
-                try {
-                    const beforeCount = (getInventoryCounts(bot)['crafting_table'] || 0);
-                    await bot.craft(recipe, 1, null);
-                    const afterCount = (getInventoryCounts(bot)['crafting_table'] || 0);
-                    if (afterCount > beforeCount) {
-                        log(bot, 'Crafted crafting_table (2x2, inline after crafting planks).');
-                        hasTable = true;
-                        canCraft = true;
-                        break;
-                    }
-                } catch (e) {
-                    console.log(\`[ensureCraftingTable] inline craft retry failed: \${e.message}\`);
+                const beforeCount = (getInventoryCounts(bot)['crafting_table'] || 0);
+                await bot.craft(recipe, 1, null);
+                const afterCount = (getInventoryCounts(bot)['crafting_table'] || 0);
+                if (afterCount > beforeCount) {
+                    log(bot, 'Crafted crafting_table (2x2, inline after crafting ingredients).');
+                    hasTable = true;
+                    canCraft = true;
+                    break;
                 }
             }
         }
         
-        // FAIL loud if still can't craft: report exactly what's missing
+        // FAIL loud if still can't craft
         if (!canCraft && !hasTable) {
             inv = getInventoryCounts(bot);
             const missingIngredients = [];
-            if (allRecipes.length) {
-                const recipe = allRecipes[0];
-                const ingredients = recipe.delta?.filter(d => d.count < 0) || [];
-                for (const ing of ingredients) {
-                    const ingItem = bot.registry.items[ing.id];
-                    if (ingItem) {
-                        const have = inv[ingItem.name] || 0;
-                        const need = Math.abs(ing.count);
-                        if (have < need) {
-                            missingIngredients.push(\`\${ingItem.name} (need \${need}, have \${have})\`);
-                        }
+            const recipe = allRecipes[0];
+            const ingredients = recipe.delta?.filter(d => d.count < 0) || [];
+            for (const ing of ingredients) {
+                const ingItem = bot.registry.items[ing.id];
+                if (ingItem) {
+                    const have = inv[ingItem.name] || 0;
+                    const need = Math.abs(ing.count);
+                    if (have < need) {
+                        missingIngredients.push(\`\${ingItem.name} (need \${need}, have \${have})\`);
                     }
                 }
             }
-            if (missingIngredients.length) {
-                log(bot, \`FAILED: crafting_table requires planks - missing: \${missingIngredients.join(', ')}\`);
-            } else {
-                log(bot, 'FAILED: no crafting_table in inventory and cannot craft (no recipe or unknown error)');
-            }
-            return false;
+            throw new Error(\`[ensureCraftingTable] FAILED: cannot craft - missing: \${missingIngredients.join(', ') || 'unknown'}\`);
         }
     }
     
-    // fix25: multi-cell retry pattern (same as craftRecipe/placeBlock)
+    // fix25: multi-cell retry pattern
     const freeSpaces = getAllFreeSpaces(bot, 1, 6, 5);
-    if (!freeSpaces.length) { log(bot, 'FAILED: no free space within 6 blocks to place crafting_table'); return false; }
+    if (!freeSpaces.length) throw new Error('[ensureCraftingTable] FAILED: no free space within 6 blocks to place crafting_table');
     let placed = false;
     const tried = [];
     for (const pos of freeSpaces) {
@@ -3839,8 +3816,7 @@ Voyager.SEEDED_PRIMITIVES = [
         else console.log(\`[ensureCraftingTable] placeBlock returned true at \${tried[tried.length - 1]} but block is \${check?.name || 'null'}, trying next cell...\`);
     }
     if (!placed) {
-        log(bot, \`FAILED: could not place crafting_table at any of \${tried.length} free space(s): \${tried.join(', ')}\`);
-        return false;
+        throw new Error(\`[ensureCraftingTable] FAILED: could not place crafting_table at any of \${tried.length} free space(s): \${tried.join(', ')}\`);
     }
     return true;
 }`,
