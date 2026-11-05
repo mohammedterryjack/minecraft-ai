@@ -1219,23 +1219,18 @@ Use only c; no other globals.`;
     }
 
     // fix47: compute what can be produced from current inventory via learned producers ONLY
-    // NO hard-coded name patterns (e.g., _ingot -> raw_X) - uses only learned skill consumes/effects
-    // Returns { count, sources: [{type, item, count, ratio, producer}] } where count is total producible
+    // NO hard-coded name patterns - uses only learned skill consumes/effects
+    // Returns { count, sources: [{item, count, ratio, producer, task}] } where count is total producible
     _computeProducibleFromInventory(targetItem, inv) {
         const sources = [];
         let total = inv[targetItem] || 0;
         sources.push({ type: 'inventory', item: targetItem, count: total });
         
         // Use ONLY learned producers from skills with effects containing targetItem
-        // Get ratio from skill's learned .consumes, determine type from skill name/task
+        // Get ratio from skill's learned .consumes, store skill's task for subgoal generation
         const producers = this._producers(targetItem);
         for (const { s: skill } of producers) {
             const consumes = skill.consumes || {};
-            // Determine producer type from skill name/task (smelt, craft, etc.)
-            const taskLower = (skill.task || skill.name || '').toLowerCase();
-            let prodType = 'learned_producer';
-            if (/smelt|cook|furnace/.test(taskLower)) prodType = 'smelt';
-            else if (/craft|make|create/.test(taskLower)) prodType = 'craft';
             
             // For each consumed item, check if we have it in inventory
             for (const [consumeItem, consumeCount] of Object.entries(consumes)) {
@@ -1246,11 +1241,12 @@ Use only c; no other globals.`;
                     const ratio = consumeCount > 0 ? 1 / consumeCount : 1;
                     const producibleFromThis = Math.floor(haveCount * ratio);
                     sources.push({ 
-                        type: prodType, 
+                        type: 'learned_producer',
                         item: consumeItem, 
                         count: producibleFromThis,
                         ratio,
-                        producer: skill.name
+                        producer: skill.name,
+                        task: skill.task  // Store the learned skill's task for subgoal
                     });
                     total += producibleFromThis;
                 }
@@ -1261,7 +1257,7 @@ Use only c; no other globals.`;
     }
 
     // fix47: compute the real shortfall after considering inventory + producible items
-    // Returns { shortfall, plan, produceItems } where plan comes from learned producer type
+    // Returns { shortfall, plan, produceItems } where plan is 'learned', 'none', or 'gather'
     _computeShortfall(goal, inv) {
         const targetItem = goal.item;
         const targetCount = goal.count;
@@ -1269,15 +1265,11 @@ Use only c; no other globals.`;
         const producible = this._computeProducibleFromInventory(targetItem, inv);
         const shortfall = Math.max(0, targetCount - producible.count);
         
-        // Determine what plan to use - plan type comes from learned producer, not hard-coded
         if (shortfall === 0) {
             // Can satisfy from inventory + producing
-            // Filter to sources that can actually produce (not inventory itself)
             const produceSources = producible.sources.filter(s => s.type !== 'inventory' && s.count > 0);
             if (produceSources.length > 0) {
-                // Plan type comes from the first producer's type (smelt, craft, or learned_producer)
-                const planType = produceSources[0].type;
-                return { shortfall: 0, plan: planType, produceItems: produceSources, producible };
+                return { shortfall: 0, plan: 'learned', produceItems: produceSources, producible };
             }
             return { shortfall: 0, plan: 'none', producible };
         }
@@ -2093,18 +2085,22 @@ Use only c; no other globals.`;
             const inv = state.inventory || {};
             const shortfallInfo = this._computeShortfall(goal, inv);
             
-            // If shortfall is 0 and we can produce via learned producers, queue produce subgoal instead of asking LLM
+            // If shortfall is 0 and we can produce via learned producers, queue the learned skill's task as subgoal
             if (shortfallInfo.shortfall === 0 && shortfallInfo.produceItems?.length > 0) {
                 const produceSubs = shortfallInfo.produceItems.map(s => {
-                    // Queue a produce subgoal - type comes from learned producer (smelt, craft, etc.)
+                    // Use the learned skill's own task string, scaled to needed count
                     const needed = Math.min(s.count, goal.count - (inv[goal.item] || 0));
-                    const verb = s.type === 'smelt' ? 'Smelt' : s.type === 'craft' ? 'Craft' : 'Produce';
-                    return `${verb} ${needed} ${s.item} into ${needed} ${goal.item}`;
+                    if (s.task) {
+                        // Scale the count in the task string if it contains a number
+                        return s.task.replace(/\d+/, String(needed));
+                    }
+                    // Fallback: use producer name with needed count
+                    return `${s.producer} ${needed}`;
                 });
-                d[task] = { subs: produceSubs, skills: [], at: Date.now(), reason: `inventory-first: can produce ${goal.item} via ${shortfallInfo.plan}` };
+                d[task] = { subs: produceSubs, skills: [], at: Date.now(), reason: `inventory-first: can produce ${goal.item} via learned producers` };
                 q.unshift(...produceSubs.map(t => ({ task: t, parent: task, depth: depth + 1 })), { task, retry: true, depth });
                 this._saveProgress();
-                console.log(`[psn] DECOMPOSE (inventory-first) "${task}" -> ${shortfallInfo.plan}: ${produceSubs.join(', ')}; no mine/gather needed`);
+                console.log(`[psn] DECOMPOSE (inventory-first) "${task}" -> learned: ${produceSubs.join(', ')}; no mine/gather needed`);
                 return true;
             }
         }
@@ -3745,7 +3741,8 @@ Voyager.SEEDED_PRIMITIVES = [
                     
                     if (canCraftIng) {
                         // Compute how many times to craft based on recipe output
-                        const resultCount = ingRecipe.result?.count || 1;
+                        if (!ingRecipe.result?.count) throw new Error(\`[ensureCraftingTable] FAILED: recipe for \${ingItem.name} has no result.count\`);
+                        const resultCount = ingRecipe.result.count;
                         const craftTimes = Math.ceil(shortfall / resultCount);
                         
                         console.log(\`[ensureCraftingTable] crafting \${craftTimes}x \${ingItem.name} (produces \${resultCount} each)...\`);

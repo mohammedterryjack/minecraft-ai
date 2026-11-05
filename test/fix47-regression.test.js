@@ -182,9 +182,9 @@ describe('fix47: decompose subtracts inventory and producible items', () => {
         assert.strictEqual(shortfall, 2, 'Should need 2 more iron_ingot when have 2 raw_iron + 1 ingot for 5 needed');
     });
 
-    it('should use _computeShortfall to plan smelt instead of mine when raw_iron available', async () => {
+    it('should use _computeShortfall to plan learned producer instead of mine when raw_iron available', async () => {
         // This tests the actual Voyager._computeShortfall method behavior
-        // Now uses ONLY learned producers - no hard-coded name patterns
+        // Uses ONLY learned producers - plan is always 'learned' (no type inference)
         const { Voyager, _setVersionForTest } = await import('../src/agent/voyager.js');
         
         _setVersionForTest('1.20.4');
@@ -194,7 +194,7 @@ describe('fix47: decompose subtracts inventory and producible items', () => {
         // Seed a learned skill that produces iron_ingot from raw_iron (learned from past runs)
         voyager.skills = [{
             name: 'smeltRawIron',
-            task: 'Smelt raw_iron into iron_ingot',
+            task: 'Smelt 1 raw_iron into 1 iron_ingot',
             effects: ['iron_ingot'],
             consumes: { raw_iron: 1 },  // Learned: consumes 1 raw_iron per iron_ingot
             demoted: false,
@@ -204,7 +204,7 @@ describe('fix47: decompose subtracts inventory and producible items', () => {
         voyager.npGraph = null;
         
         // Test: goal 3 iron_ingot with inv {raw_iron: 28, iron_ingot: 1}
-        // Should plan to smelt via learned producer
+        // Should plan to use learned producer
         const goal = { item: 'iron_ingot', count: 3, items: ['iron_ingot'] };
         const inv = { raw_iron: 28, iron_ingot: 1 };
         
@@ -212,12 +212,13 @@ describe('fix47: decompose subtracts inventory and producible items', () => {
         
         // With 1 in inventory + 28 producible via learned skill = 29 total
         assert.strictEqual(result.shortfall, 0, 'Shortfall should be 0 (have 1 + can produce 28 via learned skill)');
-        assert.strictEqual(result.plan, 'smelt', 'Plan should be "smelt" (from learned producer task)');
+        assert.strictEqual(result.plan, 'learned', 'Plan should be "learned"');
         assert.ok(result.produceItems?.length > 0, 'Should have produce items identified');
         assert.ok(result.produceItems?.some(s => s.item === 'raw_iron'), 'Should identify raw_iron as source');
+        assert.ok(result.produceItems?.some(s => s.task === 'Smelt 1 raw_iron into 1 iron_ingot'), 'Should include skill task string');
     });
 
-    it('should identify smelt plan when can satisfy goal entirely from producible', async () => {
+    it('should identify learned plan when can satisfy goal entirely from producible', async () => {
         const { Voyager, _setVersionForTest } = await import('../src/agent/voyager.js');
         
         _setVersionForTest('1.20.4');
@@ -226,7 +227,7 @@ describe('fix47: decompose subtracts inventory and producible items', () => {
         const voyager = Object.create(Voyager.prototype);
         voyager.skills = [{
             name: 'smeltRawIron',
-            task: 'Smelt raw_iron into iron_ingot',
+            task: 'Smelt 1 raw_iron into 1 iron_ingot',
             effects: ['iron_ingot'],
             consumes: { raw_iron: 1 },
             demoted: false,
@@ -242,7 +243,7 @@ describe('fix47: decompose subtracts inventory and producible items', () => {
         const result = voyager._computeShortfall(goal, inv);
         
         assert.strictEqual(result.shortfall, 0, 'Shortfall should be 0 (can produce 28 via learned skill)');
-        assert.strictEqual(result.plan, 'smelt', 'Should plan to smelt');
+        assert.strictEqual(result.plan, 'learned', 'Should plan learned');
     });
 });
 
