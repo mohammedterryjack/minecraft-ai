@@ -17,15 +17,39 @@ if (!pathfinderGoals || !pathfinderGoals.GoalNear) {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// fix39: exported standalone helper for the real skills.*/world.* API surface (from module exports, not JSDoc)
-// Used by voyager.js repair prompts to inject the API catalogue (avoids goToBlock hallucinations)
-let _realAPICache = null;
+// fix40: unified bare-name API - all functions (built-in + learned) use bare names only
+// Exported for voyager.js to build the unified signature list for prompts
+let _bareAPICache = null;
+export function getBareAPI() {
+    if (_bareAPICache) return _bareAPICache;
+    const extractSig = (fn, modName) => {
+        const str = fn.toString();
+        const match = str.match(/function\s+\w+\s*\(([^)]*)\)/);
+        if (!match) return null;
+        const params = match[1].trim();
+        return { name: fn.name, sig: `${fn.name}(${params})`, source: modName };
+    };
+    const skillsFns = Object.keys(skills).filter(k => typeof skills[k] === 'function' && k !== 'log')
+        .map(k => extractSig(skills[k], 'skills')).filter(Boolean);
+    const worldFns = Object.keys(world).filter(k => typeof world[k] === 'function')
+        .map(k => extractSig(world[k], 'world')).filter(Boolean);
+    const all = [...skillsFns, ...worldFns];
+    _bareAPICache = { 
+        names: new Set(all.map(f => f.name)),
+        sigs: all.map(f => f.sig),
+        byName: Object.fromEntries(all.map(f => [f.name, f]))
+    };
+    return _bareAPICache;
+}
+// fix40: legacy getRealAPI for compatibility (returns both bare and prefixed forms)
 export function getRealAPI() {
-    if (_realAPICache) return _realAPICache;
-    const realSkillsAPI = Object.keys(skills).filter(k => typeof skills[k] === 'function').map(k => `skills.${k}`);
-    const realWorldAPI = Object.keys(world).filter(k => typeof world[k] === 'function').map(k => `world.${k}`);
-    _realAPICache = { set: new Set([...realSkillsAPI, ...realWorldAPI]), list: [...realSkillsAPI, ...realWorldAPI] };
-    return _realAPICache;
+    const bare = getBareAPI();
+    const list = bare.sigs.map(s => {
+        const name = s.split('(')[0];
+        const fn = bare.byName[name];
+        return fn ? `${fn.source}.${s}` : s;
+    });
+    return { set: new Set(list), list };
 }
 
 export class Coder {
@@ -143,8 +167,10 @@ export class Coder {
         catch (e) { return `syntax error: ${e.message}`; }
         const bot = this.agent.bot, reg = bot.registry;
         const declared = new Set(knownNames), assigned = new Set(), errs = new Set();
-        // fix38: include pathfinder goals in sandbox (they are exposed in the compartment)
-        const sandbox = new Set(['skills', 'world', 'log', 'sleep', 'Vec3', 'goals',
+        // fix40: sandbox includes all bare-name builtins + goals + utilities
+        // Note: 'skills' and 'world' objects are NOT available - use bare names
+        const bareAPI = getBareAPI();
+        const sandbox = new Set([...bareAPI.names, 'log', 'sleep', 'Vec3', 'goals',
             'GoalNear', 'GoalFollow', 'GoalInvert', 'GoalBlock', 'GoalXZ', 'GoalNearXZ',
             'GoalGetToBlock', 'GoalLookAtBlock', 'GoalBreakBlock', 'GoalCompositeAny', 'GoalCompositeAll']);
         const nodes = [];
@@ -184,29 +210,44 @@ export class Coder {
         }
         return prev[b.length];
     }
-    // fix34: get the real API surface from module exports (not JSDoc docs)
-    _getRealAPI() {
-        if (this._realAPICache) return this._realAPICache;
-        const realSkillsAPI = Object.keys(skills).filter(k => typeof skills[k] === 'function').map(k => `skills.${k}`);
-        const realWorldAPI = Object.keys(world).filter(k => typeof world[k] === 'function').map(k => `world.${k}`);
-        this._realAPICache = { set: new Set([...realSkillsAPI, ...realWorldAPI]), list: [...realSkillsAPI, ...realWorldAPI] };
-        return this._realAPICache;
+    // fix40: get unified bare-name API (built-in + learned)
+    _getUnifiedAPI() {
+        const bare = getBareAPI();
+        const learned = this._getLearnedSkillNames();
+        return {
+            names: new Set([...bare.names, ...learned]),
+            builtInNames: bare.names,
+            learnedNames: new Set(learned),
+            builtInSigs: bare.sigs
+        };
     }
-    // fix34: find nearest real API call by edit distance; returns { match, dist } or null
-    _nearestAPI(call) {
-        const { list } = this._getRealAPI();
-        const fnName = call.split('.').pop().toLowerCase();
-        const prefix = call.startsWith('world.') ? 'world.' : 'skills.';
-        const sameModule = list.filter(r => r.startsWith(prefix));
+    // fix40: get learned skill names from voyager (bare function names)
+    _getLearnedSkillNames() {
+        const voyager = this.agent.voyager;
+        if (!voyager || !Array.isArray(voyager.skills)) return [];
+        return voyager.skills.filter(s => !s.demoted && !s.mergedInto).map(s => s.name);
+    }
+    // fix40: find nearest bare-name function by edit distance (searches unified pool: builtins + learned)
+    // NO autocorrect - suggestions only for lint feedback
+    _nearestBareName(name) {
+        const { names, builtInNames, learnedNames } = this._getUnifiedAPI();
+        const lower = name.toLowerCase();
         let best = null, bestDist = Infinity;
-        for (const r of sameModule) {
-            const dist = this._lev(fnName, r.split('.').pop().toLowerCase());
-            if (dist < bestDist) { best = r; bestDist = dist; }
+        for (const n of names) {
+            const dist = this._lev(lower, n.toLowerCase());
+            if (dist < bestDist) { best = n; bestDist = dist; }
         }
-        return best ? { match: best, dist: bestDist } : null;
+        if (!best || bestDist > 8) return null;
+        return { 
+            match: best, 
+            dist: bestDist, 
+            isBuiltIn: builtInNames.has(best),
+            isLearned: learnedNames.has(best)
+        };
     }
-    // fix34: extract skills.*/world.* calls from code using acorn (avoids false positives in strings/comments)
-    _extractApiCalls(code) {
+    // fix40: extract skills.*/world.* calls from code using acorn - these are NOW FORBIDDEN
+    // All functions must be called by bare name, not with skills.*/world.* prefix
+    _extractOldStyleCalls(code) {
         let ast;
         try { ast = acorn.parse(code, { ecmaVersion: 'latest', sourceType: 'module', allowAwaitOutsideFunction: true }); }
         catch (e) { return { calls: [], positions: [], error: e.message }; }
@@ -241,25 +282,51 @@ export class Coder {
     }
     async  _lintCode(code) {
         let result = '#### CODE ERROR INFO ###\n';
-        // fix34: use acorn to extract actual API calls (not regex on strings/comments)
-        const { calls, error: parseError } = this._extractApiCalls(code);
+        // fix40: use acorn to extract old-style skills.*/world.* calls - these are NOW FORBIDDEN
+        const { calls: oldStyleCalls, error: parseError } = this._extractOldStyleCalls(code);
         if (parseError) {
             result += `Syntax error (cannot parse): ${parseError}\n`;
             return result;
         }
-        const { set, list } = this._getRealAPI();
-        const missingCalls = [...new Set(calls.filter(c => !set.has(c)))];
-        if (missingCalls.length > 0) {
-            result += 'These functions do not exist:\n';
-            result += missingCalls.map(m => {
-                const nearest = this._nearestAPI(m);
-                const scored = list.map(r => ({ r, dist: this._lev(m.split('.').pop().toLowerCase(), r.split('.').pop().toLowerCase()) }))
-                    .sort((a, b) => a.dist - b.dist);
-                const close = scored.filter(s => s.dist <= 8).slice(0, 5).map(s => s.r);
-                return `${m}  -> did you mean: ${close.length ? close.join(', ') : '(none close)'}`;
+        const { builtInNames, learnedNames, builtInSigs } = this._getUnifiedAPI();
+        const learned = this._getLearnedSkillNames();
+        // fix40: ANY skills.*/world.* call is an error - must use bare names
+        if (oldStyleCalls.length > 0) {
+            result += 'ERROR: Old-style skills.*/world.* calls are forbidden. Use bare function names instead.\n';
+            result += 'The following calls must be changed to bare names:\n';
+            result += oldStyleCalls.map(call => {
+                const fnName = call.split('.').pop();
+                // Find nearest match in unified pool (built-in + learned)
+                const nearest = this._nearestBareName(fnName);
+                const suggestions = [];
+                // Check if the exact bare name exists
+                if (builtInNames.has(fnName)) {
+                    suggestions.push(`${fnName} (built-in, use bare name)`);
+                } else if (learnedNames.has(fnName)) {
+                    suggestions.push(`${fnName} (learned, use bare name)`);
+                } else if (nearest) {
+                    const label = nearest.isBuiltIn ? 'built-in' : nearest.isLearned ? 'learned' : '';
+                    suggestions.push(`${nearest.match} (${label}, use bare name)`);
+                }
+                // Also show other close matches
+                const allNames = [...builtInNames, ...learnedNames];
+                const scored = allNames.map(n => ({ n, dist: this._lev(fnName.toLowerCase(), n.toLowerCase()) }))
+                    .filter(s => s.dist <= 6 && s.n !== fnName && (!nearest || s.n !== nearest.match))
+                    .sort((a, b) => a.dist - b.dist)
+                    .slice(0, 3);
+                for (const s of scored) {
+                    const label = builtInNames.has(s.n) ? 'built-in' : 'learned';
+                    suggestions.push(`${s.n} (${label})`);
+                }
+                const suggestionText = suggestions.length ? suggestions.join(', ') : '(no close match)';
+                return `  ${call} -> use bare name: ${suggestionText}`;
             }).join('\n');
-            result += '\nOnly these functions exist: ' + list.join(', ');
-            console.log(result)
+            result += '\n\nAVAILABLE FUNCTIONS (call by bare name, e.g. goToPosition(bot, x, y, z)):\n';
+            result += builtInSigs.slice(0, 20).join('\n') + (builtInSigs.length > 20 ? `\n... (${builtInSigs.length - 20} more built-in)` : '');
+            if (learned.length) {
+                result += '\n\nLEARNED SKILLS (also bare names):\n' + learned.slice(0, 15).join(', ') + (learned.length > 15 ? ` ... (${learned.length - 15} more)` : '');
+            }
+            console.log(result);
             return result;
         }
 
@@ -337,13 +404,23 @@ export class Coder {
         this.file_counter++;
         
         let write_result = await this._writeFilePromise('.' + this.fp + filename, src);
+        // fix40: unified bare-name API - all built-in functions injected as bare names
         // This is where we determine the environment the agent's code should be exposed to.
-        // It will only have access to these things, (in addition to basic javascript objects like Array, Object, etc.)
         // Note that the code may be able to modify the exposed objects.
-        // generated code gets interrupt-aware skills: once an interrupt is requested every skill call returns false at once
-        const guardedSkills = {};
-        for (const [k, f] of Object.entries(skills))
-            guardedSkills[k] = typeof f === 'function' ? (...a) => (a[0]?.interrupt_code ? Promise.resolve(false) : f(...a)) : f;
+        // Generated code gets interrupt-aware functions: once an interrupt is requested every call returns false at once
+        const endowments = {};
+        // Inject all skills.* functions as bare names (e.g., goToPosition instead of skills.goToPosition)
+        for (const [k, f] of Object.entries(skills)) {
+            if (typeof f === 'function') {
+                endowments[k] = k === 'log' ? f : (...a) => (a[0]?.interrupt_code ? Promise.resolve(false) : f(...a));
+            }
+        }
+        // Inject all world.* functions as bare names (e.g., getNearestBlock instead of world.getNearestBlock)
+        for (const [k, f] of Object.entries(world)) {
+            if (typeof f === 'function') {
+                endowments[k] = f;
+            }
+        }
         // fix38: expose pathfinder goals so generated code can use GoalNear, GoalFollow, etc.
         const goals = {
             GoalNear: pathfinderGoals.GoalNear,
@@ -358,10 +435,8 @@ export class Coder {
             GoalCompositeAny: pathfinderGoals.GoalCompositeAny,
             GoalCompositeAll: pathfinderGoals.GoalCompositeAll,
         };
-        const compartment = makeCompartment({
-            skills: guardedSkills,
-            log: skills.log,
-            world,
+        // Add goals and utilities
+        Object.assign(endowments, {
             Vec3,
             goals,
             GoalNear: goals.GoalNear,
@@ -377,6 +452,7 @@ export class Coder {
             GoalCompositeAll: goals.GoalCompositeAll,
             sleep: ms => new Promise(r => setTimeout(r, ms)),   // fix27: the only way to wait; setTimeout itself is not in scope
         });
+        const compartment = makeCompartment(endowments);
         const mainFn = compartment.evaluate(src);
         
         if (write_result) {
