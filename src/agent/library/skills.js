@@ -7,8 +7,31 @@ import settings from "../../../settings.js";
 const blockPlaceDelay = settings.block_place_delay == null ? 0 : settings.block_place_delay;
 const useDelay = blockPlaceDelay > 0;
 
+// fix46: Minecraft standard max vitals - single source shared by observe() and log()
+// Vanilla Minecraft uses 20 for both health and food max; mods may differ
+export const VITALS_MAX = { health: 20, food: 20 };
+let _vitalsMaxWarned = false;
+
+// fix46: get vitals max, log loudly once if bot reports different values
+export function getVitalsMax(bot) {
+    const botHealthMax = bot.game?.maxHealth;
+    const botFoodMax = bot.game?.maxFood;
+    if (!_vitalsMaxWarned && (botHealthMax && botHealthMax !== VITALS_MAX.health || botFoodMax && botFoodMax !== VITALS_MAX.food)) {
+        console.log(`[fix46] LOUD: bot reports non-standard vitals max (health=${botHealthMax}, food=${botFoodMax}) vs standard (${VITALS_MAX.health}, ${VITALS_MAX.food})`);
+        _vitalsMaxWarned = true;
+    }
+    return VITALS_MAX;
+}
+
+// fix46: log vitals (food and health) on every log line for recovery tracking
+// Uses shared VITALS_MAX constant (same source as observe())
 export function log(bot, message) {
-    bot.output += message + '\n';
+    let vitals = '';
+    if (typeof bot.food === 'number' && typeof bot.health === 'number') {
+        const max = getVitalsMax(bot);
+        vitals = ` [food ${bot.food}/${max.food} health ${Math.round(bot.health)}/${max.health}]`;
+    }
+    bot.output += message + vitals + '\n';
 }
 
 // fix44: close any non-inventory window before equip/consume operations

@@ -146,6 +146,76 @@ function smeltGoal(task) {
     const m = task.match(/^(?:smelt|cook)\s+(\d+)\s+([a-z_]+)\s+into\s+(\d+)\s+([a-z_]+)/i);
     return m ? { count: parseInt(m[1]), input: m[2].toLowerCase(), verb: 'smelt', item: m[4].toLowerCase(), items: [m[4].toLowerCase()] } : null;
 }
+
+// fix46: parse verbose goal strings like "craftItem: Craft 1 iron_pickaxe using 1 iron_ingot..."
+// Uses minecraft-data registry to validate item names (no hard-coded tables per owner rules)
+// Returns {item, count, items} or null if unparseable; logs loudly if VERSION is missing
+// Prefers structured {item, count} on goals - parsing is only for legacy text
+export function parseVerboseGoal(task) {
+    if (!task || typeof task !== 'string') return null;
+    const t = task.toLowerCase();
+    
+    // Try standard parsers first
+    const std = smeltGoal(task) || countGoal(task);
+    if (std) return std;
+    
+    // fix46: VERSION is the single source (set from bot.version when task starts) - fail loud if null
+    if (!VERSION) {
+        console.error(`[fix46] LOUD FAIL: parseVerboseGoal called but VERSION is null - bot version must be set before parsing goals`);
+        return null;
+    }
+    
+    let md;
+    try { md = minecraftData(version); } 
+    catch (e) { 
+        console.error(`[fix46] LOUD FAIL: minecraft-data unavailable for version ${version}: ${e.message}`);
+        return null;
+    }
+    
+    // fix46: generic plural handling against registry (no hard-coded torches/glasses)
+    // Try: name as-is, then minus 's', then minus 'es' - keep whichever is in registry
+    const resolveItem = (name) => {
+        const lower = name.toLowerCase();
+        // Try exact match first
+        if (md.itemsByName[lower] || md.blocksByName[lower]) return lower;
+        // Try minus 's'
+        if (lower.endsWith('s')) {
+            const singular = lower.slice(0, -1);
+            if (md.itemsByName[singular] || md.blocksByName[singular]) return singular;
+        }
+        // Try minus 'es'
+        if (lower.endsWith('es')) {
+            const singular = lower.slice(0, -2);
+            if (md.itemsByName[singular] || md.blocksByName[singular]) return singular;
+        }
+        return null;
+    };
+    
+    // Extract all potential "count item" pairs from the text
+    const candidates = [];
+    const pattern = /\b(\d+)\s+([a-z][a-z0-9_]*)\b/gi;
+    let m;
+    while ((m = pattern.exec(t))) {
+        const count = parseInt(m[1]);
+        const resolved = resolveItem(m[2]);
+        if (resolved) {
+            candidates.push({ count, item: resolved, pos: m.index });
+        }
+    }
+    
+    if (candidates.length === 0) {
+        console.log(`[fix46] LOUD: parseVerboseGoal failed for "${task.slice(0, 100)}": no valid item name found in registry`);
+        return null;
+    }
+    
+    // Pick the first valid candidate (typically the goal item in "Craft 1 iron_pickaxe using...")
+    const best = candidates[0];
+    
+    // fix46: removed verb list and blockLoot expansion (no silent catch, no hard-coded verbs)
+    // Return just {item, count, items} - verb is not needed for satisfaction check
+    return { count: best.count, item: best.item, items: [best.item] };
+}
+
 function gainedFor(goal, before, after) {
     return goal.items.reduce((a, it) => a + (after.inventory[it] || 0) - (before.inventory[it] || 0), 0);
 }
@@ -701,12 +771,13 @@ Use only c; no other globals.`;
             distance_to_town: dTown,
             biome: world.getBiomeName(bot),
             time: t < 12000 ? `day (${t})` : t < 13000 ? `dusk (${t}, hostiles about to spawn)` : t < 23000 ? `night (${t}, hostiles spawn outdoors)` : `dawn (${t})`,
-            health: `${Math.round(bot.health)}/20`, food: `${bot.food}/20`,
+            // fix46: use shared VITALS_MAX from skills.js (same source as log())
+            health: `${Math.round(bot.health)}/${skills.VITALS_MAX.health}`, food: `${bot.food}/${skills.VITALS_MAX.food}`,
             // fix45: expose food/health as plain numeric facts for planner/curriculum to pick restore goals
             food_value: bot.food,
-            food_max: 20,
+            food_max: skills.VITALS_MAX.food,
             health_value: Math.round(bot.health),
-            health_max: 20,
+            health_max: skills.VITALS_MAX.health,
             inventory: world.getInventoryCounts(bot),  // fix41: host code uses world. prefix
             inventory_slots: `${usedSlots}/${totalSlots}`,
             empty_inventory_slots: emptySlots,
@@ -1077,9 +1148,10 @@ Use only c; no other globals.`;
     // Returns { satisfied: boolean, reason: string, noLearnedCheck?: boolean }
     // Uses learned skill contracts (postconditions) and learned effects - no hard-coded special cases
     // fix25: prefer smeltGoal so "Smelt X into Y" checks Y (product), not X (ingredient)
+    // fix45: use parseVerboseGoal as fallback for verbose goals like "craftItem: Craft 1 iron_pickaxe..."
     _goalAlreadySatisfied(task, state) {
-        const goal = smeltGoal(task) || countGoal(task);  // fix25: smelt first (product)
-        if (!goal) return { satisfied: false, reason: 'goal not parseable as count/smelt', noLearnedCheck: true };
+        const goal = smeltGoal(task) || countGoal(task) || parseVerboseGoal(task);  // fix45: verbose fallback
+        if (!goal) return { satisfied: false, reason: 'goal not parseable as count/smelt/verbose', noLearnedCheck: true };
 
         const inv = state.inventory || {};
         const have = goal.items ? goal.items.reduce((a, it) => a + (inv[it] || 0), 0) : (inv[goal.item] || 0);
