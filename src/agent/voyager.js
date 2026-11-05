@@ -127,22 +127,24 @@ function recipeFacts(text) {
     }
     return out.length ? 'RECIPES (from minecraft-data, authoritative):\n' + out.join('\n') : '';
 }
-// fix47: parse number words (one, two, three...) generically - no hard-coded item tables
-// Supports numbers 0-20 plus tens (thirty, forty... ninety) - returns null for non-numbers
-const NUMBER_WORDS = {
-    zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9,
-    ten: 10, eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15, sixteen: 16,
-    seventeen: 17, eighteen: 18, nineteen: 19, twenty: 20, thirty: 30, forty: 40, fifty: 50,
-    sixty: 60, seventy: 70, eighty: 80, ninety: 90, hundred: 100
-};
+// fix47: parse number words using words-to-numbers library (MIT)
+import { wordsToNumbers } from 'words-to-numbers';
 export function parseNumberWord(word) {
     if (!word) return null;
     const lower = word.toLowerCase().trim();
     // Try direct numeric parse first
     const num = parseInt(lower, 10);
     if (!isNaN(num)) return num;
-    // Try word-to-number lookup
-    if (NUMBER_WORDS.hasOwnProperty(lower)) return NUMBER_WORDS[lower];
+    // Use words-to-numbers library for word-to-number conversion
+    try {
+        const result = wordsToNumbers(lower);
+        if (typeof result === 'number' && !isNaN(result)) return result;
+        // Library returns string if no conversion, try parsing it
+        const parsed = parseInt(result, 10);
+        if (!isNaN(parsed)) return parsed;
+    } catch (e) {
+        // Library threw - not a valid number word
+    }
     return null;
 }
 
@@ -229,8 +231,9 @@ export function parseVerboseGoal(task) {
             candidates.push({ count, item: resolved, pos: m.index });
         }
     }
-    // Also try number words (one, two, three, etc.)
-    const numberWordPattern = new RegExp(`\\b(${Object.keys(NUMBER_WORDS).join('|')})\\s+([a-z][a-z0-9_]*)\\b`, 'gi');
+    // Also try number words (one, two, three, etc.) - match word followed by item
+    // Common number words pattern (words-to-numbers handles the actual parsing)
+    const numberWordPattern = /\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred)\s+([a-z][a-z0-9_]*)\b/gi;
     while ((m = numberWordPattern.exec(t))) {
         const count = parseNumberWord(m[1]);
         if (count !== null) {
@@ -558,20 +561,27 @@ export class Voyager {
     _updateAllowed(e, why) { const { V, p, n } = this._maturity(e), r = Math.random(), ok = r < p; gateLog(`maturity ${e.name}: V=${V.toFixed(2)} (u=${this._maturity(e).u.toFixed(2)}, ${n} runs) P(update)=${p.toFixed(2)} draw=${r.toFixed(2)} -> ${ok ? 'UPDATE ALLOWED' : 'FROZEN (mature skill kept)'} [${why}]`); return ok; }
     // fix20 (PSN repair memory): rolling buffer of the last 5 repair proposals per skill
     _noteProposal(e, p) { e.repairHistory = [...(e.repairHistory || []), { at: new Date().toISOString(), ...p }].slice(-5); this._saveSkills(); }
+    // fix47: simple hash for skill deduplication - changes when code or contract changes
+    _skillHash(skill) {
+        if (!skill) return 'null';
+        const content = (skill.code || '') + '|' + (skill.contract?.text || '');
+        // djb2 hash - simple and fast
+        let hash = 5381;
+        for (let i = 0; i < content.length; i++) {
+            hash = ((hash << 5) + hash) ^ content.charCodeAt(i);
+        }
+        return (hash >>> 0).toString(36);
+    }
     // fix47: log repair outcomes (ok/rejected/rollback) for observability
     _proposalOutcome(e, outcome, sig = null) { 
         const h = e.repairHistory; 
         if (h?.length && !h[h.length - 1].outcome) { h[h.length - 1].outcome = outcome; }
         console.log(`[repair-outcome] ${e.name}: ${outcome}`);
-        // fix47: track failed signatures for deduplication
+        // fix47: track failed signatures for hash-based deduplication (no time window)
+        // Dedup until skill code/contract changes (hash is part of signature)
         if (outcome && /reject|fail|lint|duplicate|abort/i.test(outcome) && sig) {
             this.progress.failedRepairSigs ||= {};
-            this.progress.failedRepairSigs[sig] = Date.now();
-            // Clean up old signatures (> 30 min) to prevent unbounded growth
-            const now = Date.now();
-            for (const k of Object.keys(this.progress.failedRepairSigs)) {
-                if (now - this.progress.failedRepairSigs[k] > 30 * 60e3) delete this.progress.failedRepairSigs[k];
-            }
+            this.progress.failedRepairSigs[sig] = { at: Date.now(), hash: this._skillHash(e) };
             this._saveProgress();
         }
     }
@@ -1208,17 +1218,102 @@ Use only c; no other globals.`;
         catch (err) { this._queueContractFix(e, `post threw: ${err.message}`); return false; }
     }
 
+    // fix47: compute what can be produced from current inventory via smelting or learned producers
+    // Uses minecraft-data for smelting relationships (raw_iron -> iron_ingot) and learned producers
+    // Returns { count, sources: [{type, item, count}] } where count is total producible
+    _computeProducibleFromInventory(targetItem, inv) {
+        const sources = [];
+        let total = inv[targetItem] || 0;
+        sources.push({ type: 'inventory', item: targetItem, count: total });
+        
+        // 1) Check minecraft-data smelting: raw_X -> X_ingot pattern (e.g., raw_iron -> iron_ingot)
+        // This is a learned-from-game-mechanics relationship, not hard-coded item tables
+        if (VERSION) {
+            try {
+                const md = minecraftData(VERSION);
+                // Common smelting patterns: raw_X -> X_ingot (1:1 ratio)
+                if (targetItem.endsWith('_ingot')) {
+                    const baseType = targetItem.replace('_ingot', '');
+                    const rawItem = `raw_${baseType}`;
+                    if (md.itemsByName[rawItem] && (inv[rawItem] || 0) > 0) {
+                        const rawCount = inv[rawItem] || 0;
+                        sources.push({ type: 'smelt', item: rawItem, count: rawCount });
+                        total += rawCount;
+                    }
+                }
+                // Also check ore -> ingot via smelting (legacy: iron_ore -> iron_ingot)
+                if (targetItem.endsWith('_ingot')) {
+                    const baseType = targetItem.replace('_ingot', '');
+                    const oreItem = `${baseType}_ore`;
+                    if (md.itemsByName[oreItem] && (inv[oreItem] || 0) > 0) {
+                        const oreCount = inv[oreItem] || 0;
+                        sources.push({ type: 'smelt', item: oreItem, count: oreCount });
+                        total += oreCount;
+                    }
+                }
+            } catch (e) {
+                console.log(`[fix47] minecraft-data lookup failed for ${targetItem}: ${e.message}`);
+            }
+        }
+        
+        // 2) Check learned producers from NeedsProducesGraph
+        if (this.npGraph) {
+            const producers = this.npGraph.getProducersOf(targetItem);
+            for (const producerKey of producers) {
+                // Find what this producer consumes and if we have it
+                const needs = this.npGraph.getRequirementsOf(producerKey) || [];
+                for (const need of needs) {
+                    if ((inv[need] || 0) > 0 && !sources.some(s => s.item === need)) {
+                        sources.push({ type: 'learned_producer', item: need, count: inv[need] || 0, producer: producerKey });
+                        // Don't double-count if it's the same item we'd smelt
+                        if (!sources.some(s => s.type === 'smelt' && s.item === need)) {
+                            total += inv[need] || 0;
+                        }
+                    }
+                }
+            }
+        }
+        
+        return { count: total, sources };
+    }
+
+    // fix47: compute the real shortfall after considering inventory + producible items
+    // Returns { shortfall, plan } where plan describes what to do (smelt, nothing, or gather)
+    _computeShortfall(goal, inv) {
+        const targetItem = goal.item;
+        const targetCount = goal.count;
+        
+        const producible = this._computeProducibleFromInventory(targetItem, inv);
+        const shortfall = Math.max(0, targetCount - producible.count);
+        
+        // Determine what plan to use
+        if (shortfall === 0) {
+            // Can satisfy from inventory + producing
+            const smeltSources = producible.sources.filter(s => s.type === 'smelt' && s.count > 0);
+            if (smeltSources.length > 0) {
+                return { shortfall: 0, plan: 'smelt', smeltItems: smeltSources };
+            }
+            return { shortfall: 0, plan: 'none' };
+        }
+        
+        return { shortfall, plan: 'gather', producible };
+    }
+
     // fix37 (B): check if a goal is already satisfied BEFORE running any task, using learned postconditions/contracts
-    // Returns { satisfied: boolean, reason: string, noLearnedCheck?: boolean }
+    // Returns { satisfied: boolean, reason: string, noLearnedCheck?: boolean, plan?: object }
     // Uses learned skill contracts (postconditions) and learned effects - no hard-coded special cases
     // fix25: prefer smeltGoal so "Smelt X into Y" checks Y (product), not X (ingredient)
     // fix45: use parseVerboseGoal as fallback for verbose goals like "craftItem: Craft 1 iron_pickaxe..."
+    // fix47: enhanced to compute producible items and shortfall
     _goalAlreadySatisfied(task, state) {
         const goal = smeltGoal(task) || countGoal(task) || parseVerboseGoal(task);  // fix45: verbose fallback
         if (!goal) return { satisfied: false, reason: 'goal not parseable as count/smelt/verbose', noLearnedCheck: true };
 
         const inv = state.inventory || {};
-        const have = goal.items ? goal.items.reduce((a, it) => a + (inv[it] || 0), 0) : (inv[goal.item] || 0);
+        
+        // fix47: compute what we have + can produce
+        const shortfallInfo = this._computeShortfall(goal, inv);
+        const have = shortfallInfo.producible?.count || (goal.items ? goal.items.reduce((a, it) => a + (inv[it] || 0), 0) : (inv[goal.item] || 0));
 
         // 1) Check inventory against learned skill contracts that produce the goal item
         // Find skills whose learned effects include the goal item and have a postcondition
@@ -1268,8 +1363,19 @@ Use only c; no other globals.`;
             return { satisfied: true, reason: `already have ${have}/${goal.count} ${goal.item} (inventory check; no learned producer)` };
         }
 
+        // fix47: check if we can produce enough via smelting (inventory-first planning)
+        if (shortfallInfo.shortfall === 0 && shortfallInfo.plan === 'smelt') {
+            const smeltItems = shortfallInfo.smeltItems.map(s => `${s.count} ${s.item}`).join(', ');
+            return {
+                satisfied: false,
+                reason: `need ${goal.count} ${goal.item}, can produce by smelting: ${smeltItems}`,
+                plan: shortfallInfo,
+                goal
+            };
+        }
+
         // 4) Not satisfied: don't have enough items
-        return { satisfied: false, reason: `need ${goal.count} ${goal.item}, have ${have}` };
+        return { satisfied: false, reason: `need ${goal.count} ${goal.item}, have ${have}`, plan: shortfallInfo, goal };
     }
 
     // fix32 (PSN backward chaining): a goal item is produced by a learned skill whose learned effects contain it; the skill is
@@ -1987,11 +2093,35 @@ Use only c; no other globals.`;
     // fix29: restored fix19 PSN decomposition (removed with the milestone planner in fix27c while its callers stayed):
     // a goal that keeps failing is split by the local model into 2-4 subgoals (depth <= 2, 30-min cooldown per goal);
     // each subgoal is learned as a skill, then the parent is retried composing those skills
+    // fix47: inventory-first planning - check if goal can be satisfied by smelting before queuing gather/mine subgoals
     async _decompose(task, reason) {
         const d = (this.progress.decomposed ||= {}), q = (this.progress.subgoals ||= []);
         const depth = (this._curSub?.task === task ? this._curSub.depth : 0);
         if (depth >= 2) { console.log(`[psn] decompose skipped for "${task}": already a depth-${depth} subgoal`); return false; }
         if (d[task] && Date.now() - d[task].at < 30 * 60e3) { console.log(`[psn] decompose skipped for "${task}": decomposed ${Math.round((Date.now() - d[task].at) / 60e3)} min ago`); return false; }
+        
+        // fix47: inventory-first planning - before queuing gather/mine subgoals, check if we can smelt
+        const goal = smeltGoal(task) || countGoal(task) || parseVerboseGoal(task);
+        if (goal) {
+            const state = this.observe();
+            const inv = state.inventory || {};
+            const shortfallInfo = this._computeShortfall(goal, inv);
+            
+            // If shortfall is 0 and we can produce via smelting, queue smelt subgoal instead of asking LLM
+            if (shortfallInfo.shortfall === 0 && shortfallInfo.plan === 'smelt' && shortfallInfo.smeltItems?.length > 0) {
+                const smeltSubs = shortfallInfo.smeltItems.map(s => {
+                    // Queue a smelt subgoal for each smeltable item
+                    const needed = Math.min(s.count, goal.count - (inv[goal.item] || 0));
+                    return `Smelt ${needed} ${s.item} into ${needed} ${goal.item}`;
+                });
+                d[task] = { subs: smeltSubs, skills: [], at: Date.now(), reason: `inventory-first: can produce ${goal.item} by smelting` };
+                q.unshift(...smeltSubs.map(t => ({ task: t, parent: task, depth: depth + 1 })), { task, retry: true, depth });
+                this._saveProgress();
+                console.log(`[psn] DECOMPOSE (inventory-first) "${task}" -> smelt: ${smeltSubs.join(', ')}; no mine/gather needed`);
+                return true;
+            }
+        }
+        
         const system = `You break a Minecraft bot's failing goal into smaller steps (Voyager/PSN-style task decomposition).
 Return 2-4 concrete, verifiable subgoals, in order, that together achieve the goal; each must be doable in a few minutes by ONE small reusable skill. Use the failure reason and the state. Do not repeat the goal itself.
 Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
@@ -2398,21 +2528,29 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
             if (kid) { const par = bs.find(q => q !== kid && kid.path.includes(q.target)); bs = [{ ...kid, kind: 'joint', parent: par.target, parentKind: par.kind }, ...bs.filter(x => x !== kid && x !== par)]; console.log(`[psn] JOINT repair queued: child ${kid.target} [${kid.kind}] with its caller ${par.target} [${par.kind}] (same failure path)`); }
         }
         const rq = [...(this._repairQueue || [])];
-        // fix47: deduplication - create signature from skill name + failure evidence (first 100 chars)
-        const failSig = (b) => `${b.target}:${(b.evidence || '').slice(0, 100).replace(/\s+/g, ' ')}`;
+        // fix47: hash-based deduplication - signature includes skill hash so it resets when skill changes
+        const failSig = (b) => {
+            const skill = this.skills.find(s => s.name === b.target);
+            const hash = this._skillHash(skill);
+            return `${b.target}:${hash}:${(b.evidence || '').slice(0, 100).replace(/\s+/g, ' ')}`;
+        };
         const pendingSigs = new Set(rq.map(failSig));
-        // fix47: track failed signatures (repairs that already failed on this signature) - persisted in progress
+        // fix47: track failed signatures - dedup until skill code/contract changes (hash-based, no time window)
         const failedSigs = this.progress.failedRepairSigs || {};
         for (const b of bs) {
             const sig = failSig(b);
+            const skill = this.skills.find(s => s.name === b.target);
+            const currentHash = this._skillHash(skill);
             if (rq.some(x => x.target === b.target)) { console.log(`[psn] repair of ${b.target} already queued`); continue; }
             // fix47: loud deduplication if same skill + signature is re-queued while pending or already failed
             if (pendingSigs.has(sig)) { 
                 console.log(`[psn] WARN: repair of ${b.target} with same failure signature already pending (dedup): ${sig.slice(0, 80)}`); 
                 continue; 
             }
-            if (failedSigs[sig] && Date.now() - failedSigs[sig] < 30 * 60e3) {
-                console.log(`[psn] WARN: repair of ${b.target} with same failure signature already failed ${Math.round((Date.now() - failedSigs[sig]) / 60e3)} min ago (dedup): ${sig.slice(0, 80)}`);
+            // fix47: hash-based dedup - only skip if signature matches AND skill hasn't changed (same hash)
+            const failedEntry = failedSigs[sig];
+            if (failedEntry && failedEntry.hash === currentHash) {
+                console.log(`[psn] WARN: repair of ${b.target} with same failure signature already failed (skill unchanged, dedup): ${sig.slice(0, 80)}`);
                 continue;
             }
             rq.push({ ...b, task, trace: traceText(trace, 60), peers: bs.map(x => x.target), sig }); console.log(`[psn] queued REPAIR of ${b.target} (${rq.length} in queue)`);
@@ -3563,13 +3701,11 @@ Voyager.SEEDED_PRIMITIVES = [
     if (!hasTable) {
         console.log('[ensureCraftingTable] no crafting_table in inventory, attempting inline 2x2 craft...');
         const tableId = bot.registry.itemsByName['crafting_table']?.id;
-        // fix47: recipesAll returns all recipes regardless of inventory; recipesFor filters by inventory
-        // Try recipesFor first (can craft now), then recipesAll (recipe exists but missing ingredients)
+        // recipesAll returns all recipes regardless of inventory; recipesFor filters by inventory
         let recipes = tableId ? bot.recipesFor(tableId, null, 1, null) : [];
-        const allRecipes = tableId && typeof bot.recipesAll === 'function' ? bot.recipesAll(tableId, null, null) : recipes;
-        const inv = getInventoryCounts(bot);
+        const allRecipes = tableId ? bot.recipesAll(tableId, null, null) : [];
+        let inv = getInventoryCounts(bot);
         let canCraft = false;
-        let missingIngredients = [];
         
         // Try to craft with current inventory
         for (const recipe of recipes) {
@@ -3595,10 +3731,72 @@ Voyager.SEEDED_PRIMITIVES = [
             }
         }
         
-        // fix47: if can't craft, check what ingredients are missing (decompose to shortfall)
+        // fix47: if planks missing, try to craft planks from logs first (also 2x2, no table needed)
+        if (!canCraft && !hasTable && allRecipes.length) {
+            const tableRecipe = allRecipes[0];
+            const plankIngredients = (tableRecipe.delta?.filter(d => d.count < 0) || [])
+                .map(d => bot.registry.items[d.id])
+                .filter(item => item && item.name.endsWith('_planks'));
+            
+            for (const plankItem of plankIngredients) {
+                const plankName = plankItem.name;
+                const have = inv[plankName] || 0;
+                const need = 4; // crafting_table needs 4 planks
+                if (have < need) {
+                    // Find logs that can produce this plank type
+                    const logType = plankName.replace('_planks', '_log');
+                    const altLogType = plankName.replace('_planks', '_wood');
+                    const strippedLogType = 'stripped_' + logType;
+                    const logsInInv = [logType, altLogType, strippedLogType].filter(l => (inv[l] || 0) > 0);
+                    
+                    if (logsInInv.length) {
+                        const logName = logsInInv[0];
+                        const logsNeeded = Math.ceil((need - have) / 4); // 1 log = 4 planks
+                        const logsAvailable = inv[logName] || 0;
+                        
+                        if (logsAvailable >= logsNeeded) {
+                            // Craft planks from logs (2x2, no table)
+                            const plankId = plankItem.id;
+                            const plankRecipes = bot.recipesFor(plankId, null, 1, null);
+                            for (const pr of plankRecipes) {
+                                try {
+                                    console.log(\`[ensureCraftingTable] crafting \${plankName} from \${logName}...\`);
+                                    await bot.craft(pr, logsNeeded, null);
+                                    inv = getInventoryCounts(bot); // refresh inventory
+                                    break;
+                                } catch (e) {
+                                    console.log(\`[ensureCraftingTable] plank craft failed: \${e.message}\`);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            // Retry table craft after planks
+            recipes = tableId ? bot.recipesFor(tableId, null, 1, null) : [];
+            for (const recipe of recipes) {
+                try {
+                    const beforeCount = (getInventoryCounts(bot)['crafting_table'] || 0);
+                    await bot.craft(recipe, 1, null);
+                    const afterCount = (getInventoryCounts(bot)['crafting_table'] || 0);
+                    if (afterCount > beforeCount) {
+                        log(bot, 'Crafted crafting_table (2x2, inline after crafting planks).');
+                        hasTable = true;
+                        canCraft = true;
+                        break;
+                    }
+                } catch (e) {
+                    console.log(\`[ensureCraftingTable] inline craft retry failed: \${e.message}\`);
+                }
+            }
+        }
+        
+        // FAIL loud if still can't craft: report exactly what's missing
         if (!canCraft && !hasTable) {
-            if (allRecipes && allRecipes.length) {
-                // Recipe exists - report missing ingredients rather than "no recipe"
+            inv = getInventoryCounts(bot);
+            const missingIngredients = [];
+            if (allRecipes.length) {
                 const recipe = allRecipes[0];
                 const ingredients = recipe.delta?.filter(d => d.count < 0) || [];
                 for (const ing of ingredients) {
@@ -3611,12 +3809,13 @@ Voyager.SEEDED_PRIMITIVES = [
                         }
                     }
                 }
-                log(bot, \`FAILED: crafting_table requires planks - missing: \${missingIngredients.join(', ') || '4 planks of same type'}\`);
-                return false;
-            } else {
-                log(bot, 'FAILED: no crafting_table in inventory and no recipe found in registry');
-                return false;
             }
+            if (missingIngredients.length) {
+                log(bot, \`FAILED: crafting_table requires planks - missing: \${missingIngredients.join(', ')}\`);
+            } else {
+                log(bot, 'FAILED: no crafting_table in inventory and cannot craft (no recipe or unknown error)');
+            }
+            return false;
         }
     }
     

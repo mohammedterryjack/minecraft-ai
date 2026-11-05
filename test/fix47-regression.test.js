@@ -181,6 +181,50 @@ describe('fix47: decompose subtracts inventory and producible items', () => {
         
         assert.strictEqual(shortfall, 2, 'Should need 2 more iron_ingot when have 2 raw_iron + 1 ingot for 5 needed');
     });
+
+    it('should use _computeShortfall to plan smelt instead of mine when raw_iron available', async () => {
+        // This tests the actual Voyager._computeShortfall method behavior
+        const { Voyager, _setVersionForTest } = await import('../src/agent/voyager.js');
+        
+        // Set VERSION so minecraft-data can be loaded
+        _setVersionForTest('1.20.4');
+        
+        // Create a minimal Voyager instance to test _computeShortfall
+        const voyager = Object.create(Voyager.prototype);
+        voyager.skills = [];
+        voyager.npGraph = null;
+        
+        // Test: goal 3 iron_ingot with inv {raw_iron: 28, iron_ingot: 1}
+        // Should plan to smelt, not mine
+        const goal = { item: 'iron_ingot', count: 3, items: ['iron_ingot'] };
+        const inv = { raw_iron: 28, iron_ingot: 1 };
+        
+        const result = voyager._computeShortfall(goal, inv);
+        
+        assert.strictEqual(result.shortfall, 0, 'Shortfall should be 0 (have 1 + can smelt 28)');
+        assert.strictEqual(result.plan, 'smelt', 'Plan should be "smelt" not "gather"');
+        assert.ok(result.smeltItems?.length > 0, 'Should have smelt items identified');
+        assert.ok(result.smeltItems?.some(s => s.item === 'raw_iron'), 'Should identify raw_iron as smeltable');
+    });
+
+    it('should identify smelt plan when can satisfy goal entirely from producible', async () => {
+        const { Voyager, _setVersionForTest } = await import('../src/agent/voyager.js');
+        
+        _setVersionForTest('1.20.4');
+        
+        const voyager = Object.create(Voyager.prototype);
+        voyager.skills = [];
+        voyager.npGraph = null;
+        
+        // Need 3 iron_ingot, have 0 but can smelt 28
+        const goal = { item: 'iron_ingot', count: 3, items: ['iron_ingot'] };
+        const inv = { raw_iron: 28 };
+        
+        const result = voyager._computeShortfall(goal, inv);
+        
+        assert.strictEqual(result.shortfall, 0, 'Shortfall should be 0 (can smelt 28)');
+        assert.strictEqual(result.plan, 'smelt', 'Should plan to smelt');
+    });
 });
 
 // ============================================================================
