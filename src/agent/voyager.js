@@ -453,7 +453,24 @@ export class Voyager {
 pre: what must hold before the call for it to be able to succeed (use "c => true" if nothing).
 post: what the call promises afterwards when it reports success (state the observable effect: arrived near target, item gained, still alive, not stranded underground, etc.). If the call returns false/null it already reported failure, so post may return true in that case.
 Use only c; no other globals.`;
-    _compileContract(src) { const f = makeCompartment({}).evaluate(`(${src})`); if (typeof f !== 'function') throw new Error('not a function'); return f; }
+    // fix26: endow contract compartment with bare API surface (same as live SES) so contracts that
+    // reference getInventoryCounts, getAllFreeSpaces, etc. don't crash with "is not a function"
+    // This is for robustness - contracts SHOULD only use c, but malformed contracts shouldn't silently fail
+    _getContractEndowments() {
+        if (this._contractEndowments) return this._contractEndowments;
+        const endowments = {};
+        // Add all world.* functions as bare names
+        for (const [k, f] of Object.entries(world)) {
+            if (typeof f === 'function') endowments[k] = f;
+        }
+        // Add all skills.* functions as bare names (except log which needs special handling)
+        for (const [k, f] of Object.entries(skills)) {
+            if (typeof f === 'function' && k !== 'log') endowments[k] = f;
+        }
+        this._contractEndowments = endowments;
+        return endowments;
+    }
+    _compileContract(src) { const f = makeCompartment(this._getContractEndowments()).evaluate(`(${src})`); if (typeof f !== 'function') throw new Error('not a function'); return f; }
     _validContract(ct) {
         if (!ct || typeof ct.post !== 'string' || typeof ct.pre !== 'string') return 'missing pre/post string';
         const s = { pos: { x: 0, y: 64, z: 0 }, hp: 20, food: 20, sky: 15, alive: true, dim: 'overworld', inv: {} };
@@ -1010,11 +1027,14 @@ Use only c; no other globals.`;
         for (const skill of producers) {
             try {
                 // Build a synthetic contract context as if the skill just ran and produced the current state
+                // fix26: use 'inv' not 'inventory' to match CONTRACT_SPEC (c.post.inv, not c.post.inventory)
+                // fix26: include all state fields from CONTRACT_SPEC to avoid undefined errors
+                const syntheticState = { inv, pos: state.pos || { x: 0, y: 64, z: 0 }, hp: 20, food: 20, sky: 15, alive: true, dim: 'overworld' };
                 const c = {
                     args: [goal.item, goal.count],
                     ret: true,
-                    pre: { inventory: {} },
-                    post: { inventory: inv, pos: state.pos || {}, alive: true, sky: true },
+                    pre: { inv: {}, pos: { x: 0, y: 64, z: 0 }, hp: 20, food: 20, sky: 15, alive: true, dim: 'overworld' },
+                    post: syntheticState,
                     delta: { [goal.item]: have },
                     dist: (a, b) => Math.hypot((a?.x || 0) - (b?.x || 0), (a?.y || 0) - (b?.y || 0), (a?.z || 0) - (b?.z || 0))
                 };
@@ -1772,7 +1792,10 @@ current_health: ${Math.round(bot.health)}/20\ncurrent_food: ${bot.food}/20 (20/2
         return selected.map(x => x.s);
     }
     async saveSkill(name, description, code, task, opts = {}) {
-        const names = new Set(this.skills.map(s => s.name));
+        // fix26: names must include BOTH learned skills AND built-in bare API (skills.*/world.* exports)
+        // so missingCalls doesn't reject repairs that call getNearestBlock, getInventoryCounts, etc.
+        const bareAPI = getBareAPI();
+        const names = new Set([...this.skills.map(s => s.name), ...bareAPI.names]);
         let deps = depsOf(code, name, names);
         const missing = missingCalls(code, name, names);
         if (missing.length) { gateLog(`REJECT ${name}: calls unknown skills ${missing.join(', ')}`); return false; }
@@ -3055,16 +3078,30 @@ Voyager.SEEDED_PRIMITIVES = [
 }`,
         deps: ['moveAway', 'depositToChest'],
     },
-    // fix25: ensureCraftingTable with multi-cell retry (same pattern as craftRecipe)
+    // fix25/fix26: ensureCraftingTable with multi-cell retry (same pattern as craftRecipe)
+    // fix26: if no crafting_table in inventory, attempt to craft one first (requires planks)
     {
         name: 'ensureCraftingTable',
-        description: 'Ensure a crafting table is placed nearby for 3x3 recipes. Uses multi-cell retry if first placement fails. Returns true if a table is available.',
+        description: 'Ensure a crafting table is placed nearby for 3x3 recipes. If not in inventory, attempts to craft one from planks. Uses multi-cell retry if first placement fails. Returns true if a table is available.',
         task: 'ensure a crafting table is placed nearby',
         code: `async function ensureCraftingTable(bot) {
     let table = getNearestBlock(bot, 'crafting_table', 16);
     if (table) { log(bot, \`Crafting table already nearby at \${table.position}.\`); return true; }
-    const hasTable = (getInventoryCounts(bot)['crafting_table'] || 0) > 0;
-    if (!hasTable) { log(bot, 'FAILED: no crafting_table in inventory to place'); return false; }
+    let hasTable = (getInventoryCounts(bot)['crafting_table'] || 0) > 0;
+    // fix26: if no table in inventory, attempt to craft one (requires 4 planks)
+    if (!hasTable) {
+        console.log('[ensureCraftingTable] no crafting_table in inventory, attempting to craft one...');
+        const crafted = await craftRecipe(bot, 'crafting_table', 1);
+        if (!crafted) {
+            log(bot, 'FAILED: no crafting_table in inventory and could not craft one (need 4 planks)');
+            return false;
+        }
+        hasTable = (getInventoryCounts(bot)['crafting_table'] || 0) > 0;
+        if (!hasTable) {
+            log(bot, 'FAILED: craftRecipe reported success but no crafting_table in inventory');
+            return false;
+        }
+    }
     // fix25: multi-cell retry pattern (same as craftRecipe/placeBlock)
     const freeSpaces = getAllFreeSpaces(bot, 1, 6, 5);
     if (!freeSpaces.length) { log(bot, 'FAILED: no free space within 6 blocks to place crafting_table'); return false; }
@@ -3090,6 +3127,6 @@ Voyager.SEEDED_PRIMITIVES = [
     }
     return true;
 }`,
-        deps: ['placeBlock'],
+        deps: ['placeBlock', 'craftRecipe'],
     },
 ];

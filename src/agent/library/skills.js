@@ -122,8 +122,9 @@ export async function craftRecipe(bot, itemName, num=1) {
     const requiredIngredients = mc.ingredientsFromPrismarineRecipe(recipe); //Items required to use the recipe once.
     const craftLimit = mc.calculateLimitingResource(inventory, requiredIngredients);
     
-    // fix25: when inventory is nearly full, attempt to free space using learned toss/deposit signals
-    if (bot.inventory.emptySlotCount() < 2) {
+    // fix25/fix26: when inventory is nearly full, attempt to free space using learned toss/deposit signals
+    // fix26: threshold aligned with _freeInventory (< 4) - was < 2, causing _freeInventory to never run at 2-3 empty slots
+    if (bot.inventory.emptySlotCount() < 4) {
         console.log(`[craftRecipe] inventory nearly full (${bot.inventory.emptySlotCount()} empty), calling _freeInventory`);
         await _freeInventory(bot, itemName);
         // Re-check after attempting to free space
