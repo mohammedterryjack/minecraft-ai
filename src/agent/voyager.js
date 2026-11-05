@@ -670,7 +670,19 @@ Use only c; no other globals.`;
         return hs.length ? hs.slice(0, 6).join(', ') : 'none';
     }
     _stateText(s) {
-        return Object.entries(s).map(([k, v]) => `${k}: ${typeof v === 'object' ? JSON.stringify(v) : v}`).join('\n');
+        // fix34: present inventory facts prominently as exact counts (not just JSON blob)
+        const lines = [];
+        for (const [k, v] of Object.entries(s)) {
+            if (k === 'inventory' && typeof v === 'object') {
+                const items = Object.entries(v).map(([item, count]) => `${item}: ${count}`);
+                lines.push(`inventory (EXACT COUNTS - you cannot use more than these): ${items.length ? items.join(', ') : '(empty)'}`);
+            } else if (k === 'empty_inventory_slots') {
+                lines.push(`empty_inventory_slots: ${v} (HARD LIMIT: if 0, inventory is full and the bot cannot pick up new items until it stores/discards some)`);
+            } else {
+                lines.push(`${k}: ${typeof v === 'object' ? JSON.stringify(v) : v}`);
+            }
+        }
+        return lines.join('\n');
     }
     _local() {
         if (!this.__local) this.__local = new Ollama(LOCAL.model, LOCAL.url, { ...LOCAL.params, keep_alive: this.agent.prompter.profile.model?.params?.keep_alive });
@@ -1138,6 +1150,10 @@ Rules:
 - Propose ONE concrete, verifiable task achievable in a few minutes with the current inventory and surroundings (e.g. "Mine 5 birch_log", "Craft 1 stone_pickaxe", "Smelt 3 iron_ingot", "Build a 5x5 cobblestone floor next to the hut").
 - Do not repeat completed tasks unless needed for progress; avoid tasks that failed recently unless prerequisites are now met.
 - The bot must survive: dying loses its inventory. Nothing keeps it alive automatically (no eating, fleeing, fighting or sheltering reflexes), so survival is your job too: read time, health, food, threats and inventory space in the state and decide.
+- INVENTORY CONSTRAINTS (hard facts, never ignore):
+  * The inventory counts are EXACT. Never propose smelting/crafting/using more items than the bot currently has.
+  * If empty_inventory_slots is 0, inventory is FULL. The bot CANNOT pick up new items. Propose storing items in a chest or discarding before any gathering/mining task.
+  * Example: if inventory shows "raw_iron: 5", you can only smelt up to 5 raw_iron, not 6 or 13.
 Reply ONLY with JSON: {"reasoning": "ONE short sentence", "task": "...", "context": "short hint how to do it"}`;
         const bot = this.agent.bot;   // fix29: current vitals as plain facts, read now (an overlapped plan's state may be minutes old)
         const user = `known_skills: ${JSON.stringify(this.skills.map(s => s.name))}
