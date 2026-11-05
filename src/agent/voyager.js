@@ -20,7 +20,7 @@ import { cosineSimilarity } from '../utils/math.js';
 import minecraftData from 'minecraft-data';
 import { Ollama } from '../models/ollama.js';
 import { signatureOf, depsOf, missingCalls, findCycle, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf } from './skill_graph.js';
-const LOCAL = { model: 'qwen3:4b-instruct-2507-q4_K_M', url: 'http://192.168.1.215:11434', params: { format: 'json', options: { num_ctx: 8192, num_predict: 150 } } };   // fix31: replies are short JSON (one-sentence reasoning); hitting the cap fails loudly
+const LOCAL = { model: 'qwen3:4b-instruct-2507-q4_K_M', url: 'http://192.168.1.215:11434', params: { format: 'json', options: { num_ctx: 8192, num_predict: 512 } } };   // fix38: raised from 150 to 512 - short JSON replies still need room for reasoning; truncation fails loudly (fix31)
 export const CALLS = { local: 0, code: 0, replay: 0 };
 
 globalThis.__psnALS ||= new AsyncLocalStorage();   // fix11 (B6): call-parent tracking for PSN traces
@@ -63,6 +63,33 @@ export function parseJSON(text) {
     if (b) out.success = b[1] === 'true';
     if (!Object.keys(out).length) throw new Error('no JSON in model reply: ' + raw.slice(0, 200));
     return out;
+}
+// fix38: extract FAILED lines + head/tail for execution feedback (FAILED lines must never be truncated away)
+export function extractFeedback(output, maxChars = 1800) {
+    const text = String(output || '');
+    const lines = text.split('\n');
+    const failedLines = lines.filter(l => /FAILED|CONDITION violated|ERROR|threw error/i.test(l));
+    const nonFailedLines = lines.filter(l => !/FAILED|CONDITION violated|ERROR|threw error/i.test(l));
+    if (failedLines.length === 0) {
+        return text.slice(-maxChars);
+    }
+    const failedSection = '--- FAILED/ERROR LINES ---\n' + failedLines.slice(0, 20).join('\n');
+    const remainingBudget = maxChars - failedSection.length - 60;
+    if (remainingBudget <= 0) {
+        return failedSection.slice(0, maxChars);
+    }
+    const headN = Math.floor(remainingBudget / 3 / 80);
+    const tailN = Math.floor(remainingBudget * 2 / 3 / 80);
+    const head = nonFailedLines.slice(0, Math.max(3, headN));
+    const tail = nonFailedLines.slice(-Math.max(10, tailN));
+    const headTail = head.length + tail.length >= nonFailedLines.length
+        ? nonFailedLines
+        : [...head, '... (middle truncated) ...', ...tail];
+    const result = failedSection + '\n--- HEAD+TAIL ---\n' + headTail.join('\n');
+    if (failedLines.length > 0 && result.trim().length < 50) {
+        throw new Error('[feedback] LOUD FAIL: failures occurred but feedback is nearly empty - this is a bug');
+    }
+    return result.slice(0, maxChars);
 }
 let NAMES = null;
 function knownNames() {
@@ -156,6 +183,12 @@ export class Voyager {
         
         // SkillWeaver-style idle practice
         this.idlePractice = new IdlePractice(agent.name);
+        
+        // fix38: Chest memory - persist seen chest positions and contents (learned path, not hard-coded)
+        const chestMemFile = `./bots/${agent.name}/chest_memory.json`;
+        this.chestMemoryFile = chestMemFile;
+        this.chestMemory = existsSync(chestMemFile) ? JSON.parse(readFileSync(chestMemFile, 'utf8')) : {};
+        this._setupChestTracking();
         if (!globalThis.__voyagerGuard) {
             globalThis.__voyagerGuard = true;
             const onErr = (kind) => (err) => {
@@ -676,6 +709,10 @@ Use only c; no other globals.`;
         const p = bot.entity.position;
         const dTown = Math.round(Math.hypot(p.x - TOWN.x, p.z - TOWN.z));
         const t = bot.time.timeOfDay;
+        // fix38: add inventory_slots as N/36 plain fact
+        const usedSlots = bot.inventory.items().length;
+        const totalSlots = 36;
+        const emptySlots = bot.inventory.emptySlotCount();
         return {
             position: `${p.x.toFixed(0)}, ${p.y.toFixed(0)}, ${p.z.toFixed(0)}`,
             distance_to_town: dTown,
@@ -683,10 +720,20 @@ Use only c; no other globals.`;
             time: t < 12000 ? `day (${t})` : t < 13000 ? `dusk (${t}, hostiles about to spawn)` : t < 23000 ? `night (${t}, hostiles spawn outdoors)` : `dawn (${t})`,
             health: `${Math.round(bot.health)}/20`, food: `${bot.food}/20`,
             inventory: world.getInventoryCounts(bot),
-            equipped: bot.heldItem ? bot.heldItem.name : 'nothing',
+            inventory_slots: `${usedSlots}/${totalSlots}`,
+            empty_inventory_slots: emptySlots,
+            // fix38: full equipment (6 slots, not just held item)
+            equipment: {
+                hand: bot.heldItem ? bot.heldItem.name : 'empty',
+                off_hand: bot.inventory.slots[45] ? bot.inventory.slots[45].name : 'empty',
+                head: bot.inventory.slots[5] ? bot.inventory.slots[5].name : 'empty',
+                torso: bot.inventory.slots[6] ? bot.inventory.slots[6].name : 'empty',
+                legs: bot.inventory.slots[7] ? bot.inventory.slots[7].name : 'empty',
+                feet: bot.inventory.slots[8] ? bot.inventory.slots[8].name : 'empty',
+            },
             nearby_blocks: world.getNearbyBlockTypes(bot, 16),
             nearby_entities: world.getNearbyEntityTypes(bot),
-            empty_inventory_slots: bot.inventory.emptySlotCount(),
+            known_chests: this._getChestFacts(),
             threats: this._threats(),
             recent_deaths: (this.agent.recentDeaths || []).join('; ') || 'none',
             death_hotspots: this._deathHotspots(),
@@ -710,10 +757,62 @@ Use only c; no other globals.`;
             .map(e => `${isDatapackHostile(e) ? 'DATAPACK ' : ''}${e.name || e.username} ${e.position.distanceTo(p).toFixed(0)}m`);
         return hs.length ? hs.slice(0, 6).join(', ') : 'none';
     }
+    // fix38: Chest memory - track seen chests and their contents (learned path)
+    _setupChestTracking() {
+        const bot = this.agent.bot;
+        if (!bot) return;
+        bot.on('blockUpdate', (oldBlock, newBlock) => {
+            if (newBlock?.name === 'chest' || newBlock?.name === 'trapped_chest' || newBlock?.name === 'barrel') {
+                const pos = newBlock.position;
+                const key = `${pos.x},${pos.y},${pos.z}`;
+                if (!this.chestMemory[key]) {
+                    this.chestMemory[key] = { type: newBlock.name, contents: 'Unknown', firstSeen: Date.now() };
+                    this._saveChestMemory();
+                    console.log(`[chest] detected ${newBlock.name} at ${key}`);
+                }
+            }
+        });
+        bot.on('windowOpen', (window) => {
+            if (!window || !window.title) return;
+            const title = typeof window.title === 'string' ? window.title : JSON.stringify(window.title);
+            if (!title.toLowerCase().includes('chest') && !title.toLowerCase().includes('barrel')) return;
+            const nearestChest = world.getNearestBlock(bot, b => b.name === 'chest' || b.name === 'trapped_chest' || b.name === 'barrel', 6);
+            if (!nearestChest) return;
+            const pos = nearestChest.position;
+            const key = `${pos.x},${pos.y},${pos.z}`;
+            setTimeout(() => {
+                const items = window.containerItems ? window.containerItems() : [];
+                if (items.length === 0) {
+                    this.chestMemory[key] = { type: nearestChest.name, contents: 'Empty', lastOpened: Date.now() };
+                } else {
+                    const counts = {};
+                    for (const it of items) { counts[it.name] = (counts[it.name] || 0) + it.count; }
+                    const summary = Object.entries(counts).map(([n, c]) => `${n}:${c}`).slice(0, 12).join(',');
+                    this.chestMemory[key] = { type: nearestChest.name, contents: summary, lastOpened: Date.now() };
+                }
+                this._saveChestMemory();
+                console.log(`[chest] opened ${nearestChest.name} at ${key}: ${this.chestMemory[key].contents}`);
+            }, 200);
+        });
+    }
+    _saveChestMemory() {
+        try { writeAtomic(this.chestMemoryFile, JSON.stringify(this.chestMemory, null, 2)); }
+        catch (e) { console.log('[chest] save failed: ' + e.message); }
+    }
+    _getChestFacts() {
+        const result = {};
+        const now = Date.now();
+        for (const [pos, data] of Object.entries(this.chestMemory)) {
+            if (now - (data.lastOpened || data.firstSeen || 0) > 7 * 24 * 60 * 60e3) continue;
+            result[pos] = data.contents;
+        }
+        return result;
+    }
     _stateText(s) {
         // fix34: present inventory facts prominently as exact counts (not just JSON blob)
         // fix36: facts only, no imperatives (Mo principle: everything learned, not hard-coded)
         // fix37 (D): surface inventory fullness as facts (not rules) with exact counts
+        // fix38: add inventory_slots N/36, full equipment, known_chests
         const lines = [];
         const inv = s.inventory || {};
         const emptySlots = s.empty_inventory_slots ?? 0;
@@ -724,6 +823,9 @@ Use only c; no other globals.`;
                 // Sort by count descending to show largest stacks first (hoarding visibility)
                 const items = Object.entries(v).sort((a, b) => b[1] - a[1]).map(([item, count]) => `${item}: ${count}`);
                 lines.push(`inventory (exact counts, ${totalItems} total items): ${items.length ? items.join(', ') : '(empty)'}`);
+            } else if (k === 'inventory_slots') {
+                // fix38: N/36 plain fact
+                lines.push(`inventory_slots: ${v}`);
             } else if (k === 'empty_inventory_slots') {
                 // fix37 (D): state inventory fullness as a fact, not a rule
                 if (v === 0) {
@@ -733,6 +835,14 @@ Use only c; no other globals.`;
                 } else {
                     lines.push(`empty_inventory_slots: ${v}`);
                 }
+            } else if (k === 'equipment' && typeof v === 'object') {
+                // fix38: full equipment slots
+                const eq = Object.entries(v).map(([slot, item]) => `${slot}: ${item}`);
+                lines.push(`equipment: ${eq.join(', ')}`);
+            } else if (k === 'known_chests' && typeof v === 'object') {
+                // fix38: chest memory
+                const chests = Object.entries(v).map(([pos, contents]) => `(${pos}): ${contents}`);
+                lines.push(`known_chests: ${chests.length ? chests.join('; ') : 'none'}`);
             } else {
                 lines.push(`${k}: ${typeof v === 'object' ? JSON.stringify(v) : v}`);
             }
@@ -894,7 +1004,7 @@ Use only c; no other globals.`;
             console.log(`[psn] effect check ${r.name}: expected +[${entry.effects.join(', ')}], got +[${gotten.join(', ')}] -> ${ok}`);
         }
         else if (this._postHolds(entry)) { ok = true; console.log(`[psn] learned postcondition of ${r.name} holds; critic skipped`); }
-        else { const v = await this.critique(task, before, after, String(res.message || '').slice(-1500)); ok = !!v.success; }
+        else { const v = await this.critique(task, before, after, extractFeedback(res.message, 1500)); ok = !!v.success; }   // fix38: preserve FAILED lines
         if (entry && ok && !trial) this._learnEffects(entry, before, after);
         if (entry) this._recordRun(entry, task, ok, trial);
         // ADAM-style: record inventory delta for needs/produces learning
@@ -1985,6 +2095,10 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         if (!okKid) return single('child frozen by the maturity gate', pe, 'caller_fix');
         this._repairs[e.name] = this._repairs[pe.name] = Date.now(); this._saveProgress();
         // fix37 (C): improved prompt with clearer format instructions
+        // fix38: add live state, skill library catalogue, contracts, and AWM hints
+        const pastLessons = await this.repairMemory.retrieveSimilar(q.evidence, 2);
+        const awmHints = this.repairMemory.formatHintsForCoder(pastLessons);
+        const relevantSkills = new Set([e.name, pe.name, ...this._closure(e.name), ...this._closure(pe.name), ...parentsOf(e.name, this._graph()), ...parentsOf(pe.name, this._graph())]);
         const system = `You repair TWO skills of a Minecraft mineflayer skill library together (PSN joint repair): a child skill and the caller that uses it failed on the same path.
 
 REQUIRED FORMAT: Return ONE \`\`\`javascript code block containing EXACTLY two async function definitions:
@@ -1996,8 +2110,11 @@ Each function must:
 - Have a compatible signature
 - Be preceded by // DESCRIPTION: <one sentence>
 
-Fix the child's own logic and how/when the caller uses it. No top-level call, no extra functions.`;
-        const user = `Task that failed: ${q.task}\nEvidence: ${q.evidence}\n--- execution trace ---\n${String(q.trace || '').slice(-2500)}\n--- child ${e.name} ---\n${e.code}\n--- caller ${pe.name} ---\n${pe.code}\nWrite both fixed functions:`;
+Call other library skills by name (they are in scope); never redefine them. Every loop must check bot.interrupt_code. If something cannot be done, log(bot, 'FAILED: <reason>') and return a falsy value; no silent fallbacks. findBlock/findBlocks/nearestEntity/bot.entities/blockAt results can be null or empty: always null-check them.
+Fix the child's own logic and how/when the caller uses it. No top-level call, no extra functions.
+SKILL LIBRARY (available skills to call):
+${this.catalogue(relevantSkills)}`;
+        const user = `Task that failed: ${q.task}\nEvidence: ${q.evidence}\n--- current bot state ---\n${this._stateText(this.observe())}\n--- execution trace ---\n${extractFeedback(q.trace || '', 2500)}\n--- child ${e.name} ---\n${e.code}\n--- caller ${pe.name} ---\n${pe.code}${e.contract ? `\n--- contract of ${e.name} ---\npre: ${e.contract.pre}\npost: ${e.contract.post}` : ''}${pe.contract ? `\n--- contract of ${pe.name} ---\npre: ${pe.contract.pre}\npost: ${pe.contract.post}` : ''}${awmHints ? `\n${awmHints}` : ''}\nWrite both fixed functions (${e.name} first, then ${pe.name}):`;
         console.log(`[psn] REPAIR JOINT ${e.name} + ${pe.name} with the code model (evidence: ${String(q.evidence).slice(0, 160)})`);
         let reply; try { reply = await this._ask(system, user); } catch (err) { console.log(`[psn] joint repair FAILED: ${err.message}`); return false; }
 
@@ -2316,7 +2433,8 @@ Interrupts: the bot may be interrupted at any time (danger, getting stuck, a pla
         const ctx = related.slice(0, 3).map(s => `// ${s.description}\n${s.code}`).join('\n\n');   // fix32: full code for the top 3; the rest are signatures in the catalogue
 
         // fix37 (D): include inventory-full fact from replay failure in feedback for code gen
-        let feedback = rp?.cut ? `Replay of ${rp.name} failed: ${rp.cut}\nExecution output:\n${String(rp.output).slice(-800)}${rp.invFullFact ? `\nInventory fact: ${rp.invFullFact}` : ''}` : '';
+        // fix38: use extractFeedback to preserve FAILED lines
+        let feedback = rp?.cut ? `Replay of ${rp.name} failed: ${rp.cut}\nExecution output:\n${extractFeedback(rp.output, 800)}${rp.invFullFact ? `\nInventory fact: ${rp.invFullFact}` : ''}` : '';
         let lastCode = '', anyCut = rp?.cut || '', prevCrit = null;
         // fix37: duplicate-reply detection state
         let prevReplyHash = null, consecutiveDupes = 0;
@@ -2414,7 +2532,7 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             const invFullFact = !verdict.success ? this._detectInventoryFullFailure(task, before, after, output) : null;
             if (invFullFact) console.log(`[voyager] attempt ${i} INVENTORY FULL DETECTED: ${invFullFact}`);
 
-            feedback = `${cut ? `Attempt ${cut}\n` : ''}Execution output:\n${output}\nCritic: ${verdict.critique}${invFullFact ? `\nInventory fact: ${invFullFact}` : ''}\nChat/behaviour log: ${this.agent.bot.modes.flushBehaviorLog().slice(-400)}`;
+            feedback = `${cut ? `Attempt ${cut}\n` : ''}Execution output:\n${extractFeedback(output, 1500)}\nCritic: ${verdict.critique}${invFullFact ? `\nInventory fact: ${invFullFact}` : ''}\nChat/behaviour log: ${this.agent.bot.modes.flushBehaviorLog().slice(-400)}`;   // fix38: preserve FAILED lines
             lastCode = code;
             if (lastTry) { if (i < MAX_ATTEMPTS) console.log(`[voyager] stopping after attempt ${i}: ${same ? 'critique unchanged from the previous attempt' : `${cut} (travel/death cut-off)`}`); break; }
         }
