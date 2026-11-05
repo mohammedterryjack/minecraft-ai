@@ -999,23 +999,21 @@ Use only c; no other globals.`;
 
     // fix32: learned effects / consumption of a skill from its successful runs (union, capped) - feeds backward chaining
     // fix44: goalItems hint FILTERS which observed ups count as effects - does NOT fabricate
-    // Only adds items that were observed to increase AND match the goal hint (if provided)
+    // When goalItems present: keep only observed ∩ goal (no fabrication from goal alone)
+    // When goalItems absent: keep ALL observed ups (no hard-coded incidental/junk tables)
     _learnEffects(e, before, after, goalItems = null) {
         const inv0 = before.inventory, inv1 = after.inventory;
         let up = Object.keys(inv1).filter(k => (inv1[k] || 0) > (inv0[k] || 0));
         const down = Object.keys(inv0).filter(k => (inv1[k] || 0) < (inv0[k] || 0));
         
-        // fix44: filter up items - only include goal items if hint provided, else exclude incidentals
+        // fix44: filter up items when goal hint present (observed ∩ goal)
+        // NO hard-coded incidental/junk item tables - when no goal, keep ALL observed ups
         if (goalItems && goalItems.length) {
             const excluded = up.filter(k => !goalItems.includes(k));
             if (excluded.length) console.log(`[psn] _learnEffects filtered non-goal items: [${excluded.join(',')}]`);
             up = up.filter(k => goalItems.includes(k));
-        } else {
-            const incidental = new Set(['dirt', 'grass_block', 'short_grass', 'tall_grass', 'fern', 'dead_bush', 'gravel', 'sand', 'snow', 'flint', 'feather', 'string', 'rotten_flesh', 'spider_eye', 'bone', 'poppy', 'dandelion', 'blue_orchid', 'allium', 'azure_bluet', 'pink_petals', 'moss_carpet']);
-            const excluded = up.filter(k => incidental.has(k));
-            if (excluded.length) console.log(`[psn] _learnEffects filtered incidental: [${excluded.join(',')}]`);
-            up = up.filter(k => !incidental.has(k));
         }
+        // else: no goal hint -> keep ALL observed ups (no filtering)
         
         const eff = [...new Set([...(e.effects || []), ...up])].slice(0, 12), con = { ...(e.consumes || {}) };
         for (const k of down) con[k] = Math.max(con[k] || 0, (inv0[k] || 0) - (inv1[k] || 0));
