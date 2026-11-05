@@ -210,10 +210,10 @@ export class Voyager {
     }
     // fix40/41: migration from skills.*/world.* to bare names
     // Rewrites all saved skill code to use bare function names instead of skills.X/world.Y
-    // fix41: uses Object.keys for names (not extractSig), adds catch-all, re-runs on leftovers
+    // fix41: uses Object.keys for names (not extractSig), adds catch-all, re-runs on leftovers, also rewrites s.candidate.code
     _migrateToBarenames() {
         const LEFTOVER_RE = /\b(?:skills|world)\.\w+\s*\(/;
-        const hasLeftovers = () => this.skills.some(s => s.code && LEFTOVER_RE.test(s.code));
+        const hasLeftovers = () => this.skills.some(s => (s.code && LEFTOVER_RE.test(s.code)) || (s.candidate?.code && LEFTOVER_RE.test(s.candidate.code)));
         if (this.progress.migratedToBarenames && !hasLeftovers()) return;  // fully migrated
         if (this.progress.migratedToBarenames) {
             console.log('[fix41] migratedToBarenames was true but leftovers remain - rerunning migration');
@@ -222,45 +222,61 @@ export class Voyager {
         const skillFnNames = Object.keys(skills).filter(k => typeof skills[k] === 'function' && k !== 'log');
         const worldFnNames = Object.keys(world).filter(k => typeof world[k] === 'function');
         const allNames = new Set([...skillFnNames, ...worldFnNames]);
-        let migrated = 0, totalChanges = 0;
-        for (const s of this.skills) {
-            if (!s.code) continue;
-            let code = s.code;
+        // fix41: rewrite helper - catch-all for any skills.X( or world.X( patterns
+        const rewriteCode = (code) => {
+            if (!code) return { code, changes: 0 };
             let changes = 0;
-            // Pass 1: Replace skills.X(... -> X(... for known function names
             for (const name of allNames) {
                 const re = new RegExp(`\\bskills\\.${name}\\s*\\(`, 'g');
                 const before = code;
                 code = code.replace(re, `${name}(`);
                 if (code !== before) changes++;
             }
-            // Pass 2: Replace world.X(... -> X(... for known function names
             for (const name of allNames) {
                 const re = new RegExp(`\\bworld\\.${name}\\s*\\(`, 'g');
                 const before = code;
                 code = code.replace(re, `${name}(`);
                 if (code !== before) changes++;
             }
-            // fix41 Pass 3: catch-all for ANY remaining skills.X( or world.X( patterns (unknown helpers)
-            const catchSkills = /\bskills\.(\w+)\s*\(/g;
-            const catchWorld = /\bworld\.(\w+)\s*\(/g;
+            // catch-all for ANY remaining patterns (unknown helpers)
             let before = code;
-            code = code.replace(catchSkills, '$1(');
+            code = code.replace(/\bskills\.(\w+)\s*\(/g, '$1(');
             if (code !== before) changes++;
             before = code;
-            code = code.replace(catchWorld, '$1(');
+            code = code.replace(/\bworld\.(\w+)\s*\(/g, '$1(');
             if (code !== before) changes++;
-            if (changes > 0) {
-                console.log(`[fix41] migrate ${s.name}: ${changes} skills.*/world.* -> bare name changes`);
-                s.code = code;
+            return { code, changes };
+        };
+        let migrated = 0, totalChanges = 0, candidateChanges = 0;
+        for (const s of this.skills) {
+            let skillChanged = false;
+            // Rewrite s.code
+            if (s.code) {
+                const r = rewriteCode(s.code);
+                if (r.changes > 0) {
+                    s.code = r.code;
+                    totalChanges += r.changes;
+                    skillChanged = true;
+                }
+            }
+            // fix41: also rewrite s.candidate.code (gate trials run candidate.code in SES)
+            if (s.candidate?.code) {
+                const r = rewriteCode(s.candidate.code);
+                if (r.changes > 0) {
+                    s.candidate.code = r.code;
+                    candidateChanges += r.changes;
+                    skillChanged = true;
+                }
+            }
+            if (skillChanged) {
+                console.log(`[fix41] migrate ${s.name}: code changes=${totalChanges > 0 ? 'yes' : 'no'}, candidate changes=${s.candidate ? 'yes' : 'n/a'}`);
                 writeAtomic(`${this.dir}/${s.name}.js`, `// ${s.description}\n${s.code}\n`);
                 migrated++;
-                totalChanges += changes;
             }
         }
         if (migrated > 0) {
             this._saveSkills();
-            console.log(`[fix41] MIGRATION COMPLETE: ${migrated} skills updated, ${totalChanges} total changes`);
+            console.log(`[fix41] MIGRATION COMPLETE: ${migrated} skills updated, ${totalChanges} code changes, ${candidateChanges} candidate changes`);
         }
         // fix41: only set flag when zero leftovers remain
         if (!hasLeftovers()) {
@@ -986,6 +1002,15 @@ Use only c; no other globals.`;
     _cursorLimited() { const cm = this.agent.prompter.code_model; return !cm.fallback && Date.now() < (cm.quotaUntil || 0); }   // fix33: fallback configured = not limited
     // find a saved skill that can be replayed without any model call
     _findReplay(task) {
+        // fix41: exact skill name or exact task match FIRST, including primitives (tossClutter/tossItem/depositToChest)
+        const taskLower = task.toLowerCase().trim();
+        for (const s of this.skills) {
+            if (s.demoted || s.mergedInto) continue;
+            // exact name match (case-insensitive)
+            if (s.name.toLowerCase() === taskLower) return { name: s.name, call: `await ${s.name}(bot);` };
+            // exact task match (case-insensitive)
+            if (s.task && s.task.toLowerCase().trim() === taskLower) return { name: s.name, call: `await ${s.name}(bot);` };
+        }
         const goal = countGoal(task);
         const has = n => this.skills.some(s => s.name === n && !s.demoted);
         const kill = task.match(/^(?:kill|hunt|slay|fight)\s+(\d+)\s+([a-z_]+?)s?\b/i);
@@ -1026,12 +1051,16 @@ Use only c; no other globals.`;
         return best ? { name: best.name, call: `await ${best.name}(bot);` } : null;
     }
     // fix28 (D): nearest learned skill by nomic-embed-text over its description; the match threshold is learned from replay outcomes
+    // fix41: allow important primitives (tossClutter, tossItem, depositToChest) in embedding replay
     async _embedReplay(task) {
         const th = this.progress.replayThreshold ??= 0.85;
         const q = await this._embed(task);
         let best = null, bs = -1;
+        const IMPORTANT_PRIMITIVES = new Set(['tossClutter', 'tossItem', 'depositToChest']);
         for (const s of this.skills) {
-            if (s.primitive || s.demoted || s.mergedInto || !s.task || /^(repair|refactor)\b/.test(s.task)) continue;
+            // fix41: allow important primitives (inventory freeing skills) even if s.primitive is true
+            if (s.demoted || s.mergedInto || !s.task || /^(repair|refactor)\b/.test(s.task)) continue;
+            if (s.primitive && !IMPORTANT_PRIMITIVES.has(s.name)) continue;
             const extra = (signatureOf(s.code, s.name).match(/\(([^)]*)\)/)?.[1] || '').split(',').slice(1).map(x => x.trim()).filter(Boolean);
             if (extra.some(x => !x.includes('='))) continue;   // needs arguments it cannot get from the task text
             if (!s.embedding || s.embedding.length !== q.length) continue;

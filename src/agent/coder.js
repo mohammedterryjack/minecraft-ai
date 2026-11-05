@@ -392,7 +392,12 @@ export class Coder {
             line = line.replace(/^(\s*do\s*\{)\s*$/, '$1 if (bot.interrupt_code) {log(bot, "Code interrupted.");return;}');
             src += `    ${line}\n`;
         }
-        let src_lint_copy = this.code_lint_template.replace('/* CODE HERE */', src);
+        // fix41: generate const bindings for bare API names so ESLint no-undef can see them
+        const bareBindings = [
+            ...Object.keys(skills).filter(k => typeof skills[k] === 'function' && k !== 'log').map(k => `const ${k} = skills.${k};`),
+            ...Object.keys(world).filter(k => typeof world[k] === 'function').map(k => `const ${k} = world.${k};`)
+        ].join('\n');
+        let src_lint_copy = this.code_lint_template.replace('/* BARE API HERE */', bareBindings).replace('/* CODE HERE */', src);
         src = this.code_template.replace('/* CODE HERE */', src);
 
         let filename = this.file_counter + '.js';

@@ -4,6 +4,7 @@ import Vec3 from 'vec3';
 
 const log = skills.log;
 const sleep = ms => new Promise(r => globalThis.setTimeout(r, ms));   // fix27: mirrors the sandbox endowment
+/* BARE API HERE */
 
 export async function main(bot) {
     /* CODE HERE */
