@@ -17,8 +17,9 @@ if (!pathfinderGoals || !pathfinderGoals.GoalNear) {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// fix40: unified bare-name API - all functions (built-in + learned) use bare names only
+// fix40/41: unified bare-name API - all functions (built-in + learned) use bare names only
 // Exported for voyager.js to build the unified signature list for prompts
+// fix41: Object.keys registration for every exported function even when extractSig regex misses
 let _bareAPICache = null;
 export function getBareAPI() {
     if (_bareAPICache) return _bareAPICache;
@@ -29,10 +30,11 @@ export function getBareAPI() {
         const params = match[1].trim();
         return { name: fn.name, sig: `${fn.name}(${params})`, source: modName };
     };
-    const skillsFns = Object.keys(skills).filter(k => typeof skills[k] === 'function' && k !== 'log')
-        .map(k => extractSig(skills[k], 'skills')).filter(Boolean);
-    const worldFns = Object.keys(world).filter(k => typeof world[k] === 'function')
-        .map(k => extractSig(world[k], 'world')).filter(Boolean);
+    // fix41: collect ALL function keys first, then try extractSig; fallback to name() if regex misses
+    const skillKeys = Object.keys(skills).filter(k => typeof skills[k] === 'function' && k !== 'log');
+    const worldKeys = Object.keys(world).filter(k => typeof world[k] === 'function');
+    const skillsFns = skillKeys.map(k => extractSig(skills[k], 'skills') || { name: k, sig: `${k}()`, source: 'skills' });
+    const worldFns = worldKeys.map(k => extractSig(world[k], 'world') || { name: k, sig: `${k}()`, source: 'world' });
     const all = [...skillsFns, ...worldFns];
     _bareAPICache = { 
         names: new Set(all.map(f => f.name)),
@@ -390,7 +392,12 @@ export class Coder {
             line = line.replace(/^(\s*do\s*\{)\s*$/, '$1 if (bot.interrupt_code) {log(bot, "Code interrupted.");return;}');
             src += `    ${line}\n`;
         }
-        let src_lint_copy = this.code_lint_template.replace('/* CODE HERE */', src);
+        // fix41: generate const bindings for bare API names so ESLint no-undef can see them
+        const bareBindings = [
+            ...Object.keys(skills).filter(k => typeof skills[k] === 'function' && k !== 'log').map(k => `const ${k} = skills.${k};`),
+            ...Object.keys(world).filter(k => typeof world[k] === 'function').map(k => `const ${k} = world.${k};`)
+        ].join('\n');
+        let src_lint_copy = this.code_lint_template.replace('/* BARE API HERE */', bareBindings).replace('/* CODE HERE */', src);
         src = this.code_template.replace('/* CODE HERE */', src);
 
         let filename = this.file_counter + '.js';

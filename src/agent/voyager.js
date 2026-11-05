@@ -208,43 +208,84 @@ export class Voyager {
         this._polyMerge();
         this._extractShared();
     }
-    // fix40: one-time migration from skills.*/world.* to bare names
+    // fix40/41: migration from skills.*/world.* to bare names
     // Rewrites all saved skill code to use bare function names instead of skills.X/world.Y
+    // fix41: uses Object.keys for names (not extractSig), adds catch-all, re-runs on leftovers, also rewrites s.candidate.code
     _migrateToBarenames() {
-        if (this.progress.migratedToBarenames) return;  // already migrated
-        const bare = getBareAPI();
-        const skillNames = new Set(bare.names);
-        let migrated = 0, totalChanges = 0;
-        for (const s of this.skills) {
-            if (!s.code) continue;
-            let code = s.code;
+        const LEFTOVER_RE = /\b(?:skills|world)\.\w+\s*\(/;
+        const hasLeftovers = () => this.skills.some(s => (s.code && LEFTOVER_RE.test(s.code)) || (s.candidate?.code && LEFTOVER_RE.test(s.candidate.code)));
+        if (this.progress.migratedToBarenames && !hasLeftovers()) return;  // fully migrated
+        if (this.progress.migratedToBarenames) {
+            console.log('[fix41] migratedToBarenames was true but leftovers remain - rerunning migration');
+        }
+        // fix41: collect rewrite names from Object.keys where typeof function (not extractSig)
+        const skillFnNames = Object.keys(skills).filter(k => typeof skills[k] === 'function' && k !== 'log');
+        const worldFnNames = Object.keys(world).filter(k => typeof world[k] === 'function');
+        const allNames = new Set([...skillFnNames, ...worldFnNames]);
+        // fix41: rewrite helper - catch-all for any skills.X( or world.X( patterns
+        const rewriteCode = (code) => {
+            if (!code) return { code, changes: 0 };
             let changes = 0;
-            // Replace skills.X(... -> X(... for known function names
-            for (const name of skillNames) {
+            for (const name of allNames) {
                 const re = new RegExp(`\\bskills\\.${name}\\s*\\(`, 'g');
-                const newCode = code.replace(re, `${name}(`);
-                if (newCode !== code) { changes++; code = newCode; }
+                const before = code;
+                code = code.replace(re, `${name}(`);
+                if (code !== before) changes++;
             }
-            // Replace world.X(... -> X(... for known function names
-            for (const name of skillNames) {
+            for (const name of allNames) {
                 const re = new RegExp(`\\bworld\\.${name}\\s*\\(`, 'g');
-                const newCode = code.replace(re, `${name}(`);
-                if (newCode !== code) { changes++; code = newCode; }
+                const before = code;
+                code = code.replace(re, `${name}(`);
+                if (code !== before) changes++;
             }
-            if (changes > 0) {
-                console.log(`[fix40] migrate ${s.name}: ${changes} skills.*/world.* -> bare name changes`);
-                s.code = code;
+            // catch-all for ANY remaining patterns (unknown helpers)
+            let before = code;
+            code = code.replace(/\bskills\.(\w+)\s*\(/g, '$1(');
+            if (code !== before) changes++;
+            before = code;
+            code = code.replace(/\bworld\.(\w+)\s*\(/g, '$1(');
+            if (code !== before) changes++;
+            return { code, changes };
+        };
+        let migrated = 0, totalChanges = 0, candidateChanges = 0;
+        for (const s of this.skills) {
+            let skillChanged = false;
+            // Rewrite s.code
+            if (s.code) {
+                const r = rewriteCode(s.code);
+                if (r.changes > 0) {
+                    s.code = r.code;
+                    totalChanges += r.changes;
+                    skillChanged = true;
+                }
+            }
+            // fix41: also rewrite s.candidate.code (gate trials run candidate.code in SES)
+            if (s.candidate?.code) {
+                const r = rewriteCode(s.candidate.code);
+                if (r.changes > 0) {
+                    s.candidate.code = r.code;
+                    candidateChanges += r.changes;
+                    skillChanged = true;
+                }
+            }
+            if (skillChanged) {
+                console.log(`[fix41] migrate ${s.name}: code changes=${totalChanges > 0 ? 'yes' : 'no'}, candidate changes=${s.candidate ? 'yes' : 'n/a'}`);
                 writeAtomic(`${this.dir}/${s.name}.js`, `// ${s.description}\n${s.code}\n`);
                 migrated++;
-                totalChanges += changes;
             }
         }
         if (migrated > 0) {
             this._saveSkills();
-            console.log(`[fix40] MIGRATION COMPLETE: ${migrated} skills updated, ${totalChanges} total changes`);
+            console.log(`[fix41] MIGRATION COMPLETE: ${migrated} skills updated, ${totalChanges} code changes, ${candidateChanges} candidate changes`);
         }
-        this.progress.migratedToBarenames = true;
-        this._saveProgress();
+        // fix41: only set flag when zero leftovers remain
+        if (!hasLeftovers()) {
+            this.progress.migratedToBarenames = true;
+            this._saveProgress();
+            console.log('[fix41] migratedToBarenames set to true - no leftovers remain');
+        } else {
+            console.warn('[fix41] WARNING: some skills.*/world.* patterns remain after migration');
+        }
     }
     // fix33: seed primitives into the skill library so they are blamable/repairable (learned path, not hard-coded)
     // These are skills from skills.js that need to be in the skill graph to enable learning (e.g. water escape)
@@ -723,7 +764,7 @@ Use only c; no other globals.`;
         // are not progress); health/food are not progress (drowning damage + regen kept resetting the timer)
         const seen = new Set(), cell = p => `${Math.floor(p.x / 2)},${Math.floor(p.y / 2)},${Math.floor(p.z / 2)}`; let fresh = 0;
         const sig = () => { const p = bot.entity?.position; if (!p) return ''; const w = bot.currentWindow, c = cell(p); if (!seen.has(c)) { seen.add(c); fresh++; }
-            return `${fresh}|${JSON.stringify(getInventoryCounts(bot))}|${w ? w.type + ':' + w.slots.map(i => i ? i.name + i.count : '').join(',') : ''}|${lit() ? Date.now() : ''}`; };
+            return `${fresh}|${JSON.stringify(world.getInventoryCounts(bot))}|${w ? w.type + ':' + w.slots.map(i => i ? i.name + i.count : '').join(',') : ''}|${lit() ? Date.now() : ''}`; };  // fix41: host code uses world. prefix
         let last = sig(), since = Date.now(); this._stall = null;
         const iv = setInterval(() => { try { const s = sig(); if (s !== last) { last = s; since = Date.now(); return; }
             if (Date.now() - since >= 60e3 && this.agent.actions.executing && !this._stall) { const p = bot.entity.position; this._stall = { t: Date.now(), pos: `${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}` }; console.log(`[stall] ${label}: no progress (no new ground reached, inventory, window, lit furnace) for 60s at ${this._stall.pos}; stopping the action`); this.agent.actions.stop(); } } catch (e) { console.log('[stall] watchdog error: ' + e.message); } }, 5000);
@@ -788,6 +829,7 @@ Use only c; no other globals.`;
         const t0 = Date.now(), c0 = { ...CALLS };
         this.step().then(() => { this._errStreak = 0; }, e => {
             console.error('[voyager] step failed: ' + (e?.message ?? e));
+            if (e?.stack) console.error('[voyager] stack:', e.stack);  // fix41: log stack for debugging
             // fix31 runaway guard: consecutive failing steps back off exponentially, scaled by the failing step's own duration
             this._errStreak = (this._errStreak || 0) + 1; const ms = Math.max(Date.now() - t0, 1000) * 2 ** this._errStreak;
             this._backoffUntil = Date.now() + ms; console.log(`[voyager] ${this._errStreak} failing step(s) in a row; next step in ${Math.round(ms / 1000)}s`);
@@ -810,7 +852,7 @@ Use only c; no other globals.`;
             biome: world.getBiomeName(bot),
             time: t < 12000 ? `day (${t})` : t < 13000 ? `dusk (${t}, hostiles about to spawn)` : t < 23000 ? `night (${t}, hostiles spawn outdoors)` : `dawn (${t})`,
             health: `${Math.round(bot.health)}/20`, food: `${bot.food}/20`,
-            inventory: getInventoryCounts(bot),
+            inventory: world.getInventoryCounts(bot),  // fix41: host code uses world. prefix
             inventory_slots: `${usedSlots}/${totalSlots}`,
             empty_inventory_slots: emptySlots,
             // fix38: full equipment (6 slots, not just held item)
@@ -960,6 +1002,15 @@ Use only c; no other globals.`;
     _cursorLimited() { const cm = this.agent.prompter.code_model; return !cm.fallback && Date.now() < (cm.quotaUntil || 0); }   // fix33: fallback configured = not limited
     // find a saved skill that can be replayed without any model call
     _findReplay(task) {
+        // fix41: exact skill name or exact task match FIRST, including primitives (tossClutter/tossItem/depositToChest)
+        const taskLower = task.toLowerCase().trim();
+        for (const s of this.skills) {
+            if (s.demoted || s.mergedInto) continue;
+            // exact name match (case-insensitive)
+            if (s.name.toLowerCase() === taskLower) return { name: s.name, call: `await ${s.name}(bot);` };
+            // exact task match (case-insensitive)
+            if (s.task && s.task.toLowerCase().trim() === taskLower) return { name: s.name, call: `await ${s.name}(bot);` };
+        }
         const goal = countGoal(task);
         const has = n => this.skills.some(s => s.name === n && !s.demoted);
         const kill = task.match(/^(?:kill|hunt|slay|fight)\s+(\d+)\s+([a-z_]+?)s?\b/i);
@@ -1000,12 +1051,16 @@ Use only c; no other globals.`;
         return best ? { name: best.name, call: `await ${best.name}(bot);` } : null;
     }
     // fix28 (D): nearest learned skill by nomic-embed-text over its description; the match threshold is learned from replay outcomes
+    // fix41: allow important primitives (tossClutter, tossItem, depositToChest) in embedding replay
     async _embedReplay(task) {
         const th = this.progress.replayThreshold ??= 0.85;
         const q = await this._embed(task);
         let best = null, bs = -1;
+        const IMPORTANT_PRIMITIVES = new Set(['tossClutter', 'tossItem', 'depositToChest']);
         for (const s of this.skills) {
-            if (s.primitive || s.demoted || s.mergedInto || !s.task || /^(repair|refactor)\b/.test(s.task)) continue;
+            // fix41: allow important primitives (inventory freeing skills) even if s.primitive is true
+            if (s.demoted || s.mergedInto || !s.task || /^(repair|refactor)\b/.test(s.task)) continue;
+            if (s.primitive && !IMPORTANT_PRIMITIVES.has(s.name)) continue;
             const extra = (signatureOf(s.code, s.name).match(/\(([^)]*)\)/)?.[1] || '').split(',').slice(1).map(x => x.trim()).filter(Boolean);
             if (extra.some(x => !x.includes('='))) continue;   // needs arguments it cannot get from the task text
             if (!s.embedding || s.embedding.length !== q.length) continue;
