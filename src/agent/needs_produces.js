@@ -48,7 +48,11 @@ export class NeedsProducesGraph {
         }
     }
 
-    recordDelta(skillOrTask, beforeInv, afterInv) {
+    // fix44: goal/arg hints FILTER which observed deltas count as produces - they do NOT fabricate items
+    // goalItems: array of item names the skill/task is expected to produce (from goal parsing)
+    // When goalItems present: keep only observed ∩ goal (no fabrication from goal alone)
+    // When goalItems absent: keep ALL observed ups (no hard-coded incidental/junk tables)
+    recordDelta(skillOrTask, beforeInv, afterInv, goalItems = null) {
         if (!skillOrTask || typeof skillOrTask !== 'string') return;
         const key = skillOrTask.toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 80);
         
@@ -66,6 +70,20 @@ export class NeedsProducesGraph {
         
         if (!consumed.length && !produced.length) return;
         
+        // fix44: filter produced items when goal hint present (observed ∩ goal)
+        // NO hard-coded incidental/junk item tables - when no goal, keep ALL observed ups
+        let filteredProduced = produced;
+        if (goalItems && goalItems.length) {
+            filteredProduced = produced.filter(({ item }) => goalItems.includes(item));
+            const excluded = produced.filter(({ item }) => !goalItems.includes(item));
+            if (excluded.length) {
+                console.log(`[needs/produces] filtered out non-goal items: [${excluded.map(e => e.item).join(',')}] (goal: [${goalItems.join(',')}])`);
+            }
+        }
+        // else: no goal hint -> keep ALL observed ups (no filtering)
+        
+        if (!consumed.length && !filteredProduced.length) return;
+        
         const obs = (this.observations[key] ||= { needs: {}, produces: {}, runs: 0 });
         obs.runs++;
         obs.lastRun = new Date().toISOString();
@@ -73,14 +91,14 @@ export class NeedsProducesGraph {
         for (const { item, count } of consumed) {
             obs.needs[item] = (obs.needs[item] || 0) + 1;
         }
-        for (const { item, count } of produced) {
+        for (const { item, count } of filteredProduced) {
             obs.produces[item] = (obs.produces[item] || 0) + 1;
         }
         
         this._updateConfirmed(key, obs);
         this._save();
         
-        console.log(`[needs/produces] recorded delta for "${skillOrTask}": -[${consumed.map(c => c.item).join(',')}] +[${produced.map(p => p.item).join(',')}]`);
+        console.log(`[needs/produces] recorded delta for "${skillOrTask}": -[${consumed.map(c => c.item).join(',')}] +[${filteredProduced.map(p => p.item).join(',')}]`);
     }
 
     _updateConfirmed(key, obs) {

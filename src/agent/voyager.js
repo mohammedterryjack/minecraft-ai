@@ -972,10 +972,12 @@ Use only c; no other globals.`;
         }
         else if (this._postHolds(entry)) { ok = true; console.log(`[psn] learned postcondition of ${r.name} holds; critic skipped`); }
         else { const v = await this.critique(task, before, after, extractFeedback(res.message, 1500)); ok = !!v.success; }   // fix38: preserve FAILED lines
-        if (entry && ok && !trial) this._learnEffects(entry, before, after);
+        // fix44: pass goal items to filter learned effects and produces (denoise)
+        const goalItems = goal?.items || (goal?.item ? [goal.item] : null);
+        if (entry && ok && !trial) this._learnEffects(entry, before, after, goalItems);
         if (entry) this._recordRun(entry, task, ok, trial);
         // ADAM-style: record inventory delta for needs/produces learning
-        if (ok) this.npGraph.recordDelta(r.name, before.inventory, after.inventory);
+        if (ok) this.npGraph.recordDelta(r.name, before.inventory, after.inventory, goalItems);
         this._attribute(r.name, task, ok, over);   // fix10: per-call trace -> contract results -> blame -> targeted repair
 
         // fix37 (D): detect and log inventory-full as a fact for learning
@@ -996,9 +998,23 @@ Use only c; no other globals.`;
     _graph(exclude) { const g = {}; for (const s of this.skills) if (s.name !== exclude) g[s.name] = s.deps || []; return g; }
 
     // fix32: learned effects / consumption of a skill from its successful runs (union, capped) - feeds backward chaining
-    _learnEffects(e, before, after) {
+    // fix44: goalItems hint FILTERS which observed ups count as effects - does NOT fabricate
+    // When goalItems present: keep only observed ∩ goal (no fabrication from goal alone)
+    // When goalItems absent: keep ALL observed ups (no hard-coded incidental/junk tables)
+    _learnEffects(e, before, after, goalItems = null) {
         const inv0 = before.inventory, inv1 = after.inventory;
-        const up = Object.keys(inv1).filter(k => (inv1[k] || 0) > (inv0[k] || 0)), down = Object.keys(inv0).filter(k => (inv1[k] || 0) < (inv0[k] || 0));
+        let up = Object.keys(inv1).filter(k => (inv1[k] || 0) > (inv0[k] || 0));
+        const down = Object.keys(inv0).filter(k => (inv1[k] || 0) < (inv0[k] || 0));
+        
+        // fix44: filter up items when goal hint present (observed ∩ goal)
+        // NO hard-coded incidental/junk item tables - when no goal, keep ALL observed ups
+        if (goalItems && goalItems.length) {
+            const excluded = up.filter(k => !goalItems.includes(k));
+            if (excluded.length) console.log(`[psn] _learnEffects filtered non-goal items: [${excluded.join(',')}]`);
+            up = up.filter(k => goalItems.includes(k));
+        }
+        // else: no goal hint -> keep ALL observed ups (no filtering)
+        
         const eff = [...new Set([...(e.effects || []), ...up])].slice(0, 12), con = { ...(e.consumes || {}) };
         for (const k of down) con[k] = Math.max(con[k] || 0, (inv0[k] || 0) - (inv1[k] || 0));
         if (JSON.stringify(eff) !== JSON.stringify(e.effects || []) || JSON.stringify(con) !== JSON.stringify(e.consumes || {})) { e.effects = eff; e.consumes = con; this._saveSkills(); }
@@ -1079,14 +1095,25 @@ Use only c; no other globals.`;
     _boltzmann(c, T = 0.3) { const w = c.map(x => Math.exp(x.V / T)), tot = w.reduce((a, b) => a + b, 0); let r = Math.random() * tot; for (let i = 0; i < c.length; i++) if ((r -= w[i]) <= 0) return c[i]; return c[c.length - 1]; }
     // fix43: _producers now also checks NeedsProducesGraph for confirmed producers (learned from observation)
     // NO hard-coded ore/smelt tables - producers come from skill.effects and observed graph recordings
+    // fix44: resolve mergedInto to validated active skills (merge targets that are not candidate/demoted)
     _producers(item) {
         const fromSkills = this.skills.filter(s => !s.demoted && !s.mergedInto && !s.candidate && !/^(repair|refactor)\b/.test(s.task || '') && (s.effects || []).includes(item)
             && !(signatureOf(s.code, s.name).match(/\(([^)]*)\)/)?.[1] || '').split(',').slice(1).some(x => x.trim() && !x.includes('=')))
             .map(s => ({ s, V: this._maturity(s).V }));
         
+        // fix44: check merged skills - if a merged skill produces the item, include its merge target
+        // ONLY if the merge target is a validated active skill (not candidate, not demoted)
+        for (const merged of this.skills.filter(s => s.mergedInto && (s.effects || []).includes(item))) {
+            const target = this.skills.find(s => s.name === merged.mergedInto);
+            if (target && !target.demoted && !target.candidate && !fromSkills.some(x => x.s.name === target.name)) {
+                fromSkills.push({ s: target, V: this._maturity(target).V });
+                console.log(`[backchain] found producer for ${item} via mergedInto: ${merged.name} -> ${target.name}`);
+            }
+        }
+        
         // fix43: also check NeedsProducesGraph for confirmed producers (learned from observation)
-        if (this.needsProducesGraph) {
-            const graphProducers = this.needsProducesGraph.getProducersOf(item);
+        if (this.npGraph) {
+            const graphProducers = this.npGraph.getProducersOf(item);
             for (const producerKey of graphProducers) {
                 // Map the producer key back to a skill if possible
                 const matchingSkill = this.skills.find(s => 
@@ -1549,8 +1576,8 @@ Use only c; no other globals.`;
             }
         }
         // Also check the NeedsProducesGraph for confirmed producers
-        if (this.needsProducesGraph) {
-            const confirmed = this.needsProducesGraph.getConfirmedLinks();
+        if (this.npGraph) {
+            const confirmed = this.npGraph.getConfirmedLinks();
             for (const [key, links] of Object.entries(confirmed)) {
                 for (const prod of (links.produces || [])) {
                     hasLearnedProducer.add(prod);
@@ -2782,9 +2809,11 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
                 this.progress.failed = this.progress.failed.filter(t => t !== task);
                 this._saveProgress();
                 this._subgoalDone(fn[1]);
-                { const e = this.skills.find(s => s.name === fn[1]); if (e && !e.candidate) this._learnEffects(e, before, after); }
+                // fix44: pass goal items to filter learned effects and produces (denoise)
+                const goalItems = goal?.items || (goal?.item ? [goal.item] : null);
+                { const e = this.skills.find(s => s.name === fn[1]); if (e && !e.candidate) this._learnEffects(e, before, after, goalItems); }
                 // ADAM-style: record inventory delta for needs/produces learning
-                this.npGraph.recordDelta(fn[1], before.inventory, after.inventory);
+                this.npGraph.recordDelta(fn[1], before.inventory, after.inventory, goalItems);
                 // AWM-style: extract workflow from multi-step trace
                 const trace = this.agent.bot.__psnTrace;
                 if (Array.isArray(trace) && trace.length >= 2) {
@@ -2856,6 +2885,7 @@ Voyager.SEEDED_PRIMITIVES = [
         name: 'collectBlock',
         description: 'Collect blocks of the given type. Handles ore variants (iron->iron_ore, deepslate_iron_ore), equips proper tools, and picks up drops.',
         task: 'collect blocks or ores',
+        // fix44: add exclude list for unreachable blocks; fail loud when no progress
         code: `async function collectBlock(bot, blockType, num = 1) {
     if (!blockType || typeof blockType !== 'string') { log(bot, 'collectBlock: invalid blockType'); return false; }
     let types = [blockType];
@@ -2864,19 +2894,38 @@ Voyager.SEEDED_PRIMITIVES = [
     if (blockType === 'dirt') types.push('grass_block');
     if (blockType === 'cobblestone') types.push('stone');
     let collected = 0;
+    const excluded = new Set();
+    const posKey = p => \`\${Math.floor(p.x)},\${Math.floor(p.y)},\${Math.floor(p.z)}\`;
     for (let i = 0; i < num; i++) {
         if (bot.interrupt_code) break;
-        const block = getNearestBlock(bot, b => types.includes(b.name), 64);
-        if (!block) { log(bot, collected ? \`No more \${blockType} nearby.\` : \`No \${blockType} nearby.\`); break; }
+        const block = getNearestBlock(bot, b => types.includes(b.name) && !excluded.has(posKey(b.position)), 64);
+        if (!block) {
+            if (excluded.size) log(bot, \`FAILED: no reachable \${blockType} nearby (\${excluded.size} unreachable block(s) excluded)\`);
+            else log(bot, collected ? \`No more \${blockType} nearby.\` : \`No \${blockType} nearby.\`);
+            break;
+        }
         await bot.tool.equipForBlock(block);
         const itemId = bot.heldItem ? bot.heldItem.type : null;
         if (!block.canHarvest(itemId)) { log(bot, \`Don't have right tools to harvest \${blockType}.\`); return false; }
         const before = getInventoryCounts(bot);
+        const startPos = bot.entity.position.clone();
+        const targetDist = startPos.distanceTo(block.position);
         try {
-            await goToPosition(bot, block.position.x, block.position.y, block.position.z, 4);
+            const reached = await goToPosition(bot, block.position.x, block.position.y, block.position.z, 4);
+            const endPos = bot.entity.position;
+            const movedToward = startPos.distanceTo(block.position) - endPos.distanceTo(block.position);
+            if (!reached || (targetDist > 8 && movedToward < 2)) {
+                excluded.add(posKey(block.position));
+                log(bot, \`Cannot reach \${blockType} at \${posKey(block.position)} (moved \${movedToward.toFixed(1)} blocks toward it); trying another\`);
+                continue;
+            }
             await bot.dig(block, true);
             await pickupNearbyItems(bot);
-        } catch (err) { log(bot, \`Failed to collect \${blockType}: \${err.message}\`); continue; }
+        } catch (err) {
+            excluded.add(posKey(block.position));
+            log(bot, \`Failed to collect \${blockType} at \${posKey(block.position)}: \${err.message}; trying another\`);
+            continue;
+        }
         const after = getInventoryCounts(bot);
         if (Object.keys(after).some(k => (after[k] || 0) > (before[k] || 0))) collected++;
     }
@@ -3246,5 +3295,30 @@ Voyager.SEEDED_PRIMITIVES = [
     return true;
 }`,
         deps: ['placeBlock'],
+    },
+    // fix44: equipBestTool with eq-based contract (idempotent: already-equipped = success)
+    {
+        name: 'equipBestTool',
+        description: 'Equip the best tool of toolType (pickaxe, axe, sword, shovel, hoe) in the inventory; returns the item name or null.',
+        task: 'equip a tool',
+        code: `async function equipBestTool(bot, toolType = 'pickaxe') {
+    const tiers = ['netherite', 'diamond', 'iron', 'stone', 'golden', 'wooden'];
+    const inv = getInventoryCounts(bot);
+    for (const t of tiers) {
+        const name = \`\${t}_\${toolType}\`;
+        if (inv[name]) {
+            await bot.equip(bot.inventory.items().find(it => it.name === name), 'hand');
+            return name;
+        }
+    }
+    return null;
+}`,
+        deps: [],
+        // fix44: contract uses c.post.eq.heldItem NOT c.delta - idempotent (already-equipped = success)
+        contract: {
+            pre: 'c => true',
+            post: 'c => c.ret === null || (c.post.eq && c.post.eq.heldItem === c.ret)',
+            text: 'returns null (no tool) or the equipped tool name matches c.post.eq.heldItem',
+        },
     },
 ];
