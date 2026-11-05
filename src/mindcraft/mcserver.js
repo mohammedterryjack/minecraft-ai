@@ -145,8 +145,11 @@ export async function getServer(host, port, version) {
     ); // Checks version or parent version (e.g. if 1.7 is supported then 1.7.2 will be allowed)
      if (!isSupported)
         throw new Error(`MC server was found ${serverString}, but version is unsupported. Supported versions are: ${mc.supportedVersions.join(", ")}.`);
-    else if (version !== "auto" && server.version !== version)
-        throw new Error(`MC server was found ${serverString}, but version is incorrect. Expected ${version}, but found ${server.version}. Check the server version in settings.js.`);
+    else if (version !== "auto" && server.version !== version) {
+        // fix29: a protocol translator (ViaProxy) serves the configured version; report the mismatch as info and connect with the configured version as before
+        console.log(`[mcserver] info: server reports ${server.version}, connecting as configured ${version} ${serverString}`);
+        return { ...server, version };
+    }
     else
         console.log(`MC server found. ${serverString}`);
 
