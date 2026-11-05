@@ -397,35 +397,8 @@ Use only c; no other globals.`;
     }
     // fix19 (6): places where the bot died 2+ times (16-block cells): a problem for the curriculum to learn to handle, no reflex
     _deathHotspots() {
-        const hs = Object.values(this.progress.deathSpots || {}).filter(c => c.n >= 2).map(c => ({ ...c, hot: !!this._hotCell({ x: +c.pos.split(',')[0], z: +c.pos.split(',')[2] }) })).sort((a, b) => b.n - a.n).slice(0, 3);
-        return hs.length ? hs.map(c => `${c.n} deaths near ${c.pos} (${c.causes.slice(-2).join('; ')}) during "${c.tasks.slice(-1)[0] || 'idle'}"${c.hot ? ' [ACTIVE: tasks targeting/crossing it are rejected, entering it fails the running skill]' : ''}`).join(' | ') + ' -> propose a task that learns to survive/avoid this' : 'none';
-    }
-    // fix26: death hotspots decay by count and time (no fixed cooldown): weight = sum over deaths of 0.5^(age/6h); hot when n>=3 and weight>=1.5
-    _cellKey(p) { return `${Math.floor(p.x / 16)},${Math.floor(p.z / 16)}`; }
-    _hotCell(p) {
-        if (!p || !Number.isFinite(p.x)) return null;
-        const c = (this.progress.deathSpots || {})[this._cellKey(p)]; if (!c || c.n < 3) return null;
-        const ts = c.times?.length ? c.times : Array(c.n).fill(c.last ?? Date.now());
-        const w = ts.reduce((a, t) => a + Math.pow(0.5, (Date.now() - t) / (6 * 3600e3)), 0) + Math.max(0, c.n - ts.length) * Math.pow(0.5, (Date.now() - (c.last ?? Date.now())) / (6 * 3600e3));
-        return w >= 1.5 ? { ...c, w } : null;
-    }
-    _hsText(c) { return `${c.n} deaths near ${c.pos}: ${c.causes.slice(-2).join('; ')}; weight ${c.w.toFixed(1)}`; }
-    // first hot cell on the straight route a->b (8-block samples), excluding the start cell
-    _hotOnRoute(a, b) {
-        const n = Math.max(1, Math.ceil(Math.hypot(b.x - a.x, b.z - a.z) / 8)), k0 = this._cellKey(a);
-        for (let i = 1; i <= n; i++) { const p = { x: a.x + (b.x - a.x) * i / n, z: a.z + (b.z - a.z) * i / n }; if (this._cellKey(p) === k0) continue; const c = this._hotCell(p); if (c) return c; }
-        return null;
-    }
-    // fix26: a task is checked against the resolved target (explicit coords, else home if it says home), the route there, and the bot's own position
-    _hotspotOf(task) {
-        const m = String(task).match(/(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)/), m2 = !m && String(task).match(/\(\s*(-?\d+)\s*,\s*(-?\d+)\s*\)/);
-        const tgt = m ? { x: +m[1], z: +m[3] } : m2 ? { x: +m2[1], z: +m2[2] } : /\bhome\b|\bhut\b|\bbase\b/i.test(task) ? { x: HOME.x, z: HOME.z } : null;
-        const me = this.agent.bot?.entity?.position, here = me ? { x: me.x, z: me.z } : null;
-        let c = tgt && this._hotCell(tgt);
-        if (c) return `its target (${tgt.x}, ${tgt.z}) is in a death hotspot (${this._hsText(c)}); choose a goal away from there or one that first learns to survive it from a safe distance`;
-        if (tgt && here && (c = this._hotOnRoute(here, tgt))) return `the route from the bot (${Math.round(here.x)}, ${Math.round(here.z)}) to its target (${tgt.x}, ${tgt.z}) crosses a death hotspot (${this._hsText(c)}); choose a goal reachable without crossing it`;
-        if (here && (c = this._hotCell(here)) && !tgt) return `the bot is standing in a death hotspot (${this._hsText(c)}) and the task has no explicit target; give a task with explicit x, y, z coordinates outside that area`;
-        return null;
+        const hs = Object.values(this.progress.deathSpots || {}).filter(c => c.n >= 2).sort((a, b) => b.n - a.n).slice(0, 3);
+        return hs.length ? hs.map(c => `${c.n} deaths near ${c.pos} (${c.causes.slice(-2).join('; ')}) during "${c.tasks.slice(-1)[0] || 'idle'}"`).join(' | ') + ' -> propose a task that learns to survive/avoid this' : 'none';
     }
     _noteDeath(d, task) {
         const [x, y, z] = d.pos.split(',').map(Number), k = `${Math.floor(x / 16)},${Math.floor(z / 16)}`;
@@ -692,9 +665,9 @@ Use only c; no other globals.`;
         const system = `You break a Minecraft bot's failing goal into smaller steps (Voyager/PSN-style task decomposition).
 Return 2-4 concrete, verifiable subgoals, in order, that together achieve the goal; each must be doable in a few minutes by ONE small reusable skill (e.g. "Mine 20 cobblestone", "Clear and flatten a 7x7 area at x=.., z=..", "Place a 7x7 cobblestone floor at ..."). Use the failure reason. Do not repeat the goal itself.
 Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
-        const user = `goal: ${task}\nwhy it failed: ${String(reason).slice(0, 600)}\ndeath_hotspots (subgoals targeting these are rejected; plan around them): ${this._deathHotspots()}\n${this._stateText(this.observe())}\nknown_skills: ${JSON.stringify(this.skills.filter(s => !s.demoted).map(s => s.name))}`;
+        const user = `goal: ${task}\nwhy it failed: ${String(reason).slice(0, 600)}\ndeath_hotspots (places it keeps dying): ${this._deathHotspots()}\n${this._stateText(this.observe())}\nknown_skills: ${JSON.stringify(this.skills.filter(s => !s.demoted).map(s => s.name))}`;
         let subs = [];
-        try { subs = (parseJSON(await this._askLocal(system, user)).subgoals || []).map(t => String(t).trim()).filter(t => { if (!t || t === task || validateTask(t)) return false; const h = this._hotspotOf(t); if (h) console.log(`[psn] subgoal rejected: "${t}": ${h}`); return !h; }).slice(0, 4); }
+        try { subs = (parseJSON(await this._askLocal(system, user)).subgoals || []).map(t => String(t).trim()).filter(t => t && t !== task && !validateTask(t)).slice(0, 4); }
         catch (e) { console.log(`[psn] decompose FAILED for "${task}": ${e.message}`); return false; }
         if (subs.length < 2) { console.log(`[psn] decompose FAILED for "${task}": model gave ${subs.length} valid subgoal(s)`); d[task] = { subs, skills: [], at: Date.now(), reason }; this._saveProgress(); return false; }
         d[task] = { subs, skills: [], at: Date.now(), reason: String(reason).slice(0, 200) };
@@ -923,13 +896,7 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         if (died) { let i = -1; for (let k = 0; k < trace.length; k++) if ((trace[k].t0 || 0) <= died.t && (trace[k].t1 ?? Infinity) >= died.t - 1500 && (i < 0 || trace[k].depth >= trace[i].depth)) i = k; if (i < 0) i = trace.length - 1; console.log(`[psn] death attributed to the call running at death time: ${trace[i].name} (depth ${trace[i].depth})`); trace[i].ownFail = [`DIED: ${died.message} at ${died.pos}`]; for (; i >= 0; i = trace[i].parent) { trace[i].intr = false; trace[i].ok = false; trace[i].fail = true; } ok = false; }
         const stalled = !died && this._stalledInRun();   // fix27: a stall is a failure of the deepest call open at stall time
         if (stalled) { let i = -1; for (let k = 0; k < trace.length; k++) if ((trace[k].t0 || 0) <= stalled.t && (trace[k].t1 ?? Infinity) >= stalled.t - 1500 && (i < 0 || trace[k].depth >= trace[i].depth)) i = k; if (i < 0) i = trace.length - 1; console.log(`[psn] stall attributed to the call running at stall time: ${trace[i].name} (depth ${trace[i].depth})`); trace[i].ownFail = [`FAILED: STALLED: no position or inventory change for 60s at ${stalled.pos}`]; for (; i >= 0; i = trace[i].parent) { trace[i].intr = false; trace[i].ok = false; trace[i].fail = true; } ok = false; }
-        // fix26: a call that moved the bot from outside into an active hotspot failed its contract (deepest such call); blame/repair learns avoidance
-        for (let k = trace.length - 1; k >= 0; k--) { const r = trace[k]; if (r.intr || !r.s0?.pos || !r.s1?.pos) continue;
-            const c = this._hotCell(r.s1.pos); if (!c || this._cellKey(r.s0.pos) === this._cellKey(r.s1.pos)) continue;
-            if (trace.some((q, j) => j > k && q.depth > r.depth && q.ownFail?.some(l => /HOTSPOT/.test(l)))) continue;
-            console.log(`[psn] hotspot entry: ${r.name} moved the bot into a death hotspot (${this._hsText(c)}) -> contract failure`);
-            r.ownFail = [...(r.ownFail || []), `FAILED: HOTSPOT entered: moved from ${Math.round(r.s0.pos.x)},${Math.round(r.s0.pos.z)} into a death hotspot at ${c.pos} (${c.n} deaths: ${c.causes.slice(-1)[0]})`];
-            for (let i = k; i >= 0; i = trace[i].parent) { trace[i].intr = false; trace[i].ok = false; trace[i].fail = true; } ok = false; }
+        // fix27: no hotspot filter; deaths stay traced failures (above) and blame/repair learns avoidance
         // fix19 (5): an explicit FAILED line from a skill is a contract failure even if the task check passed (e.g. ensureChest inside a storage task)
         const explicit = trace.some(r => !r.intr && (r.ownFail || []).some(l => /FAILED|CONDITION violated/.test(l)));   // fix22: contract violations count
         if (ok && !revalFail && !explicit) return;
@@ -1084,13 +1051,13 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         const sub = this._subgoalTask(), ms = sub ? null : this._milestoneTask(before), fromCurr = !sub && !ms;
         let proposal = sub || ms || await this.proposeTask(before);
         let task = String(proposal.task || '').trim();
-        let invalid = task ? (validateTask(task) || this._hotspotOf(task)) : 'empty task';
+        let invalid = task ? validateTask(task) : 'empty task';
         if (invalid) {
             console.log(`[voyager] rejected task "${task}": ${invalid}`);
             this.progress.failed.push(`${task} (invalid: ${invalid})`);
             proposal = await this.proposeTask({ ...before, note: `Your last proposal "${task}" was rejected: ${invalid}` });
             task = String(proposal.task || '').trim();
-            invalid = task ? (validateTask(task) || this._hotspotOf(task)) : 'empty task';
+            invalid = task ? validateTask(task) : 'empty task';
             if (invalid) { console.log(`[voyager] rejected again "${task}": ${invalid}; skipping`); this._saveProgress(); return; }
         }
         console.log(`[voyager] new task: ${task} (${proposal.reasoning})`);
