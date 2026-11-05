@@ -948,9 +948,21 @@ Use only c; no other globals.`;
         CALLS.replay++;
         console.log(`[voyager] REPLAY skill ${r.name} for "${task}" (no code model)`);
         const entry = this.skills.find(s => s.name === r.name);
-        const trial = entry?.candidate ? true : false;   // gate: a pending candidate gets trial runs before promotion
-        if (trial) gateLog(`trial run of candidate ${r.name} (candidate ${entry.candidate.stats.success}/${entry.candidate.stats.success + entry.candidate.stats.fail}, current ${entry.stats?.success || 0}/${(entry.stats?.success || 0) + (entry.stats?.fail || 0)})`);
-        const over = {}; for (const s of this.skills) if (s.candidate && (s.name === r.name || this._closure(r.name).has(s.name))) over[s.name] = s.candidate.code;   // fix10: candidates of children are trialled in place too
+        // fix44: gate trials only when candidate effects overlap with task goal
+        // Prevents trialing e.g. craftIronHelmet on an iron_pickaxe goal (wastes ingots, wrong outcome)
+        let trial = false;
+        if (entry?.candidate) {
+            const candidateEffects = entry.candidate.effects || entry.effects || [];
+            const goalItems = goal?.items || (goal?.item ? [goal.item] : []);
+            const effectsOverlap = goalItems.length === 0 || candidateEffects.some(eff => goalItems.includes(eff));
+            if (effectsOverlap) {
+                trial = true;
+                gateLog(`trial run of candidate ${r.name} (candidate ${entry.candidate.stats.success}/${entry.candidate.stats.success + entry.candidate.stats.fail}, current ${entry.stats?.success || 0}/${(entry.stats?.success || 0) + (entry.stats?.fail || 0)})`);
+            } else {
+                gateLog(`SKIP trial of candidate ${r.name}: effects [${candidateEffects.join(', ')}] do not overlap goal [${goalItems.join(', ')}]`);
+            }
+        }
+        const over = {}; for (const s of this.skills) if (s.candidate && trial && (s.name === r.name || this._closure(r.name).has(s.name))) over[s.name] = s.candidate.code;   // fix10: candidates of children are trialled in place too (only if trial enabled)
         const full = this._libSrc(over) + '\n\n' + instrumentSrc(this.skills.filter(s => new RegExp(`async\\s+function\\s+${s.name}\\s*\\(`).test(over[s.name] ?? s.code)).map(s => s.name)) + '\n\nasync function __replay(bot) {\n    try { ' + r.call + ' } finally { bot.__psnOut = bot.output; }\n}\nawait __replay(bot);';
         const staged = await this.agent.coder._stageCode(full);
         if (!staged) return { ok: false };
