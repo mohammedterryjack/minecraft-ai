@@ -48,7 +48,11 @@ export class NeedsProducesGraph {
         }
     }
 
-    recordDelta(skillOrTask, beforeInv, afterInv) {
+    // fix44: goal/arg hints FILTER which observed deltas count as produces - they do NOT fabricate items
+    // goalItems: array of item names the skill/task is expected to produce (from goal parsing)
+    // Only observed inventory ups that match goalItems (or are clearly related) count as produces
+    // This excludes incidental pickups (dirt, petals, etc.) that happen to rise during the run
+    recordDelta(skillOrTask, beforeInv, afterInv, goalItems = null) {
         if (!skillOrTask || typeof skillOrTask !== 'string') return;
         const key = skillOrTask.toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 80);
         
@@ -66,6 +70,29 @@ export class NeedsProducesGraph {
         
         if (!consumed.length && !produced.length) return;
         
+        // fix44: filter produced items - only count items that match goal/arg hints (observed AND relevant)
+        // If no goalItems hint, still exclude common incidental pickups that clearly aren't skill outputs
+        const incidental = new Set(['dirt', 'grass_block', 'short_grass', 'tall_grass', 'fern', 'dead_bush', 'poppy', 'dandelion', 'blue_orchid', 'allium', 'azure_bluet', 'red_tulip', 'orange_tulip', 'white_tulip', 'pink_tulip', 'oxeye_daisy', 'cornflower', 'lily_of_the_valley', 'pink_petals', 'torchflower', 'pitcher_plant', 'spore_blossom', 'moss_carpet', 'small_dripleaf', 'big_dripleaf', 'glow_lichen', 'hanging_roots', 'seagrass', 'kelp', 'sea_pickle', 'lily_pad', 'sugar_cane', 'bamboo', 'cactus', 'vine', 'cave_vines', 'weeping_vines', 'twisting_vines', 'nether_sprouts', 'warped_roots', 'crimson_roots', 'gravel', 'sand', 'red_sand', 'snow', 'snow_block', 'ice', 'packed_ice', 'blue_ice', 'clay_ball', 'flint', 'feather', 'string', 'gunpowder', 'rotten_flesh', 'spider_eye', 'bone', 'slime_ball', 'ender_pearl', 'blaze_rod', 'ghast_tear', 'magma_cream', 'phantom_membrane']);
+        
+        let filteredProduced = produced;
+        if (goalItems && goalItems.length) {
+            // Only count items that match goal hints - strict filtering
+            filteredProduced = produced.filter(({ item }) => goalItems.includes(item));
+            const excluded = produced.filter(({ item }) => !goalItems.includes(item));
+            if (excluded.length) {
+                console.log(`[needs/produces] filtered out non-goal items: [${excluded.map(e => e.item).join(',')}] (goal: [${goalItems.join(',')}])`);
+            }
+        } else {
+            // No goal hint - exclude clearly incidental pickups only
+            filteredProduced = produced.filter(({ item }) => !incidental.has(item));
+            const excluded = produced.filter(({ item }) => incidental.has(item));
+            if (excluded.length) {
+                console.log(`[needs/produces] filtered out incidental pickups: [${excluded.map(e => e.item).join(',')}]`);
+            }
+        }
+        
+        if (!consumed.length && !filteredProduced.length) return;
+        
         const obs = (this.observations[key] ||= { needs: {}, produces: {}, runs: 0 });
         obs.runs++;
         obs.lastRun = new Date().toISOString();
@@ -73,14 +100,14 @@ export class NeedsProducesGraph {
         for (const { item, count } of consumed) {
             obs.needs[item] = (obs.needs[item] || 0) + 1;
         }
-        for (const { item, count } of produced) {
+        for (const { item, count } of filteredProduced) {
             obs.produces[item] = (obs.produces[item] || 0) + 1;
         }
         
         this._updateConfirmed(key, obs);
         this._save();
         
-        console.log(`[needs/produces] recorded delta for "${skillOrTask}": -[${consumed.map(c => c.item).join(',')}] +[${produced.map(p => p.item).join(',')}]`);
+        console.log(`[needs/produces] recorded delta for "${skillOrTask}": -[${consumed.map(c => c.item).join(',')}] +[${filteredProduced.map(p => p.item).join(',')}]`);
     }
 
     _updateConfirmed(key, obs) {

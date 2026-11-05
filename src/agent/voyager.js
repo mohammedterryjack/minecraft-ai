@@ -972,10 +972,12 @@ Use only c; no other globals.`;
         }
         else if (this._postHolds(entry)) { ok = true; console.log(`[psn] learned postcondition of ${r.name} holds; critic skipped`); }
         else { const v = await this.critique(task, before, after, extractFeedback(res.message, 1500)); ok = !!v.success; }   // fix38: preserve FAILED lines
-        if (entry && ok && !trial) this._learnEffects(entry, before, after);
+        // fix44: pass goal items to filter learned effects and produces (denoise)
+        const goalItems = goal?.items || (goal?.item ? [goal.item] : null);
+        if (entry && ok && !trial) this._learnEffects(entry, before, after, goalItems);
         if (entry) this._recordRun(entry, task, ok, trial);
         // ADAM-style: record inventory delta for needs/produces learning
-        if (ok) this.npGraph.recordDelta(r.name, before.inventory, after.inventory);
+        if (ok) this.npGraph.recordDelta(r.name, before.inventory, after.inventory, goalItems);
         this._attribute(r.name, task, ok, over);   // fix10: per-call trace -> contract results -> blame -> targeted repair
 
         // fix37 (D): detect and log inventory-full as a fact for learning
@@ -996,9 +998,25 @@ Use only c; no other globals.`;
     _graph(exclude) { const g = {}; for (const s of this.skills) if (s.name !== exclude) g[s.name] = s.deps || []; return g; }
 
     // fix32: learned effects / consumption of a skill from its successful runs (union, capped) - feeds backward chaining
-    _learnEffects(e, before, after) {
+    // fix44: goalItems hint FILTERS which observed ups count as effects - does NOT fabricate
+    // Only adds items that were observed to increase AND match the goal hint (if provided)
+    _learnEffects(e, before, after, goalItems = null) {
         const inv0 = before.inventory, inv1 = after.inventory;
-        const up = Object.keys(inv1).filter(k => (inv1[k] || 0) > (inv0[k] || 0)), down = Object.keys(inv0).filter(k => (inv1[k] || 0) < (inv0[k] || 0));
+        let up = Object.keys(inv1).filter(k => (inv1[k] || 0) > (inv0[k] || 0));
+        const down = Object.keys(inv0).filter(k => (inv1[k] || 0) < (inv0[k] || 0));
+        
+        // fix44: filter up items - only include goal items if hint provided, else exclude incidentals
+        if (goalItems && goalItems.length) {
+            const excluded = up.filter(k => !goalItems.includes(k));
+            if (excluded.length) console.log(`[psn] _learnEffects filtered non-goal items: [${excluded.join(',')}]`);
+            up = up.filter(k => goalItems.includes(k));
+        } else {
+            const incidental = new Set(['dirt', 'grass_block', 'short_grass', 'tall_grass', 'fern', 'dead_bush', 'gravel', 'sand', 'snow', 'flint', 'feather', 'string', 'rotten_flesh', 'spider_eye', 'bone', 'poppy', 'dandelion', 'blue_orchid', 'allium', 'azure_bluet', 'pink_petals', 'moss_carpet']);
+            const excluded = up.filter(k => incidental.has(k));
+            if (excluded.length) console.log(`[psn] _learnEffects filtered incidental: [${excluded.join(',')}]`);
+            up = up.filter(k => !incidental.has(k));
+        }
+        
         const eff = [...new Set([...(e.effects || []), ...up])].slice(0, 12), con = { ...(e.consumes || {}) };
         for (const k of down) con[k] = Math.max(con[k] || 0, (inv0[k] || 0) - (inv1[k] || 0));
         if (JSON.stringify(eff) !== JSON.stringify(e.effects || []) || JSON.stringify(con) !== JSON.stringify(e.consumes || {})) { e.effects = eff; e.consumes = con; this._saveSkills(); }
@@ -2793,9 +2811,11 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
                 this.progress.failed = this.progress.failed.filter(t => t !== task);
                 this._saveProgress();
                 this._subgoalDone(fn[1]);
-                { const e = this.skills.find(s => s.name === fn[1]); if (e && !e.candidate) this._learnEffects(e, before, after); }
+                // fix44: pass goal items to filter learned effects and produces (denoise)
+                const goalItems = goal?.items || (goal?.item ? [goal.item] : null);
+                { const e = this.skills.find(s => s.name === fn[1]); if (e && !e.candidate) this._learnEffects(e, before, after, goalItems); }
                 // ADAM-style: record inventory delta for needs/produces learning
-                this.npGraph.recordDelta(fn[1], before.inventory, after.inventory);
+                this.npGraph.recordDelta(fn[1], before.inventory, after.inventory, goalItems);
                 // AWM-style: extract workflow from multi-step trace
                 const trace = this.agent.bot.__psnTrace;
                 if (Array.isArray(trace) && trace.length >= 2) {
@@ -3277,5 +3297,30 @@ Voyager.SEEDED_PRIMITIVES = [
     return true;
 }`,
         deps: ['placeBlock'],
+    },
+    // fix44: equipBestTool with eq-based contract (idempotent: already-equipped = success)
+    {
+        name: 'equipBestTool',
+        description: 'Equip the best tool of toolType (pickaxe, axe, sword, shovel, hoe) in the inventory; returns the item name or null.',
+        task: 'equip a tool',
+        code: `async function equipBestTool(bot, toolType = 'pickaxe') {
+    const tiers = ['netherite', 'diamond', 'iron', 'stone', 'golden', 'wooden'];
+    const inv = getInventoryCounts(bot);
+    for (const t of tiers) {
+        const name = \`\${t}_\${toolType}\`;
+        if (inv[name]) {
+            await bot.equip(bot.inventory.items().find(it => it.name === name), 'hand');
+            return name;
+        }
+    }
+    return null;
+}`,
+        deps: [],
+        // fix44: contract uses c.post.eq.heldItem NOT c.delta - idempotent (already-equipped = success)
+        contract: {
+            pre: 'c => true',
+            post: 'c => c.ret === null || (c.post.eq && c.post.eq.heldItem === c.ret)',
+            text: 'returns null (no tool) or the equipped tool name matches c.post.eq.heldItem',
+        },
     },
 ];
