@@ -250,6 +250,7 @@ Use only c; no other globals.`;
                 try { ok = this._compileContract(e.contract[k])(c); }
                 catch (err) { console.log(`!!! [contract] ${e.name}.${k} THREW: ${err.message}; queued contract repair`); this._queueContractFix(e, `${k} threw: ${err.message}`); continue; }
                 if (ok !== false) continue;
+                if (k === 'pre' && !r.fail && r.rv !== false && r.rv !== null) { console.log(`[contract] ${e.name} precondition violated but the call succeeded -> precondition is wrong; queued contract repair`); this._queueContractFix(e, `precondition ${e.contract.pre} was false but the call succeeded (ret ${r.ret})`); continue; }
                 r.ok = false; r.fail = true; if (k === 'pre') r.preFail = true;
                 r.ownFail = [...(r.ownFail || []), `${k === 'pre' ? 'PRECONDITION' : 'POSTCONDITION'} violated: ${e.contract.text || e.contract[k]} (post pos ${r.s1.pos ? [r.s1.pos.x, r.s1.pos.y, r.s1.pos.z].map(Math.round).join(',') : '?'}, sky ${r.s1.sky}, alive ${r.s1.alive})`];
                 console.log(`[contract] ${e.name}(${(r.argv || []).join(',')}) ${k}condition VIOLATED: ${e.contract[k].slice(0, 160)}`);
@@ -557,7 +558,8 @@ Use only c; no other globals.`;
             else gateLog(`candidate ${entry.name} trial ${ok ? 'passed' : 'failed'} (${c.stats.success}/${n}); waiting for more runs`);
         } else {
             entry.stats = recordRun(entry.stats || newStats(), task, ok);
-            if (!ok && entry.stats.streakFail >= 3 && !entry.primitive && !entry.demoted) { entry.demoted = true; gateLog(`DEMOTE ${entry.name}: failed 3 times in a row (kept on disk, not replayed)`); }
+            if (!ok && entry.stats.streakFail >= 3 && entry.handwritten_original && entry.code !== entry.handwritten_original.code) { gateLog(`ROLLBACK ${entry.name}: promoted replacement failed 3 times in a row`); this.restoreHandwritten(entry.name); }
+            else if (!ok && entry.stats.streakFail >= 3 && !entry.primitive && !entry.demoted) { entry.demoted = true; gateLog(`DEMOTE ${entry.name}: failed 3 times in a row (kept on disk, not replayed)`); }
         }
         this._saveSkills();
     }
@@ -646,9 +648,9 @@ Use only c; no other globals.`;
         const system = `You break a Minecraft bot's failing goal into smaller steps (Voyager/PSN-style task decomposition).
 Return 2-4 concrete, verifiable subgoals, in order, that together achieve the goal; each must be doable in a few minutes by ONE small reusable skill (e.g. "Mine 20 cobblestone", "Clear and flatten a 7x7 area at x=.., z=..", "Place a 7x7 cobblestone floor at ..."). Use the failure reason. Do not repeat the goal itself.
 Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
-        const user = `goal: ${task}\nwhy it failed: ${String(reason).slice(0, 600)}\n${this._stateText(this.observe())}\nknown_skills: ${JSON.stringify(this.skills.filter(s => !s.demoted).map(s => s.name))}`;
+        const user = `goal: ${task}\nwhy it failed: ${String(reason).slice(0, 600)}\ndeath_hotspots (subgoals targeting these are rejected; plan around them): ${this._deathHotspots()}\n${this._stateText(this.observe())}\nknown_skills: ${JSON.stringify(this.skills.filter(s => !s.demoted).map(s => s.name))}`;
         let subs = [];
-        try { subs = (parseJSON(await this._askLocal(system, user)).subgoals || []).map(t => String(t).trim()).filter(t => t && t !== task && !validateTask(t)).slice(0, 4); }
+        try { subs = (parseJSON(await this._askLocal(system, user)).subgoals || []).map(t => String(t).trim()).filter(t => { if (!t || t === task || validateTask(t)) return false; const h = this._hotspotOf(t); if (h) console.log(`[psn] subgoal rejected: "${t}": ${h}`); return !h; }).slice(0, 4); }
         catch (e) { console.log(`[psn] decompose FAILED for "${task}": ${e.message}`); return false; }
         if (subs.length < 2) { console.log(`[psn] decompose FAILED for "${task}": model gave ${subs.length} valid subgoal(s)`); d[task] = { subs, skills: [], at: Date.now(), reason }; this._saveProgress(); return false; }
         d[task] = { subs, skills: [], at: Date.now(), reason: String(reason).slice(0, 200) };
@@ -727,6 +729,7 @@ replayable_tasks (cheap, no new code needed): ${JSON.stringify(this.skills.filte
             writeAtomic(`${this.dir}/${name}.js`, `// ${description}\n${code}\n`);
             this._saveSkills();
             gateLog(`NEW ${name} deps=[${deps.join(', ')}]`);
+            if (!this._cursorLimited()) await this._learnContracts([entry], 'saved');   // fix24: contract learned at save time
             this._extractShared();
             console.log(`[voyager] saved skill ${name}: ${description}`);
             return true;
@@ -741,7 +744,7 @@ replayable_tasks (cheap, no new code needed): ${JSON.stringify(this.skills.filte
         if (reg === true) { gateLog(`PROMOTE ${name}: passed regression rerun on a past task`); this._promote(entry, cand); }
         else if (reg === false) { gateLog(`REJECT update to ${name}: failed regression rerun on a past task; keeping current version`); this._proposalOutcome(entry, 'failed regression rerun'); if (opts.refactor) this._rollbackRefactor(opts.refactor, name); }
         else if (opts.repair) { entry.candidate = cand; gateLog(`HOLD repair of ${name}: kept as candidate; needs 2+ trial runs with success rate >= current ${rate(entry.stats || newStats()).toFixed(2)}`); }   // fix11 (B3)
-        else if (!(entry.stats?.success)) { gateLog(`PROMOTE ${name}: current version has no recorded successes`); this._promote(entry, cand); }
+        else if (!entry.handwritten && !(entry.stats?.success)) { gateLog(`PROMOTE ${name}: current version has no recorded successes`); this._promote(entry, cand); }
         else { entry.candidate = cand; gateLog(`HOLD ${name}: new version kept as candidate (1/1); needs 2+ trial runs with success rate >= current ${rate(entry.stats).toFixed(2)}`); }
         this._saveSkills();
         return true;
@@ -848,7 +851,7 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
     // fix11 (B1): only hand-written/primitive skills with no skill deps are fixed leaves; learned skills stay repairable.
     // Names outside the library (freshly generated code) are not leaves.
     _isLeaf(name) { if (name.startsWith('skills.')) return true;   // fix21: traced primitives are fixed leaves
-        const e = this.skills.find(s => s.name === name); return !!e && !!(e.primitive || e.handwritten) && !(e.deps || []).length; }
+        const e = this.skills.find(s => s.name === name); return !!e && !!e.primitive && !(e.deps || []).length; }   // fix24: hand-written skills are repairable
     _attribute(root, task, ok, over) {
         const bot = this.agent.bot, trace = bot.__psnTrace;
         bot.__psnTrace = null;
@@ -879,7 +882,7 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         if (ok && !revalFail && !explicit) return;
         if (ok && explicit) console.log(`[psn] task check passed but a skill reported FAILED; attributing that contract failure`);
         console.log(`[psn] execution trace of ${root} (${trace.length} calls):\n${traceText(trace)}`);
-        const learned = n => { const e = this.skills.find(s => s.name === n); return !!e && !e.primitive && !e.handwritten; };
+        const learned = n => { const e = this.skills.find(s => s.name === n); return !!e && !e.primitive; };   // fix24: includes hand-written (repairs become learned candidates)
         let bs = blameAll(trace, n => this._isLeaf(n), learned).slice(0, 3);   // at most 3 patches per failure (deepest first)
         // fix19 (2): no learned skill on a failure path: the root's own composition is at fault
         if (!bs.length) {
@@ -1005,7 +1008,7 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         const sub = this._subgoalTask(), ms = sub ? null : this._milestoneTask(before), fromCurr = !sub && !ms;
         let proposal = sub || ms || await this.proposeTask(before);
         let task = String(proposal.task || '').trim();
-        let invalid = task ? (validateTask(task) || (fromCurr && this._hotspotOf(task))) : 'empty task';
+        let invalid = task ? (validateTask(task) || this._hotspotOf(task)) : 'empty task';
         if (invalid) {
             console.log(`[voyager] rejected task "${task}": ${invalid}`);
             this.progress.failed.push(`${task} (invalid: ${invalid})`);
@@ -1061,12 +1064,13 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             const desc = (code.match(/\/\/\s*DESCRIPTION:\s*(.+)/) || [])[1] || task;
             const own = fn[1];
             const libOthers = this.skills.filter(s => s.name !== own);
-            const full = libOthers.map(s => s.code).join('\n\n') + '\n\n' + code;
+            const over = {}; for (const s of libOthers) if (s.candidate) over[s.name] = s.candidate.code;   // fix24: candidates get trial runs in every task
+            const full = libOthers.map(s => over[s.name] ?? s.code).join('\n\n') + '\n\n' + code;
             const plain = await this.agent.coder._stageCode(full);
             const lint = plain ? await this.agent.coder._lintCode(plain.src_lint_copy) : 'staging failed';
             // fix11 (B7): run the generated code with the PSN trace wrapper (rebinding happens before the code's own top-level call)
             const traced = [...libOthers.map(s => s.name), own];
-            const staged = lint ? null : await this.agent.coder._stageCode(libOthers.map(s => s.code).join('\n\n') + '\n\n' + instrumentSrc(traced) + '\n\n' + code);
+            const staged = lint ? null : await this.agent.coder._stageCode(libOthers.map(s => over[s.name] ?? s.code).join('\n\n') + '\n\n' + instrumentSrc(traced) + '\n\n' + code);
             if (!lint && !staged) throw new Error('[psn] staging of traced generated code failed');
             if (lint) { console.log('[voyager] lint failed: ' + String(lint).slice(0, 300)); feedback = 'Lint error:\n' + lint; lastCode = code; continue; }
 
@@ -1090,7 +1094,7 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
                 : await this.critique(task, before, after, output);
             if (goal && gained >= goal.count) console.log(`[voyager] verified from inventory (+${gained} ${goal.item}), critic skipped`);
             console.log(`[voyager] attempt ${i} critic: success=${verdict.success} ${verdict.critique || ''}`);
-            this._attribute(own, task, !!verdict.success, {});   // fix11 (B7)
+            this._attribute(own, task, !!verdict.success, over);   // fix11 (B7)
             if (this._repairQueue?.some(x => x.target === own)) { console.log(`[psn] blame lands on the generated ${own} itself; the critic feedback loop fixes it (no library repair)`); this._repairQueue = this._repairQueue.filter(x => x.target !== own); }
             const lastTry = i >= MAX_ATTEMPTS || (!verdict.success && /travel|underground|died/.test(cut) && i >= 2);   // fix23: repeated travel cut-offs -> stop at 2 and decompose
             if (this._decomposeQueue?.task === task && !lastTry) this._decomposeQueue = null;   // still iterating; decomposition decided after the last attempt
