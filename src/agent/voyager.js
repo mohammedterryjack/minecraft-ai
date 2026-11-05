@@ -211,6 +211,7 @@ export class Voyager {
     // fix40/41: migration from skills.*/world.* to bare names
     // Rewrites all saved skill code to use bare function names instead of skills.X/world.Y
     // fix41: uses Object.keys for names (not extractSig), adds catch-all, re-runs on leftovers, also rewrites s.candidate.code
+    // fix42: MUST NOT create self-recursion by rewriting skills.NAME/world.NAME to NAME inside function NAME
     _migrateToBarenames() {
         const LEFTOVER_RE = /\b(?:skills|world)\.\w+\s*\(/;
         const hasLeftovers = () => this.skills.some(s => (s.code && LEFTOVER_RE.test(s.code)) || (s.candidate?.code && LEFTOVER_RE.test(s.candidate.code)));
@@ -222,17 +223,35 @@ export class Voyager {
         const skillFnNames = Object.keys(skills).filter(k => typeof skills[k] === 'function' && k !== 'log');
         const worldFnNames = Object.keys(world).filter(k => typeof world[k] === 'function');
         const allNames = new Set([...skillFnNames, ...worldFnNames]);
-        // fix41: rewrite helper - catch-all for any skills.X( or world.X( patterns
-        const rewriteCode = (code) => {
+        // fix42: derive seeded names from SEEDED_PRIMITIVES source of truth (not a hard-coded list)
+        const seededNames = new Set(Voyager.SEEDED_PRIMITIVES.map(p => p.name));
+        const needsReheal = new Set();
+        // fix42: rewrite helper - detects self-call and marks seeded for reheal instead of creating recursion
+        const rewriteCode = (code, skillFnName) => {
             if (!code) return { code, changes: 0 };
             let changes = 0;
             for (const name of allNames) {
+                // fix42: detect self-call: skills.NAME or world.NAME inside function NAME
+                if (name === skillFnName) {
+                    const selfCallSkills = new RegExp(`\\bskills\\.${name}\\s*\\(`).test(code);
+                    const selfCallWorld = new RegExp(`\\bworld\\.${name}\\s*\\(`).test(code);
+                    if (selfCallSkills || selfCallWorld) {
+                        if (seededNames.has(name)) {
+                            console.log(`[fix42] SELF-CALL DETECTED: function ${skillFnName} calls ${selfCallSkills ? 'skills' : 'world'}.${name}; marking for seed reheal`);
+                            needsReheal.add(name);
+                        } else {
+                            console.error(`[fix42] SELF-CALL BLOCKED: function ${skillFnName} calls ${selfCallSkills ? 'skills' : 'world'}.${name} - rewrite would cause infinite recursion; skipping`);
+                        }
+                        continue;
+                    }
+                }
                 const re = new RegExp(`\\bskills\\.${name}\\s*\\(`, 'g');
                 const before = code;
                 code = code.replace(re, `${name}(`);
                 if (code !== before) changes++;
             }
             for (const name of allNames) {
+                if (name === skillFnName) continue;  // already handled above
                 const re = new RegExp(`\\bworld\\.${name}\\s*\\(`, 'g');
                 const before = code;
                 code = code.replace(re, `${name}(`);
@@ -250,9 +269,12 @@ export class Voyager {
         let migrated = 0, totalChanges = 0, candidateChanges = 0;
         for (const s of this.skills) {
             let skillChanged = false;
+            // Extract function name from skill code
+            const fnMatch = s.code?.match(/(?:async\s+)?function\s+([A-Za-z_]\w*)\s*\(/);
+            const skillFnName = fnMatch ? fnMatch[1] : null;
             // Rewrite s.code
             if (s.code) {
-                const r = rewriteCode(s.code);
+                const r = rewriteCode(s.code, skillFnName);
                 if (r.changes > 0) {
                     s.code = r.code;
                     totalChanges += r.changes;
@@ -261,7 +283,9 @@ export class Voyager {
             }
             // fix41: also rewrite s.candidate.code (gate trials run candidate.code in SES)
             if (s.candidate?.code) {
-                const r = rewriteCode(s.candidate.code);
+                const candFnMatch = s.candidate.code.match(/(?:async\s+)?function\s+([A-Za-z_]\w*)\s*\(/);
+                const candFnName = candFnMatch ? candFnMatch[1] : null;
+                const r = rewriteCode(s.candidate.code, candFnName);
                 if (r.changes > 0) {
                     s.candidate.code = r.code;
                     candidateChanges += r.changes;
@@ -274,9 +298,22 @@ export class Voyager {
                 migrated++;
             }
         }
+        // fix42: post-migration scan for any remaining skills.*/world.* calls (fail loud)
+        for (const s of this.skills) {
+            if (!s.code) continue;
+            const leftover = s.code.match(/\b(?:skills|world)\.[A-Za-z_]\w*\s*\(/g);
+            if (leftover) {
+                console.error(`[fix42] LEFTOVER OLD-STYLE CALLS in ${s.name}: ${leftover.join(', ')} - these will fail at runtime (SES has no skills/world objects)`);
+            }
+        }
         if (migrated > 0) {
             this._saveSkills();
             console.log(`[fix41] MIGRATION COMPLETE: ${migrated} skills updated, ${totalChanges} code changes, ${candidateChanges} candidate changes`);
+        }
+        // fix42: pass needsReheal to _seedPrimitives
+        if (needsReheal.size > 0) {
+            this._needsReheal = needsReheal;
+            console.log(`[fix42] ${needsReheal.size} skill(s) marked for seed reheal: ${[...needsReheal].join(', ')}`);
         }
         // fix41: only set flag when zero leftovers remain
         if (!hasLeftovers()) {
@@ -289,270 +326,31 @@ export class Voyager {
     }
     // fix33: seed primitives into the skill library so they are blamable/repairable (learned path, not hard-coded)
     // These are skills from skills.js that need to be in the skill graph to enable learning (e.g. water escape)
+    // fix42: SEEDED_PRIMITIVES moved to static property so _migrateToBarenames can derive seeded names from it
     _seedPrimitives() {
-        const SEEDED_PRIMITIVES = [
-            {
-                name: 'travelTo',
-                description: 'Travel long distances (hundreds of blocks) in short hops of up to 32 blocks, so chunks load and paths stay short. Returns true once within 4 blocks (horizontally) of the target.',
-                task: 'travel to a distant location',
-                code: `async function travelTo(bot, x, y, z, maxHops = 120) {
-    let fails = 0;
-    for (let hop = 0; hop < maxHops; hop++) {
-        if (bot.interrupt_code) return false;
-        const p = bot.entity.position;
-        const dx = x - p.x, dz = z - p.z, d = Math.hypot(dx, dz);
-        if (d <= 4) { log(bot, \`Arrived near \${x}, \${y}, \${z}.\`); return true; }
-        if (d <= 32) { if (await goToPosition(bot, x, y, z, 3)) continue; }
-        const step = Math.min(32, d);
-        const side = fails ? (fails % 2 ? 1 : -1) * 10 * fails : 0;
-        const tx = Math.round(p.x + dx / d * step - dz / d * side), tz = Math.round(p.z + dz / d * step + dx / d * side);
-        try { await goToGoal(bot, new Vec3(tx, p.y, tz), 3); fails = 0; }
-        catch (err) {
-            if (bot.interrupt_code) return false;
-            if (++fails >= 6) { log(bot, \`travelTo gave up at \${p.floored()} after 6 failed hops: \${err?.message}\`); return false; }
-        }
-    }
-    log(bot, \`travelTo ran out of hops; still \${Math.round(Math.hypot(x - bot.entity.position.x, z - bot.entity.position.z))} blocks away.\`);
-    return false;
-}`,
-                deps: [],
-            },
-            {
-                name: 'collectBlock',
-                description: 'Collect blocks of the given type. Handles ore variants (iron->iron_ore, deepslate_iron_ore), equips proper tools, and picks up drops.',
-                task: 'collect blocks or ores',
-                code: `async function collectBlock(bot, blockType, num = 1) {
-    if (!blockType || typeof blockType !== 'string') { log(bot, 'collectBlock: invalid blockType'); return false; }
-    let types = [blockType];
-    if (['coal','diamond','emerald','iron','gold','lapis_lazuli','redstone'].includes(blockType)) types.push(blockType + '_ore');
-    if (blockType.endsWith('ore')) types.push('deepslate_' + blockType);
-    if (blockType === 'dirt') types.push('grass_block');
-    if (blockType === 'cobblestone') types.push('stone');
-    let collected = 0;
-    for (let i = 0; i < num; i++) {
-        if (bot.interrupt_code) break;
-        const block = getNearestBlock(bot, b => types.includes(b.name), 64);
-        if (!block) { log(bot, collected ? \`No more \${blockType} nearby.\` : \`No \${blockType} nearby.\`); break; }
-        await bot.tool.equipForBlock(block);
-        const itemId = bot.heldItem ? bot.heldItem.type : null;
-        if (!block.canHarvest(itemId)) { log(bot, \`Don't have right tools to harvest \${blockType}.\`); return false; }
-        const before = getInventoryCounts(bot);
-        try {
-            await goToPosition(bot, block.position.x, block.position.y, block.position.z, 4);
-            await bot.dig(block, true);
-            await pickupNearbyItems(bot);
-        } catch (err) { log(bot, \`Failed to collect \${blockType}: \${err.message}\`); continue; }
-        const after = getInventoryCounts(bot);
-        if (Object.keys(after).some(k => (after[k] || 0) > (before[k] || 0))) collected++;
-    }
-    log(bot, \`Collected \${collected} \${blockType}.\`);
-    return collected > 0;
-}`,
-                deps: ['pickupNearbyItems'],
-            },
-            {
-                name: 'craftRecipe',
-                description: 'Craft an item using the crafting recipe. Places and retrieves crafting table if needed.',
-                task: 'craft an item',
-                code: `async function craftRecipe(bot, itemName, num = 1) {
-    if (!itemName) { log(bot, 'craftRecipe: no item specified'); return false; }
-    let recipes = bot.recipesFor(bot.registry.itemsByName[itemName]?.id, null, 1, null);
-    let craftingTable = null, placedTable = false;
-    if (!recipes || !recipes.length) {
-        recipes = bot.recipesFor(bot.registry.itemsByName[itemName]?.id, null, 1, true);
-        if (!recipes || !recipes.length) { log(bot, \`No recipe for \${itemName} or missing ingredients.\`); return false; }
-        craftingTable = getNearestBlock(bot, 'crafting_table', 16);
-        if (!craftingTable) {
-            const hasTable = (getInventoryCounts(bot)['crafting_table'] || 0) > 0;
-            if (hasTable) {
-                const pos = getNearestFreeSpace(bot, 1, 6);
-                await placeBlock(bot, 'crafting_table', pos.x, pos.y, pos.z);
-                craftingTable = getNearestBlock(bot, 'crafting_table', 16);
-                placedTable = true;
-            } else { log(bot, \`Crafting \${itemName} requires a crafting table.\`); return false; }
-        }
-        if (craftingTable) recipes = bot.recipesFor(bot.registry.itemsByName[itemName]?.id, null, 1, craftingTable);
-    }
-    if (!recipes || !recipes.length) { log(bot, \`Cannot craft \${itemName}: missing ingredients.\`); if (placedTable) await collectBlock(bot, 'crafting_table', 1); return false; }
-    if (craftingTable) await goToPosition(bot, craftingTable.position.x, craftingTable.position.y, craftingTable.position.z, 3);
-    const before = getInventoryCounts(bot)[itemName] || 0;
-    try { await bot.craft(recipes[0], Math.min(num, 64), craftingTable); }
-    catch (err) { log(bot, \`Crafting \${itemName} failed: \${err.message}\`); if (placedTable) await collectBlock(bot, 'crafting_table', 1); return false; }
-    const after = getInventoryCounts(bot)[itemName] || 0;
-    if (placedTable) await collectBlock(bot, 'crafting_table', 1);
-    if (after > before) { log(bot, \`Crafted \${itemName}, now have \${after}.\`); return true; }
-    log(bot, \`Crafting \${itemName} produced no items.\`); return false;
-}`,
-                deps: ['placeBlock', 'collectBlock'],
-            },
-            {
-                name: 'attackNearest',
-                description: 'Attack the nearest mob of the given type. Equips best weapon and fights until the mob is dead or bot is interrupted.',
-                task: 'attack a mob',
-                code: `async function attackNearest(bot, mobType, kill = true) {
-    if (!mobType) { log(bot, 'attackNearest: no mob type specified'); return false; }
-    bot.modes.pause('cowardice');
-    const waterMobs = ['drowned', 'cod', 'salmon', 'tropical_fish', 'squid'];
-    if (waterMobs.includes(mobType)) bot.modes.pause('self_preservation');
-    const mob = getNearbyEntities(bot, 24).find(e => e.name === mobType);
-    if (!mob) { log(bot, \`Could not find any \${mobType} to attack.\`); return false; }
-    const weapons = bot.inventory.items().filter(it => it.name.includes('sword') || (it.name.includes('axe') && !it.name.includes('pickaxe')));
-    if (weapons.length) { weapons.sort((a, b) => (b.attackDamage || 0) - (a.attackDamage || 0)); await bot.equip(weapons[0], 'hand'); }
-    if (!kill) {
-        if (bot.entity.position.distanceTo(mob.position) > 5) await goToPosition(bot, mob.position.x, mob.position.y, mob.position.z, 2);
-        await bot.attack(mob); return true;
-    }
-    bot.pvp.attack(mob);
-    while (getNearbyEntities(bot, 24).includes(mob)) {
-        await sleep(1000);
-        if (bot.interrupt_code) { bot.pvp.stop(); return false; }
-    }
-    log(bot, \`Successfully killed \${mob.name}.\`);
-    await pickupNearbyItems(bot);
-    return true;
-}`,
-                deps: ['pickupNearbyItems'],
-            },
-            {
-                name: 'placeBlock',
-                description: 'Place a block at the given position. Finds an adjacent block to build off and handles common block types.',
-                task: 'place a block',
-                code: `async function placeBlock(bot, blockType, x, y, z, placeOn = 'bottom') {
-    if (!blockType) { log(bot, 'placeBlock: no block type specified'); return false; }
-    const target = new Vec3(Math.floor(x), Math.floor(y), Math.floor(z));
-    const existing = bot.blockAt(target);
-    if (existing && existing.name === blockType) { log(bot, \`\${blockType} already at \${target}.\`); return false; }
-    const empty = ['air', 'water', 'lava', 'grass', 'short_grass', 'tall_grass', 'snow', 'dead_bush', 'fern'];
-    if (existing && !empty.includes(existing.name)) {
-        await breakBlockAt(bot, x, y, z);
-        await sleep(200);
-    }
-    let itemName = blockType === 'redstone_wire' ? 'redstone' : blockType;
-    let block = bot.inventory.findInventoryItem(itemName);
-    if (!block) { log(bot, \`Don't have any \${itemName} to place.\`); return false; }
-    const dirs = { top: [0,1,0], bottom: [0,-1,0], north: [0,0,-1], south: [0,0,1], east: [1,0,0], west: [-1,0,0] };
-    const order = placeOn === 'side' ? ['north','south','east','west','bottom','top'] : [placeOn, 'bottom','top','north','south','east','west'];
-    let buildOff = null, faceVec = null;
-    for (const dir of order) {
-        const d = dirs[dir]; if (!d) continue;
-        const adj = bot.blockAt(target.offset(d[0], d[1], d[2]));
-        if (adj && !empty.includes(adj.name)) { buildOff = adj; faceVec = new Vec3(-d[0], -d[1], -d[2]); break; }
-    }
-    if (!buildOff) { log(bot, \`Cannot place \${blockType}: no adjacent block to build off.\`); return false; }
-    if (bot.entity.position.distanceTo(target) > 4) await goToPosition(bot, target.x, target.y, target.z, 3);
-    await bot.equip(block, 'hand');
-    await bot.lookAt(buildOff.position.offset(0.5, 0.5, 0.5));
-    try { await bot.placeBlock(buildOff, faceVec); log(bot, \`Placed \${blockType} at \${target}.\`); return true; }
-    catch (err) { log(bot, \`Failed to place \${blockType}: \${err.message}\`); return false; }
-}`,
-                deps: ['breakBlockAt'],
-            },
-            {
-                name: 'breakBlockAt',
-                description: 'Break the block at the given position. Equips the right tool and moves within range if needed.',
-                task: 'break a block',
-                code: `async function breakBlockAt(bot, x, y, z) {
-    if (x == null || y == null || z == null) { log(bot, 'breakBlockAt: invalid coordinates'); return false; }
-    const block = bot.blockAt(new Vec3(x, y, z));
-    if (!block || block.name === 'air' || block.name === 'water' || block.name === 'lava') {
-        log(bot, \`No solid block at \${x}, \${y}, \${z}.\`); return false;
-    }
-    if (bot.entity.position.distanceTo(block.position) > 4.5) {
-        await goToPosition(bot, block.position.x, block.position.y, block.position.z, 4);
-    }
-    if (bot.game.gameMode !== 'creative') {
-        await bot.tool.equipForBlock(block);
-        const itemId = bot.heldItem ? bot.heldItem.type : null;
-        if (!block.canHarvest(itemId)) { log(bot, \`Don't have right tools to break \${block.name}.\`); return false; }
-    }
-    await bot.dig(block, true);
-    log(bot, \`Broke \${block.name} at \${x.toFixed(1)}, \${y.toFixed(1)}, \${z.toFixed(1)}.\`);
-    return true;
-}`,
-                deps: [],
-            },
-            {
-                name: 'pickupNearbyItems',
-                description: 'Pick up all nearby dropped items within 8 blocks. Waits for drops to settle first.',
-                task: 'pick up items',
-                code: `async function pickupNearbyItems(bot) {
-    const distance = 8;
-    await sleep(400);
-    const getNearestItem = () => bot.nearestEntity(e => e.name === 'item' && bot.entity.position.distanceTo(e.position) < distance);
-    let nearestItem = getNearestItem();
-    let pickedUp = 0;
-    for (let tries = 0; nearestItem && tries < 12; tries++) {
-        try { await goToPosition(bot, nearestItem.position.x, nearestItem.position.y, nearestItem.position.z, 0.5); }
-        catch (e) { log(bot, \`Failed to reach item: \${e.message}\`); throw e; }
-        await sleep(500);
-        const prev = nearestItem;
-        nearestItem = getNearestItem();
-        if (prev === nearestItem && prev.isValid) break;
-        pickedUp++;
-    }
-    log(bot, \`Picked up \${pickedUp} items.\`);
-    return true;
-}`,
-                deps: [],
-            },
-            // fix38: seeded primitives for inventory management (freeing space)
-            // These are basic building blocks; WHICH items and WHEN stay learned by the agent
-            {
-                name: 'depositToChest',
-                description: 'Deposit items to a nearby chest to free inventory space. Parameters (which item, how many) are chosen by the agent.',
-                task: 'deposit items to free inventory space',
-                code: `async function depositToChest(bot, itemName, count = 64) {
-    if (!itemName) { log(bot, 'FAILED: depositToChest requires an item name'); return false; }
-    const chest = getNearestBlock(bot, b => /chest|barrel|shulker/.test(b.name), 32);
-    if (!chest) { log(bot, 'FAILED: no chest/barrel/shulker_box within 32 blocks to deposit items'); return false; }
-    const item = bot.inventory.items().find(it => it.name === itemName);
-    if (!item) { log(bot, \`Don't have any \${itemName} to deposit.\`); return false; }
-    const toDeposit = Math.min(count, item.count);
-    if (bot.entity.position.distanceTo(chest.position) > 4) {
-        await goToPosition(bot, chest.position.x, chest.position.y, chest.position.z, 3);
-    }
-    const containerWindow = await bot.openContainer(chest);
-    if (!containerWindow) { log(bot, 'FAILED: could not open chest'); return false; }
-    try {
-        const slot = bot.inventory.items().find(it => it.name === itemName);
-        if (!slot) { containerWindow.close(); log(bot, \`Item \${itemName} not found after opening chest\`); return false; }
-        await containerWindow.deposit(slot.type, null, toDeposit);
-        log(bot, \`[chest] Deposited \${toDeposit} \${itemName} to chest.\`);
-    } finally {
-        containerWindow.close();
-    }
-    return true;
-}`,
-                deps: [],
-            },
-            {
-                name: 'tossItem',
-                description: 'Toss (drop) items from inventory to free space. Parameters (which item, how many) are chosen by the agent.',
-                task: 'toss items to free inventory space',
-                code: `async function tossItem(bot, itemName, count = 64) {
-    if (!itemName) { log(bot, 'FAILED: tossItem requires an item name'); return false; }
-    const item = bot.inventory.items().find(it => it.name === itemName);
-    if (!item) { log(bot, \`Don't have any \${itemName} to toss.\`); return false; }
-    const toToss = Math.min(count, item.count);
-    await bot.toss(item.type, null, toToss);
-    log(bot, \`[toss] Tossed \${toToss} \${itemName}.\`);
-    return true;
-}`,
-                deps: [],
-            },
-        ];
+        const SEEDED_PRIMITIVES = Voyager.SEEDED_PRIMITIVES;  // fix42: use static source of truth
         let seeded = 0, rehealed = 0;
+        const forceReheal = this._needsReheal || new Set();
         for (const prim of SEEDED_PRIMITIVES) {
             const existing = this.skills.find(s => s.name === prim.name);
             if (existing) {
-                // fix36: reheal stale seeded primitives when their code changes (e.g. empty catch fixes)
-                if (existing.seeded && existing.code !== prim.code) {
-                    console.log(`[psn] rehealing seeded primitive ${prim.name}: code updated`);
+                // fix42: always reheal if:
+                // - seeded:true but code differs (fix36 case)
+                // - seeded is NOT set (e.g. primitive:true without seeded) and code differs
+                // - marked for reheal by migration (self-call wrapper detection)
+                const needsReheal = forceReheal.has(prim.name) || existing.code !== prim.code;
+                if (needsReheal) {
+                    const reason = forceReheal.has(prim.name) ? 'self-call wrapper' : existing.seeded ? 'code updated' : 'seeded flag missing';
+                    console.log(`[psn] rehealing seeded primitive ${prim.name}: ${reason}`);
                     existing.code = prim.code;
                     existing.deps = prim.deps;
                     existing.description = prim.description;
+                    existing.seeded = true;
                     existing.saved = new Date().toISOString();
                     writeAtomic(`${this.dir}/${prim.name}.js`, `// ${prim.description}\n${prim.code}\n`);
+                    rehealed++;
+                } else if (!existing.seeded) {
+                    existing.seeded = true;
                     rehealed++;
                 }
                 continue;
@@ -2801,3 +2599,257 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
         else if (this._curSub?.parent) console.log(`[psn] subgoal "${task}" failed; moving on`);
     }
 }
+
+// fix42: SEEDED_PRIMITIVES as static property - single source of truth for seeded primitive names and bodies
+// Used by both _migrateToBarenames (to derive seeded names) and _seedPrimitives (to seed/reheal)
+Voyager.SEEDED_PRIMITIVES = [
+    {
+        name: 'travelTo',
+        description: 'Travel long distances (hundreds of blocks) in short hops of up to 32 blocks, so chunks load and paths stay short. Returns true once within 4 blocks (horizontally) of the target.',
+        task: 'travel to a distant location',
+        code: `async function travelTo(bot, x, y, z, maxHops = 120) {
+    let fails = 0;
+    for (let hop = 0; hop < maxHops; hop++) {
+        if (bot.interrupt_code) return false;
+        const p = bot.entity.position;
+        const dx = x - p.x, dz = z - p.z, d = Math.hypot(dx, dz);
+        if (d <= 4) { log(bot, \`Arrived near \${x}, \${y}, \${z}.\`); return true; }
+        if (d <= 32) { if (await goToPosition(bot, x, y, z, 3)) continue; }
+        const step = Math.min(32, d);
+        const side = fails ? (fails % 2 ? 1 : -1) * 10 * fails : 0;
+        const tx = Math.round(p.x + dx / d * step - dz / d * side), tz = Math.round(p.z + dz / d * step + dx / d * side);
+        try { await goToGoal(bot, new Vec3(tx, p.y, tz), 3); fails = 0; }
+        catch (err) {
+            if (bot.interrupt_code) return false;
+            if (++fails >= 6) { log(bot, \`travelTo gave up at \${p.floored()} after 6 failed hops: \${err?.message}\`); return false; }
+        }
+    }
+    log(bot, \`travelTo ran out of hops; still \${Math.round(Math.hypot(x - bot.entity.position.x, z - bot.entity.position.z))} blocks away.\`);
+    return false;
+}`,
+        deps: [],
+    },
+    {
+        name: 'collectBlock',
+        description: 'Collect blocks of the given type. Handles ore variants (iron->iron_ore, deepslate_iron_ore), equips proper tools, and picks up drops.',
+        task: 'collect blocks or ores',
+        code: `async function collectBlock(bot, blockType, num = 1) {
+    if (!blockType || typeof blockType !== 'string') { log(bot, 'collectBlock: invalid blockType'); return false; }
+    let types = [blockType];
+    if (['coal','diamond','emerald','iron','gold','lapis_lazuli','redstone'].includes(blockType)) types.push(blockType + '_ore');
+    if (blockType.endsWith('ore')) types.push('deepslate_' + blockType);
+    if (blockType === 'dirt') types.push('grass_block');
+    if (blockType === 'cobblestone') types.push('stone');
+    let collected = 0;
+    for (let i = 0; i < num; i++) {
+        if (bot.interrupt_code) break;
+        const block = getNearestBlock(bot, b => types.includes(b.name), 64);
+        if (!block) { log(bot, collected ? \`No more \${blockType} nearby.\` : \`No \${blockType} nearby.\`); break; }
+        await bot.tool.equipForBlock(block);
+        const itemId = bot.heldItem ? bot.heldItem.type : null;
+        if (!block.canHarvest(itemId)) { log(bot, \`Don't have right tools to harvest \${blockType}.\`); return false; }
+        const before = getInventoryCounts(bot);
+        try {
+            await goToPosition(bot, block.position.x, block.position.y, block.position.z, 4);
+            await bot.dig(block, true);
+            await pickupNearbyItems(bot);
+        } catch (err) { log(bot, \`Failed to collect \${blockType}: \${err.message}\`); continue; }
+        const after = getInventoryCounts(bot);
+        if (Object.keys(after).some(k => (after[k] || 0) > (before[k] || 0))) collected++;
+    }
+    log(bot, \`Collected \${collected} \${blockType}.\`);
+    return collected > 0;
+}`,
+        deps: ['pickupNearbyItems'],
+    },
+    {
+        name: 'craftRecipe',
+        description: 'Craft an item using the crafting recipe. Places and retrieves crafting table if needed.',
+        task: 'craft an item',
+        code: `async function craftRecipe(bot, itemName, num = 1) {
+    if (!itemName) { log(bot, 'craftRecipe: no item specified'); return false; }
+    let recipes = bot.recipesFor(bot.registry.itemsByName[itemName]?.id, null, 1, null);
+    let craftingTable = null, placedTable = false;
+    if (!recipes || !recipes.length) {
+        recipes = bot.recipesFor(bot.registry.itemsByName[itemName]?.id, null, 1, true);
+        if (!recipes || !recipes.length) { log(bot, \`No recipe for \${itemName} or missing ingredients.\`); return false; }
+        craftingTable = getNearestBlock(bot, 'crafting_table', 16);
+        if (!craftingTable) {
+            const hasTable = (getInventoryCounts(bot)['crafting_table'] || 0) > 0;
+            if (hasTable) {
+                const pos = getNearestFreeSpace(bot, 1, 6);
+                await placeBlock(bot, 'crafting_table', pos.x, pos.y, pos.z);
+                craftingTable = getNearestBlock(bot, 'crafting_table', 16);
+                placedTable = true;
+            } else { log(bot, \`Crafting \${itemName} requires a crafting table.\`); return false; }
+        }
+        if (craftingTable) recipes = bot.recipesFor(bot.registry.itemsByName[itemName]?.id, null, 1, craftingTable);
+    }
+    if (!recipes || !recipes.length) { log(bot, \`Cannot craft \${itemName}: missing ingredients.\`); if (placedTable) await collectBlock(bot, 'crafting_table', 1); return false; }
+    if (craftingTable) await goToPosition(bot, craftingTable.position.x, craftingTable.position.y, craftingTable.position.z, 3);
+    const before = getInventoryCounts(bot)[itemName] || 0;
+    try { await bot.craft(recipes[0], Math.min(num, 64), craftingTable); }
+    catch (err) { log(bot, \`Crafting \${itemName} failed: \${err.message}\`); if (placedTable) await collectBlock(bot, 'crafting_table', 1); return false; }
+    const after = getInventoryCounts(bot)[itemName] || 0;
+    if (placedTable) await collectBlock(bot, 'crafting_table', 1);
+    if (after > before) { log(bot, \`Crafted \${itemName}, now have \${after}.\`); return true; }
+    log(bot, \`Crafting \${itemName} produced no items.\`); return false;
+}`,
+        deps: ['placeBlock', 'collectBlock'],
+    },
+    {
+        name: 'attackNearest',
+        description: 'Attack the nearest mob of the given type. Equips best weapon and fights until the mob is dead or bot is interrupted.',
+        task: 'attack a mob',
+        code: `async function attackNearest(bot, mobType, kill = true) {
+    if (!mobType) { log(bot, 'attackNearest: no mob type specified'); return false; }
+    bot.modes.pause('cowardice');
+    const waterMobs = ['drowned', 'cod', 'salmon', 'tropical_fish', 'squid'];
+    if (waterMobs.includes(mobType)) bot.modes.pause('self_preservation');
+    const mob = getNearbyEntities(bot, 24).find(e => e.name === mobType);
+    if (!mob) { log(bot, \`Could not find any \${mobType} to attack.\`); return false; }
+    const weapons = bot.inventory.items().filter(it => it.name.includes('sword') || (it.name.includes('axe') && !it.name.includes('pickaxe')));
+    if (weapons.length) { weapons.sort((a, b) => (b.attackDamage || 0) - (a.attackDamage || 0)); await bot.equip(weapons[0], 'hand'); }
+    if (!kill) {
+        if (bot.entity.position.distanceTo(mob.position) > 5) await goToPosition(bot, mob.position.x, mob.position.y, mob.position.z, 2);
+        await bot.attack(mob); return true;
+    }
+    bot.pvp.attack(mob);
+    while (getNearbyEntities(bot, 24).includes(mob)) {
+        await sleep(1000);
+        if (bot.interrupt_code) { bot.pvp.stop(); return false; }
+    }
+    log(bot, \`Successfully killed \${mob.name}.\`);
+    await pickupNearbyItems(bot);
+    return true;
+}`,
+        deps: ['pickupNearbyItems'],
+    },
+    {
+        name: 'placeBlock',
+        description: 'Place a block at the given position. Finds an adjacent block to build off and handles common block types.',
+        task: 'place a block',
+        code: `async function placeBlock(bot, blockType, x, y, z, placeOn = 'bottom') {
+    if (!blockType) { log(bot, 'placeBlock: no block type specified'); return false; }
+    const target = new Vec3(Math.floor(x), Math.floor(y), Math.floor(z));
+    const existing = bot.blockAt(target);
+    if (existing && existing.name === blockType) { log(bot, \`\${blockType} already at \${target}.\`); return false; }
+    const empty = ['air', 'water', 'lava', 'grass', 'short_grass', 'tall_grass', 'snow', 'dead_bush', 'fern'];
+    if (existing && !empty.includes(existing.name)) {
+        await breakBlockAt(bot, x, y, z);
+        await sleep(200);
+    }
+    let itemName = blockType === 'redstone_wire' ? 'redstone' : blockType;
+    let block = bot.inventory.findInventoryItem(itemName);
+    if (!block) { log(bot, \`Don't have any \${itemName} to place.\`); return false; }
+    const dirs = { top: [0,1,0], bottom: [0,-1,0], north: [0,0,-1], south: [0,0,1], east: [1,0,0], west: [-1,0,0] };
+    const order = placeOn === 'side' ? ['north','south','east','west','bottom','top'] : [placeOn, 'bottom','top','north','south','east','west'];
+    let buildOff = null, faceVec = null;
+    for (const dir of order) {
+        const d = dirs[dir]; if (!d) continue;
+        const adj = bot.blockAt(target.offset(d[0], d[1], d[2]));
+        if (adj && !empty.includes(adj.name)) { buildOff = adj; faceVec = new Vec3(-d[0], -d[1], -d[2]); break; }
+    }
+    if (!buildOff) { log(bot, \`Cannot place \${blockType}: no adjacent block to build off.\`); return false; }
+    if (bot.entity.position.distanceTo(target) > 4) await goToPosition(bot, target.x, target.y, target.z, 3);
+    await bot.equip(block, 'hand');
+    await bot.lookAt(buildOff.position.offset(0.5, 0.5, 0.5));
+    try { await bot.placeBlock(buildOff, faceVec); log(bot, \`Placed \${blockType} at \${target}.\`); return true; }
+    catch (err) { log(bot, \`Failed to place \${blockType}: \${err.message}\`); return false; }
+}`,
+        deps: ['breakBlockAt'],
+    },
+    {
+        name: 'breakBlockAt',
+        description: 'Break the block at the given position. Equips the right tool and moves within range if needed.',
+        task: 'break a block',
+        code: `async function breakBlockAt(bot, x, y, z) {
+    if (x == null || y == null || z == null) { log(bot, 'breakBlockAt: invalid coordinates'); return false; }
+    const block = bot.blockAt(new Vec3(x, y, z));
+    if (!block || block.name === 'air' || block.name === 'water' || block.name === 'lava') {
+        log(bot, \`No solid block at \${x}, \${y}, \${z}.\`); return false;
+    }
+    if (bot.entity.position.distanceTo(block.position) > 4.5) {
+        await goToPosition(bot, block.position.x, block.position.y, block.position.z, 4);
+    }
+    if (bot.game.gameMode !== 'creative') {
+        await bot.tool.equipForBlock(block);
+        const itemId = bot.heldItem ? bot.heldItem.type : null;
+        if (!block.canHarvest(itemId)) { log(bot, \`Don't have right tools to break \${block.name}.\`); return false; }
+    }
+    await bot.dig(block, true);
+    log(bot, \`Broke \${block.name} at \${x.toFixed(1)}, \${y.toFixed(1)}, \${z.toFixed(1)}.\`);
+    return true;
+}`,
+        deps: [],
+    },
+    {
+        name: 'pickupNearbyItems',
+        description: 'Pick up all nearby dropped items within 8 blocks. Waits for drops to settle first.',
+        task: 'pick up items',
+        code: `async function pickupNearbyItems(bot) {
+    const distance = 8;
+    await sleep(400);
+    const getNearestItem = () => bot.nearestEntity(e => e.name === 'item' && bot.entity.position.distanceTo(e.position) < distance);
+    let nearestItem = getNearestItem();
+    let pickedUp = 0;
+    for (let tries = 0; nearestItem && tries < 12; tries++) {
+        try { await goToPosition(bot, nearestItem.position.x, nearestItem.position.y, nearestItem.position.z, 0.5); }
+        catch (e) { log(bot, \`Failed to reach item: \${e.message}\`); throw e; }
+        await sleep(500);
+        const prev = nearestItem;
+        nearestItem = getNearestItem();
+        if (prev === nearestItem && prev.isValid) break;
+        pickedUp++;
+    }
+    log(bot, \`Picked up \${pickedUp} items.\`);
+    return true;
+}`,
+        deps: [],
+    },
+    // fix38: seeded primitives for inventory management (freeing space)
+    // These are basic building blocks; WHICH items and WHEN stay learned by the agent
+    {
+        name: 'depositToChest',
+        description: 'Deposit items to a nearby chest to free inventory space. Parameters (which item, how many) are chosen by the agent.',
+        task: 'deposit items to free inventory space',
+        code: `async function depositToChest(bot, itemName, count = 64) {
+    if (!itemName) { log(bot, 'FAILED: depositToChest requires an item name'); return false; }
+    const chest = getNearestBlock(bot, b => /chest|barrel|shulker/.test(b.name), 32);
+    if (!chest) { log(bot, 'FAILED: no chest/barrel/shulker_box within 32 blocks to deposit items'); return false; }
+    const item = bot.inventory.items().find(it => it.name === itemName);
+    if (!item) { log(bot, \`Don't have any \${itemName} to deposit.\`); return false; }
+    const toDeposit = Math.min(count, item.count);
+    if (bot.entity.position.distanceTo(chest.position) > 4) {
+        await goToPosition(bot, chest.position.x, chest.position.y, chest.position.z, 3);
+    }
+    const containerWindow = await bot.openContainer(chest);
+    if (!containerWindow) { log(bot, 'FAILED: could not open chest'); return false; }
+    try {
+        const slot = bot.inventory.items().find(it => it.name === itemName);
+        if (!slot) { containerWindow.close(); log(bot, \`Item \${itemName} not found after opening chest\`); return false; }
+        await containerWindow.deposit(slot.type, null, toDeposit);
+        log(bot, \`[chest] Deposited \${toDeposit} \${itemName} to chest.\`);
+    } finally {
+        containerWindow.close();
+    }
+    return true;
+}`,
+        deps: [],
+    },
+    {
+        name: 'tossItem',
+        description: 'Toss (drop) items from inventory to free space. Parameters (which item, how many) are chosen by the agent.',
+        task: 'toss items to free inventory space',
+        code: `async function tossItem(bot, itemName, count = 64) {
+    if (!itemName) { log(bot, 'FAILED: tossItem requires an item name'); return false; }
+    const item = bot.inventory.items().find(it => it.name === itemName);
+    if (!item) { log(bot, \`Don't have any \${itemName} to toss.\`); return false; }
+    const toToss = Math.min(count, item.count);
+    await bot.toss(item.type, null, toToss);
+    log(bot, \`[toss] Tossed \${toToss} \${itemName}.\`);
+    return true;
+}`,
+        deps: [],
+    },
+];
