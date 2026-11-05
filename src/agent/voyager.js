@@ -1079,14 +1079,25 @@ Use only c; no other globals.`;
     _boltzmann(c, T = 0.3) { const w = c.map(x => Math.exp(x.V / T)), tot = w.reduce((a, b) => a + b, 0); let r = Math.random() * tot; for (let i = 0; i < c.length; i++) if ((r -= w[i]) <= 0) return c[i]; return c[c.length - 1]; }
     // fix43: _producers now also checks NeedsProducesGraph for confirmed producers (learned from observation)
     // NO hard-coded ore/smelt tables - producers come from skill.effects and observed graph recordings
+    // fix44: resolve mergedInto to validated active skills (merge targets that are not candidate/demoted)
     _producers(item) {
         const fromSkills = this.skills.filter(s => !s.demoted && !s.mergedInto && !s.candidate && !/^(repair|refactor)\b/.test(s.task || '') && (s.effects || []).includes(item)
             && !(signatureOf(s.code, s.name).match(/\(([^)]*)\)/)?.[1] || '').split(',').slice(1).some(x => x.trim() && !x.includes('=')))
             .map(s => ({ s, V: this._maturity(s).V }));
         
+        // fix44: check merged skills - if a merged skill produces the item, include its merge target
+        // ONLY if the merge target is a validated active skill (not candidate, not demoted)
+        for (const merged of this.skills.filter(s => s.mergedInto && (s.effects || []).includes(item))) {
+            const target = this.skills.find(s => s.name === merged.mergedInto);
+            if (target && !target.demoted && !target.candidate && !fromSkills.some(x => x.s.name === target.name)) {
+                fromSkills.push({ s: target, V: this._maturity(target).V });
+                console.log(`[backchain] found producer for ${item} via mergedInto: ${merged.name} -> ${target.name}`);
+            }
+        }
+        
         // fix43: also check NeedsProducesGraph for confirmed producers (learned from observation)
-        if (this.needsProducesGraph) {
-            const graphProducers = this.needsProducesGraph.getProducersOf(item);
+        if (this.npGraph) {
+            const graphProducers = this.npGraph.getProducersOf(item);
             for (const producerKey of graphProducers) {
                 // Map the producer key back to a skill if possible
                 const matchingSkill = this.skills.find(s => 
@@ -1549,8 +1560,8 @@ Use only c; no other globals.`;
             }
         }
         // Also check the NeedsProducesGraph for confirmed producers
-        if (this.needsProducesGraph) {
-            const confirmed = this.needsProducesGraph.getConfirmedLinks();
+        if (this.npGraph) {
+            const confirmed = this.npGraph.getConfirmedLinks();
             for (const [key, links] of Object.entries(confirmed)) {
                 for (const prod of (links.produces || [])) {
                     hasLearnedProducer.add(prod);
@@ -2856,6 +2867,7 @@ Voyager.SEEDED_PRIMITIVES = [
         name: 'collectBlock',
         description: 'Collect blocks of the given type. Handles ore variants (iron->iron_ore, deepslate_iron_ore), equips proper tools, and picks up drops.',
         task: 'collect blocks or ores',
+        // fix44: add exclude list for unreachable blocks; fail loud when no progress
         code: `async function collectBlock(bot, blockType, num = 1) {
     if (!blockType || typeof blockType !== 'string') { log(bot, 'collectBlock: invalid blockType'); return false; }
     let types = [blockType];
@@ -2864,19 +2876,38 @@ Voyager.SEEDED_PRIMITIVES = [
     if (blockType === 'dirt') types.push('grass_block');
     if (blockType === 'cobblestone') types.push('stone');
     let collected = 0;
+    const excluded = new Set();
+    const posKey = p => \`\${Math.floor(p.x)},\${Math.floor(p.y)},\${Math.floor(p.z)}\`;
     for (let i = 0; i < num; i++) {
         if (bot.interrupt_code) break;
-        const block = getNearestBlock(bot, b => types.includes(b.name), 64);
-        if (!block) { log(bot, collected ? \`No more \${blockType} nearby.\` : \`No \${blockType} nearby.\`); break; }
+        const block = getNearestBlock(bot, b => types.includes(b.name) && !excluded.has(posKey(b.position)), 64);
+        if (!block) {
+            if (excluded.size) log(bot, \`FAILED: no reachable \${blockType} nearby (\${excluded.size} unreachable block(s) excluded)\`);
+            else log(bot, collected ? \`No more \${blockType} nearby.\` : \`No \${blockType} nearby.\`);
+            break;
+        }
         await bot.tool.equipForBlock(block);
         const itemId = bot.heldItem ? bot.heldItem.type : null;
         if (!block.canHarvest(itemId)) { log(bot, \`Don't have right tools to harvest \${blockType}.\`); return false; }
         const before = getInventoryCounts(bot);
+        const startPos = bot.entity.position.clone();
+        const targetDist = startPos.distanceTo(block.position);
         try {
-            await goToPosition(bot, block.position.x, block.position.y, block.position.z, 4);
+            const reached = await goToPosition(bot, block.position.x, block.position.y, block.position.z, 4);
+            const endPos = bot.entity.position;
+            const movedToward = startPos.distanceTo(block.position) - endPos.distanceTo(block.position);
+            if (!reached || (targetDist > 8 && movedToward < 2)) {
+                excluded.add(posKey(block.position));
+                log(bot, \`Cannot reach \${blockType} at \${posKey(block.position)} (moved \${movedToward.toFixed(1)} blocks toward it); trying another\`);
+                continue;
+            }
             await bot.dig(block, true);
             await pickupNearbyItems(bot);
-        } catch (err) { log(bot, \`Failed to collect \${blockType}: \${err.message}\`); continue; }
+        } catch (err) {
+            excluded.add(posKey(block.position));
+            log(bot, \`Failed to collect \${blockType} at \${posKey(block.position)}: \${err.message}; trying another\`);
+            continue;
+        }
         const after = getInventoryCounts(bot);
         if (Object.keys(after).some(k => (after[k] || 0) > (before[k] || 0))) collected++;
     }
