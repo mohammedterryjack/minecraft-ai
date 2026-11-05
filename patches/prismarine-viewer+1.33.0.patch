@@ -21848,7 +21848,7 @@ diff --git a/node_modules/prismarine-viewer/viewer/lib/worldView.js b/node_modul
 index ec2ccd9..16212a6 100644
 --- a/node_modules/prismarine-viewer/viewer/lib/worldView.js
 +++ b/node_modules/prismarine-viewer/viewer/lib/worldView.js
-@@ -1,6 +1,44 @@
+@@ -1,6 +1,46 @@
  const { spiral, ViewRect, chunkPos } = require('./simpleUtils')
  const { Vec3 } = require('vec3')
  const EventEmitter = require('events')
@@ -21865,6 +21865,8 @@ index ec2ccd9..16212a6 100644
 +  }
 +
 +  if (e.name === 'item' || e.name === 'item_stack' || e.name === 'Item') {
++    // Item metadata arrives after entitySpawn; itemDrop re-packs once it is set.
++    if (e.metadata[bot.registry.supportFeature('metadataIxOfItem')] === undefined) return payload
 +    let dropped
 +    try {
 +      dropped = e.getDroppedItem()
@@ -21893,7 +21895,7 @@ index ec2ccd9..16212a6 100644
  
  class WorldView extends EventEmitter {
    constructor (world, viewDistance, position = new Vec3(0, 0, 0), emitter = null) {
-@@ -27,7 +65,15 @@ class WorldView extends EventEmitter {
+@@ -27,7 +67,15 @@ class WorldView extends EventEmitter {
        // 'move': botPosition,
        entitySpawn: function (e) {
          if (e === bot.entity) return
@@ -21910,7 +21912,7 @@ index ec2ccd9..16212a6 100644
        },
        entityMoved: function (e) {
          worldView.emitter.emit('entity', { id: e.id, pos: e.position, pitch: e.pitch, yaw: e.yaw })
-@@ -51,7 +97,7 @@ class WorldView extends EventEmitter {
+@@ -51,7 +99,7 @@ class WorldView extends EventEmitter {
      for (const id in bot.entities) {
        const e = bot.entities[id]
        if (e && e !== bot.entity) {
