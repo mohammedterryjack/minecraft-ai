@@ -7,7 +7,7 @@ import settings from '../../settings.js';
 //   - AWM repair/workflow memory (https://arxiv.org/abs/2409.07429)
 //   - SkillWeaver-style idle practice (https://arxiv.org/abs/2504.07079)
 import { AsyncLocalStorage } from 'async_hooks';
-import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, renameSync, statSync, copyFileSync, truncateSync, appendFileSync } from 'fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, renameSync, statSync, copyFileSync, truncateSync, appendFileSync, readdirSync } from 'fs';
 import { NeedsProducesGraph } from './needs_produces.js';
 import { RepairMemory } from './repair_memory.js';
 import { IdlePractice } from './idle_practice.js';
@@ -442,7 +442,7 @@ export class Voyager {
                 }
             }
         } catch (e) {
-            console.log(`[fix47] standalone file migration skipped: ${e.message}`);
+            throw new Error(`[fix47] standalone file migration FAILED: ${e.message}`);
         }
         if (migrated > 0 || fileMigrated > 0) {
             this._saveSkills();
@@ -539,13 +539,20 @@ export class Voyager {
         const selfRecursive = [];
         for (const s of this.skills) {
             if (!s.code) continue;
-            // Check if skill calls itself by name (self-recursion through bare name)
-            // Must exclude the function declaration itself (function fnName(...) or async function fnName(...))
-            const fnMatch = s.code.match(/(?:async\s+)?function\s+([A-Za-z_]\w*)\s*\(/);
-            const fnName = fnMatch ? fnMatch[1] : s.name;
-            // Remove the function declaration, then check for calls
-            const codeWithoutDecl = s.code.replace(/(?:async\s+)?function\s+[A-Za-z_]\w*\s*\([^)]*\)\s*\{/, '');
-            const callsItself = new RegExp(`(?<![.\\w])${fnName}\\s*\\(`).test(codeWithoutDecl);
+            // hotfix: only flag an unconditional self-forward (calls itself with its own params unchanged, inside its own body)
+            // - bounded recursion with different args (obtainItem(bot, smelt[x], need)) and top-level invocations are not loops
+            const fnMatch = s.code.match(/(?:async\s+)?function\s+([A-Za-z_]\w*)\s*\(([^)]*)\)\s*\{/);
+            if (!fnMatch) continue;
+            const fnName = fnMatch[1];
+            const params = fnMatch[2].split(',').map(p => p.split('=')[0].trim()).filter(Boolean);
+            let bi = fnMatch.index + fnMatch[0].length, depth = 1; const bstart = bi;
+            while (bi < s.code.length && depth) { const ch = s.code[bi]; if (ch === '{') depth++; else if (ch === '}') depth--; bi++; }
+            const body = s.code.slice(bstart, bi - 1);
+            let callsItself = false;
+            for (const m of body.matchAll(new RegExp(`(?<![.\\w])${fnName}\\s*\\(([^)]*)\\)`, 'g'))) {
+                const args = m[1].split(',').map(a => a.trim()).filter(Boolean);
+                if (args.length === params.length && args.every((a, k) => a === params[k])) { callsItself = true; break; }
+            }
             if (callsItself) {
                 selfRecursive.push(s.name);
             }
