@@ -476,40 +476,44 @@ export async function defendSelf(bot, range=9) {
 
 
 
-// fix42: _freeInventory uses LEARNED signals only (bot.__safeToToss set by voyager)
-// NO hard-coded junk list - what's safe to toss is determined by needs/produces
-// fix42: actually tasks depositToChest when toss alone is insufficient (not just log)
+// fix43: _freeInventory uses POSITIVE learned signals only (bot.__safeToToss set by voyager)
+// NO hard-coded junk/useful lists - what's safe to toss is determined by POSITIVE learned producer + surplus
+// Unknown items (no learned producer) are NOT auto-tossed - they stay in uncertain list
+// fix43: fail loud when deposit prerequisite (chest) missing
 // fix25: raised threshold from >= 2 to < 4 so it runs when 2-3 empty (not just 0-1)
 async function _freeInventory(bot, keepName) {
     // survival-only: toss surplus items when nearly full
     if (bot.inventory.emptySlotCount() >= 4) return;  // fix25: was >= 2
     
-    // fix42: use learned safe-to-toss signals (populated by voyager._prepareTossSignals)
+    // fix43: use learned safe-to-toss signals (populated by voyager._prepareTossSignals)
     const safeList = bot.__safeToToss || [];
     const depositList = bot.__depositCandidates || [];
+    const uncertainList = bot.__uncertainItems || [];
     
-    // Phase 1: toss safe items
+    // Phase 1: toss safe items (items with POSITIVE learned producer signal)
     let freed = 0;
     for (const tossName of safeList) {
         if (tossName === keepName) continue;
         const it = bot.inventory.items().find(i => i.name === tossName);
         if (!it) continue;
         
-        // Keep some scaffolding materials (minimal, not item-specific deny list)
-        const keepCount = /^(cobblestone|dirt)$/.test(tossName) ? 32 : 0;
-        const total = bot.inventory.items().filter(i => i.name === tossName).reduce((a, i) => a + i.count, 0);
-        const n = Math.min(it.count, total - keepCount);
-        if (n <= 0) continue;
-        
-        try { await bot.toss(it.type, null, n); freed++; console.log(`[_freeInventory] tossed ${n} ${tossName}`); }
-        catch (e) { console.log(`[_freeInventory] FAILED to toss ${tossName}: ${e.message}`); }  // fix25: fail loud
+        // Toss the whole stack - surplus threshold already computed by voyager
+        try { await bot.toss(it.type, null, it.count); freed++; console.log(`[_freeInventory] tossed ${it.count} ${tossName} (has learned producer)`); }
+        catch (e) { console.log(`[_freeInventory] FAILED to toss ${tossName}: ${e.message}`); }  // fail loud
         if (bot.inventory.emptySlotCount() >= 4) break;
     }
-    if (freed) log(bot, `[_freeInventory] dropped ${freed} stacks using learned safe-to-toss signals.`);
+    if (freed) log(bot, `[_freeInventory] dropped ${freed} stacks using learned safe-to-toss signals (items with known producers).`);
     
-    // Phase 2: if still low on space, actually run depositToChest (not just log)
+    // Phase 2: if still low on space, try to deposit to chest
     if (bot.inventory.emptySlotCount() < 2 && depositList.length) {
-        console.log(`[_freeInventory] still only ${bot.inventory.emptySlotCount()} empty after tossing ${freed} stacks; depositing to chest`);
+        // fix43: check for chest FIRST and fail loud if missing
+        const chest = world.getNearestBlock(bot, 'chest', 32);
+        if (!chest) {
+            log(bot, `[_freeInventory] PREREQUISITE FAILED: need chest within 32 blocks to deposit items (have ${depositList.length} deposit candidates). Place or find a chest first.`);
+            return;
+        }
+        
+        console.log(`[_freeInventory] still only ${bot.inventory.emptySlotCount()} empty after tossing ${freed} stacks; depositing to chest at ${chest.position}`);
         let deposited = 0;
         for (const itemName of depositList) {
             if (itemName === keepName) continue;
@@ -519,14 +523,19 @@ async function _freeInventory(bot, keepName) {
                 const ok = await putInChest(bot, itemName);
                 if (ok) deposited++;
             } catch (e) {
-                console.log(`[_freeInventory] depositToChest failed for ${itemName}: ${e.message}`);
+                log(bot, `[_freeInventory] FAILED to deposit ${itemName}: ${e.message}`);
             }
         }
         if (deposited) console.log(`[_freeInventory] deposited ${deposited} item type(s) to chest (empty slots now ${bot.inventory.emptySlotCount()})`);
     }
     
-    if (bot.inventory.emptySlotCount() < 2 && !safeList.length && !depositList.length) {
-        console.log('[_freeInventory] FAILED to free inventory: no learned safe-to-toss/deposit signals available');
+    // fix43: fail loud if we couldn't free space
+    if (bot.inventory.emptySlotCount() < 2) {
+        if (uncertainList.length && !safeList.length) {
+            log(bot, `[_freeInventory] FAILED: ${uncertainList.length} item(s) have NO learned producer signal (${uncertainList.slice(0, 3).join(', ')}${uncertainList.length > 3 ? '...' : ''}) - cannot auto-toss unknown items. Return decision to model/planning.`);
+        } else if (!safeList.length && !depositList.length) {
+            log(bot, '[_freeInventory] FAILED: no learned signal indicates what is safe to toss/deposit');
+        }
     }
 }
 
