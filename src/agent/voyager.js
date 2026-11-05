@@ -440,11 +440,7 @@ Use only c; no other globals.`;
         const now = Date.now();
         if (now - this.lastPlayerMsg < PLAYER_QUIET_MS || now < (this._backoffUntil || 0)) return;   // fix31: no fixed task cooldown; only an error backoff
         if (!this.agent.isIdle() || this.agent.self_prompter.isActive() || this.agent.prompter.awaiting_coding) return;
-        if (false && now < (this.agent.prompter.code_model.quotaUntil || 0)) {
-            if (!this._quotaNoted) { console.log(`[voyager] paused: code model (${this.agent.prompter.code_model.pName}) quota/usage limit; retrying at ${new Date(this.agent.prompter.code_model.quotaUntil).toISOString()}`); this._quotaNoted = true; }
-            return;
-        }
-        this._quotaNoted = false;
+        // fix33: quota check removed; CodeModel handles paid→free fallback internally
         this.running = true; this.abort = false;
         const t0 = Date.now(), c0 = { ...CALLS };
         this.step().then(() => { this._errStreak = 0; }, e => {
@@ -512,7 +508,7 @@ Use only c; no other globals.`;
         console.log(`[voyager] local model call #${CALLS.local}`);
         return r;
     }
-    _cursorLimited() { return Date.now() < (this.agent.prompter.code_model.quotaUntil || 0); }
+    _cursorLimited() { const cm = this.agent.prompter.code_model; return !cm.fallback && Date.now() < (cm.quotaUntil || 0); }   // fix33: fallback configured = not limited
     // find a saved skill that can be replayed without any model call
     _findReplay(task) {
         const goal = countGoal(task);
@@ -816,13 +812,10 @@ Use only c; no other globals.`;
     }
     async _ask(system, user) {
         CALLS.code++;
-        // code model = Cursor CLI composer-2.5 (quota/usage-limit pause lives in CodeModel; one path, throws).
-        // If the limit is (or becomes) active, abandon this step.
+        // fix33: CodeModel.sendRequest handles paid→free fallback internally; no pre/post quota check here
         const cm = this.agent.prompter.code_model;
-        if (Date.now() < (cm.quotaUntil || 0)) throw new Error('code model quota/usage-limit pause active; voyager step abandoned');
-        const t0 = Date.now(); console.log(`[timing] ${new Date().toISOString().slice(11,19)}Z composer call #${CALLS.code} start (prompt ${system.length + user.length} chars)`);   // fix27
+        const t0 = Date.now(); console.log(`[timing] ${new Date().toISOString().slice(11,19)}Z composer call #${CALLS.code} start (prompt ${system.length + user.length} chars)`);
         let r; try { r = await cm.sendRequest([{ role: 'user', content: user }], system); } finally { console.log(`[timing] ${new Date().toISOString().slice(11,19)}Z composer call #${CALLS.code} took ${Date.now() - t0}ms (reply ${String(r ?? '').length} chars)`); }
-        if (Date.now() < (cm.quotaUntil || 0)) throw new Error('code model quota/usage limit hit; voyager step abandoned');
         return r;
     }
 
