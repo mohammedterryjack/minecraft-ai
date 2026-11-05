@@ -353,7 +353,7 @@ export class Voyager {
     let pickedUp = 0;
     for (let tries = 0; nearestItem && tries < 12; tries++) {
         try { await skills.goToPosition(bot, nearestItem.position.x, nearestItem.position.y, nearestItem.position.z, 0.5); }
-        catch (e) {}
+        catch (e) { log(bot, \`Failed to reach item: \${e.message}\`); throw e; }
         await sleep(500);
         const prev = nearestItem;
         nearestItem = getNearestItem();
