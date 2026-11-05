@@ -335,7 +335,24 @@ export class Coder {
         const eslint = new ESLint();
         const results = await eslint.lintText(code);
         const codeLines = code.split('\n');
-        const exceptions = results.map(r => r.messages).flat();
+        let exceptions = results.map(r => r.messages).flat();
+        
+        // fix26: filter out lint messages about inserted interrupt return statements
+        // These are inserted by _stageCode as `if(bot.interrupt_code) {log(bot, "Code interrupted.");return;}`
+        // and may trigger lint warnings about ReturnStatement usage. Per Mo: feedback-only, not blocking.
+        const isInterruptReturnError = (exc) => {
+            if (!exc.line) return false;
+            const line = codeLines[exc.line - 1] || '';
+            return line.includes('bot.interrupt_code') && (
+                (exc.message && /return|ReturnStatement/i.test(exc.message)) ||
+                (exc.ruleId && /return/i.test(exc.ruleId))
+            );
+        };
+        const interruptErrors = exceptions.filter(isInterruptReturnError);
+        if (interruptErrors.length > 0) {
+            console.log(`[lint] filtered ${interruptErrors.length} lint warning(s) about inserted interrupt return statements (feedback-only)`);
+        }
+        exceptions = exceptions.filter(exc => !isInterruptReturnError(exc));
 
         if (exceptions.length > 0) {
             exceptions.forEach((exc, index) => {
@@ -471,7 +488,7 @@ export class Coder {
 
     _sanitizeCode(code) {
         code = code.trim();
-        const remove_strs = ['Javascript', 'javascript', 'js']
+        const remove_strs = ['Javascript', 'javascript', 'js'];
         for (let r of remove_strs) {
             if (code.startsWith(r)) {
                 code = code.slice(r.length);
