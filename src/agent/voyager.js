@@ -1022,13 +1022,38 @@ Use only c; no other globals.`;
         if (res.interrupted || this.abort) return null;
         return gainedFor(goal, before, this.observe()) >= goal.count;
     }
+    // fix35: serialized code-model calls with loud logging (one in flight at a time; no dual same-model Ollama generate)
     async _ask(system, user) {
         CALLS.code++;
+        const callNum = CALLS.code;
+        // serialize code-model calls; queue if another is in flight
+        const prev = this._askQ || Promise.resolve();
+        let release; this._askQ = new Promise(r => release = r);
+        const wasQueued = prev !== (this._askQPrev || Promise.resolve());
+        this._askQPrev = prev;
+        if (wasQueued) console.log(`[overlap] code-model call #${callNum} waiting for previous call to finish (serialized)`);
+        try { await prev; } catch (e) { /* previous call's error doesn't block us */ }
+        if (wasQueued) console.log(`[overlap] code-model call #${callNum} now running (previous finished)`);
         // fix33: CodeModel.sendRequest handles paid→free fallback internally; no pre/post quota check here
         const cm = this.agent.prompter.code_model;
-        const t0 = Date.now(); console.log(`[timing] ${new Date().toISOString().slice(11,19)}Z composer call #${CALLS.code} start (prompt ${system.length + user.length} chars)`);
-        let r; try { r = await cm.sendRequest([{ role: 'user', content: user }], system); } finally { console.log(`[timing] ${new Date().toISOString().slice(11,19)}Z composer call #${CALLS.code} took ${Date.now() - t0}ms (reply ${String(r ?? '').length} chars)`); }
+        const t0 = Date.now(); console.log(`[timing] ${new Date().toISOString().slice(11,19)}Z composer call #${callNum} start (prompt ${system.length + user.length} chars)`);
+        // fix35: overlap CPU-only maintenance with code-model wait (flush debounced saves, extract shared fragments)
+        this._overlapCpuMaintenance();
+        let r; try { r = await cm.sendRequest([{ role: 'user', content: user }], system); } finally { release(); console.log(`[timing] ${new Date().toISOString().slice(11,19)}Z composer call #${callNum} took ${Date.now() - t0}ms (reply ${String(r ?? '').length} chars)`); }
         return r;
+    }
+    // fix35: CPU-only maintenance that can run overlapped with code-model waits (no model calls)
+    _overlapCpuMaintenance() {
+        const t0 = Date.now();
+        let did = [];
+        // flush debounced skill saves if dirty
+        if (this._skillsDirty) { this._flushSkills(); did.push('flush-skills'); }
+        // extract shared fragments (CPU-only analysis)
+        const prevHints = JSON.stringify(this.sharedHints || []);
+        this._extractShared();
+        if (JSON.stringify(this.sharedHints || []) !== prevHints) did.push('extract-shared');
+        // recompute shared hints if needed
+        if (did.length) console.log(`[overlap] CPU maintenance overlapped with code-model: ${did.join(', ')} (${Date.now() - t0}ms)`);
     }
 
     // ---------- automatic curriculum ----------
@@ -1069,11 +1094,17 @@ Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
         console.log(`[psn] subgoal "${c.task}" done with skill ${name} (for parent "${c.parent}")`);
     }
     // fix28 (C): plan the next task concurrently with the current action; the plan is used only if the state it was made for still holds
+    // fix35: also prefetch embeddings for skills mentioned in the context (overlapped with task execution)
     _prefetchPlan(task, before) {
         if ((this.progress.subgoals || []).length) { this._plan = null; console.log(`[plan] overlap skipped: ${this.progress.subgoals.length} subgoal(s) queued`); return; }   // fix30
         const t0 = Date.now();
         const p = this.proposeTask({ ...before, note: `The bot is now doing "${task}". Propose the task to do AFTER it, assuming it succeeds.` })
-            .then(r => { console.log(`[plan] next proposal ready in ${Date.now() - t0}ms (overlapped with "${task}"): ${r?.task}`); if (r?.task) this._embed(r.task).catch(e => console.log(`[plan] embed prefetch failed: ${e.message}`)); return r; }, e => { console.log(`[plan] prefetch failed: ${e.message}`); return null; });
+            .then(r => {
+                console.log(`[plan] next proposal ready in ${Date.now() - t0}ms (overlapped with "${task}"): ${r?.task}`);
+                if (r?.task) this._embed(r.task).catch(e => console.log(`[plan] embed prefetch failed: ${e.message}`));
+                if (r?.context) this._prefetchRelatedEmbeds(r.context);
+                return r;
+            }, e => { console.log(`[plan] prefetch failed: ${e.message}`); return null; });
         this._plan = { p, task, basis: before, t: t0 };
     }
     _planStale(pl, r, now) {
@@ -1120,6 +1151,12 @@ current_health: ${Math.round(bot.health)}/20\ncurrent_food: ${bot.food}/20 (20/2
     }
 
     // ---------- skill library ----------
+    // fix35: stable hash for description+code freshness detection (re-embed when content changes)
+    _embHash(s) {
+        const src = (s.description || '') + '\n' + (s.code || '');
+        let h = 0; for (let i = 0; i < src.length; i++) h = ((h << 5) - h + src.charCodeAt(i)) | 0;
+        return h.toString(36);
+    }
     async _embed(text) {
         const em = this.agent.prompter.embedding_model;
         if (!em) throw new Error('[voyager] embedding model required (no fallback)');
@@ -1130,19 +1167,47 @@ current_health: ${Math.round(bot.health)}/20\ncurrent_food: ${bot.food}/20 (20/2
         C.set(text, v); if (C.size > 256) C.delete(C.keys().next().value);
         return v;
     }
+    // fix35: prefetch embeddings for skill names mentioned in a context string (overlapped with other work)
+    _prefetchRelatedEmbeds(context) {
+        if (!context) return;
+        const names = (context.match(/\b[a-z][A-Za-z0-9]+\b/g) || []).filter(n => this.skills.some(s => s.name === n));
+        if (!names.length) return;
+        const t0 = Date.now();
+        console.log(`[overlap] prefetching embeds for ${names.length} skill(s) mentioned in context: ${names.join(', ')}`);
+        Promise.all(names.map(async n => {
+            const s = this.skills.find(x => x.name === n);
+            if (s && s.description) await this._embed(s.description);
+        })).then(() => console.log(`[overlap] prefetch of ${names.length} skill embed(s) done in ${Date.now() - t0}ms`))
+          .catch(e => console.log(`[overlap] prefetch failed: ${e.message}`));
+    }
     async retrieveSkills(query, k = 5) {
         if (!this.skills.length) return [];
         const q = await this._embed(query);
-        {  // re-embed skills saved with a different embedding model (e.g. nomic -> gemini-embedding-001)
-            let changed = false;
-            for (const s of this.skills) {
-                if (!s.embedding || s.embedding.length !== q.length) { s.embedding = await this._embed(s.description); changed = true; }
+        // fix35: re-embed skills whose description/code changed (hash-based freshness) or wrong embedding length
+        let changed = false;
+        for (const s of this.skills) {
+            const hash = this._embHash(s);
+            const stale = !s.embedding || s.embedding.length !== q.length || s._embHash !== hash;
+            if (stale) {
+                if (s._embHash && s._embHash !== hash) console.log(`[voyager] re-embedding ${s.name}: description/code changed`);
+                s.embedding = await this._embed(s.description);
+                s._embHash = hash;
+                changed = true;
             }
-            if (changed) { this._saveSkills(); console.log('[voyager] re-embedded skill library with current embedding model'); }
         }
-        const scored = this.skills.map(s => ({ s, score: cosineSimilarity(q, s.embedding) }));
-        console.log(`[voyager] skill search (embeddings) top: ${scored.slice().sort((a, b) => b.score - a.score).slice(0, 3).map(x => x.s.name + '=' + x.score.toFixed(2)).join(' ')}`);
-        return scored.sort((a, b) => b.score - a.score).slice(0, k).map(x => x.s);
+        if (changed) { this._saveSkills(); console.log('[voyager] re-embedded skill library (model mismatch or content changed)'); }
+        const scored = this.skills.filter(s => !s.demoted && !s.mergedInto).map(s => ({ s, score: cosineSimilarity(q, s.embedding) }));
+        scored.sort((a, b) => b.score - a.score);
+        // fix35: diversity filter - skip skills with >0.95 similarity to already-selected ones (avoid near-duplicate neighbors)
+        const selected = [];
+        for (const cand of scored) {
+            if (selected.length >= k) break;
+            const tooSimilar = selected.some(sel => cosineSimilarity(sel.s.embedding, cand.s.embedding) > 0.95);
+            if (tooSimilar) { console.log(`[voyager] diversity: skipping ${cand.s.name} (too similar to already-selected skill)`); continue; }
+            selected.push(cand);
+        }
+        console.log(`[voyager] skill search (embeddings) top: ${selected.slice(0, 3).map(x => x.s.name + '=' + x.score.toFixed(2)).join(' ')}${selected.length < scored.length ? ` (${scored.length - selected.length} skipped for diversity)` : ''}`);
+        return selected.map(x => x.s);
     }
     async saveSkill(name, description, code, task, opts = {}) {
         const names = new Set(this.skills.map(s => s.name));
@@ -1327,6 +1392,18 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
             rq.push({ ...b, task, trace: traceText(trace, 60), peers: bs.map(x => x.target) }); console.log(`[psn] queued REPAIR of ${b.target} (${rq.length} in queue)`);
         }
         rq.sort((a, b) => (b.depth ?? 0) - (a.depth ?? 0)); this._repairQueue = rq;
+        // fix35: prefetch embeddings for blamed skills (overlapped with next work; embeds are used by retrieveSkills when repair runs)
+        this._prefetchBlamedEmbeds(rq);
+    }
+    // fix35: prefetch embeddings for blamed skills while other work runs (CPU-safe, overlaps with critic/code-model waits)
+    _prefetchBlamedEmbeds(rq) {
+        const skills = rq.map(q => this.skills.find(s => s.name === q.target)).filter(Boolean);
+        if (!skills.length) return;
+        const t0 = Date.now();
+        console.log(`[overlap] prefetching embeds for ${skills.length} blamed skill(s): ${skills.map(s => s.name).join(', ')}`);
+        Promise.all(skills.map(async s => { if (s.description) await this._embed(s.description); }))
+            .then(() => console.log(`[overlap] blamed skill embed prefetch done in ${Date.now() - t0}ms`))
+            .catch(e => console.log(`[overlap] blamed skill embed prefetch failed: ${e.message}`));
     }
     // targeted repair of the blamed skill via the code model, through the normal regression gate (saveSkill)
     // fix26: a skipped repair is deferred (persisted) and re-queued when ripe, not dropped; dropped loudly after 6 deferrals
