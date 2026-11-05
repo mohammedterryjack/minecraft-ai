@@ -1,4 +1,5 @@
 import { wordOverlapScore } from '../utils/text.js';
+import settings from '../../settings.js';
 // Voyager-style lifelong learning loop (after MineDojo/Voyager):
 // automatic curriculum -> iterative code generation with env feedback -> self-verification critic -> skill library.
 // Learning upgrades (Mo-approved):
@@ -867,6 +868,15 @@ Use only c; no other globals.`;
         }
         return result;
     }
+    // fix47: compact state format for efficient prompts (one line, critical info only)
+    _compactState(s) {
+        const inv = s.inventory || {};
+        const items = Object.entries(inv).sort((a, b) => b[1] - a[1]).slice(0, 6);
+        const invSummary = items.length ? items.map(([k, v]) => `${k}:${v}`).join(',') : 'empty';
+        const eq = s.equipment || {};
+        const held = eq.hand !== 'empty' ? eq.hand : '';
+        return `pos:(${s.position}) biome:${s.biome} time:${(s.time || '').split(' ')[0]} hp:${s.health_value}/${s.health_max} food:${s.food_value}/${s.food_max} inv:${s.inventory_slots},${s.empty_inventory_slots}empty${held ? ` held:${held}` : ''} threats:${s.threats || 'none'} top_items:[${invSummary}]`;
+    }
     _stateText(s) {
         // fix34: present inventory facts prominently as exact counts (not just JSON blob)
         // fix36: facts only, no imperatives (Mo principle: everything learned, not hard-coded)
@@ -1394,20 +1404,89 @@ Use only c; no other globals.`;
             return s.name;
         });
     }
+    // fix47: core primitives that are always included (essential for any code generation)
+    static CORE_API = new Set(['log', 'sleep', 'goToPosition', 'getNearestBlock', 'getInventoryCounts', 'placeBlock', 'breakBlockAt', 'craftRecipe', 'equip', 'consume', 'wait']);
+    
+    // fix47: retrieve relevant built-in API functions by embedding search
+    // Returns top-k relevant signatures plus core primitives
+    async _relevantBuiltInAPI(query, k = 15) {
+        const bare = getBareAPI();
+        const em = this.agent.prompter.embedding_model;
+        if (!em) {
+            console.error('[fix47] FAIL LOUD: embedding model required for API filtering - no fallback');
+            throw new Error('[fix47] embedding model required for API filtering');
+        }
+        
+        const q = await this._embed(query);
+        
+        // Embed each API signature if not cached
+        const apiCache = (this._apiEmbCache ||= new Map());
+        const scored = [];
+        for (const sig of bare.sigs) {
+            const name = sig.split('(')[0];
+            if (!apiCache.has(sig)) {
+                apiCache.set(sig, await this._embed(sig));
+            }
+            const score = cosineSimilarity(q, apiCache.get(sig));
+            scored.push({ sig, name, score, isCore: Voyager.CORE_API.has(name) });
+        }
+        
+        // Sort by relevance, but ensure core APIs are always included
+        scored.sort((a, b) => b.score - a.score);
+        const selected = new Set();
+        const result = [];
+        
+        // First add core APIs (always needed)
+        for (const s of scored) {
+            if (s.isCore && !selected.has(s.name)) {
+                selected.add(s.name);
+                result.push(`- ${s.sig} [built-in, core]`);
+            }
+        }
+        
+        // Then add top-k relevant APIs
+        for (const s of scored) {
+            if (result.length >= k) break;
+            if (!selected.has(s.name)) {
+                selected.add(s.name);
+                result.push(`- ${s.sig} [built-in]`);
+            }
+        }
+        
+        console.log(`[fix47] relevant API: ${result.length} of ${bare.sigs.length} built-in (${Voyager.CORE_API.size} core + ${result.length - Voyager.CORE_API.size} by embedding)`);
+        return result.join('\n');
+    }
+    
     // fix40: unified bare-name API list (built-in + learned) with exact call signatures
     // ALL functions use bare names (e.g., goToPosition(bot, x, y, z) NOT skills.goToPosition)
-    unifiedAPIList(only) {
+    // fix47: now accepts relevantBuiltIn for efficient prompts
+    unifiedAPIList(only, relevantBuiltIn = null) {
         const bare = getBareAPI();
-        const builtInSigs = bare.sigs.map(s => `- ${s} [built-in]`);
+        const builtInSigs = relevantBuiltIn || bare.sigs.map(s => `- ${s} [built-in]`);
+        const builtInText = Array.isArray(builtInSigs) ? builtInSigs.join('\n') : builtInSigs;
         const learnedSigs = this.skills
             .filter(s => !s.demoted && !s.mergedInto && (!only || only.has(s.name)))
             .map(s => `- ${signatureOf(s.code, s.name)}${s.handwritten ? ' [handwritten]' : ''}: ${s.description}`);
-        return [...builtInSigs, ...learnedSigs].join('\n');
+        return [builtInText, ...learnedSigs].join('\n');
     }
     // fix40: legacy builtInAPIList for backward compatibility - returns bare names now
     builtInAPIList() {
         const bare = getBareAPI();
         return bare.sigs.join('\n');
+    }
+    
+    // fix47: per-prompt breakdown logging for code model and curriculum calls
+    // Logs section sizes to help diagnose prompt bloat
+    _logPromptBreakdown(kind, sections) {
+        const total = Object.values(sections).reduce((a, b) => a + b, 0);
+        const breakdown = Object.entries(sections).map(([k, v]) => `${k}=${v}`).join(' ');
+        console.log(`[prompt] kind=${kind} total=${total} chars: ${breakdown}`);
+        
+        // Loud warning if prompt is unusually large
+        if (total > 50000) {
+            console.log(`[prompt] LOUD: ${kind} prompt is ${total} chars (>50k) - check for bloat`);
+        }
+        return total;
     }
     _recordRun(entry, task, ok, trial) {
         if (trial) {
@@ -1934,14 +2013,28 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "task": "...", "contex
         const relevantWorkflows = this.repairMemory.getWorkflowsForTask(taskContext || this.progress.failed.slice(-3).join(' '), 2);
         const workflowHints = this.repairMemory.formatWorkflowHints(relevantWorkflows);
         // fix39: enriched known_skills with descriptions for primitives and space-freeing skills
-        const user = `known_skills: ${JSON.stringify(this._knownSkillsFacts())}
-replayable_tasks (cheap, no new code needed): ${JSON.stringify(this.skills.filter(s => s.task && !s.primitive).map(s => s.task.split(/\s+(?:within|at|using|from)\b/i)[0]).slice(-25))} plus any "Mine N <block or ore>", "Collect N <log>", "Get N <item>", "Smelt N <raw> into N <out>", "Kill N <mob>", "Harvest N <crop>"
+        // fix47: use compact state for curriculum (full state too verbose for local model context)
+        const compactStateText = this._compactState(state);
+        const knownSkillsFacts = this._knownSkillsFacts();
+        const replayableTasks = this.skills.filter(s => s.task && !s.primitive).map(s => s.task.split(/\s+(?:within|at|using|from)\b/i)[0]).slice(-25);
+        const user = `known_skills: ${JSON.stringify(knownSkillsFacts)}
+replayable_tasks (cheap, no new code needed): ${JSON.stringify(replayableTasks)} plus any "Mine N <block or ore>", "Collect N <log>", "Get N <item>", "Smelt N <raw> into N <out>", "Kill N <mob>", "Harvest N <crop>"
 completed_tasks: ${JSON.stringify(this.progress.completed.slice(-30))}
 failed_tasks: ${JSON.stringify(this.progress.failed.slice(-15))}
-${this._stateText(state)}
+--- state (compact) ---
+${compactStateText}
 current_health: ${Math.round(bot.health)}/20\ncurrent_food: ${bot.food}/20 (20/20 = full)${this._cursorLimited() ? '\nIMPORTANT: the code-writing model is unavailable right now, so ONLY propose a task from replayable_tasks or "Mine N <block>".' : ''}${workflowHints ? '\n' + workflowHints : ''}`;   // fix31: slow-changing lists first so Ollama reuses the cached prompt prefix
         const facts = recipeFacts(this.progress.failed.slice(-5).join(' '));
-        return parseLocalJSON(await this._askLocal(system, facts ? user + '\n' + facts : user), ['reasoning', 'task', 'context']);
+        const finalUser = facts ? user + '\n' + facts : user;
+        // fix47: per-prompt breakdown logging for curriculum
+        this._logPromptBreakdown('curriculum', {
+            system: system.length,
+            skills: JSON.stringify(knownSkillsFacts).length,
+            state: compactStateText.length,
+            history: JSON.stringify(this.progress.completed.slice(-30)).length + JSON.stringify(this.progress.failed.slice(-15)).length,
+            recipes: facts.length
+        });
+        return parseLocalJSON(await this._askLocal(system, finalUser), ['reasoning', 'task', 'context']);
     }
 
     // ---------- skill library ----------
@@ -2831,17 +2924,26 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
         if (this._cursorLimited()) { console.log(`[voyager] skipped "${task}": needs new code but Cursor is at its limit (replay-only mode)`); return; }
         this.agent.openChat?.(`New goal: ${task}`);
         // fix28 (B): the prompt carries only the skills nomic-embed-text ranks relevant, plus their dependency closures (all skills stay defined in scope)
-        const related = await this.retrieveSkills(task + ' ' + (proposal.context || ''), 8);
+        // fix47: use configurable skill_topk from settings
+        const skillTopK = settings.skill_topk || 8;
+        const apiTopK = settings.api_topk || 15;
+        const related = await this.retrieveSkills(task + ' ' + (proposal.context || ''), skillTopK);
         for (const n of (proposal.context || '').match(/\b[a-z][A-Za-z0-9]+\b/g) || []) { const e = this.skills.find(s => s.name === n && !s.demoted); if (e && !related.includes(e)) related.push(e); }
         const shown = new Set(related.map(s => s.name)); for (const s of related) for (const d of this._closure(s.name)) shown.add(d);
         const prompter = this.agent.prompter;
+        
+        // fix47: get relevant built-in API functions via embedding search
+        const relevantBuiltIn = await this._relevantBuiltInAPI(task + ' ' + (proposal.context || ''), apiTopK);
+        
         let system = await prompter.replaceStrings(prompter.profile.coding, [{ role: "user", content: `!newAction(${task})` }], prompter.coding_examples);
         // fix40: unified bare-name API - all functions called by bare name
+        // fix47: use relevantBuiltIn instead of full API list
+        const apiList = this.unifiedAPIList(shown, relevantBuiltIn);
         system += `\n\nVOYAGER MODE: write ONE reusable async function \`async function camelCaseName(bot) {...}\` that completes the task, then call it at the end with \`await camelCaseName(bot);\`.
 The first line of the code block must be a comment: // DESCRIPTION: <one sentence of what the function does>.
 
 AVAILABLE FUNCTIONS (call by bare name, e.g. goToPosition(bot, x, y, z) - do NOT use skills.* or world.* prefix):
-${this.unifiedAPIList(shown)}
+${apiList}
 
 IMPORTANT: All functions use bare names. Do NOT write skills.goToBlock or skills.goToPosition - write goToPosition(bot, x, y, z) directly. Do NOT write world.getNearestBlock - write getNearestBlock(bot, ...) directly.
 
@@ -2863,10 +2965,33 @@ Interrupts: the bot may be interrupted at any time (danger, getting stuck, a pla
             if (this.abort) { console.log('[voyager] aborted for player'); return; }
             // fix37: escalating duplicate feedback (changes each time to nudge the model)
             const dupeEscalation = consecutiveDupes > 0 ? `\n\n!!! CRITICAL: Your previous ${consecutiveDupes} reply(ies) were IDENTICAL to the one before. You MUST write DIFFERENT code this time. The previous code did not work. Change your approach, use different skills, or try a simpler strategy. Repeating the same code will cause this task to fail. !!!` : '';
-            const user = `Task: ${task}\nHint: ${proposal.context || ''}\n${recipeFacts(task)}\n--- state ---\n${this._stateText(this.observe())}
+            // fix47: use compact state for efficient prompts (verbose state is available via _stateText if needed)
+            const currentState = this.observe();
+            const compactStateText = this._compactState(currentState);
+            const user = `Task: ${task}\nHint: ${proposal.context || ''}\n${recipeFacts(task)}\n--- state (compact) ---\n${compactStateText}
 --- learned skills you can call ---\n${ctx || '(none)'}
 ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- feedback from last attempt ---\n${feedback}\n` : ''}${dupeEscalation}Attempt ${i}/${MAX_ATTEMPTS}. Write the code block:`;
-            if (i === 1) console.log(`[voyager] code prompt: ${shown.size} of ${this.skills.filter(s => !s.demoted).length} skills in the catalogue (relevant + deps), ${Math.min(3, related.length)} with source; prompt ${system.length + user.length} chars`);
+            // fix47: per-prompt breakdown logging
+            if (i === 1) {
+                this._logPromptBreakdown('code', {
+                    system: system.length,
+                    skills: ctx.length,
+                    prelude: apiList.length,
+                    state: compactStateText.length,
+                    task: task.length + (proposal.context || '').length,
+                    retry: 0
+                });
+                console.log(`[voyager] code prompt: ${shown.size} of ${this.skills.filter(s => !s.demoted).length} skills in the catalogue (relevant + deps), ${Math.min(3, related.length)} with source; prompt ${system.length + user.length} chars`);
+            } else {
+                // Log retry prompt size breakdown
+                this._logPromptBreakdown('code-retry', {
+                    system: system.length,
+                    skills: ctx.length,
+                    state: compactStateText.length,
+                    history: lastCode.length,
+                    retry: feedback.length
+                });
+            }
             const reply = await this._ask(system, user);
             // fix37: duplicate-reply detection - hash and compare to previous
             const replyHash = this._hashReply(reply);
