@@ -77,47 +77,40 @@ export class Coder {
         this.agent.bot.modes.pause('unstuck');
         lockdown();
         // this message history is transient and only maintained in this function
-        // fix45: keep base messages separate for retry cap calculation
+        // fix46: keep base messages separate - on every retry, use base + latest code + latest error only
         const baseMessages = agent_history.getHistory();
         baseMessages.push({role: 'system', content: 'Code generation started. Write code in codeblock in your response:'});
-        const basePromptSize = JSON.stringify(baseMessages).length;
-        
-        // fix45: retry prompt cap - derived from base prompt size (not a magic number)
-        // Retries should stay within 5x the base prompt (typical base is ~20k, so cap ~100k not 800k)
-        const RETRY_PROMPT_CAP_MULTIPLIER = 5;
-        const maxRetryPromptSize = basePromptSize * RETRY_PROMPT_CAP_MULTIPLIER;
-        
-        let messages = [...baseMessages];
 
         const MAX_ATTEMPTS = 5;
         const MAX_NO_CODE = 3;
 
         let code = null;
         let no_code_failures = 0;
-        let lastCode = null;  // fix45: track latest code for capped retry
-        let lastError = null; // fix45: track latest error for capped retry
+        let lastCode = null;   // fix46: track latest code for retry
+        let lastError = null;  // fix46: track latest error for retry
         
         for (let i=0; i<MAX_ATTEMPTS; i++) {
             if (this.agent.bot.interrupt_code)
                 return null;
             
-            // fix45: on retry, cap the prompt by using only base + latest error + latest code
-            // This prevents 800k char prompts from accumulated history
-            if (i > 0 && lastError) {
-                const currentSize = JSON.stringify(messages).length;
-                if (currentSize > maxRetryPromptSize) {
-                    console.log(`[fix45] Retry prompt ${currentSize} chars exceeds cap ${maxRetryPromptSize} (${RETRY_PROMPT_CAP_MULTIPLIER}x base); trimming to base + latest error`);
-                    messages = [...baseMessages];
-                    if (lastCode) {
-                        messages.push({ role: 'assistant', content: '```javascript\n' + lastCode + '\n```' });
-                    }
+            // fix46: on every retry, send base messages + latest code + latest error only
+            // This prevents prompt accumulation (800k vs 20k issue)
+            let messages;
+            if (i === 0) {
+                messages = [...baseMessages];
+            } else {
+                messages = [...baseMessages];
+                if (lastCode) {
+                    messages.push({ role: 'assistant', content: '```javascript\n' + lastCode + '\n```' });
+                }
+                if (lastError) {
                     messages.push({ role: 'system', content: lastError });
-                    
-                    // Verify capped size is reasonable
-                    const cappedSize = JSON.stringify(messages).length;
-                    if (cappedSize > maxRetryPromptSize * 2) {
-                        console.error(`[fix45] LOUD FAIL: Capped retry prompt ${cappedSize} chars still exceeds 2x cap - error message may be too large`);
-                    }
+                }
+                const promptSize = JSON.stringify(messages).length;
+                console.log(`[fix46] Retry ${i} prompt: ${promptSize} chars (base + latest code + latest error)`);
+                // Log loudly if still large (likely indicates an unusually large error message)
+                if (promptSize > 100000) {
+                    console.log(`[fix46] LOUD: Retry prompt is ${promptSize} chars - consider if error message is too verbose`);
                 }
             }
             
@@ -128,11 +121,8 @@ export class Coder {
             let contains_code = res.indexOf('```') !== -1;
             if (!contains_code) {
                 if (res.indexOf('!newAction') !== -1) {
-                    messages.push({
-                        role: 'assistant', 
-                        content: res.substring(0, res.indexOf('!newAction'))
-                    });
-                    continue; // using newaction will continue the loop
+                    // Continue without accumulating - next iteration rebuilds from base
+                    continue;
                 }
                 
                 if (no_code_failures >= MAX_NO_CODE) {
@@ -140,7 +130,6 @@ export class Coder {
                     return 'Action failed, agent would not write code.';
                 }
                 lastError = 'Error: no code provided. Write code in codeblock in your response. ``` // example ```';
-                messages.push({ role: 'system', content: lastError });
                 console.warn("No code block generated. Trying again.");
                 no_code_failures++;
                 continue;
@@ -148,7 +137,7 @@ export class Coder {
             code = res.substring(res.indexOf('```')+3, res.lastIndexOf('```'));
             // fix34: formatting-only auto-fix before lint (whitespace, semicolons, quotes - nothing semantic)
             code = this._autoFixFormatting(code);
-            lastCode = code;  // fix45: track for capped retry
+            lastCode = code;  // fix46: track for retry
             const result = await this._stageCode(code);
             const executionModule = result.func;
             // fix45: pass preludeLines to exclude prelude bindings from shadow warnings
@@ -156,7 +145,6 @@ export class Coder {
             if (lintResult) {
                 lastError = 'Error: Code lint error:\n' + lintResult + '\nPlease try again.';
                 console.warn("Linting error:\n" + lintResult + '\n');
-                messages.push({ role: 'system', content: lastError });
                 continue;
             }
             if (!executionModule) {
@@ -179,13 +167,8 @@ export class Coder {
                 console.warn('trying again...');
 
                 const code_output = this.agent.actions.getBotOutputSummary();
-
-                messages.push({
-                    role: 'assistant',
-                    content: res
-                });
+                // fix46: just track lastError - messages are rebuilt from base on next retry
                 lastError = `Code Output:\n${code_output}\nCODE EXECUTION THREW ERROR: ${e.toString()}\n Please try again:`;
-                messages.push({ role: 'system', content: lastError });
             }
         }
         return `Code generation failed after ${MAX_ATTEMPTS} attempts.`;

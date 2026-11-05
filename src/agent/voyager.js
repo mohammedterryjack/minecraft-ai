@@ -18,6 +18,7 @@ import { makeCompartment } from './library/lockdown.js';
 import { getAllItems, getAllBlocks, getItemCraftingRecipes, isHostile, isDatapackHostile } from '../utils/mcdata.js';
 import { cosineSimilarity } from '../utils/math.js';
 import minecraftData from 'minecraft-data';
+import settings from '../../settings.js';  // fix46: for minecraft_version fallback
 import { Ollama } from '../models/ollama.js';
 import { signatureOf, depsOf, missingCalls, findCycle, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf } from './skill_graph.js';
 import { getBareAPI } from './coder.js';   // fix40: unified bare-name API helper
@@ -147,9 +148,10 @@ function smeltGoal(task) {
     return m ? { count: parseInt(m[1]), input: m[2].toLowerCase(), verb: 'smelt', item: m[4].toLowerCase(), items: [m[4].toLowerCase()] } : null;
 }
 
-// fix45: parse verbose goal strings like "craftItem: Craft 1 iron_pickaxe using 1 iron_ingot..."
+// fix46: parse verbose goal strings like "craftItem: Craft 1 iron_pickaxe using 1 iron_ingot..."
 // Uses minecraft-data registry to validate item names (no hard-coded tables per owner rules)
-// Returns {item, count, items, verb} or null if unparseable; logs loudly on parse failure
+// Returns {item, count, items} or null if unparseable; logs loudly if VERSION is missing
+// Prefers structured {item, count} on goals - parsing is only for legacy text
 export function parseVerboseGoal(task) {
     if (!task || typeof task !== 'string') return null;
     const t = task.toLowerCase();
@@ -158,11 +160,38 @@ export function parseVerboseGoal(task) {
     const std = smeltGoal(task) || countGoal(task);
     if (std) return std;
     
-    // Verbose goal patterns:
-    // "craftItem: Craft 1 iron_pickaxe using..." / "equipToolOrCraft: Equip or craft 1 stone_pickaxe..."
-    // Generic: look for "N item_name" where item_name is in the minecraft-data registry
+    // fix46: use VERSION if set, otherwise settings.minecraft_version; fail loud if both missing
+    const version = VERSION || settings.minecraft_version;
+    if (!version) {
+        console.error(`[fix46] LOUD FAIL: parseVerboseGoal called but VERSION is null and settings.minecraft_version is not configured`);
+        return null;
+    }
+    
     let md;
-    try { md = minecraftData(VERSION || '1.20.4'); } catch (e) { console.log(`[fix45] minecraft-data unavailable: ${e.message}`); return null; }
+    try { md = minecraftData(version); } 
+    catch (e) { 
+        console.error(`[fix46] LOUD FAIL: minecraft-data unavailable for version ${version}: ${e.message}`);
+        return null;
+    }
+    
+    // fix46: generic plural handling against registry (no hard-coded torches/glasses)
+    // Try: name as-is, then minus 's', then minus 'es' - keep whichever is in registry
+    const resolveItem = (name) => {
+        const lower = name.toLowerCase();
+        // Try exact match first
+        if (md.itemsByName[lower] || md.blocksByName[lower]) return lower;
+        // Try minus 's'
+        if (lower.endsWith('s')) {
+            const singular = lower.slice(0, -1);
+            if (md.itemsByName[singular] || md.blocksByName[singular]) return singular;
+        }
+        // Try minus 'es'
+        if (lower.endsWith('es')) {
+            const singular = lower.slice(0, -2);
+            if (md.itemsByName[singular] || md.blocksByName[singular]) return singular;
+        }
+        return null;
+    };
     
     // Extract all potential "count item" pairs from the text
     const candidates = [];
@@ -170,32 +199,23 @@ export function parseVerboseGoal(task) {
     let m;
     while ((m = pattern.exec(t))) {
         const count = parseInt(m[1]);
-        let item = m[2].toLowerCase();
-        // Handle plurals: sticks -> stick, torches -> torch
-        if (item.endsWith('es') && item !== 'glasses') { const t = item === 'torches' ? 'torch' : item.slice(0, -2); if (md.itemsByName[t] || md.blocksByName[t]) item = t; }
-        else if (item.endsWith('s') && (md.itemsByName[item.slice(0, -1)] || md.blocksByName[item.slice(0, -1)])) item = item.slice(0, -1);
-        // Check if this is a valid item/block name in the registry
-        if (md.itemsByName[item] || md.blocksByName[item]) {
-            candidates.push({ count, item, pos: m.index });
+        const resolved = resolveItem(m[2]);
+        if (resolved) {
+            candidates.push({ count, item: resolved, pos: m.index });
         }
     }
     
     if (candidates.length === 0) {
-        console.log(`[fix45] LOUD: parseVerboseGoal failed for "${task.slice(0, 100)}": no valid item name found`);
+        console.log(`[fix46] LOUD: parseVerboseGoal failed for "${task.slice(0, 100)}": no valid item name found in registry`);
         return null;
     }
     
     // Pick the first valid candidate (typically the goal item in "Craft 1 iron_pickaxe using...")
     const best = candidates[0];
-    const verb = t.match(/^(craft|mine|collect|gather|smelt|obtain|get|chop|cook|equip)/)?.[1] || 'craft';
     
-    // Include block loot drops (same logic as countGoal)
-    let items = [best.item];
-    if (['mine', 'collect', 'gather', 'chop', 'get', 'obtain'].includes(verb)) {
-        try { for (const d of (md.blockLoot?.[best.item]?.drops || [])) if (!items.includes(d.item)) items.push(d.item); } catch (e) {}
-    }
-    
-    return { count: best.count, item: best.item, items, verb };
+    // fix46: removed verb list and blockLoot expansion (no silent catch, no hard-coded verbs)
+    // Return just {item, count, items} - verb is not needed for satisfaction check
+    return { count: best.count, item: best.item, items: [best.item] };
 }
 
 function gainedFor(goal, before, after) {

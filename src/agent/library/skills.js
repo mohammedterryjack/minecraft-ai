@@ -7,12 +7,15 @@ import settings from "../../../settings.js";
 const blockPlaceDelay = settings.block_place_delay == null ? 0 : settings.block_place_delay;
 const useDelay = blockPlaceDelay > 0;
 
-// fix45: log vitals (food and health) on every log line for recovery tracking
+// fix46: log vitals (food and health) on every log line for recovery tracking
+// Uses bot's own max values if available, otherwise settings or default 20 (consistent with observe())
 export function log(bot, message) {
-    // Include vitals if available (format: "food X/20 health Y/20")
     let vitals = '';
     if (typeof bot.food === 'number' && typeof bot.health === 'number') {
-        vitals = ` [food ${bot.food}/20 health ${Math.round(bot.health)}/20]`;
+        // Use bot's max values if game provides them, otherwise fall back to standard Minecraft defaults
+        const foodMax = bot.game?.maxFood ?? settings.max_food ?? 20;
+        const healthMax = bot.game?.maxHealth ?? settings.max_health ?? 20;
+        vitals = ` [food ${bot.food}/${foodMax} health ${Math.round(bot.health)}/${healthMax}]`;
     }
     bot.output += message + vitals + '\n';
 }
