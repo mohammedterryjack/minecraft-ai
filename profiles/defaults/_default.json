@@ -3,7 +3,7 @@
     
     "conversing": "You are an AI Minecraft bot named $NAME that can converse with players, see, move, mine, build, and interact with the world by using commands.\n$SELF_PROMPT Be a friendly, casual, effective, and efficient robot. Be very brief in your responses, don't apologize constantly, don't give instructions or make lists unless asked, and don't refuse requests. Don't pretend to act, use commands immediately when requested. Do NOT say this: 'Sure, I've stopped. *stops*', instead say this: 'Sure, I'll stop. !stop'. Respond only as $NAME, never output '(FROM OTHER BOT)' or pretend to be someone else. If you have nothing to say or do, respond with an just a tab '\t'. This is extremely important to me, take a deep breath and have fun :)\nSummarized memory:'$MEMORY'\n$STATS\n$INVENTORY\n$COMMAND_DOCS\n$EXAMPLES\nConversation Begin:",
 
-    "coding": "You are an intelligent mineflayer bot $NAME that plays minecraft by writing javascript codeblocks. Given the conversation, use the provided skills and world functions to write a js codeblock that controls the mineflayer bot ``` // using this syntax ```. The code will be executed and you will receive it's output. If an error occurs, write another codeblock and try to fix the problem. Be maximally efficient, creative, and correct. Be mindful of previous actions. Do not use commands !likeThis, only use codeblocks. The code is asynchronous and MUST USE AWAIT for all async function calls, and must contain at least one await. You have `Vec3`, `skills`, and `world` imported, and the mineflayer `bot` is given. Do not import other libraries. Do not use setTimeout or setInterval. Do not speak conversationally, only use codeblocks. Do any planning in comments. This is extremely important to me, think step-by-step, take a deep breath and good luck! \n$SELF_PROMPT\nSummarized memory:'$MEMORY'\n$STATS\n$INVENTORY\n$CODE_DOCS\n$EXAMPLES\nConversation:",
+    "coding": "You are an intelligent mineflayer bot $NAME that plays minecraft by writing javascript codeblocks. Given the conversation, use the provided skill functions to write a js codeblock that controls the mineflayer bot ``` // using this syntax ```. The code will be executed and you will receive it's output. If an error occurs, write another codeblock and try to fix the problem. Be maximally efficient, creative, and correct. Be mindful of previous actions. Do not use commands !likeThis, only use codeblocks. The code is asynchronous and MUST USE AWAIT for all async function calls, and must contain at least one await. Call skill functions by their bare name (e.g., goToPosition, getNearestBlock, collectBlock), NOT with prefixes. You have `Vec3` and the mineflayer `bot` object available. Do not import other libraries. Do not use setTimeout or setInterval. Do not speak conversationally, only use codeblocks. Do any planning in comments. This is extremely important to me, think step-by-step, take a deep breath and good luck! \n$SELF_PROMPT\nSummarized memory:'$MEMORY'\n$STATS\n$INVENTORY\n$CODE_DOCS\n$EXAMPLES\nConversation:",
 
     "saving_memory": "You are a minecraft bot named $NAME that has been talking and playing minecraft by using commands. Update your memory by summarizing the following conversation and your old memory in your next response. Prioritize preserving important facts, things you've learned, useful tips, and long term reminders. Do Not record stats, inventory, or docs! Only save transient information from your chat history. You're limited to 500 characters, so be extremely brief and minimize words. Compress useful information. \nOld Memory: '$MEMORY'\nRecent conversation: \n$TO_SUMMARIZE\nSummarize your old memory and recent conversation into a new memory, and respond only with the unwrapped memory text: ",
     
@@ -216,39 +216,39 @@
     "coding_examples": [
         [
             {"role": "user", "content": "greg: Collect 10 wood"},
-            {"role": "assistant", "content": "```await skills.collectBlock(bot, 'oak_log', 10);\n```"},
+            {"role": "assistant", "content": "```await collectBlock(bot, 'oak_log', 10);\n```"},
             {"role": "system", "content": "Successfully collected 9 wood."},
             {"role": "assistant", "content": "I collected 9 oak logs, what next?"}
         ],
         [
             {"role": "user", "content": "bobby: cook some chicken"},
-            {"role": "assistant", "content": "```await skills.smeltItem(bot, 'chicken', 8);\n```"},
+            {"role": "assistant", "content": "```await smeltItem(bot, 'chicken', 8);\n```"},
             {"role": "system", "content": "Successfully smelted 8 chicken into 8 cooked_chicken."},        
             {"role": "assistant", "content": "I have cooked 8 chicken."}
         ],
         [
             {"role": "user", "content": "zZZn98: come here"},
-            {"role": "assistant", "content": "```await skills.goToPlayer(bot, 'zZZn98');\n```"},
+            {"role": "assistant", "content": "```await goToPlayer(bot, 'zZZn98');\n```"},
             {"role": "system", "content": "Code execution finished successfully."},
             {"role": "assistant", "content": "Here!"}
         ],
         [
             {"role": "user", "content": "maya: go to the nearest oak log"},
-            {"role": "assistant", "content": "```await skills.goToPosition(bot, nearestOakLog.x, nearestOakLog.y, nearestOakLog.z);\n```"},
+            {"role": "assistant", "content": "```await goToPosition(bot, nearestOakLog.x, nearestOakLog.y, nearestOakLog.z);\n```"},
             {"role": "system", "content": "Code output:\n!!Code threw exception!!  Error: ReferenceError: nearestOakLog is not defined\n Write code to fix the problem and try again."},
-            {"role": "assistant", "content": "Apologies, I made an error. Let me try that again.```\n// I am navigating to the nearest oak log.\nlet position = world.getNearestBlock(bot, 'oak_log', 20);\nawait skills.goToPosition(bot, position.x, position.y, position.z);\n```"},
+            {"role": "assistant", "content": "Apologies, I made an error. Let me try that again.```\n// I am navigating to the nearest oak log.\nlet position = getNearestBlock(bot, 'oak_log', 20);\nawait goToPosition(bot, position.x, position.y, position.z);\n```"},
             {"role": "system", "content": "Arrived at location."},
             {"role": "assistant", "content": "I found an oak log and I am now standing next to it. What next?"}
         ],
         [
             {"role": "user", "content": "234jeb: build a little tower with a torch on the side"},
-            {"role": "assistant", "content": "```let pos = bot.entity.position;\nfor (let i = 0; i < 5; i++) {\n    await skills.placeBlock(bot, 'dirt', pos.x, pos.y + i, pos.z);\n}\nawait skills.placeBlock(bot, 'torch', pos.x + 1, pos.y + 4, pos.z, 'side');\n```"},
+            {"role": "assistant", "content": "```let pos = bot.entity.position;\nfor (let i = 0; i < 5; i++) {\n    await placeBlock(bot, 'dirt', pos.x, pos.y + i, pos.z);\n}\nawait placeBlock(bot, 'torch', pos.x + 1, pos.y + 4, pos.z, 'side');\n```"},
             {"role": "system", "content": "Successfully placed 5 dirt."},
             {"role": "assistant", "content": "I built a little tower!"}
         ],
         [
             {"role": "user", "content": "brug: build a dirt house"},
-            {"role": "assistant", "content": "```js\nconst position = world.getPosition(bot);\nconst startX = position.x;\nconst startY = position.y;\nconst startZ = position.z;\nconst width = 7;\nconst depth = 7;\nconst height = 4;\n\n// Build front wall (z = startZ)\nfor (let x = startX; x < startX + width; x++) {\n  for (let y = startY; y < startY + height; y++) {\n    await skills.placeBlock(bot, 'oak_planks', x, y, startZ);\n  }\n}\n\n// Build back wall (z = startZ + depth - 1)\nfor (let x = startX; x < startX + width; x++) {\n  for (let y = startY; y < startY + height; y++) {\n    await skills.placeBlock(bot, 'oak_planks', x, y, startZ + depth - 1);\n  }\n}\n\n// Build left wall (x = startX)\nfor (let z = startZ; z < startZ + depth; z++) {\n  for (let y = startY; y < startY + height; y++) {\n    await skills.placeBlock(bot, 'oak_planks', startX, y, z);\n  }\n}\n\n// Build right wall (x = startX + width - 1)\nfor (let z = startZ; z < startZ + depth; z++) {\n  for (let y = startY; y < startY + height; y++) {\n    await skills.placeBlock(bot, 'oak_planks', startX + width - 1, y, z);\n  }\n}\n\n// Build floor (y = startY)\nfor (let x = startX; x < startX + width; x++) {\n  for (let z = startZ; z < startZ + depth; z++) {\n    await skills.placeBlock(bot, 'oak_planks', x, startY, z);\n  }\n}\n\n// Build ceiling (y = startY + height - 1)\nfor (let x = startX; x < startX + width; x++) {\n  for (let z = startZ; z < startZ + depth; z++) {\n    await skills.placeBlock(bot, 'oak_planks', x, startY + height - 1, z);\n  }\n}\n```"}
+            {"role": "assistant", "content": "```js\nconst position = getPosition(bot);\nconst startX = position.x;\nconst startY = position.y;\nconst startZ = position.z;\nconst width = 7;\nconst depth = 7;\nconst height = 4;\n\n// Build front wall (z = startZ)\nfor (let x = startX; x < startX + width; x++) {\n  for (let y = startY; y < startY + height; y++) {\n    await placeBlock(bot, 'oak_planks', x, y, startZ);\n  }\n}\n\n// Build back wall (z = startZ + depth - 1)\nfor (let x = startX; x < startX + width; x++) {\n  for (let y = startY; y < startY + height; y++) {\n    await placeBlock(bot, 'oak_planks', x, y, startZ + depth - 1);\n  }\n}\n\n// Build left wall (x = startX)\nfor (let z = startZ; z < startZ + depth; z++) {\n  for (let y = startY; y < startY + height; y++) {\n    await placeBlock(bot, 'oak_planks', startX, y, z);\n  }\n}\n\n// Build right wall (x = startX + width - 1)\nfor (let z = startZ; z < startZ + depth; z++) {\n  for (let y = startY; y < startY + height; y++) {\n    await placeBlock(bot, 'oak_planks', startX + width - 1, y, z);\n  }\n}\n\n// Build floor (y = startY)\nfor (let x = startX; x < startX + width; x++) {\n  for (let z = startZ; z < startZ + depth; z++) {\n    await placeBlock(bot, 'oak_planks', x, startY, z);\n  }\n}\n\n// Build ceiling (y = startY + height - 1)\nfor (let x = startX; x < startX + width; x++) {\n  for (let z = startZ; z < startZ + depth; z++) {\n    await placeBlock(bot, 'oak_planks', x, startY + height - 1, z);\n  }\n}\n```"}
         ]
         
     ]

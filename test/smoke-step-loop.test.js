@@ -272,7 +272,13 @@ describe('smoke: full step loop', { skip: !DEPS_AVAILABLE ? `Dependencies not in
         if (!DEPS_AVAILABLE) return;
         if (voyager) {
             clearTimeout(voyager._saveTimer);
+            clearInterval(voyager._dimTimer);
             voyager._skillsDirty = false;
+        }
+        // Clear global log rotation interval
+        if (globalThis.__logRotate) {
+            clearInterval(globalThis.__logRotate);
+            globalThis.__logRotate = null;
         }
         cleanupTestEnvironment();
     });

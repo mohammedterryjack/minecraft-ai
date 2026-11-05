@@ -73,7 +73,7 @@ export class Coder {
         });
         mkdirSync('.' + this.fp, { recursive: true });
     }
-
+    
     // fix47: per-prompt breakdown logging for code generation (uses shared helper)
     _logPromptBreakdown(kind, sections) {
         return logPromptBreakdown(kind, sections);

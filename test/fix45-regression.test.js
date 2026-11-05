@@ -99,8 +99,9 @@ describe('fix45: hunger/health as planner facts', () => {
             'proposeTask should include current_health from bot.health');
         assert.ok(/current_food.*bot\.food|bot\.food.*current_food/.test(proposeTaskBody), 
             'proposeTask should include current_food from bot.food');
-        assert.ok(/_stateText\s*\(\s*state\s*\)/.test(proposeTaskBody), 
-            'proposeTask should pass state through _stateText which includes food_value/health_value');
+        // fix47: proposeTask now uses _compactState for efficiency (includes food/health in compact format)
+        assert.ok(/_compactState\s*\(\s*state\s*\)/.test(proposeTaskBody), 
+            'proposeTask should pass state through _compactState which includes food_value/health_value');
     });
 
     it('should have curriculum system prompt mention survival and reading health/food', async () => {
@@ -174,16 +175,16 @@ describe('fix45: already-have goal satisfaction', () => {
     it('should satisfy goal when inventory count >= goal count even without learned producer', async () => {
         const { Voyager } = await import('../src/agent/voyager.js');
         
-        const mockVoyager = {
-            skills: [],
-            npGraph: { consumesOf: () => ({}) },
-        };
+        // Create mock using Object.create to properly inherit prototype methods like _computeShortfall
+        const mockVoyager = Object.create(Voyager.prototype);
+        mockVoyager.skills = [];
+        mockVoyager.npGraph = { consumesOf: () => ({}), getProducersOf: () => [], getRequirementsOf: () => [] };
         
         const state = {
             inventory: { iron_pickaxe: 1 }
         };
         
-        const result = Voyager.prototype._goalAlreadySatisfied.call(mockVoyager, 'obtain 1 iron_pickaxe', state);
+        const result = mockVoyager._goalAlreadySatisfied('obtain 1 iron_pickaxe', state);
         
         assert.strictEqual(result.satisfied, true, 'Should be satisfied when have 1/1 iron_pickaxe');
         assert.ok(result.reason.includes('already have'), 'Reason should mention already having the item');
@@ -192,16 +193,15 @@ describe('fix45: already-have goal satisfaction', () => {
     it('should NOT satisfy goal when inventory count < goal count', async () => {
         const { Voyager } = await import('../src/agent/voyager.js');
         
-        const mockVoyager = {
-            skills: [],
-            npGraph: { consumesOf: () => ({}) },
-        };
+        const mockVoyager = Object.create(Voyager.prototype);
+        mockVoyager.skills = [];
+        mockVoyager.npGraph = { consumesOf: () => ({}), getProducersOf: () => [], getRequirementsOf: () => [] };
         
         const state = {
             inventory: { iron_pickaxe: 0 }
         };
         
-        const result = Voyager.prototype._goalAlreadySatisfied.call(mockVoyager, 'obtain 1 iron_pickaxe', state);
+        const result = mockVoyager._goalAlreadySatisfied('obtain 1 iron_pickaxe', state);
         
         assert.strictEqual(result.satisfied, false, 'Should NOT be satisfied when have 0/1 iron_pickaxe');
     });
@@ -209,16 +209,15 @@ describe('fix45: already-have goal satisfaction', () => {
     it('should satisfy goal with multiple items in inventory sum', async () => {
         const { Voyager } = await import('../src/agent/voyager.js');
         
-        const mockVoyager = {
-            skills: [],
-            npGraph: { consumesOf: () => ({}) },
-        };
+        const mockVoyager = Object.create(Voyager.prototype);
+        mockVoyager.skills = [];
+        mockVoyager.npGraph = { consumesOf: () => ({}), getProducersOf: () => [], getRequirementsOf: () => [] };
         
         const state = {
             inventory: { cobblestone: 64, stone: 10 }
         };
         
-        const result = Voyager.prototype._goalAlreadySatisfied.call(mockVoyager, 'mine 20 cobblestone', state);
+        const result = mockVoyager._goalAlreadySatisfied('mine 20 cobblestone', state);
         
         assert.strictEqual(result.satisfied, true, 'Should be satisfied when have 64+ cobblestone');
     });
@@ -226,15 +225,15 @@ describe('fix45: already-have goal satisfaction', () => {
     it('should result in zero attempts when already satisfied', async () => {
         let attempts = 0;
         
-        const mockVoyager = {
-            skills: [],
-            npGraph: { consumesOf: () => ({}) },
-            progress: { completed: [], failed: [] },
-            _saveProgress: () => {},
-        };
-        
         const { Voyager } = await import('../src/agent/voyager.js');
-        const satisfied = Voyager.prototype._goalAlreadySatisfied.call(mockVoyager, 'obtain 1 iron_pickaxe', { inventory: { iron_pickaxe: 1 } });
+        
+        const mockVoyager = Object.create(Voyager.prototype);
+        mockVoyager.skills = [];
+        mockVoyager.npGraph = { consumesOf: () => ({}), getProducersOf: () => [], getRequirementsOf: () => [] };
+        mockVoyager.progress = { completed: [], failed: [] };
+        mockVoyager._saveProgress = () => {};
+        
+        const satisfied = mockVoyager._goalAlreadySatisfied('obtain 1 iron_pickaxe', { inventory: { iron_pickaxe: 1 } });
         
         if (satisfied.satisfied) {
             mockVoyager.progress.completed.push('obtain 1 iron_pickaxe');

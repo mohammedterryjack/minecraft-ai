@@ -20,7 +20,7 @@ import { getAllItems, getAllBlocks, getItemCraftingRecipes, isHostile, isDatapac
 import { cosineSimilarity } from '../utils/math.js';
 import minecraftData from 'minecraft-data';
 import { Ollama } from '../models/ollama.js';
-import { signatureOf, depsOf, missingCalls, findCycle, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf } from './skill_graph.js';
+import { signatureOf, depsOf, missingCalls, findCycle, findAllCycles, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf } from './skill_graph.js';
 import { getBareAPI } from './coder.js';   // fix40: unified bare-name API helper
 import { logPromptBreakdown, extractBareCalls } from './prompt_utils.js';   // fix47: shared prompt utilities
 const LOCAL = { model: 'qwen3:4b-instruct-2507-q4_K_M', url: 'http://192.168.1.215:11434', params: { format: 'json', options: { num_ctx: 8192, num_predict: 512 } } };   // fix38: raised from 150 to 512 - short JSON replies still need room for reasoning; truncation fails loudly (fix31)
@@ -127,10 +127,34 @@ function recipeFacts(text) {
     }
     return out.length ? 'RECIPES (from minecraft-data, authoritative):\n' + out.join('\n') : '';
 }
+// fix47: parse number words using words-to-numbers library (MIT)
+import { wordsToNumbers } from 'words-to-numbers';
+export function parseNumberWord(word) {
+    if (!word) return null;
+    const lower = word.toLowerCase().trim();
+    // Try direct numeric parse first
+    const num = parseInt(lower, 10);
+    if (!isNaN(num)) return num;
+    // Use words-to-numbers library for word-to-number conversion
+    try {
+        const result = wordsToNumbers(lower);
+        if (typeof result === 'number' && !isNaN(result)) return result;
+        // Library returns string if no conversion, try parsing it
+        const parsed = parseInt(result, 10);
+        if (!isNaN(parsed)) return parsed;
+    } catch (e) {
+        // Library threw - not a valid number word
+    }
+    return null;
+}
+
 function countGoal(task) {
-    const m = task.match(/^(mine|collect|gather|craft|smelt|obtain|get|chop|cook)\s+(\d+)\s+([a-z_]+)\b/i);
+    // fix47: support both numeric ("5") and word ("five") counts
+    const m = task.match(/^(mine|collect|gather|craft|smelt|obtain|get|chop|cook)\s+(\d+|[a-z]+)\s+([a-z_]+)\b/i);
     if (!m) return null;
     const verb = m[1].toLowerCase();
+    const countParsed = parseNumberWord(m[2]);
+    if (countParsed === null) return null;  // not a valid number
     let item = m[3].toLowerCase();
     // plural item names from the curriculum ("torches", "sticks") -> registry id
     { const irr = { torches: 'torch' }; if (irr[item]) item = irr[item];
@@ -140,7 +164,7 @@ function countGoal(task) {
     if (['mine', 'collect', 'gather', 'chop', 'get', 'obtain'].includes(verb)) {
         try { const md = minecraftData(VERSION || '1.20.4'); for (const d of (md.blockLoot?.[item]?.drops || [])) if (!items.includes(d.item)) items.push(d.item); } catch (e) {}
     }
-    return { count: parseInt(m[2]), item, items, verb };
+    return { count: countParsed, item, items, verb };
 }
 let VERSION = null;
 // fix46: test-only setter for VERSION (parseVerboseGoal requires VERSION to be set)
@@ -196,14 +220,27 @@ export function parseVerboseGoal(task) {
     };
     
     // Extract all potential "count item" pairs from the text
+    // fix47: support both numeric ("5") and word ("five") counts
     const candidates = [];
-    const pattern = /\b(\d+)\s+([a-z][a-z0-9_]*)\b/gi;
+    const patternNumeric = /\b(\d+)\s+([a-z][a-z0-9_]*)\b/gi;
     let m;
-    while ((m = pattern.exec(t))) {
+    while ((m = patternNumeric.exec(t))) {
         const count = parseInt(m[1]);
         const resolved = resolveItem(m[2]);
         if (resolved) {
             candidates.push({ count, item: resolved, pos: m.index });
+        }
+    }
+    // Also try number words (one, two, three, etc.) - match word followed by item
+    // Common number words pattern (words-to-numbers handles the actual parsing)
+    const numberWordPattern = /\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred)\s+([a-z][a-z0-9_]*)\b/gi;
+    while ((m = numberWordPattern.exec(t))) {
+        const count = parseNumberWord(m[1]);
+        if (count !== null) {
+            const resolved = resolveItem(m[2]);
+            if (resolved) {
+                candidates.push({ count, item: resolved, pos: m.index });
+            }
         }
     }
     
@@ -287,7 +324,8 @@ export class Voyager {
     // fix41: uses Object.keys for names (not extractSig), adds catch-all, re-runs on leftovers, also rewrites s.candidate.code
     // fix42: MUST NOT create self-recursion by rewriting skills.NAME/world.NAME to NAME inside function NAME
     _migrateToBarenames() {
-        const LEFTOVER_RE = /\b(?:skills|world)\.\w+\s*\(/;
+        // fix47: also detect shadow patterns like "const log = skills.log"
+        const LEFTOVER_RE = /\b(?:skills|world)\.\w+/;
         const hasLeftovers = () => this.skills.some(s => (s.code && LEFTOVER_RE.test(s.code)) || (s.candidate?.code && LEFTOVER_RE.test(s.candidate.code)));
         if (this.progress.migratedToBarenames && !hasLeftovers()) return;  // fully migrated
         if (this.progress.migratedToBarenames) {
@@ -338,6 +376,13 @@ export class Voyager {
             before = code;
             code = code.replace(/\bworld\.(\w+)\s*\(/g, '$1(');
             if (code !== before) changes++;
+            // fix47: remove shadow patterns like "const log = skills.log" / "const foo = world.bar"
+            before = code;
+            code = code.replace(/\bconst\s+(\w+)\s*=\s*(?:skills|world)\.(\w+)\s*[;\n]/g, (match, localName, apiName) => {
+                if (localName === apiName) return '';  // Remove redundant shadow
+                return `const ${localName} = ${apiName};\n`;  // Keep alias but use bare name
+            });
+            if (code !== before) changes++;
             return { code, changes };
         };
         let migrated = 0, totalChanges = 0, candidateChanges = 0;
@@ -372,17 +417,36 @@ export class Voyager {
                 migrated++;
             }
         }
-        // fix42: post-migration scan for any remaining skills.*/world.* calls (fail loud)
+        // fix42/47: post-migration scan for any remaining skills.*/world.* patterns (fail loud)
         for (const s of this.skills) {
             if (!s.code) continue;
-            const leftover = s.code.match(/\b(?:skills|world)\.[A-Za-z_]\w*\s*\(/g);
+            const leftover = s.code.match(/\b(?:skills|world)\.[A-Za-z_]\w*/g);
             if (leftover) {
-                console.error(`[fix42] LEFTOVER OLD-STYLE CALLS in ${s.name}: ${leftover.join(', ')} - these will fail at runtime (SES has no skills/world objects)`);
+                console.error(`[fix47] LEFTOVER OLD-STYLE PATTERNS in ${s.name}: ${leftover.join(', ')} - these will fail at runtime (SES has no skills/world objects)`);
             }
         }
-        if (migrated > 0) {
+        // fix47: also migrate standalone .js files in the skills directory
+        let fileMigrated = 0;
+        try {
+            const files = readdirSync(this.dir).filter(f => f.endsWith('.js'));
+            for (const file of files) {
+                const filePath = `${this.dir}/${file}`;
+                let content = readFileSync(filePath, 'utf8');
+                const fnMatch = content.match(/(?:async\s+)?function\s+([A-Za-z_]\w*)\s*\(/);
+                const fnName = fnMatch ? fnMatch[1] : file.replace('.js', '');
+                const r = rewriteCode(content, fnName);
+                if (r.changes > 0) {
+                    writeFileSync(filePath, r.code);
+                    fileMigrated++;
+                    console.log(`[fix47] migrated standalone file ${file}: ${r.changes} changes`);
+                }
+            }
+        } catch (e) {
+            console.log(`[fix47] standalone file migration skipped: ${e.message}`);
+        }
+        if (migrated > 0 || fileMigrated > 0) {
             this._saveSkills();
-            console.log(`[fix41] MIGRATION COMPLETE: ${migrated} skills updated, ${totalChanges} code changes, ${candidateChanges} candidate changes`);
+            console.log(`[fix41] MIGRATION COMPLETE: ${migrated} skills updated, ${totalChanges} code changes, ${candidateChanges} candidate changes, ${fileMigrated} files migrated`);
         }
         // fix42: pass needsReheal to _seedPrimitives
         if (needsReheal.size > 0) {
@@ -470,6 +534,37 @@ export class Voyager {
             const d = depsOf(s.code, s.name, names);
             if (JSON.stringify([...d].sort()) !== JSON.stringify([...(s.deps || [])].sort())) { console.log(`[psn] relink ${s.name}: deps [${(s.deps || []).join(', ')}] -> [${d.join(', ')}]`); s.deps = d; n++; }
         }
+        // fix47: comprehensive cycle check over ALL skills (seeded + stored)
+        // Detect self-recursion (skill calls itself) and mutual recursion (A->B->A)
+        const selfRecursive = [];
+        for (const s of this.skills) {
+            if (!s.code) continue;
+            // Check if skill calls itself by name (self-recursion through bare name)
+            // Must exclude the function declaration itself (function fnName(...) or async function fnName(...))
+            const fnMatch = s.code.match(/(?:async\s+)?function\s+([A-Za-z_]\w*)\s*\(/);
+            const fnName = fnMatch ? fnMatch[1] : s.name;
+            // Remove the function declaration, then check for calls
+            const codeWithoutDecl = s.code.replace(/(?:async\s+)?function\s+[A-Za-z_]\w*\s*\([^)]*\)\s*\{/, '');
+            const callsItself = new RegExp(`(?<![.\\w])${fnName}\\s*\\(`).test(codeWithoutDecl);
+            if (callsItself) {
+                selfRecursive.push(s.name);
+            }
+        }
+        if (selfRecursive.length > 0) {
+            const msg = `[psn] SELF-RECURSION DETECTED in ${selfRecursive.length} skill(s): ${selfRecursive.join(', ')} - these will cause stack overflow at runtime`;
+            console.error(msg);
+            throw new Error(msg);
+        }
+        // Check for mutual recursion cycles in the dependency graph
+        const graph = this._graph();
+        const allCycles = findAllCycles(graph);
+        if (allCycles.length > 0) {
+            const cycleStrs = allCycles.map(c => c.join(' -> ')).join('; ');
+            const msg = `[psn] DEPENDENCY CYCLES DETECTED: ${cycleStrs}`;
+            console.error(msg);
+            throw new Error(msg);
+        }
+        // Original per-skill cycle check (kept for completeness)
         for (const s of this.skills) { const c = findCycle(s.name, s.deps, this._graph(s.name)); if (c) throw new Error(`[psn] relink: dependency cycle ${c.join(' -> ')}`); }
         console.log(`[psn] relink: ${this.skills.length} skills, ${n} edge set(s) changed`);
         if (n) this._saveSkills();
@@ -524,7 +619,30 @@ export class Voyager {
     _updateAllowed(e, why) { const { V, p, n } = this._maturity(e), r = Math.random(), ok = r < p; gateLog(`maturity ${e.name}: V=${V.toFixed(2)} (u=${this._maturity(e).u.toFixed(2)}, ${n} runs) P(update)=${p.toFixed(2)} draw=${r.toFixed(2)} -> ${ok ? 'UPDATE ALLOWED' : 'FROZEN (mature skill kept)'} [${why}]`); return ok; }
     // fix20 (PSN repair memory): rolling buffer of the last 5 repair proposals per skill
     _noteProposal(e, p) { e.repairHistory = [...(e.repairHistory || []), { at: new Date().toISOString(), ...p }].slice(-5); this._saveSkills(); }
-    _proposalOutcome(e, outcome) { const h = e.repairHistory; if (h?.length && !h[h.length - 1].outcome) { h[h.length - 1].outcome = outcome; } }
+    // fix47: simple hash for skill deduplication - changes when code or contract changes
+    _skillHash(skill) {
+        if (!skill) return 'null';
+        const content = (skill.code || '') + '|' + (skill.contract?.text || '');
+        // djb2 hash - simple and fast
+        let hash = 5381;
+        for (let i = 0; i < content.length; i++) {
+            hash = ((hash << 5) + hash) ^ content.charCodeAt(i);
+        }
+        return (hash >>> 0).toString(36);
+    }
+    // fix47: log repair outcomes (ok/rejected/rollback) for observability
+    _proposalOutcome(e, outcome, sig = null) { 
+        const h = e.repairHistory; 
+        if (h?.length && !h[h.length - 1].outcome) { h[h.length - 1].outcome = outcome; }
+        console.log(`[repair-outcome] ${e.name}: ${outcome}`);
+        // fix47: track failed signatures for hash-based deduplication (no time window)
+        // Dedup until skill code/contract changes (hash is part of signature)
+        if (outcome && /reject|fail|lint|duplicate|abort/i.test(outcome) && sig) {
+            this.progress.failedRepairSigs ||= {};
+            this.progress.failedRepairSigs[sig] = { at: Date.now(), hash: this._skillHash(e) };
+            this._saveProgress();
+        }
+    }
     // ---------- fix22: learned skill contracts (PSN pre/postconditions) ----------
     // Each library skill carries { pre, post, text }: JS predicates over c = { args, ret, pre, post, delta } learned by the code model
     // from the skill's description, code and observed effects; evaluated after every traced call against real bot state.
@@ -1158,17 +1276,80 @@ Use only c; no other globals.`;
         catch (err) { this._queueContractFix(e, `post threw: ${err.message}`); return false; }
     }
 
+    // fix47: compute what can be produced from current inventory via learned producers ONLY
+    // NO hard-coded name patterns - uses only learned skill consumes/effects
+    // Returns { count, sources: [{item, count, ratio, producer, task}] } where count is total producible
+    _computeProducibleFromInventory(targetItem, inv) {
+        const sources = [];
+        let total = inv[targetItem] || 0;
+        sources.push({ type: 'inventory', item: targetItem, count: total });
+        
+        // Use ONLY learned producers from skills with effects containing targetItem
+        // Get ratio from skill's learned .consumes, store skill's task for subgoal generation
+        const producers = this._producers(targetItem);
+        for (const { s: skill } of producers) {
+            const consumes = skill.consumes || {};
+            
+            // For each consumed item, check if we have it in inventory
+            for (const [consumeItem, consumeCount] of Object.entries(consumes)) {
+                const haveCount = inv[consumeItem] || 0;
+                if (haveCount > 0 && !sources.some(s => s.item === consumeItem && s.producer === skill.name)) {
+                    // Ratio: how many target items per consume (from learned delta)
+                    // Default to 1:1 if consumeCount is 0 or missing (shouldn't happen)
+                    const ratio = consumeCount > 0 ? 1 / consumeCount : 1;
+                    const producibleFromThis = Math.floor(haveCount * ratio);
+                    sources.push({ 
+                        type: 'learned_producer',
+                        item: consumeItem, 
+                        count: producibleFromThis,
+                        ratio,
+                        producer: skill.name,
+                        task: skill.task  // Store the learned skill's task for subgoal
+                    });
+                    total += producibleFromThis;
+                }
+            }
+        }
+        
+        return { count: total, sources };
+    }
+
+    // fix47: compute the real shortfall after considering inventory + producible items
+    // Returns { shortfall, plan, produceItems } where plan is 'learned', 'none', or 'gather'
+    _computeShortfall(goal, inv) {
+        const targetItem = goal.item;
+        const targetCount = goal.count;
+        
+        const producible = this._computeProducibleFromInventory(targetItem, inv);
+        const shortfall = Math.max(0, targetCount - producible.count);
+        
+        if (shortfall === 0) {
+            // Can satisfy from inventory + producing
+            const produceSources = producible.sources.filter(s => s.type !== 'inventory' && s.count > 0);
+            if (produceSources.length > 0) {
+                return { shortfall: 0, plan: 'learned', produceItems: produceSources, producible };
+            }
+            return { shortfall: 0, plan: 'none', producible };
+        }
+        
+        return { shortfall, plan: 'gather', producible };
+    }
+
     // fix37 (B): check if a goal is already satisfied BEFORE running any task, using learned postconditions/contracts
-    // Returns { satisfied: boolean, reason: string, noLearnedCheck?: boolean }
+    // Returns { satisfied: boolean, reason: string, noLearnedCheck?: boolean, plan?: object }
     // Uses learned skill contracts (postconditions) and learned effects - no hard-coded special cases
     // fix25: prefer smeltGoal so "Smelt X into Y" checks Y (product), not X (ingredient)
     // fix45: use parseVerboseGoal as fallback for verbose goals like "craftItem: Craft 1 iron_pickaxe..."
+    // fix47: enhanced to compute producible items and shortfall
     _goalAlreadySatisfied(task, state) {
         const goal = smeltGoal(task) || countGoal(task) || parseVerboseGoal(task);  // fix45: verbose fallback
         if (!goal) return { satisfied: false, reason: 'goal not parseable as count/smelt/verbose', noLearnedCheck: true };
 
         const inv = state.inventory || {};
-        const have = goal.items ? goal.items.reduce((a, it) => a + (inv[it] || 0), 0) : (inv[goal.item] || 0);
+        
+        // fix47: compute what we have + can produce (no fallback - producible is the single source)
+        const shortfallInfo = this._computeShortfall(goal, inv);
+        const have = shortfallInfo.producible.count;
 
         // 1) Check inventory against learned skill contracts that produce the goal item
         // Find skills whose learned effects include the goal item and have a postcondition
@@ -1218,8 +1399,19 @@ Use only c; no other globals.`;
             return { satisfied: true, reason: `already have ${have}/${goal.count} ${goal.item} (inventory check; no learned producer)` };
         }
 
+        // fix47: check if we can produce enough via learned producers (inventory-first planning)
+        if (shortfallInfo.shortfall === 0 && shortfallInfo.produceItems?.length > 0) {
+            const produceDesc = shortfallInfo.produceItems.map(s => `${s.count} ${s.item} via ${s.producer || s.type}`).join(', ');
+            return {
+                satisfied: false,
+                reason: `need ${goal.count} ${goal.item}, can produce: ${produceDesc}`,
+                plan: shortfallInfo,
+                goal
+            };
+        }
+
         // 4) Not satisfied: don't have enough items
-        return { satisfied: false, reason: `need ${goal.count} ${goal.item}, have ${have}` };
+        return { satisfied: false, reason: `need ${goal.count} ${goal.item}, have ${have}`, plan: shortfallInfo, goal };
     }
 
     // fix32 (PSN backward chaining): a goal item is produced by a learned skill whose learned effects contain it; the skill is
@@ -1933,15 +2125,177 @@ Use only c; no other globals.`;
         return { message: `completed in ${Date.now() - practiceStart}ms` };
     }
 
+    // fix47: compute cheapest tool to break a block by recursing through recipes
+    // Returns { tool, chain: [{item, count}] } where chain is the recipe steps from gatherable materials
+    _cheapestHarvestTool(blockName, inv) {
+        if (!VERSION) return null;
+        try {
+            const md = minecraftData(VERSION);
+            const block = md.blocksByName[blockName];
+            if (!block?.harvestTools) return null;
+            
+            // Get all valid tools from harvestTools (keys are item IDs)
+            const validToolIds = Object.keys(block.harvestTools).map(Number);
+            if (!validToolIds.length) return null;
+            
+            // Find the cheapest tool by recipe depth
+            let cheapest = null;
+            let cheapestDepth = Infinity;
+            
+            for (const toolId of validToolIds) {
+                const toolItem = md.items[toolId];
+                if (!toolItem) continue;
+                
+                // Check if we already have it
+                if ((inv[toolItem.name] || 0) > 0) {
+                    return { tool: toolItem.name, chain: [], reason: 'already have' };
+                }
+                
+                // Compute recipe chain depth
+                const chain = this._recipeChain(toolItem.name, inv, md, 0, new Set());
+                if (chain && chain.length < cheapestDepth) {
+                    cheapestDepth = chain.length;
+                    cheapest = { tool: toolItem.name, chain };
+                }
+            }
+            return cheapest;
+        } catch (e) {
+            console.log(`[fix47] _cheapestHarvestTool failed for ${blockName}: ${e.message}`);
+            return null;
+        }
+    }
+    
+    // fix47: compute recipe chain from gatherable materials (harvestTools undefined = can break by hand)
+    _recipeChain(itemName, inv, md, depth, visited) {
+        if (depth > 10 || visited.has(itemName)) return null;
+        visited.add(itemName);
+        
+        // Already have it
+        if ((inv[itemName] || 0) > 0) return [];
+        
+        const item = md.itemsByName[itemName];
+        if (!item) return null;
+        
+        // Check recipes
+        const recipes = md.recipes?.[item.id];
+        if (!recipes?.length) {
+            // No recipe - check if it's a gatherable block (can break by hand)
+            const block = md.blocksByName[itemName];
+            if (block && !block.harvestTools) {
+                // Can gather by hand
+                return [{ item: itemName, count: 1, action: 'gather' }];
+            }
+            return null;
+        }
+        
+        // Find simplest recipe
+        let bestChain = null;
+        for (const recipe of recipes) {
+            const ingredients = [];
+            if (recipe.inShape) {
+                for (const row of recipe.inShape) {
+                    for (const slot of row) {
+                        if (slot?.id >= 0) {
+                            const ingName = md.items[slot.id]?.name;
+                            if (ingName) ingredients.push({ name: ingName, count: slot.count || 1 });
+                        }
+                    }
+                }
+            } else if (recipe.ingredients) {
+                for (const ing of recipe.ingredients) {
+                    if (ing?.id >= 0) {
+                        const ingName = md.items[ing.id]?.name;
+                        if (ingName) ingredients.push({ name: ingName, count: ing.count || 1 });
+                    }
+                }
+            }
+            
+            // Recurse for each ingredient
+            let totalChain = [];
+            let valid = true;
+            for (const ing of ingredients) {
+                const subChain = this._recipeChain(ing.name, inv, md, depth + 1, new Set(visited));
+                if (!subChain) { valid = false; break; }
+                totalChain = [...totalChain, ...subChain];
+            }
+            
+            if (valid) {
+                totalChain.push({ item: itemName, count: recipe.result?.count || 1, action: 'craft' });
+                if (!bestChain || totalChain.length < bestChain.length) {
+                    bestChain = totalChain;
+                }
+            }
+        }
+        return bestChain;
+    }
+    
     // ---------- automatic curriculum ----------
     // fix29: restored fix19 PSN decomposition (removed with the milestone planner in fix27c while its callers stayed):
     // a goal that keeps failing is split by the local model into 2-4 subgoals (depth <= 2, 30-min cooldown per goal);
     // each subgoal is learned as a skill, then the parent is retried composing those skills
+    // fix47: inventory-first planning + harvestTools-based tool decompose
     async _decompose(task, reason) {
         const d = (this.progress.decomposed ||= {}), q = (this.progress.subgoals ||= []);
         const depth = (this._curSub?.task === task ? this._curSub.depth : 0);
         if (depth >= 2) { console.log(`[psn] decompose skipped for "${task}": already a depth-${depth} subgoal`); return false; }
         if (d[task] && Date.now() - d[task].at < 30 * 60e3) { console.log(`[psn] decompose skipped for "${task}": decomposed ${Math.round((Date.now() - d[task].at) / 60e3)} min ago`); return false; }
+        
+        const reasonStr = String(reason);
+        const inv = this.observe().inventory || {};
+        
+        // fix47: detect "Cannot break X with current tools" and compute cheapest tool via harvestTools
+        const cannotBreak = reasonStr.match(/Cannot break (\w+) with current tools/i);
+        if (cannotBreak) {
+            const blockName = cannotBreak[1].toLowerCase();
+            const toolInfo = this._cheapestHarvestTool(blockName, inv);
+            if (toolInfo?.chain?.length > 0) {
+                // Queue the recipe chain as subgoals
+                const subs = toolInfo.chain.map(step => {
+                    if (step.action === 'gather') return `Collect 1 ${step.item}`;
+                    return `Craft 1 ${step.item}`;
+                });
+                d[task] = { subs, skills: [], at: Date.now(), reason: `need ${toolInfo.tool} to break ${blockName}` };
+                q.unshift(...subs.map(t => ({ task: t, parent: task, depth: depth + 1 })), { task, retry: true, depth });
+                // fix47: track this as a blocker so curriculum prioritizes tool acquisition
+                // Blockers are cleared when: (1) tool appears in inventory, (2) blocked task passes
+                this.progress.blockers = this.progress.blockers || [];
+                const blockerEntry = { tool: toolInfo.tool, block: blockName, task, at: Date.now() };
+                // Remove duplicate blockers for same block/tool, keep only most recent 5
+                this.progress.blockers = this.progress.blockers.filter(b => b.block !== blockName).slice(-4);
+                this.progress.blockers.push(blockerEntry);
+                this._saveProgress();
+                console.log(`[psn] DECOMPOSE (harvestTools) "${task}" -> need ${toolInfo.tool}: ${subs.join(', ')}`);
+                return true;
+            }
+        }
+        
+        // fix47: inventory-first planning - before queuing gather/mine subgoals, check if we can produce
+        const goal = smeltGoal(task) || countGoal(task) || parseVerboseGoal(task);
+        if (goal) {
+            const state = this.observe();
+            const inv = state.inventory || {};
+            const shortfallInfo = this._computeShortfall(goal, inv);
+            
+            // If shortfall is 0 and we can produce via learned producers, queue the learned skill's task as subgoal
+            if (shortfallInfo.shortfall === 0 && shortfallInfo.produceItems?.length > 0) {
+                const produceSubs = shortfallInfo.produceItems.map(s => {
+                    // Use the learned skill's own task string, scaled to needed count
+                    const needed = Math.min(s.count, goal.count - (inv[goal.item] || 0));
+                    if (s.task) {
+                        // Scale the count in the task string if it contains a number
+                        return s.task.replace(/\d+/, String(needed));
+                    }
+                    // Fallback: use producer name with needed count
+                    return `${s.producer} ${needed}`;
+                });
+                d[task] = { subs: produceSubs, skills: [], at: Date.now(), reason: `inventory-first: can produce ${goal.item} via learned producers` };
+                q.unshift(...produceSubs.map(t => ({ task: t, parent: task, depth: depth + 1 })), { task, retry: true, depth });
+                this._saveProgress();
+                console.log(`[psn] DECOMPOSE (inventory-first) "${task}" -> learned: ${produceSubs.join(', ')}; no mine/gather needed`);
+                return true;
+            }
+        }
+        
         const system = `You break a Minecraft bot's failing goal into smaller steps (Voyager/PSN-style task decomposition).
 Return 2-4 concrete, verifiable subgoals, in order, that together achieve the goal; each must be doable in a few minutes by ONE small reusable skill. Use the failure reason and the state. Do not repeat the goal itself.
 Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
@@ -2027,10 +2381,19 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "task": "...", "contex
         const compactStateText = this._compactState(state);
         const knownSkillsFacts = this._knownSkillsFacts();
         const replayableTasks = this.skills.filter(s => s.task && !s.primitive).map(s => s.task.split(/\s+(?:within|at|using|from)\b/i)[0]).slice(-25);
+        // fix47: include active blockers so curriculum prioritizes unblocking goals
+        // Clear resolved blockers: tool now in inventory
+        const inv = state.inventory || {};
+        this.progress.blockers = (this.progress.blockers || []).filter(b => !(inv[b.tool] > 0));
+        if (this.progress.blockers.length > 0) this._saveProgress();
+        const blockers = this.progress.blockers;
+        const blockerHint = blockers.length > 0 
+            ? `\nBLOCKERS (prioritize these - failures need tools): ${blockers.map(b => `need ${b.tool} to break ${b.block}`).join('; ')}`
+            : '';
         const user = `known_skills: ${JSON.stringify(knownSkillsFacts)}
 replayable_tasks (cheap, no new code needed): ${JSON.stringify(replayableTasks)} plus any "Mine N <block or ore>", "Collect N <log>", "Get N <item>", "Smelt N <raw> into N <out>", "Kill N <mob>", "Harvest N <crop>"
 completed_tasks: ${JSON.stringify(this.progress.completed.slice(-30))}
-failed_tasks: ${JSON.stringify(this.progress.failed.slice(-15))}
+failed_tasks: ${JSON.stringify(this.progress.failed.slice(-15))}${blockerHint}
 --- state (compact) ---
 ${compactStateText}
 current_health: ${Math.round(bot.health)}/20\ncurrent_food: ${bot.food}/20 (20/20 = full)${this._cursorLimited() ? '\nIMPORTANT: the code-writing model is unavailable right now, so ONLY propose a task from replayable_tasks or "Mine N <block>".' : ''}${workflowHints ? '\n' + workflowHints : ''}`;   // fix31: slow-changing lists first so Ollama reuses the cached prompt prefix
@@ -2348,9 +2711,33 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
             if (kid) { const par = bs.find(q => q !== kid && kid.path.includes(q.target)); bs = [{ ...kid, kind: 'joint', parent: par.target, parentKind: par.kind }, ...bs.filter(x => x !== kid && x !== par)]; console.log(`[psn] JOINT repair queued: child ${kid.target} [${kid.kind}] with its caller ${par.target} [${par.kind}] (same failure path)`); }
         }
         const rq = [...(this._repairQueue || [])];
+        // fix47: hash-based deduplication - signature includes skill hash so it resets when skill changes
+        const failSig = (b) => {
+            const skill = this.skills.find(s => s.name === b.target);
+            const hash = this._skillHash(skill);
+            return `${b.target}:${hash}:${(b.evidence || '').slice(0, 100).replace(/\s+/g, ' ')}`;
+        };
+        const pendingSigs = new Set(rq.map(failSig));
+        // fix47: track failed signatures - dedup until skill code/contract changes (hash-based, no time window)
+        const failedSigs = this.progress.failedRepairSigs || {};
         for (const b of bs) {
+            const sig = failSig(b);
+            const skill = this.skills.find(s => s.name === b.target);
+            const currentHash = this._skillHash(skill);
             if (rq.some(x => x.target === b.target)) { console.log(`[psn] repair of ${b.target} already queued`); continue; }
-            rq.push({ ...b, task, trace: traceText(trace, 60), peers: bs.map(x => x.target) }); console.log(`[psn] queued REPAIR of ${b.target} (${rq.length} in queue)`);
+            // fix47: loud deduplication if same skill + signature is re-queued while pending or already failed
+            if (pendingSigs.has(sig)) { 
+                console.log(`[psn] WARN: repair of ${b.target} with same failure signature already pending (dedup): ${sig.slice(0, 80)}`); 
+                continue; 
+            }
+            // fix47: hash-based dedup - only skip if signature matches AND skill hasn't changed (same hash)
+            const failedEntry = failedSigs[sig];
+            if (failedEntry && failedEntry.hash === currentHash) {
+                console.log(`[psn] WARN: repair of ${b.target} with same failure signature already failed (skill unchanged, dedup): ${sig.slice(0, 80)}`);
+                continue;
+            }
+            rq.push({ ...b, task, trace: traceText(trace, 60), peers: bs.map(x => x.target), sig }); console.log(`[psn] queued REPAIR of ${b.target} (${rq.length} in queue)`);
+            pendingSigs.add(sig);
         }
         rq.sort((a, b) => (b.depth ?? 0) - (a.depth ?? 0)); this._repairQueue = rq;
         // fix35: prefetch embeddings for blamed skills (overlapped with next work; embeds are used by retrieveSkills when repair runs)
@@ -2476,7 +2863,7 @@ IMPORTANT: All functions use bare names. Do NOT write skills.goToPosition - writ
         this._noteProposal(e, { task: q.task, kind: q.kind, evidence: q.evidence.slice(0, 200), desc: desc.slice(0, 200) });
         const saved = await this.saveSkill(e.name, desc, body, `repair: ${q.task}`, { repair: true });
         if (!saved) {
-            this._proposalOutcome(e, 'rejected at submit'); this._saveSkills();
+            this._proposalOutcome(e, 'rejected at submit', q.sig); this._saveSkills();
             // AWM-style: record gate rejection
             await this.repairMemory.recordRepair({ errorSignature: q.evidence, fixSnippet: desc?.slice(0, 200), outcome: false, taskHint: q.task, skillName: e.name });
             console.log(`[psn] repair of ${e.name} rejected by the gate`);
@@ -2910,6 +3297,8 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
             console.log(`[voyager] goal already satisfied: ${task} (${alreadySatisfied.reason})`);
             this.progress.completed.push(task);
             this.progress.failed = this.progress.failed.filter(t => t !== task);
+            // fix47: clear blockers for this task when it passes
+            this.progress.blockers = (this.progress.blockers || []).filter(b => b.task !== task);
             this._saveProgress();
             this.agent.openChat?.(`Done: ${task} (already satisfied: ${alreadySatisfied.reason}).`);
             this._afterSuccess();
@@ -2924,7 +3313,10 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
         if (!rp?.ok && !rp?.interrupted) { const bc = await this._backchain(task, rp ? this.observe() : before); if (bc) rp = bc; }   // fix32 PSN backward chaining
         if (rp?.interrupted) { console.log('[voyager] task interrupted'); return; }
         if (rp?.ok) {
-            this.progress.completed.push(task); this.progress.failed = this.progress.failed.filter(t => t !== task); this._saveProgress();
+            this.progress.completed.push(task); this.progress.failed = this.progress.failed.filter(t => t !== task);
+            // fix47: clear blockers for this task when it passes
+            this.progress.blockers = (this.progress.blockers || []).filter(b => b.task !== task);
+            this._saveProgress();
             this._subgoalDone(rp.name);
             this.agent.openChat?.(`Done: ${task} (replayed ${rp.name}).`);
             this._afterSuccess();
@@ -3073,6 +3465,8 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
                 await this.saveSkill(fn[1], desc.trim(), code.replace(/\n\s*await\s+\w+\(bot\);\s*$/, '').trim(), task);
                 this.progress.completed.push(task);
                 this.progress.failed = this.progress.failed.filter(t => t !== task);
+                // fix47: clear blockers for this task when it passes
+                this.progress.blockers = (this.progress.blockers || []).filter(b => b.task !== task);
                 this._saveProgress();
                 this._subgoalDone(fn[1]);
                 // fix44: pass goal items to filter learned effects and produces (denoise)
@@ -3480,64 +3874,135 @@ Voyager.SEEDED_PRIMITIVES = [
 }`,
         deps: ['moveAway', 'depositToChest'],
     },
-    // fix43: ensureCraftingTable with multi-cell retry AND inline 2x2 crafting (no craftRecipe dep to avoid cycle)
-    // The 2x2 crafting of a crafting_table does NOT need a table, so it's done inline here via bot.recipesFor/bot.craft.
-    // Plank type is derived from recipe ingredients in inventory, not hard-coded.
+    // fix43/47: ensureCraftingTable with multi-cell retry AND inline 2x2 crafting (no craftRecipe dep)
+    // Generic: for each missing ingredient, find a 2x2 recipe from recipesAll and craft it
+    // NO hard-coded item names, ratios, or patterns - all derived from mineflayer recipe data
     {
         name: 'ensureCraftingTable',
-        description: 'Ensure a crafting table is placed nearby for 3x3 recipes. If not in inventory, crafts one inline from planks (2x2, no table needed). Uses multi-cell retry if first placement fails. Returns true if a table is available.',
+        description: 'Ensure a crafting table is placed nearby for 3x3 recipes. If not in inventory, crafts one inline (2x2, no table needed). For missing ingredients, finds and crafts from available recipes. Uses multi-cell retry. Returns true if a table is available.',
         task: 'ensure a crafting table is placed nearby',
         code: `async function ensureCraftingTable(bot) {
     let table = getNearestBlock(bot, 'crafting_table', 16);
     if (table) { log(bot, \`Crafting table already nearby at \${table.position}.\`); return true; }
     let hasTable = (getInventoryCounts(bot)['crafting_table'] || 0) > 0;
     
-    // fix43: if no table in inventory, craft one INLINE (2x2, no table needed) - avoids craftRecipe dep cycle
-    // Derive plank types from recipes API rather than hard-coded list
     if (!hasTable) {
         console.log('[ensureCraftingTable] no crafting_table in inventory, attempting inline 2x2 craft...');
         const tableId = bot.registry.itemsByName['crafting_table']?.id;
-        const recipes = tableId ? bot.recipesFor(tableId, null, 1, null) : [];  // null = no crafting table needed (2x2)
-        if (recipes && recipes.length) {
-            // Find which plank ingredient we have in inventory
-            const inv = getInventoryCounts(bot);
-            let canCraft = false;
+        if (!tableId) throw new Error('[ensureCraftingTable] FAILED: crafting_table not in registry');
+        
+        let recipes = bot.recipesFor(tableId, null, 1, null);
+        const allRecipes = bot.recipesAll(tableId, null, null);
+        if (!allRecipes.length) throw new Error('[ensureCraftingTable] FAILED: no recipe for crafting_table in registry');
+        let inv = getInventoryCounts(bot);
+        let canCraft = false;
+        
+        // Try to craft with current inventory
+        for (const recipe of recipes) {
+            const ingredients = recipe.delta?.filter(d => d.count < 0) || [];
+            const haveAll = ingredients.every(ing => {
+                const ingItem = bot.registry.items[ing.id];
+                return ingItem && (inv[ingItem.name] || 0) >= Math.abs(ing.count);
+            });
+            if (haveAll) {
+                try {
+                    const beforeCount = (getInventoryCounts(bot)['crafting_table'] || 0);
+                    await bot.craft(recipe, 1, null);
+                    const afterCount = (getInventoryCounts(bot)['crafting_table'] || 0);
+                    if (afterCount > beforeCount) {
+                        log(bot, 'Crafted crafting_table (2x2, inline).');
+                        hasTable = true;
+                        canCraft = true;
+                        break;
+                    }
+                } catch (e) {
+                    console.log(\`[ensureCraftingTable] inline craft failed: \${e.message}\`);
+                }
+            }
+        }
+        
+        // fix47: if can't craft, try to craft missing ingredients (generic: no hard-coded names/ratios)
+        if (!canCraft && !hasTable && allRecipes.length) {
+            const tableRecipe = allRecipes[0];
+            const ingredients = tableRecipe.delta?.filter(d => d.count < 0) || [];
+            
+            for (const ing of ingredients) {
+                const ingItem = bot.registry.items[ing.id];
+                if (!ingItem) continue;
+                const have = inv[ingItem.name] || 0;
+                const need = Math.abs(ing.count);
+                if (have >= need) continue;
+                
+                const shortfall = need - have;
+                // Find a 2x2 recipe (no table) that produces this ingredient
+                const ingRecipes = bot.recipesAll(ingItem.id, null, null);
+                let crafted = false;
+                
+                for (const ingRecipe of ingRecipes) {
+                    // Check if we have the ingredients for this recipe
+                    const subIngs = ingRecipe.delta?.filter(d => d.count < 0) || [];
+                    const canCraftIng = subIngs.every(sub => {
+                        const subItem = bot.registry.items[sub.id];
+                        return subItem && (inv[subItem.name] || 0) >= Math.abs(sub.count);
+                    });
+                    
+                    if (canCraftIng) {
+                        // Compute how many times to craft based on recipe output
+                        if (!ingRecipe.result?.count) throw new Error(\`[ensureCraftingTable] FAILED: recipe for \${ingItem.name} has no result.count\`);
+                        const resultCount = ingRecipe.result.count;
+                        const craftTimes = Math.ceil(shortfall / resultCount);
+                        
+                        console.log(\`[ensureCraftingTable] crafting \${craftTimes}x \${ingItem.name} (produces \${resultCount} each)...\`);
+                        await bot.craft(ingRecipe, craftTimes, null);
+                        inv = getInventoryCounts(bot);
+                        crafted = true;
+                        break;
+                    }
+                }
+                
+                if (!crafted && shortfall > 0) {
+                    throw new Error(\`[ensureCraftingTable] FAILED: cannot craft \${ingItem.name} - no 2x2 recipe with available ingredients\`);
+                }
+            }
+            
+            // Retry table craft after ingredients
+            recipes = tableId ? bot.recipesFor(tableId, null, 1, null) : [];
             for (const recipe of recipes) {
-                // Check if we have the ingredients for this recipe
-                const ingredients = recipe.delta?.filter(d => d.count < 0) || [];
-                const haveAll = ingredients.every(ing => {
-                    const ingItem = bot.registry.items[ing.id];
-                    return ingItem && (inv[ingItem.name] || 0) >= Math.abs(ing.count);
-                });
-                if (haveAll) {
-                    try {
-                        const beforeCount = (getInventoryCounts(bot)['crafting_table'] || 0);
-                        await bot.craft(recipe, 1, null);
-                        const afterCount = (getInventoryCounts(bot)['crafting_table'] || 0);
-                        if (afterCount > beforeCount) {
-                            log(bot, 'Crafted crafting_table (2x2, inline).');
-                            hasTable = true;
-                            canCraft = true;
-                            break;
-                        }
-                    } catch (e) {
-                        console.log(\`[ensureCraftingTable] inline craft failed: \${e.message}\`);
+                const beforeCount = (getInventoryCounts(bot)['crafting_table'] || 0);
+                await bot.craft(recipe, 1, null);
+                const afterCount = (getInventoryCounts(bot)['crafting_table'] || 0);
+                if (afterCount > beforeCount) {
+                    log(bot, 'Crafted crafting_table (2x2, inline after crafting ingredients).');
+                    hasTable = true;
+                    canCraft = true;
+                    break;
+                }
+            }
+        }
+        
+        // FAIL loud if still can't craft
+        if (!canCraft && !hasTable) {
+            inv = getInventoryCounts(bot);
+            const missingIngredients = [];
+            const recipe = allRecipes[0];
+            const ingredients = recipe.delta?.filter(d => d.count < 0) || [];
+            for (const ing of ingredients) {
+                const ingItem = bot.registry.items[ing.id];
+                if (ingItem) {
+                    const have = inv[ingItem.name] || 0;
+                    const need = Math.abs(ing.count);
+                    if (have < need) {
+                        missingIngredients.push(\`\${ingItem.name} (need \${need}, have \${have})\`);
                     }
                 }
             }
-            if (!canCraft && !hasTable) {
-                log(bot, 'FAILED: no crafting_table in inventory and cannot craft one (need 4 planks of same type)');
-                return false;
-            }
-        } else {
-            log(bot, 'FAILED: no crafting_table in inventory and no recipe found');
-            return false;
+            throw new Error(\`[ensureCraftingTable] FAILED: cannot craft - missing: \${missingIngredients.join(', ') || 'unknown'}\`);
         }
     }
     
-    // fix25: multi-cell retry pattern (same as craftRecipe/placeBlock)
+    // fix25: multi-cell retry pattern
     const freeSpaces = getAllFreeSpaces(bot, 1, 6, 5);
-    if (!freeSpaces.length) { log(bot, 'FAILED: no free space within 6 blocks to place crafting_table'); return false; }
+    if (!freeSpaces.length) throw new Error('[ensureCraftingTable] FAILED: no free space within 6 blocks to place crafting_table');
     let placed = false;
     const tried = [];
     for (const pos of freeSpaces) {
@@ -3555,8 +4020,7 @@ Voyager.SEEDED_PRIMITIVES = [
         else console.log(\`[ensureCraftingTable] placeBlock returned true at \${tried[tried.length - 1]} but block is \${check?.name || 'null'}, trying next cell...\`);
     }
     if (!placed) {
-        log(bot, \`FAILED: could not place crafting_table at any of \${tried.length} free space(s): \${tried.join(', ')}\`);
-        return false;
+        throw new Error(\`[ensureCraftingTable] FAILED: could not place crafting_table at any of \${tried.length} free space(s): \${tried.join(', ')}\`);
     }
     return true;
 }`,
