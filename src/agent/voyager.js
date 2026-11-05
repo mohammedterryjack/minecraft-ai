@@ -628,6 +628,35 @@ Use only c; no other globals.`;
         if (!d.skills.includes(name)) d.skills.push(name); this._saveProgress();
         console.log(`[psn] subgoal "${c.task}" done with skill ${name} (for parent "${c.parent}")`);
     }
+    // fix28 (C): plan the next task concurrently with the current action; the plan is used only if the state it was made for still holds
+    _prefetchPlan(task, before) {
+        const t0 = Date.now();
+        const p = this.proposeTask({ ...before, note: `The bot is now doing "${task}". Propose the task to do AFTER it, assuming it succeeds.` })
+            .then(r => { console.log(`[plan] next proposal ready in ${Date.now() - t0}ms (overlapped with "${task}"): ${r?.task}`); return r; }, e => { console.log(`[plan] prefetch failed: ${e.message}`); return null; });
+        this._plan = { p, task, basis: before, t: t0 };
+    }
+    _planStale(pl, r, now) {
+        if (!r?.task) return 'no proposal';
+        if (Date.now() - pl.t > 20 * 60e3) return 'older than 20 min';
+        const last = this.progress.failed.slice(-1)[0];
+        if (last === pl.task) return `it assumed "${pl.task}" would succeed, but it failed`;
+        if (String(r.task).trim() === pl.task) return 'it repeats the task it was planned during';
+        const P = s => s.position.split(',').map(Number), [a, b] = [P(pl.basis), P(now)];
+        if (Math.hypot(a[0] - b[0], a[2] - b[2]) > 32) return 'the bot moved more than 32 blocks';
+        const ph = s => s.time.split(' ')[0]; if (ph(pl.basis) !== ph(now)) return `time of day changed (${ph(pl.basis)} -> ${ph(now)})`;
+        if (parseInt(now.health) < parseInt(pl.basis.health) - 6 || parseInt(now.food) < parseInt(pl.basis.food) - 6) return 'health/food dropped';
+        if ((now.threats === 'none') !== (pl.basis.threats === 'none')) return 'threat situation changed';
+        if (now.recent_deaths !== pl.basis.recent_deaths) return 'the bot died since';
+        return null;
+    }
+    async _takePlan(before) {
+        const pl = this._plan; this._plan = null;
+        if (!pl) return this.proposeTask(before);
+        const r = await pl.p, why = this._planStale(pl, r, before);
+        if (!why) { console.log(`[plan] using the overlapped proposal (planned during "${pl.task}")`); return r; }
+        console.log(`[plan] overlapped proposal "${r?.task}" is stale (${why}); re-planning`);
+        return this.proposeTask(before);
+    }
     async proposeTask(state) {
         const system = `You are the automatic curriculum for a Minecraft bot named ${this.agent.name} (Voyager-style).
 Goal: discover as many diverse things as possible and grow a small town of its own, progressing wood -> stone -> iron -> diamond tech.
@@ -988,7 +1017,7 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         const before = this.observe();
         this._curSub = null;
         const sub = this._subgoalTask(), ms = null, fromCurr = !sub && !ms;
-        let proposal = sub || ms || await this.proposeTask(before);
+        let proposal = sub || ms || await this._takePlan(before);
         let task = String(proposal.task || '').trim();
         let invalid = task ? validateTask(task) : 'empty task';
         if (invalid) {
@@ -1001,6 +1030,7 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         }
         console.log(`[voyager] new task: ${task} (${proposal.reasoning})`);
         this.currentTask = task;
+        this._prefetchPlan(task, before);   // fix28 (C): the next proposal is planned while this task runs
         VERSION = this.agent.bot.version;
         const rp = await this._replay(task, before);
         if (rp?.interrupted) { console.log('[voyager] task interrupted'); return; }
