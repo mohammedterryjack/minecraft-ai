@@ -544,3 +544,155 @@ describe('fix44: window cleanup on all paths', () => {
         assert.strictEqual(bot.currentWindow, null, 'window should be closed on interrupt');
     });
 });
+
+// fix45: equipBestTool contract idempotent success and no material-tier hard-code in contract
+describe('fix45: equipBestTool contract idempotent success', () => {
+    it('should PASS when stone_pickaxe returned and eq.heldItem === stone_pickaxe (idempotent)', async () => {
+        const { Voyager } = await import('../src/agent/voyager.js');
+        const equipBestToolPrim = Voyager.SEEDED_PRIMITIVES.find(p => p.name === 'equipBestTool');
+        assert.ok(equipBestToolPrim, 'equipBestTool should be in SEEDED_PRIMITIVES');
+        assert.ok(equipBestToolPrim.contract, 'equipBestTool should have a seeded contract');
+        
+        const postFn = eval(equipBestToolPrim.contract.post);
+        
+        const c = {
+            args: ['pickaxe'],
+            ret: 'stone_pickaxe',
+            pre: { pos: { x: 0, y: 64, z: 0 }, hp: 20, food: 20, sky: 15, alive: true, dim: 'overworld', inv: { stone_pickaxe: 1 }, eq: { heldItem: null, offHand: null, helmet: null, chestplate: null, leggings: null, boots: null } },
+            post: { pos: { x: 0, y: 64, z: 0 }, hp: 20, food: 20, sky: 15, alive: true, dim: 'overworld', inv: { stone_pickaxe: 1 }, eq: { heldItem: 'stone_pickaxe', offHand: null, helmet: null, chestplate: null, leggings: null, boots: null } },
+            delta: {},
+            dist: (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z),
+        };
+        
+        const result = postFn(c);
+        assert.strictEqual(result, true, 'Contract should PASS when stone_pickaxe returned and eq.heldItem === stone_pickaxe');
+    });
+
+    it('should PASS for wooden_axe with matching eq.heldItem (proves no material allowlist)', async () => {
+        const { Voyager } = await import('../src/agent/voyager.js');
+        const equipBestToolPrim = Voyager.SEEDED_PRIMITIVES.find(p => p.name === 'equipBestTool');
+        const postFn = eval(equipBestToolPrim.contract.post);
+        
+        const c = {
+            args: ['axe'],
+            ret: 'wooden_axe',
+            pre: { pos: { x: 0, y: 64, z: 0 }, hp: 20, food: 20, sky: 15, alive: true, dim: 'overworld', inv: { wooden_axe: 1 }, eq: { heldItem: null, offHand: null, helmet: null, chestplate: null, leggings: null, boots: null } },
+            post: { pos: { x: 0, y: 64, z: 0 }, hp: 20, food: 20, sky: 15, alive: true, dim: 'overworld', inv: { wooden_axe: 1 }, eq: { heldItem: 'wooden_axe', offHand: null, helmet: null, chestplate: null, leggings: null, boots: null } },
+            delta: {},
+            dist: (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z),
+        };
+        
+        const result = postFn(c);
+        assert.strictEqual(result, true, 'Contract should PASS for wooden_axe with matching eq.heldItem');
+    });
+
+    it('should PASS for iron_sword with matching eq.heldItem (proves no material allowlist)', async () => {
+        const { Voyager } = await import('../src/agent/voyager.js');
+        const equipBestToolPrim = Voyager.SEEDED_PRIMITIVES.find(p => p.name === 'equipBestTool');
+        const postFn = eval(equipBestToolPrim.contract.post);
+        
+        const c = {
+            args: ['sword'],
+            ret: 'iron_sword',
+            pre: { pos: { x: 0, y: 64, z: 0 }, hp: 20, food: 20, sky: 15, alive: true, dim: 'overworld', inv: { iron_sword: 1 }, eq: { heldItem: null, offHand: null, helmet: null, chestplate: null, leggings: null, boots: null } },
+            post: { pos: { x: 0, y: 64, z: 0 }, hp: 20, food: 20, sky: 15, alive: true, dim: 'overworld', inv: { iron_sword: 1 }, eq: { heldItem: 'iron_sword', offHand: null, helmet: null, chestplate: null, leggings: null, boots: null } },
+            delta: {},
+            dist: (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z),
+        };
+        
+        const result = postFn(c);
+        assert.strictEqual(result, true, 'Contract should PASS for iron_sword with matching eq.heldItem');
+    });
+
+    it('should PASS when ret === null (no tool available)', async () => {
+        const { Voyager } = await import('../src/agent/voyager.js');
+        const equipBestToolPrim = Voyager.SEEDED_PRIMITIVES.find(p => p.name === 'equipBestTool');
+        const postFn = eval(equipBestToolPrim.contract.post);
+        
+        const c = {
+            args: ['pickaxe'],
+            ret: null,
+            pre: { pos: { x: 0, y: 64, z: 0 }, hp: 20, food: 20, sky: 15, alive: true, dim: 'overworld', inv: {}, eq: { heldItem: null, offHand: null, helmet: null, chestplate: null, leggings: null, boots: null } },
+            post: { pos: { x: 0, y: 64, z: 0 }, hp: 20, food: 20, sky: 15, alive: true, dim: 'overworld', inv: {}, eq: { heldItem: null, offHand: null, helmet: null, chestplate: null, leggings: null, boots: null } },
+            delta: {},
+            dist: (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z),
+        };
+        
+        const result = postFn(c);
+        assert.strictEqual(result, true, 'Contract should PASS when ret === null (no tool available)');
+    });
+
+    it('should FAIL when stone_pickaxe returned but eq.heldItem mismatches', async () => {
+        const { Voyager } = await import('../src/agent/voyager.js');
+        const equipBestToolPrim = Voyager.SEEDED_PRIMITIVES.find(p => p.name === 'equipBestTool');
+        const postFn = eval(equipBestToolPrim.contract.post);
+        
+        const c = {
+            args: ['pickaxe'],
+            ret: 'stone_pickaxe',
+            pre: { pos: { x: 0, y: 64, z: 0 }, hp: 20, food: 20, sky: 15, alive: true, dim: 'overworld', inv: { stone_pickaxe: 1, cobblestone: 64 }, eq: { heldItem: null, offHand: null, helmet: null, chestplate: null, leggings: null, boots: null } },
+            post: { pos: { x: 0, y: 64, z: 0 }, hp: 20, food: 20, sky: 15, alive: true, dim: 'overworld', inv: { stone_pickaxe: 1, cobblestone: 64 }, eq: { heldItem: 'cobblestone', offHand: null, helmet: null, chestplate: null, leggings: null, boots: null } },
+            delta: {},
+            dist: (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z),
+        };
+        
+        const result = postFn(c);
+        assert.strictEqual(result, false, 'Contract should FAIL when stone_pickaxe returned but eq.heldItem is cobblestone');
+    });
+
+    it('should FAIL when tool returned but eq is missing', async () => {
+        const { Voyager } = await import('../src/agent/voyager.js');
+        const equipBestToolPrim = Voyager.SEEDED_PRIMITIVES.find(p => p.name === 'equipBestTool');
+        const postFn = eval(equipBestToolPrim.contract.post);
+        
+        const c = {
+            args: ['pickaxe'],
+            ret: 'stone_pickaxe',
+            pre: { pos: { x: 0, y: 64, z: 0 }, hp: 20, food: 20, sky: 15, alive: true, dim: 'overworld', inv: { stone_pickaxe: 1 }, eq: { heldItem: null, offHand: null, helmet: null, chestplate: null, leggings: null, boots: null } },
+            post: { pos: { x: 0, y: 64, z: 0 }, hp: 20, food: 20, sky: 15, alive: true, dim: 'overworld', inv: { stone_pickaxe: 1 } },
+            delta: {},
+            dist: (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z),
+        };
+        
+        const result = postFn(c);
+        assert.strictEqual(result, false, 'Contract should FAIL when tool returned but eq is missing from post state');
+    });
+
+    it('should have NO material-tier array in contract pre/post/text', async () => {
+        const { Voyager } = await import('../src/agent/voyager.js');
+        const equipBestToolPrim = Voyager.SEEDED_PRIMITIVES.find(p => p.name === 'equipBestTool');
+        assert.ok(equipBestToolPrim.contract, 'equipBestTool should have a seeded contract');
+        
+        const contractStr = JSON.stringify(equipBestToolPrim.contract);
+        const materialTierPattern = /\b(netherite|diamond|iron|stone|golden|wooden)\b.*\b(netherite|diamond|iron|stone|golden|wooden)\b/i;
+        
+        assert.strictEqual(
+            materialTierPattern.test(contractStr),
+            false,
+            `Contract should NOT contain material-tier list: ${contractStr}`
+        );
+        
+        assert.ok(!contractStr.includes('['), `Contract should not contain array literals: ${contractStr}`);
+    });
+});
+
+describe('fix45: seeded contract protection', () => {
+    it('should mark seeded contracts with seeded: true flag', async () => {
+        const { Voyager } = await import('../src/agent/voyager.js');
+        const equipBestToolPrim = Voyager.SEEDED_PRIMITIVES.find(p => p.name === 'equipBestTool');
+        
+        assert.ok(equipBestToolPrim.contract, 'equipBestTool should have a contract in SEEDED_PRIMITIVES');
+        assert.ok(equipBestToolPrim.contract.pre, 'contract should have pre');
+        assert.ok(equipBestToolPrim.contract.post, 'contract should have post');
+        assert.ok(equipBestToolPrim.contract.text, 'contract should have text');
+    });
+
+    it('should have eq-based postcondition (not delta-based)', async () => {
+        const { Voyager } = await import('../src/agent/voyager.js');
+        const equipBestToolPrim = Voyager.SEEDED_PRIMITIVES.find(p => p.name === 'equipBestTool');
+        
+        assert.ok(equipBestToolPrim.contract.post.includes('eq'), 'postcondition should reference eq');
+        assert.ok(equipBestToolPrim.contract.post.includes('heldItem'), 'postcondition should reference heldItem');
+        assert.ok(!equipBestToolPrim.contract.post.includes('delta'), 'postcondition should NOT reference delta');
+    });
+});

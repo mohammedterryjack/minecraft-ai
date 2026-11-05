@@ -338,15 +338,21 @@ export class Voyager {
                 // - seeded:true but code differs (fix36 case)
                 // - seeded is NOT set (e.g. primitive:true without seeded) and code differs
                 // - marked for reheal by migration (self-call wrapper detection)
-                const needsReheal = forceReheal.has(prim.name) || existing.code !== prim.code;
+                // fix45: also reheal if prim has a seeded contract and it differs from existing.contract
+                const contractDiffers = prim.contract && JSON.stringify(existing.contract) !== JSON.stringify(prim.contract);
+                const needsReheal = forceReheal.has(prim.name) || existing.code !== prim.code || contractDiffers;
                 if (needsReheal) {
-                    const reason = forceReheal.has(prim.name) ? 'self-call wrapper' : existing.seeded ? 'code updated' : 'seeded flag missing';
+                    const reason = forceReheal.has(prim.name) ? 'self-call wrapper' : contractDiffers ? 'contract updated' : existing.seeded ? 'code updated' : 'seeded flag missing';
                     console.log(`[psn] rehealing seeded primitive ${prim.name}: ${reason}`);
                     existing.code = prim.code;
                     existing.deps = prim.deps;
                     existing.description = prim.description;
                     existing.seeded = true;
                     existing.saved = new Date().toISOString();
+                    // fix45: restore seeded contract if present (overwrites any learned contract that may have material-tier hard-codes)
+                    if (prim.contract) {
+                        existing.contract = { ...prim.contract, seeded: true };
+                    }
                     writeAtomic(`${this.dir}/${prim.name}.js`, `// ${prim.description}\n${prim.code}\n`);
                     rehealed++;
                 } else if (!existing.seeded) {
@@ -365,6 +371,10 @@ export class Voyager {
                 stats: newStats(),
                 saved: new Date().toISOString(),
             };
+            // fix45: copy seeded contract if present
+            if (prim.contract) {
+                entry.contract = { ...prim.contract, seeded: true };
+            }
             this.skills.push(entry);
             writeAtomic(`${this.dir}/${prim.name}.js`, `// ${prim.description}\n${prim.code}\n`);
             seeded++;
@@ -524,13 +534,21 @@ Use only c; no other globals.`;
         this._repairQueue = rq;
     }
     // learn contracts for a batch of skills with one code-model call; invalid ones fail loudly (no default contract)
+    // fix45: skills with seeded contracts (contract.seeded === true) are never overwritten by learned contracts
     async _learnContracts(ents, why, fixNote = '') {
+        // fix45: filter out skills with seeded contracts - they must not be overwritten
+        const learnable = ents.filter(e => !e.contract?.seeded);
+        const skipped = ents.filter(e => e.contract?.seeded);
+        if (skipped.length) {
+            console.log(`[contract] SKIPPED ${skipped.length} skill(s) with seeded contracts: ${skipped.map(e => e.name).join(', ')}`);
+        }
+        if (!learnable.length) return 0;
         const system = `You write PSN skill contracts for a Minecraft mineflayer skill library.\n${Voyager.CONTRACT_SPEC}\nReply ONLY with JSON: {"<skillName>": {"pre": "c => ...", "post": "c => ...", "text": "<one-line contract summary>"}, ...} for exactly the skills given.`;
-        const user = ents.map(e => `--- ${e.name} ---\ndescription: ${e.description}\nobserved effects: ${JSON.stringify(e.effects || [])}\n${e.contract ? `current contract (${fixNote || 'to fix'}): ${JSON.stringify(e.contract)}\n` : ''}code:\n${String(e.code).slice(0, 1800)}`).join('\n');
-        console.log(`[contract] learning contracts for ${ents.length} skill(s) (${why}): ${ents.map(e => e.name).join(', ')}`);
+        const user = learnable.map(e => `--- ${e.name} ---\ndescription: ${e.description}\nobserved effects: ${JSON.stringify(e.effects || [])}\n${e.contract ? `current contract (${fixNote || 'to fix'}): ${JSON.stringify(e.contract)}\n` : ''}code:\n${String(e.code).slice(0, 1800)}`).join('\n');
+        console.log(`[contract] learning contracts for ${learnable.length} skill(s) (${why}): ${learnable.map(e => e.name).join(', ')}`);
         let out; try { out = parseJSON(await this._ask(system, user)); } catch (err) { console.log(`[contract] learning FAILED: ${err.message}`); return 0; }
         let n = 0;
-        for (const e of ents) {
+        for (const e of learnable) {
             const ct = out?.[e.name], bad = this._validContract(ct);
             e.contractTried = Date.now();
             if (bad) { console.log(`[contract] FAILED for ${e.name}: ${bad}`); continue; }
@@ -2185,6 +2203,16 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         this._repairs = (this.progress.repairs ||= {});   // fix11 (B8): repair cap persisted in progress.json
         if (q.kind === 'joint') return await this._repairJoint(q, e);
         if (q.kind === 'contract_fix') {   // fix25b: contract-only repair is independent of code candidates and the code-repair cap
+            // fix45: if the skill has a seeded contract in SEEDED_PRIMITIVES, restore it instead of learning a new one
+            // This prevents LLM-generated contracts from re-introducing material-tier hard-codes for equip skills
+            const prim = Voyager.SEEDED_PRIMITIVES.find(p => p.name === e.name);
+            if (prim?.contract) {
+                console.log(`[psn] RESTORE seeded contract of ${e.name} (seeded contracts are immutable; ${q.evidence})`);
+                e.contract = { ...prim.contract, seeded: true, restored: new Date().toISOString() };
+                this._saveSkills();
+                this._noteProposal(e, { task: q.task, kind: q.kind, evidence: q.evidence.slice(0, 200), desc: `seeded contract restored: ${e.contract.text}`, outcome: 'seeded contract restored' });
+                return true;
+            }
             if (this._cursorLimited()) { console.log(`[psn] contract repair of ${e.name} deferred: code model at its limit`); this._deferRepair(q, 10 * 60e3, 'code model at its limit'); return false; }
             delete (this.progress.deferCounts || {})[`${e.name}:contract_fix`];
             console.log(`[psn] REPAIR contract of ${e.name} (${q.evidence})`);
@@ -3326,10 +3354,11 @@ Voyager.SEEDED_PRIMITIVES = [
     return null;
 }`,
         deps: [],
-        // fix44: contract uses c.post.eq.heldItem NOT c.delta - idempotent (already-equipped = success)
+        // fix44/45: contract uses c.post.eq.heldItem NOT c.delta - idempotent (already-equipped = success)
+        // fix45: explicit false when eq missing but ret non-null (fail loud, don't return undefined)
         contract: {
             pre: 'c => true',
-            post: 'c => c.ret === null || (c.post.eq && c.post.eq.heldItem === c.ret)',
+            post: 'c => c.ret === null || (c.post.eq ? c.post.eq.heldItem === c.ret : false)',
             text: 'returns null (no tool) or the equipped tool name matches c.post.eq.heldItem',
         },
     },
