@@ -444,14 +444,16 @@ export class Voyager {
     // ---------- fix22: learned skill contracts (PSN pre/postconditions) ----------
     // Each library skill carries { pre, post, text }: JS predicates over c = { args, ret, pre, post, delta } learned by the code model
     // from the skill's description, code and observed effects; evaluated after every traced call against real bot state.
+    // fix43: added eq (equipment state) for idempotent equip contracts
     static CONTRACT_SPEC = `A contract is two JavaScript arrow functions over one argument c, each returning true when satisfied:
   c.args  = the call's arguments after bot (numbers/strings; objects are null)
   c.ret   = the call's return value (primitive, or null for objects)
-  c.pre / c.post = bot state before / after the call: { pos:{x,y,z}, hp (0-20), food (0-20), sky (sky light 0-15 at head height; 0 = underground or enclosed), alive (bool), dim (dimension string), inv:{item:count} }
+  c.pre / c.post = bot state before / after the call: { pos:{x,y,z}, hp (0-20), food (0-20), sky (sky light 0-15 at head height; 0 = underground or enclosed), alive (bool), dim (dimension string), inv:{item:count}, eq:{heldItem,offHand,helmet,chestplate,leggings,boots} }
   c.delta = inventory change {item: +n/-n}
   c.dist(a, b) = euclidean distance between two {x,y,z}
 pre: what must hold before the call for it to be able to succeed (use "c => true" if nothing).
 post: what the call promises afterwards when it reports success (state the observable effect: arrived near target, item gained, still alive, not stranded underground, etc.). If the call returns false/null it already reported failure, so post may return true in that case.
+IMPORTANT for equip skills: postconditions should check c.post.eq (equipment state) rather than c.delta for idempotency - already-equipped items should satisfy the postcondition without requiring an inventory change.
 Use only c; no other globals.`;
     // fix26: endow contract compartment with bare API surface (same as live SES) so contracts that
     // reference getInventoryCounts, getAllFreeSpaces, etc. don't crash with "is not a function"
@@ -473,7 +475,9 @@ Use only c; no other globals.`;
     _compileContract(src) { const f = makeCompartment(this._getContractEndowments()).evaluate(`(${src})`); if (typeof f !== 'function') throw new Error('not a function'); return f; }
     _validContract(ct) {
         if (!ct || typeof ct.post !== 'string' || typeof ct.pre !== 'string') return 'missing pre/post string';
-        const s = { pos: { x: 0, y: 64, z: 0 }, hp: 20, food: 20, sky: 15, alive: true, dim: 'overworld', inv: {} };
+        // fix43: include eq (equipment state) in test state for contract validation
+        const eq = { heldItem: null, offHand: null, helmet: null, chestplate: null, leggings: null, boots: null };
+        const s = { pos: { x: 0, y: 64, z: 0 }, hp: 20, food: 20, sky: 15, alive: true, dim: 'overworld', inv: {}, eq };
         const c = { args: [0, 64, 0, 'x', 1], ret: true, pre: s, post: s, delta: {}, dist: (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z) };
         try { for (const k of ['pre', 'post']) { const r = this._compileContract(ct[k])(c); if (typeof r !== 'boolean') return `${k} returned ${typeof r}, not boolean`; } } catch (e) { return `throws: ${e.message}`; }
         return null;
@@ -1029,11 +1033,13 @@ Use only c; no other globals.`;
                 // Build a synthetic contract context as if the skill just ran and produced the current state
                 // fix26: use 'inv' not 'inventory' to match CONTRACT_SPEC (c.post.inv, not c.post.inventory)
                 // fix26: include all state fields from CONTRACT_SPEC to avoid undefined errors
-                const syntheticState = { inv, pos: state.pos || { x: 0, y: 64, z: 0 }, hp: 20, food: 20, sky: 15, alive: true, dim: 'overworld' };
+                // fix43: include eq (equipment state) for idempotent equip contracts
+                const eq = state.equipment || { heldItem: null, offHand: null, helmet: null, chestplate: null, leggings: null, boots: null };
+                const syntheticState = { inv, pos: state.pos || { x: 0, y: 64, z: 0 }, hp: 20, food: 20, sky: 15, alive: true, dim: 'overworld', eq };
                 const c = {
                     args: [goal.item, goal.count],
                     ret: true,
-                    pre: { inv: {}, pos: { x: 0, y: 64, z: 0 }, hp: 20, food: 20, sky: 15, alive: true, dim: 'overworld' },
+                    pre: { inv: {}, pos: { x: 0, y: 64, z: 0 }, hp: 20, food: 20, sky: 15, alive: true, dim: 'overworld', eq: { heldItem: null, offHand: null, helmet: null, chestplate: null, leggings: null, boots: null } },
                     post: syntheticState,
                     delta: { [goal.item]: have },
                     dist: (a, b) => Math.hypot((a?.x || 0) - (b?.x || 0), (a?.y || 0) - (b?.y || 0), (a?.z || 0) - (b?.z || 0))
@@ -1071,10 +1077,30 @@ Use only c; no other globals.`;
     // chosen by Boltzmann sampling over V (T = 0.3); every item that skill consumes and the bot lacks is chained the same way
     // (depth <= 3). The plan runs as replays, children first; no model call.
     _boltzmann(c, T = 0.3) { const w = c.map(x => Math.exp(x.V / T)), tot = w.reduce((a, b) => a + b, 0); let r = Math.random() * tot; for (let i = 0; i < c.length; i++) if ((r -= w[i]) <= 0) return c[i]; return c[c.length - 1]; }
+    // fix43: _producers now also checks NeedsProducesGraph for confirmed producers (learned from observation)
+    // NO hard-coded ore/smelt tables - producers come from skill.effects and observed graph recordings
     _producers(item) {
-        return this.skills.filter(s => !s.demoted && !s.mergedInto && !s.candidate && !/^(repair|refactor)\b/.test(s.task || '') && (s.effects || []).includes(item)
+        const fromSkills = this.skills.filter(s => !s.demoted && !s.mergedInto && !s.candidate && !/^(repair|refactor)\b/.test(s.task || '') && (s.effects || []).includes(item)
             && !(signatureOf(s.code, s.name).match(/\(([^)]*)\)/)?.[1] || '').split(',').slice(1).some(x => x.trim() && !x.includes('=')))
             .map(s => ({ s, V: this._maturity(s).V }));
+        
+        // fix43: also check NeedsProducesGraph for confirmed producers (learned from observation)
+        if (this.needsProducesGraph) {
+            const graphProducers = this.needsProducesGraph.getProducersOf(item);
+            for (const producerKey of graphProducers) {
+                // Map the producer key back to a skill if possible
+                const matchingSkill = this.skills.find(s => 
+                    !s.demoted && !s.mergedInto && !s.candidate &&
+                    (s.name.toLowerCase().replace(/[^a-z0-9_]/g, '_') === producerKey ||
+                     s.task?.toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 80) === producerKey));
+                if (matchingSkill && !fromSkills.some(x => x.s.name === matchingSkill.name)) {
+                    fromSkills.push({ s: matchingSkill, V: this._maturity(matchingSkill).V });
+                    console.log(`[backchain] found producer for ${item} via NeedsProducesGraph: ${matchingSkill.name}`);
+                }
+            }
+        }
+        
+        return fromSkills;
     }
     _chain(item, need, inv, depth, plan, path) {
         if ((inv[item] || 0) >= need) return true;
@@ -1491,30 +1517,53 @@ Use only c; no other globals.`;
         }
         return null;
     }
-    // fix42: compute safe-to-toss and deposit-candidate items based on LEARNED signals only (no hard-coded junk list)
-    // Items are safe to toss if:
-    // 1. NOT consumed by any known skill (not in any skill's consumes)
-    // 2. NOT needed as input to produce pending goal items
-    // 3. In surplus (have more than needed for any known recipe)
-    // Returns { toss: [item names], deposit: [item names for large stacks better deposited] }
+    // fix43: compute safe-to-toss and deposit-candidate items based on POSITIVE learned signals only
+    // INVERTED POLARITY: absence from needs/produces does NOT imply disposable
+    // Items are safe to toss ONLY if:
+    // 1. We have a POSITIVE learned producer signal for them (skill.effects or NeedsProducesGraph confirms we can get more)
+    // 2. NOT consumed by pending goal items
+    // 3. In surplus (count > max(64, learned consume amount × 3))
+    // Unknown/unlinked items → NOT auto-tossed, returned to model/planning as 'uncertain'
+    // Returns { toss: [item names], deposit: [item names], uncertain: [items with no learned signal] }
     _computeTossAndDepositLists() {
         const inv = this.observe().inventory || {};
         const pendingItems = this._getPendingGoalItems();
         
         // Collect all items that are consumed by any skill
         const consumedBySkills = new Set();
+        const maxConsumed = {};  // track max consumption per item for surplus threshold
         for (const s of this.skills) {
             if (s.demoted || s.mergedInto) continue;
-            for (const item of Object.keys(s.consumes || {})) {
+            for (const [item, amt] of Object.entries(s.consumes || {})) {
                 consumedBySkills.add(item);
+                maxConsumed[item] = Math.max(maxConsumed[item] || 0, amt);
             }
         }
         
-        // Essential tools/armor - always keep (minimal list, learned path should handle most)
+        // Collect items that we have POSITIVE learned producer signals for (we can get more)
+        const hasLearnedProducer = new Set();
+        for (const s of this.skills) {
+            if (s.demoted || s.mergedInto || s.candidate) continue;
+            for (const eff of (s.effects || [])) {
+                hasLearnedProducer.add(eff);
+            }
+        }
+        // Also check the NeedsProducesGraph for confirmed producers
+        if (this.needsProducesGraph) {
+            const confirmed = this.needsProducesGraph.getConfirmedLinks();
+            for (const [key, links] of Object.entries(confirmed)) {
+                for (const prod of (links.produces || [])) {
+                    hasLearnedProducer.add(prod);
+                }
+            }
+        }
+        
+        // Essential tools/armor - always keep (minimal: equipped gear only, no food/torch lists)
         const essential = /pickaxe|axe|sword|shovel|hoe|helmet|chestplate|leggings|boots|shield|bow|crossbow|trident|elytra|crafting_table|furnace/;
         
         const tossItems = [];
         const depositItems = [];
+        const uncertainItems = [];
         
         for (const [item, count] of Object.entries(inv)) {
             if (count <= 0) continue;
@@ -1523,41 +1572,62 @@ Use only c; no other globals.`;
             // Skip if this is needed for pending goals
             if (pendingItems.has(item)) continue;
             
-            // Items consumed by skills are deposit candidates (not toss) - valuable for future crafting
+            // Skip if consumed by any known skill (valuable for future crafting)
             if (consumedBySkills.has(item)) {
-                // Large stacks (>32) are better deposited than kept
-                if (count > 32) {
+                // Large stacks (>64) of consumed items are deposit candidates only
+                if (count > 64) {
                     depositItems.push({ item, count, score: count });
                 }
                 continue;
             }
             
-            // Items not consumed by any skill are safe to toss
-            tossItems.push({ item, count, score: count });
+            // fix43: ONLY toss if we have a POSITIVE learned producer signal (we can get more)
+            // Unknown items (no learned producer) → NOT auto-tossed, marked uncertain
+            if (!hasLearnedProducer.has(item)) {
+                uncertainItems.push({ item, count });
+                // Large stacks of uncertain items can still be deposit candidates (safer than toss)
+                if (count > 64) {
+                    depositItems.push({ item, count, score: count });
+                }
+                continue;
+            }
             
-            // Large stacks of anything are also deposit candidates (backup if toss fails)
-            if (count > 32) {
+            // Has learned producer AND not consumed AND not pending → safe to toss surplus
+            // Surplus threshold: max(64, learned consume × 3) - learned, not hard-coded per-item
+            const surplusThreshold = Math.max(64, (maxConsumed[item] || 0) * 3);
+            if (count > surplusThreshold) {
+                const surplus = count - surplusThreshold;
+                tossItems.push({ item, count, surplus, score: surplus });
+            }
+            
+            // Large stacks are also deposit candidates (backup if toss fails)
+            if (count > 64) {
                 depositItems.push({ item, count, score: count });
             }
         }
         
-        // Sort by score (highest surplus first)
+        // Sort by surplus/score (highest surplus first)
         tossItems.sort((a, b) => b.score - a.score);
         depositItems.sort((a, b) => b.score - a.score);
         
-        console.log(`[toss] computed ${tossItems.length} safe-to-toss item(s) from learned signals: ${tossItems.slice(0, 5).map(x => `${x.item}(${x.count})`).join(', ')}${tossItems.length > 5 ? '...' : ''}`);
+        console.log(`[toss] computed ${tossItems.length} safe-to-toss item(s) (POSITIVE learned producer + surplus): ${tossItems.slice(0, 5).map(x => `${x.item}(${x.surplus}/${x.count})`).join(', ')}${tossItems.length > 5 ? '...' : ''}`);
         console.log(`[toss] computed ${depositItems.length} deposit candidate(s): ${depositItems.slice(0, 5).map(x => `${x.item}(${x.count})`).join(', ')}${depositItems.length > 5 ? '...' : ''}`);
+        if (uncertainItems.length) {
+            console.log(`[toss] ${uncertainItems.length} item(s) have NO learned producer (not auto-tossed, returned to model/planning): ${uncertainItems.slice(0, 5).map(x => `${x.item}(${x.count})`).join(', ')}${uncertainItems.length > 5 ? '...' : ''}`);
+        }
         
         return {
             toss: tossItems.map(x => x.item),
-            deposit: depositItems.map(x => x.item)
+            deposit: depositItems.map(x => x.item),
+            uncertain: uncertainItems.map(x => x.item)
         };
     }
-    // fix42: populate bot.__safeToToss and bot.__depositCandidates before running tossClutter/freeInventory
+    // fix43: populate bot.__safeToToss, __depositCandidates, and __uncertainItems before running tossClutter/freeInventory
     _prepareTossSignals() {
         const lists = this._computeTossAndDepositLists();
         this.agent.bot.__safeToToss = lists.toss;
         this.agent.bot.__depositCandidates = lists.deposit;
+        this.agent.bot.__uncertainItems = lists.uncertain || [];
     }
     // fix37: run a practice skill safely - returns { message } on success, false on context-fail, null on abort
     // Fail-loud: all skips and failures are logged clearly
@@ -3019,18 +3089,19 @@ Voyager.SEEDED_PRIMITIVES = [
     {
         // fix42: tossClutter uses LEARNED signals only - no hard-coded junk list
         // Consults bot.__safeToToss (set by voyager before skill runs) for items safe to toss
-        // Fail loud if no learned signal says what is safe to toss
-        // fix42: actually tasks depositToChest when toss alone is insufficient (not just log)
+        // fix43: tossClutter uses POSITIVE learned signals only - unknown items NOT auto-tossed
+        // Fail loud if no learned signal, or if deposit prerequisite (chest) missing
         name: 'tossClutter',
-        description: 'Toss surplus/low-value items to free inventory space using LEARNED signals (needs/produces, not hard-coded lists). If toss is insufficient, calls depositToChest. Fails loud if nothing is safe to toss/deposit.',
+        description: 'Toss surplus/low-value items to free inventory space using LEARNED signals (needs/produces, not hard-coded lists). If toss is insufficient, calls depositToChest. Fails loud if nothing is safe to toss/deposit or if chest prerequisite missing.',
         task: 'toss clutter to free inventory space',
         code: `async function tossClutter(bot, minFree = 4) {
     const start = bot.entity.position.clone();
     let tossed = 0;
     const safeList = bot.__safeToToss || [];
     const depositList = bot.__depositCandidates || [];
+    const uncertainList = bot.__uncertainItems || [];
     
-    // Phase 1: toss safe items
+    // Phase 1: toss safe items (items with POSITIVE learned producer signal + surplus)
     if (safeList.length) {
         const inv = getInventoryCounts(bot);
         for (let i = 0; i < 40 && bot.inventory.emptySlotCount() < minFree; i++) {
@@ -3051,57 +3122,104 @@ Voyager.SEEDED_PRIMITIVES = [
         }
     }
     
-    // Phase 2: if still low on space, actually run depositToChest (not just log)
+    // Phase 2: if still low on space, try depositToChest
     if (bot.inventory.emptySlotCount() < minFree && !bot.interrupt_code) {
-        if (depositList.length) {
-            console.log(\`[toss] still only \${bot.inventory.emptySlotCount()} empty after tossing \${tossed} stacks; depositing \${depositList.length} candidate(s) to chest\`);
+        // fix43: check for chest FIRST and fail loud with PREREQUISITE if missing
+        const chest = getNearestBlock(bot, b => /chest|barrel|shulker/.test(b.name), 32);
+        if (!chest) {
+            if (depositList.length || (bot.inventory.emptySlotCount() < 2 && uncertainList.length)) {
+                log(bot, \`PREREQUISITE FAILED: tossClutter needs chest within 32 blocks to deposit items (have \${depositList.length} deposit candidates, \${uncertainList.length} uncertain items). Place or find a chest first.\`);
+                return bot.inventory.emptySlotCount();
+            }
+        } else if (depositList.length) {
+            console.log(\`[toss] still only \${bot.inventory.emptySlotCount()} empty after tossing \${tossed} stacks; depositing \${depositList.length} candidate(s) to chest at \${chest.position}\`);
             let deposited = 0;
+            let depositFailed = false;
             for (const itemName of depositList) {
                 if (bot.interrupt_code) break;
                 if (bot.inventory.emptySlotCount() >= minFree) break;
                 const ok = await depositToChest(bot, itemName);
                 if (ok) deposited++;
+                else depositFailed = true;
             }
             if (deposited) console.log(\`[toss] deposited \${deposited} item type(s) to chest (empty slots now \${bot.inventory.emptySlotCount()})\`);
             if (bot.inventory.emptySlotCount() < minFree && !bot.interrupt_code) {
-                log(bot, \`FAILED tossClutter: still only \${bot.inventory.emptySlotCount()} empty after tossing \${tossed} + depositing \${deposited} items\`);
+                if (depositFailed) {
+                    log(bot, \`FAILED tossClutter: deposit to chest failed - chest may be full or inaccessible.\`);
+                } else {
+                    log(bot, \`FAILED tossClutter: still only \${bot.inventory.emptySlotCount()} empty after tossing \${tossed} + depositing \${deposited} items\`);
+                }
             }
-        } else {
-            log(bot, \`FAILED tossClutter: only \${bot.inventory.emptySlotCount()} empty after tossing \${tossed} stacks; no deposit candidates (no chest nearby or nothing to deposit)\`);
         }
     }
     
-    if (!safeList.length && !depositList.length) {
-        log(bot, 'FAILED tossClutter: no learned signal indicates what is safe to toss/deposit (needs/produces empty or all items are inputs to known skills)');
+    // fix43: if we couldn't free space and have uncertain items, surface this for model/planning
+    if (bot.inventory.emptySlotCount() < minFree && !bot.interrupt_code) {
+        if (uncertainList.length && !safeList.length) {
+            log(bot, \`FAILED tossClutter: \${uncertainList.length} item(s) have NO learned producer signal (\${uncertainList.slice(0,3).join(', ')}\${uncertainList.length > 3 ? '...' : ''}) - cannot auto-toss unknown items. Return decision to model/planning.\`);
+        } else if (!safeList.length && !depositList.length) {
+            log(bot, 'FAILED tossClutter: no learned signal indicates what is safe to toss/deposit');
+        }
     }
     return bot.inventory.emptySlotCount();
 }`,
         deps: ['moveAway', 'depositToChest'],
     },
-    // fix25/fix26: ensureCraftingTable with multi-cell retry (same pattern as craftRecipe)
-    // fix26: if no crafting_table in inventory, attempt to craft one first (requires planks)
+    // fix43: ensureCraftingTable with multi-cell retry AND inline 2x2 crafting (no craftRecipe dep to avoid cycle)
+    // The 2x2 crafting of a crafting_table does NOT need a table, so it's done inline here via bot.recipesFor/bot.craft.
+    // Plank type is derived from recipe ingredients in inventory, not hard-coded.
     {
         name: 'ensureCraftingTable',
-        description: 'Ensure a crafting table is placed nearby for 3x3 recipes. If not in inventory, attempts to craft one from planks. Uses multi-cell retry if first placement fails. Returns true if a table is available.',
+        description: 'Ensure a crafting table is placed nearby for 3x3 recipes. If not in inventory, crafts one inline from planks (2x2, no table needed). Uses multi-cell retry if first placement fails. Returns true if a table is available.',
         task: 'ensure a crafting table is placed nearby',
         code: `async function ensureCraftingTable(bot) {
     let table = getNearestBlock(bot, 'crafting_table', 16);
     if (table) { log(bot, \`Crafting table already nearby at \${table.position}.\`); return true; }
     let hasTable = (getInventoryCounts(bot)['crafting_table'] || 0) > 0;
-    // fix26: if no table in inventory, attempt to craft one (requires 4 planks)
+    
+    // fix43: if no table in inventory, craft one INLINE (2x2, no table needed) - avoids craftRecipe dep cycle
+    // Derive plank types from recipes API rather than hard-coded list
     if (!hasTable) {
-        console.log('[ensureCraftingTable] no crafting_table in inventory, attempting to craft one...');
-        const crafted = await craftRecipe(bot, 'crafting_table', 1);
-        if (!crafted) {
-            log(bot, 'FAILED: no crafting_table in inventory and could not craft one (need 4 planks)');
-            return false;
-        }
-        hasTable = (getInventoryCounts(bot)['crafting_table'] || 0) > 0;
-        if (!hasTable) {
-            log(bot, 'FAILED: craftRecipe reported success but no crafting_table in inventory');
+        console.log('[ensureCraftingTable] no crafting_table in inventory, attempting inline 2x2 craft...');
+        const tableId = bot.registry.itemsByName['crafting_table']?.id;
+        const recipes = tableId ? bot.recipesFor(tableId, null, 1, null) : [];  // null = no crafting table needed (2x2)
+        if (recipes && recipes.length) {
+            // Find which plank ingredient we have in inventory
+            const inv = getInventoryCounts(bot);
+            let canCraft = false;
+            for (const recipe of recipes) {
+                // Check if we have the ingredients for this recipe
+                const ingredients = recipe.delta?.filter(d => d.count < 0) || [];
+                const haveAll = ingredients.every(ing => {
+                    const ingItem = bot.registry.items[ing.id];
+                    return ingItem && (inv[ingItem.name] || 0) >= Math.abs(ing.count);
+                });
+                if (haveAll) {
+                    try {
+                        const beforeCount = (getInventoryCounts(bot)['crafting_table'] || 0);
+                        await bot.craft(recipe, 1, null);
+                        const afterCount = (getInventoryCounts(bot)['crafting_table'] || 0);
+                        if (afterCount > beforeCount) {
+                            log(bot, 'Crafted crafting_table (2x2, inline).');
+                            hasTable = true;
+                            canCraft = true;
+                            break;
+                        }
+                    } catch (e) {
+                        console.log(\`[ensureCraftingTable] inline craft failed: \${e.message}\`);
+                    }
+                }
+            }
+            if (!canCraft && !hasTable) {
+                log(bot, 'FAILED: no crafting_table in inventory and cannot craft one (need 4 planks of same type)');
+                return false;
+            }
+        } else {
+            log(bot, 'FAILED: no crafting_table in inventory and no recipe found');
             return false;
         }
     }
+    
     // fix25: multi-cell retry pattern (same as craftRecipe/placeBlock)
     const freeSpaces = getAllFreeSpaces(bot, 1, 6, 5);
     if (!freeSpaces.length) { log(bot, 'FAILED: no free space within 6 blocks to place crafting_table'); return false; }
@@ -3127,6 +3245,6 @@ Voyager.SEEDED_PRIMITIVES = [
     }
     return true;
 }`,
-        deps: ['placeBlock', 'craftRecipe'],
+        deps: ['placeBlock'],
     },
 ];
