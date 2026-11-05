@@ -146,6 +146,58 @@ function smeltGoal(task) {
     const m = task.match(/^(?:smelt|cook)\s+(\d+)\s+([a-z_]+)\s+into\s+(\d+)\s+([a-z_]+)/i);
     return m ? { count: parseInt(m[1]), input: m[2].toLowerCase(), verb: 'smelt', item: m[4].toLowerCase(), items: [m[4].toLowerCase()] } : null;
 }
+
+// fix45: parse verbose goal strings like "craftItem: Craft 1 iron_pickaxe using 1 iron_ingot..."
+// Uses minecraft-data registry to validate item names (no hard-coded tables per owner rules)
+// Returns {item, count, items, verb} or null if unparseable; logs loudly on parse failure
+export function parseVerboseGoal(task) {
+    if (!task || typeof task !== 'string') return null;
+    const t = task.toLowerCase();
+    
+    // Try standard parsers first
+    const std = smeltGoal(task) || countGoal(task);
+    if (std) return std;
+    
+    // Verbose goal patterns:
+    // "craftItem: Craft 1 iron_pickaxe using..." / "equipToolOrCraft: Equip or craft 1 stone_pickaxe..."
+    // Generic: look for "N item_name" where item_name is in the minecraft-data registry
+    let md;
+    try { md = minecraftData(VERSION || '1.20.4'); } catch (e) { console.log(`[fix45] minecraft-data unavailable: ${e.message}`); return null; }
+    
+    // Extract all potential "count item" pairs from the text
+    const candidates = [];
+    const pattern = /\b(\d+)\s+([a-z][a-z0-9_]*)\b/gi;
+    let m;
+    while ((m = pattern.exec(t))) {
+        const count = parseInt(m[1]);
+        let item = m[2].toLowerCase();
+        // Handle plurals: sticks -> stick, torches -> torch
+        if (item.endsWith('es') && item !== 'glasses') { const t = item === 'torches' ? 'torch' : item.slice(0, -2); if (md.itemsByName[t] || md.blocksByName[t]) item = t; }
+        else if (item.endsWith('s') && (md.itemsByName[item.slice(0, -1)] || md.blocksByName[item.slice(0, -1)])) item = item.slice(0, -1);
+        // Check if this is a valid item/block name in the registry
+        if (md.itemsByName[item] || md.blocksByName[item]) {
+            candidates.push({ count, item, pos: m.index });
+        }
+    }
+    
+    if (candidates.length === 0) {
+        console.log(`[fix45] LOUD: parseVerboseGoal failed for "${task.slice(0, 100)}": no valid item name found`);
+        return null;
+    }
+    
+    // Pick the first valid candidate (typically the goal item in "Craft 1 iron_pickaxe using...")
+    const best = candidates[0];
+    const verb = t.match(/^(craft|mine|collect|gather|smelt|obtain|get|chop|cook|equip)/)?.[1] || 'craft';
+    
+    // Include block loot drops (same logic as countGoal)
+    let items = [best.item];
+    if (['mine', 'collect', 'gather', 'chop', 'get', 'obtain'].includes(verb)) {
+        try { for (const d of (md.blockLoot?.[best.item]?.drops || [])) if (!items.includes(d.item)) items.push(d.item); } catch (e) {}
+    }
+    
+    return { count: best.count, item: best.item, items, verb };
+}
+
 function gainedFor(goal, before, after) {
     return goal.items.reduce((a, it) => a + (after.inventory[it] || 0) - (before.inventory[it] || 0), 0);
 }
@@ -1077,9 +1129,10 @@ Use only c; no other globals.`;
     // Returns { satisfied: boolean, reason: string, noLearnedCheck?: boolean }
     // Uses learned skill contracts (postconditions) and learned effects - no hard-coded special cases
     // fix25: prefer smeltGoal so "Smelt X into Y" checks Y (product), not X (ingredient)
+    // fix45: use parseVerboseGoal as fallback for verbose goals like "craftItem: Craft 1 iron_pickaxe..."
     _goalAlreadySatisfied(task, state) {
-        const goal = smeltGoal(task) || countGoal(task);  // fix25: smelt first (product)
-        if (!goal) return { satisfied: false, reason: 'goal not parseable as count/smelt', noLearnedCheck: true };
+        const goal = smeltGoal(task) || countGoal(task) || parseVerboseGoal(task);  // fix45: verbose fallback
+        if (!goal) return { satisfied: false, reason: 'goal not parseable as count/smelt/verbose', noLearnedCheck: true };
 
         const inv = state.inventory || {};
         const have = goal.items ? goal.items.reduce((a, it) => a + (inv[it] || 0), 0) : (inv[goal.item] || 0);

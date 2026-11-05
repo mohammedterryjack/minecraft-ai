@@ -77,17 +77,50 @@ export class Coder {
         this.agent.bot.modes.pause('unstuck');
         lockdown();
         // this message history is transient and only maintained in this function
-        let messages = agent_history.getHistory(); 
-        messages.push({role: 'system', content: 'Code generation started. Write code in codeblock in your response:'});
+        // fix45: keep base messages separate for retry cap calculation
+        const baseMessages = agent_history.getHistory();
+        baseMessages.push({role: 'system', content: 'Code generation started. Write code in codeblock in your response:'});
+        const basePromptSize = JSON.stringify(baseMessages).length;
+        
+        // fix45: retry prompt cap - derived from base prompt size (not a magic number)
+        // Retries should stay within 5x the base prompt (typical base is ~20k, so cap ~100k not 800k)
+        const RETRY_PROMPT_CAP_MULTIPLIER = 5;
+        const maxRetryPromptSize = basePromptSize * RETRY_PROMPT_CAP_MULTIPLIER;
+        
+        let messages = [...baseMessages];
 
         const MAX_ATTEMPTS = 5;
         const MAX_NO_CODE = 3;
 
         let code = null;
         let no_code_failures = 0;
+        let lastCode = null;  // fix45: track latest code for capped retry
+        let lastError = null; // fix45: track latest error for capped retry
+        
         for (let i=0; i<MAX_ATTEMPTS; i++) {
             if (this.agent.bot.interrupt_code)
                 return null;
+            
+            // fix45: on retry, cap the prompt by using only base + latest error + latest code
+            // This prevents 800k char prompts from accumulated history
+            if (i > 0 && lastError) {
+                const currentSize = JSON.stringify(messages).length;
+                if (currentSize > maxRetryPromptSize) {
+                    console.log(`[fix45] Retry prompt ${currentSize} chars exceeds cap ${maxRetryPromptSize} (${RETRY_PROMPT_CAP_MULTIPLIER}x base); trimming to base + latest error`);
+                    messages = [...baseMessages];
+                    if (lastCode) {
+                        messages.push({ role: 'assistant', content: '```javascript\n' + lastCode + '\n```' });
+                    }
+                    messages.push({ role: 'system', content: lastError });
+                    
+                    // Verify capped size is reasonable
+                    const cappedSize = JSON.stringify(messages).length;
+                    if (cappedSize > maxRetryPromptSize * 2) {
+                        console.error(`[fix45] LOUD FAIL: Capped retry prompt ${cappedSize} chars still exceeds 2x cap - error message may be too large`);
+                    }
+                }
+            }
+            
             const messages_copy = JSON.parse(JSON.stringify(messages));
             let res = await this.agent.prompter.promptCoding(messages_copy);
             if (this.agent.bot.interrupt_code)
@@ -106,10 +139,8 @@ export class Coder {
                     console.warn("Action failed, agent would not write code.");
                     return 'Action failed, agent would not write code.';
                 }
-                messages.push({
-                    role: 'system', 
-                    content: 'Error: no code provided. Write code in codeblock in your response. ``` // example ```'}
-                );
+                lastError = 'Error: no code provided. Write code in codeblock in your response. ``` // example ```';
+                messages.push({ role: 'system', content: lastError });
                 console.warn("No code block generated. Trying again.");
                 no_code_failures++;
                 continue;
@@ -117,13 +148,15 @@ export class Coder {
             code = res.substring(res.indexOf('```')+3, res.lastIndexOf('```'));
             // fix34: formatting-only auto-fix before lint (whitespace, semicolons, quotes - nothing semantic)
             code = this._autoFixFormatting(code);
+            lastCode = code;  // fix45: track for capped retry
             const result = await this._stageCode(code);
             const executionModule = result.func;
-            const lintResult = await this._lintCode(result.src_lint_copy);
+            // fix45: pass preludeLines to exclude prelude bindings from shadow warnings
+            const lintResult = await this._lintCode(result.src_lint_copy, result.preludeLines || 0);
             if (lintResult) {
-                const message = 'Error: Code lint error:'+'\n'+lintResult+'\nPlease try again.';
-                console.warn("Linting error:"+'\n'+lintResult+'\n');
-                messages.push({ role: 'system', content: message });
+                lastError = 'Error: Code lint error:\n' + lintResult + '\nPlease try again.';
+                console.warn("Linting error:\n" + lintResult + '\n');
+                messages.push({ role: 'system', content: lastError });
                 continue;
             }
             if (!executionModule) {
@@ -151,10 +184,8 @@ export class Coder {
                     role: 'assistant',
                     content: res
                 });
-                messages.push({
-                    role: 'system',
-                    content: `Code Output:\n${code_output}\nCODE EXECUTION THREW ERROR: ${e.toString()}\n Please try again:`
-                });
+                lastError = `Code Output:\n${code_output}\nCODE EXECUTION THREW ERROR: ${e.toString()}\n Please try again:`;
+                messages.push({ role: 'system', content: lastError });
             }
         }
         return `Code generation failed after ${MAX_ATTEMPTS} attempts.`;
@@ -248,8 +279,9 @@ export class Coder {
         };
     }
     // fix44: check for variable declarations that shadow the `log` helper (lint feedback only, NO auto-rename)
-    // Returns array of { line, text } for each shadowing declaration found
-    _checkLogShadowing(code) {
+    // fix45: accepts preludeLines parameter to exclude prelude bindings from shadow warnings
+    // Returns array of { line, text } for each shadowing declaration found (only user code, not prelude)
+    _checkLogShadowing(code, preludeLines = 0) {
         let ast;
         try { ast = acorn.parse(code, { ecmaVersion: 'latest', sourceType: 'module', allowAwaitOutsideFunction: true, locations: true }); }
         catch (e) { return []; }
@@ -259,11 +291,17 @@ export class Coder {
             if (!node || typeof node.type !== 'string') return;
             if (node.type === 'VariableDeclarator' && node.id?.type === 'Identifier' && node.id.name === 'log') {
                 const line = node.loc?.start?.line || 0;
-                warnings.push({ line, text: codeLines[line - 1]?.trim() || `const/let/var log = ...` });
+                // fix45: exclude prelude lines (injected bare API bindings like `const log = skills.log`)
+                if (line > preludeLines) {
+                    warnings.push({ line, text: codeLines[line - 1]?.trim() || `const/let/var log = ...` });
+                }
             }
             if (node.type === 'FunctionDeclaration' && node.id?.name === 'log') {
                 const line = node.loc?.start?.line || 0;
-                warnings.push({ line, text: codeLines[line - 1]?.trim() || `function log(...)` });
+                // fix45: exclude prelude lines
+                if (line > preludeLines) {
+                    warnings.push({ line, text: codeLines[line - 1]?.trim() || `function log(...)` });
+                }
             }
             for (const key in node) {
                 const val = node[key];
@@ -309,7 +347,8 @@ export class Coder {
         fixed = fixed.replace(/[ \t]+$/gm, '');
         return fixed;
     }
-    async  _lintCode(code) {
+    // fix45: accept preludeLines to exclude prelude bindings from shadow warnings
+    async  _lintCode(code, preludeLines = 0) {
         let result = '#### CODE ERROR INFO ###\n';
         // fix40: use acorn to extract old-style skills.*/world.* calls - these are NOW FORBIDDEN
         const { calls: oldStyleCalls, error: parseError } = this._extractOldStyleCalls(code);
@@ -362,7 +401,8 @@ export class Coder {
         // fix44: lint check for shadowing `log` - explicit feedback only, NO auto-renaming of user locals
         // This warns when generated code does e.g. `const log = getNearestBlock(...)` which would break
         // the bare `log()` helper. The interrupt guard is safe (uses __mcLog__), but user code calling log() is not.
-        const shadowLogWarnings = this._checkLogShadowing(code);
+        // fix45: use preludeLines from _stageCode (calculated after inserting bare bindings)
+        const shadowLogWarnings = this._checkLogShadowing(code, preludeLines);
         if (shadowLogWarnings.length > 0) {
             result += 'WARNING: Variable(s) shadowing the built-in `log` helper detected.\n';
             result += 'This will prevent log(bot, ...) calls from working in that scope.\n';
@@ -452,11 +492,16 @@ export class Coder {
             src += `    ${line}\n`;
         }
         // fix41: generate const bindings for bare API names so ESLint no-undef can see them
+        // fix45: include log in bare bindings (no longer in prelude to avoid shadow warning on prelude)
         const bareBindings = [
-            ...Object.keys(skills).filter(k => typeof skills[k] === 'function' && k !== 'log').map(k => `const ${k} = skills.${k};`),
+            ...Object.keys(skills).filter(k => typeof skills[k] === 'function').map(k => `const ${k} = skills.${k};`),
             ...Object.keys(world).filter(k => typeof world[k] === 'function').map(k => `const ${k} = world.${k};`)
         ].join('\n');
-        let src_lint_copy = this.code_lint_template.replace('/* BARE API HERE */', bareBindings).replace('/* CODE HERE */', src);
+        // fix45: calculate prelude line count AFTER inserting bare bindings but BEFORE inserting user code
+        // This is used by _lintCode to exclude prelude lines from shadow warnings
+        const templateWithBindings = this.code_lint_template.replace('/* BARE API HERE */', bareBindings);
+        const preludeLines = (templateWithBindings.split('/* CODE HERE */')[0] || '').split('\n').length;
+        let src_lint_copy = templateWithBindings.replace('/* CODE HERE */', src);
         src = this.code_template.replace('/* CODE HERE */', src);
 
         let filename = this.file_counter + '.js';
@@ -527,7 +572,8 @@ export class Coder {
             console.error('Error writing code execution file: ' + write_result);
             return null;
         }
-        return { func:{main: mainFn}, src_lint_copy: src_lint_copy };
+        // fix45: return preludeLines for shadow warning exclusion
+        return { func:{main: mainFn}, src_lint_copy: src_lint_copy, preludeLines };
     }
 
     _sanitizeCode(code) {

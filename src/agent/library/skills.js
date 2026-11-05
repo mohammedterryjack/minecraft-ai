@@ -7,8 +7,14 @@ import settings from "../../../settings.js";
 const blockPlaceDelay = settings.block_place_delay == null ? 0 : settings.block_place_delay;
 const useDelay = blockPlaceDelay > 0;
 
+// fix45: log vitals (food and health) on every log line for recovery tracking
 export function log(bot, message) {
-    bot.output += message + '\n';
+    // Include vitals if available (format: "food X/20 health Y/20")
+    let vitals = '';
+    if (typeof bot.food === 'number' && typeof bot.health === 'number') {
+        vitals = ` [food ${bot.food}/20 health ${Math.round(bot.health)}/20]`;
+    }
+    bot.output += message + vitals + '\n';
 }
 
 // fix44: close any non-inventory window before equip/consume operations
