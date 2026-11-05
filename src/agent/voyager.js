@@ -2257,12 +2257,11 @@ Use only c; no other globals.`;
                 d[task] = { subs, skills: [], at: Date.now(), reason: `need ${toolInfo.tool} to break ${blockName}` };
                 q.unshift(...subs.map(t => ({ task: t, parent: task, depth: depth + 1 })), { task, retry: true, depth });
                 // fix47: track this as a blocker so curriculum prioritizes tool acquisition
+                // Blockers are cleared when: (1) tool appears in inventory, (2) blocked task passes
                 this.progress.blockers = this.progress.blockers || [];
                 const blockerEntry = { tool: toolInfo.tool, block: blockName, task, at: Date.now() };
-                // Remove old blockers for same block/tool, keep only recent ones
-                this.progress.blockers = this.progress.blockers.filter(b => 
-                    b.block !== blockName && Date.now() - b.at < 30 * 60e3
-                ).slice(-5);
+                // Remove duplicate blockers for same block/tool, keep only most recent 5
+                this.progress.blockers = this.progress.blockers.filter(b => b.block !== blockName).slice(-4);
                 this.progress.blockers.push(blockerEntry);
                 this._saveProgress();
                 console.log(`[psn] DECOMPOSE (harvestTools) "${task}" -> need ${toolInfo.tool}: ${subs.join(', ')}`);
@@ -2383,9 +2382,13 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "task": "...", "contex
         const knownSkillsFacts = this._knownSkillsFacts();
         const replayableTasks = this.skills.filter(s => s.task && !s.primitive).map(s => s.task.split(/\s+(?:within|at|using|from)\b/i)[0]).slice(-25);
         // fix47: include active blockers so curriculum prioritizes unblocking goals
-        const blockers = (this.progress.blockers || []).filter(b => Date.now() - b.at < 30 * 60e3);
+        // Clear resolved blockers: tool now in inventory
+        const inv = state.inventory || {};
+        this.progress.blockers = (this.progress.blockers || []).filter(b => !(inv[b.tool] > 0));
+        if (this.progress.blockers.length > 0) this._saveProgress();
+        const blockers = this.progress.blockers;
         const blockerHint = blockers.length > 0 
-            ? `\nBLOCKERS (prioritize these - recent failures need tools): ${blockers.map(b => `need ${b.tool} to break ${b.block}`).join('; ')}`
+            ? `\nBLOCKERS (prioritize these - failures need tools): ${blockers.map(b => `need ${b.tool} to break ${b.block}`).join('; ')}`
             : '';
         const user = `known_skills: ${JSON.stringify(knownSkillsFacts)}
 replayable_tasks (cheap, no new code needed): ${JSON.stringify(replayableTasks)} plus any "Mine N <block or ore>", "Collect N <log>", "Get N <item>", "Smelt N <raw> into N <out>", "Kill N <mob>", "Harvest N <crop>"
@@ -3294,6 +3297,8 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
             console.log(`[voyager] goal already satisfied: ${task} (${alreadySatisfied.reason})`);
             this.progress.completed.push(task);
             this.progress.failed = this.progress.failed.filter(t => t !== task);
+            // fix47: clear blockers for this task when it passes
+            this.progress.blockers = (this.progress.blockers || []).filter(b => b.task !== task);
             this._saveProgress();
             this.agent.openChat?.(`Done: ${task} (already satisfied: ${alreadySatisfied.reason}).`);
             this._afterSuccess();
@@ -3308,7 +3313,10 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
         if (!rp?.ok && !rp?.interrupted) { const bc = await this._backchain(task, rp ? this.observe() : before); if (bc) rp = bc; }   // fix32 PSN backward chaining
         if (rp?.interrupted) { console.log('[voyager] task interrupted'); return; }
         if (rp?.ok) {
-            this.progress.completed.push(task); this.progress.failed = this.progress.failed.filter(t => t !== task); this._saveProgress();
+            this.progress.completed.push(task); this.progress.failed = this.progress.failed.filter(t => t !== task);
+            // fix47: clear blockers for this task when it passes
+            this.progress.blockers = (this.progress.blockers || []).filter(b => b.task !== task);
+            this._saveProgress();
             this._subgoalDone(rp.name);
             this.agent.openChat?.(`Done: ${task} (replayed ${rp.name}).`);
             this._afterSuccess();
@@ -3457,6 +3465,8 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
                 await this.saveSkill(fn[1], desc.trim(), code.replace(/\n\s*await\s+\w+\(bot\);\s*$/, '').trim(), task);
                 this.progress.completed.push(task);
                 this.progress.failed = this.progress.failed.filter(t => t !== task);
+                // fix47: clear blockers for this task when it passes
+                this.progress.blockers = (this.progress.blockers || []).filter(b => b.task !== task);
                 this._saveProgress();
                 this._subgoalDone(fn[1]);
                 // fix44: pass goal items to filter learned effects and produces (denoise)
