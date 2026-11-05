@@ -8,6 +8,7 @@ import { Vec3 } from 'vec3';
 import {ESLint} from "eslint";
 import * as acorn from "acorn";
 import pf from 'mineflayer-pathfinder';
+import { logPromptBreakdown } from './prompt_utils.js';
 
 // fix38: expose pathfinder goals to generated code (fail loud if missing)
 const pathfinderGoals = pf.goals;
@@ -73,6 +74,11 @@ export class Coder {
         mkdirSync('.' + this.fp, { recursive: true });
     }
 
+    // fix47: per-prompt breakdown logging for code generation (uses shared helper)
+    _logPromptBreakdown(kind, sections) {
+        return logPromptBreakdown(kind, sections);
+    }
+    
     async generateCode(agent_history) {
         this.agent.bot.modes.pause('unstuck');
         lockdown();
@@ -80,6 +86,12 @@ export class Coder {
         // fix46: keep base messages separate - on every retry, use base + latest code + latest error only
         const baseMessages = agent_history.getHistory();
         baseMessages.push({role: 'system', content: 'Code generation started. Write code in codeblock in your response:'});
+        
+        // fix47: log initial base prompt size
+        const baseSize = JSON.stringify(baseMessages).length;
+        this._logPromptBreakdown('coder-base', {
+            history: baseSize
+        });
 
         const MAX_ATTEMPTS = 5;
         const MAX_NO_CODE = 3;
@@ -107,6 +119,13 @@ export class Coder {
                     messages.push({ role: 'system', content: lastError });
                 }
                 const promptSize = JSON.stringify(messages).length;
+                // fix47: per-prompt breakdown logging for retries
+                this._logPromptBreakdown('coder-retry', {
+                    base: baseSize,
+                    history: 0,
+                    code: lastCode ? lastCode.length : 0,
+                    error: lastError ? lastError.length : 0
+                });
                 console.log(`[fix46] Retry ${i} prompt: ${promptSize} chars (base + latest code + latest error)`);
                 // Log loudly if still large (likely indicates an unusually large error message)
                 if (promptSize > 100000) {
