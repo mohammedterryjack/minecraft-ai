@@ -1,8 +1,15 @@
 import { wordOverlapScore } from '../utils/text.js';
 // Voyager-style lifelong learning loop (after MineDojo/Voyager):
 // automatic curriculum -> iterative code generation with env feedback -> self-verification critic -> skill library.
+// Learning upgrades (Mo-approved):
+//   - ADAM-style needs/produces graph (https://arxiv.org/abs/2410.22194)
+//   - AWM repair/workflow memory (https://arxiv.org/abs/2409.07429)
+//   - SkillWeaver-style idle practice (https://arxiv.org/abs/2504.07079)
 import { AsyncLocalStorage } from 'async_hooks';
 import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, renameSync, statSync, copyFileSync, truncateSync, appendFileSync } from 'fs';
+import { NeedsProducesGraph } from './needs_produces.js';
+import { RepairMemory } from './repair_memory.js';
+import { IdlePractice } from './idle_practice.js';
 // fix14: crash-safe writes (tmp file + rename)
 export function writeAtomic(fp, text) { const tmp = `${fp}.tmp-${process.pid}`; writeFileSync(tmp, text); renameSync(tmp, fp); }
 import * as world from './library/world.js';
@@ -140,6 +147,15 @@ export class Voyager {
         this.abort = false;
         this.lastPlayerMsg = 0;
         this.lastTaskEnd = 0;
+        
+        // ADAM-style needs/produces graph (learned item relationships)
+        this.npGraph = new NeedsProducesGraph(agent.name);
+        
+        // AWM repair/workflow memory (repair lessons and workflows)
+        this.repairMemory = new RepairMemory(agent.name, async (text) => this._embed(text));
+        
+        // SkillWeaver-style idle practice
+        this.idlePractice = new IdlePractice(agent.name);
         if (!globalThis.__voyagerGuard) {
             globalThis.__voyagerGuard = true;
             const onErr = (kind) => (err) => {
@@ -614,10 +630,21 @@ Use only c; no other globals.`;
     }
     update() {
         try { this._sample(); } catch (e) { console.log('[death] sampler error: ' + e.message); }
-        if (!this.enabled || this.running) return;
+        if (!this.enabled || this.running) {
+            this.idlePractice.markBusy();
+            return;
+        }
         const now = Date.now();
-        if (now - this.lastPlayerMsg < PLAYER_QUIET_MS || now < (this._backoffUntil || 0)) return;   // fix31: no fixed task cooldown; only an error backoff
-        if (!this.agent.isIdle() || this.agent.self_prompter.isActive() || this.agent.prompter.awaiting_coding) return;
+        if (now - this.lastPlayerMsg < PLAYER_QUIET_MS || now < (this._backoffUntil || 0)) {
+            this.idlePractice.markBusy();
+            return;   // fix31: no fixed task cooldown; only an error backoff
+        }
+        if (!this.agent.isIdle() || this.agent.self_prompter.isActive() || this.agent.prompter.awaiting_coding) {
+            this.idlePractice.markBusy();
+            return;
+        }
+        // SkillWeaver-style: track idle state for practice opportunities
+        this.idlePractice.markIdle();
         // fix33: quota check removed; CodeModel handles paid→free fallback internally
         this.running = true; this.abort = false;
         const t0 = Date.now(), c0 = { ...CALLS };
@@ -626,7 +653,7 @@ Use only c; no other globals.`;
             // fix31 runaway guard: consecutive failing steps back off exponentially, scaled by the failing step's own duration
             this._errStreak = (this._errStreak || 0) + 1; const ms = Math.max(Date.now() - t0, 1000) * 2 ** this._errStreak;
             this._backoffUntil = Date.now() + ms; console.log(`[voyager] ${this._errStreak} failing step(s) in a row; next step in ${Math.round(ms / 1000)}s`);
-        }).finally(() => { this.running = false; this.lastTaskEnd = Date.now();
+        }).finally(() => { this.running = false; this.lastTaskEnd = Date.now(); this.idlePractice.markBusy();
             console.log(`[timing] step model calls: local ${CALLS.local - c0.local}, code ${CALLS.code - c0.code}, replay ${CALLS.replay - c0.replay}`); });
     }
 
@@ -683,6 +710,9 @@ Use only c; no other globals.`;
                 lines.push(`${k}: ${typeof v === 'object' ? JSON.stringify(v) : v}`);
             }
         }
+        // ADAM-style: add learned needs/produces facts
+        const npFacts = this.npGraph.getFactsText();
+        if (npFacts) lines.push('', npFacts);
         return lines.join('\n');
     }
     _local() {
@@ -840,6 +870,8 @@ Use only c; no other globals.`;
         else { const v = await this.critique(task, before, after, String(res.message || '').slice(-1500)); ok = !!v.success; }
         if (entry && ok && !trial) this._learnEffects(entry, before, after);
         if (entry) this._recordRun(entry, task, ok, trial);
+        // ADAM-style: record inventory delta for needs/produces learning
+        if (ok) this.npGraph.recordDelta(r.name, before.inventory, after.inventory);
         this._attribute(r.name, task, ok, over);   // fix10: per-call trace -> contract results -> blame -> targeted repair
         console.log(`[voyager] replay ${r.name}: ${ok ? 'PASSED' : 'failed'}${goal ? ` (+${gainedFor(goal, before, after)} ${goal.items.join('/')})` : ''}`);
         if (r.free) console.log(`[voyager] storage replay ${r.name} output: ${String(res.message || '(none)').split(/\n|\|/).filter(l => /\[(toss|chest)\]/.test(l)).join(' | ').slice(-800)}; inv now ${JSON.stringify(after.inventory)}`);
@@ -878,7 +910,13 @@ Use only c; no other globals.`;
     _chain(item, need, inv, depth, plan, path) {
         if ((inv[item] || 0) >= need) return true;
         if (depth > 3 || path.includes(item)) return false;
-        const c = this._producers(item); if (!c.length) { console.log(`[backchain] no learned skill produces ${item}`); return false; }
+        const c = this._producers(item);
+        if (!c.length) {
+            console.log(`[backchain] no learned skill produces ${item}`);
+            // SkillWeaver-style: record missing producer for idle practice
+            this.idlePractice.recordMissingProducer(item);
+            return false;
+        }
         const pick = this._boltzmann(c);
         console.log(`[backchain] ${'  '.repeat(depth)}${item} x${need}: ${c.length} producer(s) [${c.map(x => `${x.s.name} V=${x.V.toFixed(2)}`).join(', ')}] -> Boltzmann picked ${pick.s.name}`);
         for (const [k, n] of Object.entries(pick.s.consumes || {})) if (!this._chain(k, n, inv, depth + 1, plan, [...path, item])) return false;
@@ -904,6 +942,17 @@ Use only c; no other globals.`;
     // fix34: added prune, generalise, split detection
     _afterSuccess() {
         this._polyMerge();
+        // SkillWeaver-style: track weak skills for idle practice
+        for (const s of this.skills) {
+            if (s.demoted || s.mergedInto || !s.stats) continue;
+            const total = (s.stats.success || 0) + (s.stats.fail || 0);
+            if (total >= 3) {
+                const failRate = (s.stats.fail || 0) / total;
+                if (failRate >= 0.4) {
+                    this.idlePractice.recordWeakSkill(s.name, failRate);
+                }
+            }
+        }
         let n = 0;
         const L = this.skills.filter(s => !s.primitive && !s.handwritten && !s.demoted && !s.mergedInto && !s.candidate && s.embedding && (s.effects || []).length);
         for (let i = 0; i < L.length; i++) for (let j = i + 1; j < L.length; j++) {
@@ -1153,12 +1202,16 @@ Rules:
 - The bot must survive: dying loses its inventory. Nothing keeps it alive automatically (no eating, fleeing, fighting or sheltering reflexes), so survival is your job too: read time, health, food, threats and inventory space in the state and decide.
 Reply ONLY with JSON: {"reasoning": "ONE short sentence", "task": "...", "context": "short hint how to do it"}`;
         const bot = this.agent.bot;   // fix29: current vitals as plain facts, read now (an overlapped plan's state may be minutes old)
+        // AWM-style: retrieve relevant workflows for context
+        const taskContext = state.note || '';
+        const relevantWorkflows = this.repairMemory.getWorkflowsForTask(taskContext || this.progress.failed.slice(-3).join(' '), 2);
+        const workflowHints = this.repairMemory.formatWorkflowHints(relevantWorkflows);
         const user = `known_skills: ${JSON.stringify(this.skills.map(s => s.name))}
 replayable_tasks (cheap, no new code needed): ${JSON.stringify(this.skills.filter(s => s.task && !s.primitive).map(s => s.task.split(/\s+(?:within|at|using|from)\b/i)[0]).slice(-25))} plus any "Mine N <block or ore>", "Collect N <log>", "Get N <item>", "Smelt N <raw> into N <out>", "Kill N <mob>", "Harvest N <crop>"
 completed_tasks: ${JSON.stringify(this.progress.completed.slice(-30))}
 failed_tasks: ${JSON.stringify(this.progress.failed.slice(-15))}
 ${this._stateText(state)}
-current_health: ${Math.round(bot.health)}/20\ncurrent_food: ${bot.food}/20 (20/20 = full)${this._cursorLimited() ? '\nIMPORTANT: the code-writing model is unavailable right now, so ONLY propose a task from replayable_tasks or "Mine N <block>".' : ''}`;   // fix31: slow-changing lists first so Ollama reuses the cached prompt prefix
+current_health: ${Math.round(bot.health)}/20\ncurrent_food: ${bot.food}/20 (20/20 = full)${this._cursorLimited() ? '\nIMPORTANT: the code-writing model is unavailable right now, so ONLY propose a task from replayable_tasks or "Mine N <block>".' : ''}${workflowHints ? '\n' + workflowHints : ''}`;   // fix31: slow-changing lists first so Ollama reuses the cached prompt prefix
         const facts = recipeFacts(this.progress.failed.slice(-5).join(' '));
         return parseLocalJSON(await this._askLocal(system, facts ? user + '\n' + facts : user), ['reasoning', 'task', 'context']);
     }
@@ -1456,9 +1509,12 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         if (!this._updateAllowed(e, `repair after ${q.kind}`)) { console.log(`[psn] repair of ${e.name} skipped: maturity gate froze it`); return false; }
         this._repairs[e.name] = Date.now(); delete (this.progress.deferCounts || {})[`${e.name}:${q.kind}`]; this._saveProgress();   // fix27: counter resets when the repair actually runs
         const kids = [...this._closure(e.name)].map(n => this.skills.find(s => s.name === n)).filter(Boolean);
+        // AWM-style: retrieve similar past repair lessons
+        const pastLessons = await this.repairMemory.retrieveSimilar(q.evidence, 3);
+        const awmHints = this.repairMemory.formatHintsForCoder(pastLessons);
         const system = `You repair ONE skill in a Minecraft mineflayer skill library (PSN-style targeted fix). Return a single \`\`\`javascript code block containing ONLY the fixed function, with the SAME name and a compatible signature. First line inside the block: // DESCRIPTION: <one sentence>. Call other library skills by name (they are in scope); never redefine them. Every loop must check bot.interrupt_code. If something still cannot be done, log(bot, 'FAILED: <reason>') and return a falsy value; no silent fallbacks. findBlock/findBlocks/nearestEntity/bot.entities/blockAt results can be null or empty: always null-check them before reading .position/.x or calling methods on them.\nLIBRARY (the blamed skill's dependencies and callers):\n${this.catalogue(new Set([e.name, ...this._closure(e.name), ...parentsOf(e.name, this._graph())]))}`;
-        const user = `Blamed skill: ${e.name} (${q.kind === 'caller_fix' ? 'it calls the leaf ' + q.leaf + ' in a situation where the leaf cannot succeed: fix how/when it calls it, e.g. obtain the missing prerequisite first' : 'its own logic failed'})\nTask that failed: ${q.task}\nFailure path: ${q.path.join(' > ')}\nEvidence: ${q.evidence}\n--- execution trace (indent = call depth) ---\n${q.trace}\n${e.contract ? `--- learned contract of ${e.name} (must hold after your fix) ---\npre: ${e.contract.pre}\npost: ${e.contract.post}\n` : ''}--- current code of ${e.name} ---\n${e.code}\n--- skills it uses ---\n${kids.map(k => '// ' + k.description + '\n' + signatureOf(k.code, k.name)).join('\n')}\n${(e.repairHistory || []).length ? `\n--- your last ${e.repairHistory.length} repair proposal(s) for ${e.name} (do not repeat what failed) ---\n` + e.repairHistory.map((h, i) => `${i + 1}. [${h.outcome || 'pending'}] ${h.kind}: ${h.evidence}\n   change: ${h.desc}`).join('\n') : ''}${q.peers?.length > 1 ? `\nOther skills blamed on the same failure (repaired children-first): ${q.peers.join(', ')}` : ''}\nWrite the fixed ${e.name}:`;
-        console.log(`[psn] repair memory for ${e.name}: ${(e.repairHistory || []).length} past proposal(s) in the prompt`);
+        const user = `Blamed skill: ${e.name} (${q.kind === 'caller_fix' ? 'it calls the leaf ' + q.leaf + ' in a situation where the leaf cannot succeed: fix how/when it calls it, e.g. obtain the missing prerequisite first' : 'its own logic failed'})\nTask that failed: ${q.task}\nFailure path: ${q.path.join(' > ')}\nEvidence: ${q.evidence}\n--- execution trace (indent = call depth) ---\n${q.trace}\n${e.contract ? `--- learned contract of ${e.name} (must hold after your fix) ---\npre: ${e.contract.pre}\npost: ${e.contract.post}\n` : ''}--- current code of ${e.name} ---\n${e.code}\n--- skills it uses ---\n${kids.map(k => '// ' + k.description + '\n' + signatureOf(k.code, k.name)).join('\n')}\n${(e.repairHistory || []).length ? `\n--- your last ${e.repairHistory.length} repair proposal(s) for ${e.name} (do not repeat what failed) ---\n` + e.repairHistory.map((h, i) => `${i + 1}. [${h.outcome || 'pending'}] ${h.kind}: ${h.evidence}\n   change: ${h.desc}`).join('\n') : ''}${q.peers?.length > 1 ? `\nOther skills blamed on the same failure (repaired children-first): ${q.peers.join(', ')}` : ''}${awmHints ? `\n${awmHints}` : ''}\nWrite the fixed ${e.name}:`;
+        console.log(`[psn] repair memory for ${e.name}: ${(e.repairHistory || []).length} past proposal(s) in the prompt${pastLessons.length ? `, ${pastLessons.length} AWM lesson(s)` : ''}`);
         console.log(`[psn] REPAIR ${e.name} [${q.kind}] with the code model (evidence: ${q.evidence.slice(0, 160)})`);
         let code, body, desc, extra = '';
         for (let att = 1; att <= 2; att++) {   // fix19 (3): one retry with the lint/format error fed back
@@ -1477,13 +1533,26 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
             }
             if (!err) break;
             console.log(`[psn] repair attempt ${att} FAILED for ${e.name}: ${err.slice(0, 300)}${att < 2 ? '; retrying with the error fed back' : ''}`);
-            if (att === 2) { this._noteProposal(e, { task: q.task, kind: q.kind, evidence: q.evidence.slice(0, 200), desc: `invalid code: ${err.slice(0, 150)}`, outcome: 'lint failed' }); return false; }
+            if (att === 2) {
+                this._noteProposal(e, { task: q.task, kind: q.kind, evidence: q.evidence.slice(0, 200), desc: `invalid code: ${err.slice(0, 150)}`, outcome: 'lint failed' });
+                // AWM-style: record lint failure
+                await this.repairMemory.recordRepair({ errorSignature: q.evidence, fixSnippet: code?.slice(0, 300), outcome: false, taskHint: q.task, skillName: e.name });
+                return false;
+            }
             extra = `\n--- your previous reply was rejected ---\n${err}\n--- previous code ---\n${code || '(none)'}\nFix the error and write the fixed ${e.name} again:`;
         }
         this._lastEffects = e.effects || [];
         this._noteProposal(e, { task: q.task, kind: q.kind, evidence: q.evidence.slice(0, 200), desc: desc.slice(0, 200) });
         const saved = await this.saveSkill(e.name, desc, body, `repair: ${q.task}`, { repair: true });
-        if (!saved) { this._proposalOutcome(e, 'rejected at submit'); this._saveSkills(); console.log(`[psn] repair of ${e.name} rejected by the gate`); return false; }
+        if (!saved) {
+            this._proposalOutcome(e, 'rejected at submit'); this._saveSkills();
+            // AWM-style: record gate rejection
+            await this.repairMemory.recordRepair({ errorSignature: q.evidence, fixSnippet: desc?.slice(0, 200), outcome: false, taskHint: q.task, skillName: e.name });
+            console.log(`[psn] repair of ${e.name} rejected by the gate`);
+            return false;
+        }
+        // AWM-style: record successful repair submission
+        await this.repairMemory.recordRepair({ errorSignature: q.evidence, fixSnippet: desc?.slice(0, 200), outcome: true, taskHint: q.task, skillName: e.name });
         if (e.candidate) { e.candidate.trialTask = q.task; e.candidate.trialAfter = Date.now(); this._saveSkills(); }   // fix28: dedicated trial run next step
         console.log(`[psn] repaired ${e.name}: submitted to the gate (parents are re-validated once it is promoted)`);
         return true;
@@ -1665,6 +1734,64 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         return true;
     }
 
+    // SkillWeaver-style idle practice (https://arxiv.org/abs/2504.07079)
+    // When idle with no pending tasks/repairs, propose a small practice goal from gaps/weak skills
+    async _idlePractice() {
+        const check = this.idlePractice.isReadyForPractice(
+            !!(this._repairQueue?.length),
+            !!(this.progress.subgoals?.length) || !!this._decomposeQueue
+        );
+        if (!check.ready) {
+            if (check.reason !== 'not idle' && check.reason !== 'practice disabled') {
+                console.log(`[idle-practice] not ready: ${check.reason}`);
+            }
+            return false;
+        }
+
+        const goal = this.idlePractice.proposePracticeGoal(
+            this.skills,
+            this.npGraph,
+            this.progress.failed.slice(-10)
+        );
+        if (!goal) return false;
+
+        console.log(`[idle-practice] STARTING practice: ${goal.goal}`);
+        this.idlePractice.startPractice(goal);
+
+        try {
+            const before = this.observe();
+            let ok = false;
+            let skillLearned = null;
+
+            if (goal.skill && goal.type !== 'producer_gap') {
+                const entry = this.skills.find(s => s.name === goal.skill && !s.demoted);
+                if (entry) {
+                    const rp = await this._replay(entry.task || goal.goal, before, { name: entry.name, call: `await ${entry.name}(bot);` });
+                    ok = !!rp?.ok;
+                    if (ok) skillLearned = entry.name;
+                }
+            } else {
+                const route = this._findReplay(goal.goal) || await this._embedReplay(goal.goal);
+                if (route) {
+                    const rp = await this._replay(goal.goal, before, route);
+                    ok = !!rp?.ok;
+                    if (ok) skillLearned = route.name;
+                }
+            }
+
+            this.idlePractice.endPractice(ok, skillLearned);
+            if (ok && skillLearned) {
+                console.log(`[idle-practice] SUCCESS: practiced ${skillLearned}`);
+                this._afterSuccess();
+            }
+            return true;
+        } catch (e) {
+            console.error(`[idle-practice] practice FAILED with error: ${e.message}`);
+            try { this.idlePractice.endPractice(false, null); } catch (e2) { /* fail-loud already threw */ }
+            return true;
+        }
+    }
+
     async step() {
         const now = Date.now(); console.log(`[timing] ${new Date().toISOString().slice(11,19)}Z step start (gap since last step end ${this._stepEnd ? now - this._stepEnd : 0}ms)`);   // fix27
         try { return await this._step(); } finally { this._flushSkills(); this._stepEnd = Date.now(); console.log(`[timing] ${new Date().toISOString().slice(11,19)}Z step end (took ${this._stepEnd - now}ms)`); }
@@ -1687,6 +1814,8 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         if (await this._generalise()) return;   // fix34
         if (await this._split()) return;   // fix34
         if (await this._retention()) return;   // fix32
+        // SkillWeaver-style: idle practice when no pending work (gated: idle, no repairs, no subgoals)
+        if (await this._idlePractice()) return;
         const before = this.observe();
         this._curSub = null;
         const sub = this._subgoalTask(), ms = null, fromCurr = !sub && !ms;
@@ -1797,6 +1926,16 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
                 this._saveProgress();
                 this._subgoalDone(fn[1]);
                 { const e = this.skills.find(s => s.name === fn[1]); if (e && !e.candidate) this._learnEffects(e, before, after); }
+                // ADAM-style: record inventory delta for needs/produces learning
+                this.npGraph.recordDelta(fn[1], before.inventory, after.inventory);
+                // AWM-style: extract workflow from multi-step trace
+                const trace = this.agent.bot.__psnTrace;
+                if (Array.isArray(trace) && trace.length >= 2) {
+                    const steps = trace.filter(t => !t.name.startsWith('skills.')).map(t => t.name).slice(0, 8);
+                    if (steps.length >= 2) {
+                        this.repairMemory.recordWorkflow({ steps, task, outcome: true });
+                    }
+                }
                 this.agent.openChat?.(`Done: ${task}. Learned skill ${fn[1]}.`);
                 this._afterSuccess();
                 return;
@@ -1808,6 +1947,8 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
         this.progress.failed.push(task);
         this._saveProgress(); this._windowCheck(false);
         console.log(`[voyager] task failed after ${MAX_ATTEMPTS} attempts: ${task}`);
+        // SkillWeaver-style: record gap for idle practice
+        this.idlePractice.recordGap(task, anyCut || `failed ${MAX_ATTEMPTS}x`);
         // fix19 (1): failed twice (recently) or cut off -> decompose
         const fails = this.progress.failed.slice(-20).filter(t => t === task).length;
         if (fails >= 2 || anyCut || this._decomposeQueue?.task === task) { if (this._decomposeQueue?.task === task) this._decomposeQueue = null; await this._decompose(task, anyCut || `failed ${fails}x; last critic: ${String(feedback).slice(-300)}`); }
