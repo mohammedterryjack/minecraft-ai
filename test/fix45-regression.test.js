@@ -99,8 +99,9 @@ describe('fix45: hunger/health as planner facts', () => {
             'proposeTask should include current_health from bot.health');
         assert.ok(/current_food.*bot\.food|bot\.food.*current_food/.test(proposeTaskBody), 
             'proposeTask should include current_food from bot.food');
-        assert.ok(/_stateText\s*\(\s*state\s*\)/.test(proposeTaskBody), 
-            'proposeTask should pass state through _stateText which includes food_value/health_value');
+        // fix47: proposeTask now uses _compactState for efficiency (includes food/health in compact format)
+        assert.ok(/_compactState\s*\(\s*state\s*\)/.test(proposeTaskBody), 
+            'proposeTask should pass state through _compactState which includes food_value/health_value');
     });
 
     it('should have curriculum system prompt mention survival and reading health/food', async () => {
