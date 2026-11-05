@@ -339,7 +339,7 @@ Use only c; no other globals.`;
     _interruptReason(output = '') {
         const died = this._diedInRun();
         if (died) return `died: ${died.message} at ${died.pos}${this._deathDetail(died)}`;
-        const st = this._stalledInRun(); if (st) return `stalled: no position or inventory change for 60s at ${st.pos}`;
+        const st = this._stalledInRun(); if (st) return `stalled: no progress (position, inventory, health, food, window, lit furnace) for 60s at ${st.pos}`;
         const bot = this.agent.bot, p = bot.entity.position, by = this.agent.actions.lastInterruptBy || 'unknown';
         const s = this._surfaceY(p.x, p.z), under = s !== null && p.y < s - 4;
         const travelling = /travelTo|goToPosition|goToSurface|path|Moving|travell/i.test(String(output).slice(-800));
@@ -687,6 +687,7 @@ Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
     }
     // fix28 (C): plan the next task concurrently with the current action; the plan is used only if the state it was made for still holds
     _prefetchPlan(task, before) {
+        if ((this.progress.subgoals || []).length) { this._plan = null; console.log(`[plan] overlap skipped: ${this.progress.subgoals.length} subgoal(s) queued`); return; }   // fix30
         const t0 = Date.now();
         const p = this.proposeTask({ ...before, note: `The bot is now doing "${task}". Propose the task to do AFTER it, assuming it succeeds.` })
             .then(r => { console.log(`[plan] next proposal ready in ${Date.now() - t0}ms (overlapped with "${task}"): ${r?.task}`); return r; }, e => { console.log(`[plan] prefetch failed: ${e.message}`); return null; });
@@ -904,7 +905,7 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         const died = this._diedInRun();
         if (died) { let i = -1; for (let k = 0; k < trace.length; k++) if ((trace[k].t0 || 0) <= died.t && (trace[k].t1 ?? Infinity) >= died.t - 1500 && (i < 0 || trace[k].depth >= trace[i].depth)) i = k; if (i < 0) i = trace.length - 1; console.log(`[psn] death attributed to the call running at death time: ${trace[i].name} (depth ${trace[i].depth})`); trace[i].ownFail = [`DIED: ${died.message} at ${died.pos}${this._deathDetail(died)}`]; for (; i >= 0; i = trace[i].parent) { trace[i].intr = false; trace[i].ok = false; trace[i].fail = true; } ok = false; }
         const stalled = !died && this._stalledInRun();   // fix27: a stall is a failure of the deepest call open at stall time
-        if (stalled) { let i = -1; for (let k = 0; k < trace.length; k++) if ((trace[k].t0 || 0) <= stalled.t && (trace[k].t1 ?? Infinity) >= stalled.t - 1500 && (i < 0 || trace[k].depth >= trace[i].depth)) i = k; if (i < 0) i = trace.length - 1; console.log(`[psn] stall attributed to the call running at stall time: ${trace[i].name} (depth ${trace[i].depth})`); trace[i].ownFail = [`FAILED: STALLED: no position or inventory change for 60s at ${stalled.pos}`]; for (; i >= 0; i = trace[i].parent) { trace[i].intr = false; trace[i].ok = false; trace[i].fail = true; } ok = false; }
+        if (stalled) { let i = -1; for (let k = 0; k < trace.length; k++) if ((trace[k].t0 || 0) <= stalled.t && (trace[k].t1 ?? Infinity) >= stalled.t - 1500 && (i < 0 || trace[k].depth >= trace[i].depth)) i = k; if (i < 0) i = trace.length - 1; console.log(`[psn] stall attributed to the call running at stall time: ${trace[i].name} (depth ${trace[i].depth})`); trace[i].ownFail = [`FAILED: STALLED: no progress (position, inventory, health, food, window, lit furnace) for 60s at ${stalled.pos}`]; for (; i >= 0; i = trace[i].parent) { trace[i].intr = false; trace[i].ok = false; trace[i].fail = true; } ok = false; }
         // fix27: no hotspot filter; deaths stay traced failures (above) and blame/repair learns avoidance
         // fix19 (5): an explicit FAILED line from a skill is a contract failure even if the task check passed (e.g. ensureChest inside a storage task)
         const explicit = trace.some(r => !r.intr && (r.ownFail || []).some(l => /FAILED|CONDITION violated/.test(l)));   // fix22: contract violations count
