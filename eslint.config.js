@@ -24,7 +24,10 @@ export default [
       "curly": "off",                   // Do not enforce the use of curly braces around blocks of code.
       "no-unused-vars": "off",          // Disable warnings for unused variables.
       "no-unreachable": "off",          // Disable warnings for unreachable code.
-      "require-await": "error",         // Disallow async functions which have no await expression
+      // fix38: demoted require-await from error to off - async functions may be async for API consistency
+      // without needing internal await (e.g. returning a Promise). This is not a fail-loud issue.
+      // Real fail-loud rules: no-undef, no-empty (catch blocks), no-floating-promise
+      "require-await": "off",
       "no-floating-promise/no-floating-promise": "error", // Disallow Promises without error handling or awaiting
     },
   },
