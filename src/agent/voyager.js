@@ -324,7 +324,8 @@ export class Voyager {
     // fix41: uses Object.keys for names (not extractSig), adds catch-all, re-runs on leftovers, also rewrites s.candidate.code
     // fix42: MUST NOT create self-recursion by rewriting skills.NAME/world.NAME to NAME inside function NAME
     _migrateToBarenames() {
-        const LEFTOVER_RE = /\b(?:skills|world)\.\w+\s*\(/;
+        // fix47: also detect shadow patterns like "const log = skills.log"
+        const LEFTOVER_RE = /\b(?:skills|world)\.\w+/;
         const hasLeftovers = () => this.skills.some(s => (s.code && LEFTOVER_RE.test(s.code)) || (s.candidate?.code && LEFTOVER_RE.test(s.candidate.code)));
         if (this.progress.migratedToBarenames && !hasLeftovers()) return;  // fully migrated
         if (this.progress.migratedToBarenames) {
@@ -375,6 +376,13 @@ export class Voyager {
             before = code;
             code = code.replace(/\bworld\.(\w+)\s*\(/g, '$1(');
             if (code !== before) changes++;
+            // fix47: remove shadow patterns like "const log = skills.log" / "const foo = world.bar"
+            before = code;
+            code = code.replace(/\bconst\s+(\w+)\s*=\s*(?:skills|world)\.(\w+)\s*[;\n]/g, (match, localName, apiName) => {
+                if (localName === apiName) return '';  // Remove redundant shadow
+                return `const ${localName} = ${apiName};\n`;  // Keep alias but use bare name
+            });
+            if (code !== before) changes++;
             return { code, changes };
         };
         let migrated = 0, totalChanges = 0, candidateChanges = 0;
@@ -409,12 +417,12 @@ export class Voyager {
                 migrated++;
             }
         }
-        // fix42: post-migration scan for any remaining skills.*/world.* calls (fail loud)
+        // fix42/47: post-migration scan for any remaining skills.*/world.* patterns (fail loud)
         for (const s of this.skills) {
             if (!s.code) continue;
-            const leftover = s.code.match(/\b(?:skills|world)\.[A-Za-z_]\w*\s*\(/g);
+            const leftover = s.code.match(/\b(?:skills|world)\.[A-Za-z_]\w*/g);
             if (leftover) {
-                console.error(`[fix42] LEFTOVER OLD-STYLE CALLS in ${s.name}: ${leftover.join(', ')} - these will fail at runtime (SES has no skills/world objects)`);
+                console.error(`[fix47] LEFTOVER OLD-STYLE PATTERNS in ${s.name}: ${leftover.join(', ')} - these will fail at runtime (SES has no skills/world objects)`);
             }
         }
         if (migrated > 0) {
@@ -2067,16 +2075,142 @@ Use only c; no other globals.`;
         return { message: `completed in ${Date.now() - practiceStart}ms` };
     }
 
+    // fix47: compute cheapest tool to break a block by recursing through recipes
+    // Returns { tool, chain: [{item, count}] } where chain is the recipe steps from gatherable materials
+    _cheapestHarvestTool(blockName, inv) {
+        if (!VERSION) return null;
+        try {
+            const md = minecraftData(VERSION);
+            const block = md.blocksByName[blockName];
+            if (!block?.harvestTools) return null;
+            
+            // Get all valid tools from harvestTools (keys are item IDs)
+            const validToolIds = Object.keys(block.harvestTools).map(Number);
+            if (!validToolIds.length) return null;
+            
+            // Find the cheapest tool by recipe depth
+            let cheapest = null;
+            let cheapestDepth = Infinity;
+            
+            for (const toolId of validToolIds) {
+                const toolItem = md.items[toolId];
+                if (!toolItem) continue;
+                
+                // Check if we already have it
+                if ((inv[toolItem.name] || 0) > 0) {
+                    return { tool: toolItem.name, chain: [], reason: 'already have' };
+                }
+                
+                // Compute recipe chain depth
+                const chain = this._recipeChain(toolItem.name, inv, md, 0, new Set());
+                if (chain && chain.length < cheapestDepth) {
+                    cheapestDepth = chain.length;
+                    cheapest = { tool: toolItem.name, chain };
+                }
+            }
+            return cheapest;
+        } catch (e) {
+            console.log(`[fix47] _cheapestHarvestTool failed for ${blockName}: ${e.message}`);
+            return null;
+        }
+    }
+    
+    // fix47: compute recipe chain from gatherable materials (harvestTools undefined = can break by hand)
+    _recipeChain(itemName, inv, md, depth, visited) {
+        if (depth > 10 || visited.has(itemName)) return null;
+        visited.add(itemName);
+        
+        // Already have it
+        if ((inv[itemName] || 0) > 0) return [];
+        
+        const item = md.itemsByName[itemName];
+        if (!item) return null;
+        
+        // Check recipes
+        const recipes = md.recipes?.[item.id];
+        if (!recipes?.length) {
+            // No recipe - check if it's a gatherable block (can break by hand)
+            const block = md.blocksByName[itemName];
+            if (block && !block.harvestTools) {
+                // Can gather by hand
+                return [{ item: itemName, count: 1, action: 'gather' }];
+            }
+            return null;
+        }
+        
+        // Find simplest recipe
+        let bestChain = null;
+        for (const recipe of recipes) {
+            const ingredients = [];
+            if (recipe.inShape) {
+                for (const row of recipe.inShape) {
+                    for (const slot of row) {
+                        if (slot?.id >= 0) {
+                            const ingName = md.items[slot.id]?.name;
+                            if (ingName) ingredients.push({ name: ingName, count: slot.count || 1 });
+                        }
+                    }
+                }
+            } else if (recipe.ingredients) {
+                for (const ing of recipe.ingredients) {
+                    if (ing?.id >= 0) {
+                        const ingName = md.items[ing.id]?.name;
+                        if (ingName) ingredients.push({ name: ingName, count: ing.count || 1 });
+                    }
+                }
+            }
+            
+            // Recurse for each ingredient
+            let totalChain = [];
+            let valid = true;
+            for (const ing of ingredients) {
+                const subChain = this._recipeChain(ing.name, inv, md, depth + 1, new Set(visited));
+                if (!subChain) { valid = false; break; }
+                totalChain = [...totalChain, ...subChain];
+            }
+            
+            if (valid) {
+                totalChain.push({ item: itemName, count: recipe.result?.count || 1, action: 'craft' });
+                if (!bestChain || totalChain.length < bestChain.length) {
+                    bestChain = totalChain;
+                }
+            }
+        }
+        return bestChain;
+    }
+    
     // ---------- automatic curriculum ----------
     // fix29: restored fix19 PSN decomposition (removed with the milestone planner in fix27c while its callers stayed):
     // a goal that keeps failing is split by the local model into 2-4 subgoals (depth <= 2, 30-min cooldown per goal);
     // each subgoal is learned as a skill, then the parent is retried composing those skills
-    // fix47: inventory-first planning - check if goal can be satisfied by smelting before queuing gather/mine subgoals
+    // fix47: inventory-first planning + harvestTools-based tool decompose
     async _decompose(task, reason) {
         const d = (this.progress.decomposed ||= {}), q = (this.progress.subgoals ||= []);
         const depth = (this._curSub?.task === task ? this._curSub.depth : 0);
         if (depth >= 2) { console.log(`[psn] decompose skipped for "${task}": already a depth-${depth} subgoal`); return false; }
         if (d[task] && Date.now() - d[task].at < 30 * 60e3) { console.log(`[psn] decompose skipped for "${task}": decomposed ${Math.round((Date.now() - d[task].at) / 60e3)} min ago`); return false; }
+        
+        const reasonStr = String(reason);
+        const inv = this.observe().inventory || {};
+        
+        // fix47: detect "Cannot break X with current tools" and compute cheapest tool via harvestTools
+        const cannotBreak = reasonStr.match(/Cannot break (\w+) with current tools/i);
+        if (cannotBreak) {
+            const blockName = cannotBreak[1].toLowerCase();
+            const toolInfo = this._cheapestHarvestTool(blockName, inv);
+            if (toolInfo?.chain?.length > 0) {
+                // Queue the recipe chain as subgoals
+                const subs = toolInfo.chain.map(step => {
+                    if (step.action === 'gather') return `Collect 1 ${step.item}`;
+                    return `Craft 1 ${step.item}`;
+                });
+                d[task] = { subs, skills: [], at: Date.now(), reason: `need ${toolInfo.tool} to break ${blockName}` };
+                q.unshift(...subs.map(t => ({ task: t, parent: task, depth: depth + 1 })), { task, retry: true, depth });
+                this._saveProgress();
+                console.log(`[psn] DECOMPOSE (harvestTools) "${task}" -> need ${toolInfo.tool}: ${subs.join(', ')}`);
+                return true;
+            }
+        }
         
         // fix47: inventory-first planning - before queuing gather/mine subgoals, check if we can produce
         const goal = smeltGoal(task) || countGoal(task) || parseVerboseGoal(task);

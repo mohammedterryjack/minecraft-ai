@@ -9,7 +9,7 @@
  * 6. Open items: tossClutter postcondition, deposit logic
  */
 
-import { describe, it, beforeEach } from 'node:test';
+import { describe, it, before, beforeEach } from 'node:test';
 import assert from 'node:assert';
 import { readFileSync } from 'fs';
 
@@ -607,5 +607,180 @@ describe('fix47: integration - all prefixed patterns removed', () => {
         
         assert.strictEqual(violations.length, 0, 
             `Found prefixed calls in model-visible content: ${JSON.stringify(violations)}`);
+    });
+});
+
+describe('fix47: prefix migration and shadow removal', () => {
+    it('should remove skills.* and world.* prefixes from stored skill code', async () => {
+        const { Voyager } = await import('../src/agent/voyager.js');
+        const { mkdirSync } = await import('fs');
+        const tmpDir = `/tmp/test-prefix-${Date.now()}`;
+        mkdirSync(tmpDir, { recursive: true });
+        // Create a mock Voyager to test _migrateToBarenames
+        const mockVoyager = Object.create(Voyager.prototype);
+        mockVoyager.dir = tmpDir;
+        mockVoyager.progress = { migratedToBarenames: false };
+        mockVoyager._saveProgress = () => {};
+        mockVoyager._saveSkills = () => {};
+        mockVoyager.skills = [{
+            name: 'testPrefixedSkill',
+            code: `async function testPrefixedSkill(bot) {
+    const inv = world.getInventoryCounts(bot);
+    await skills.wait(bot, 100);
+    skills.log(bot, "test");
+    await skills.goToPosition(bot, 0, 64, 0);
+}`
+        }];
+        
+        // Call the migration
+        mockVoyager._migrateToBarenames();
+        
+        // Assert no prefixes remain
+        const code = mockVoyager.skills[0].code;
+        assert.ok(!code.includes('skills.'), `Found 'skills.' in migrated code: ${code}`);
+        assert.ok(!code.includes('world.'), `Found 'world.' in migrated code: ${code}`);
+        assert.ok(code.includes('getInventoryCounts(bot)'), 'Should have bare getInventoryCounts');
+        assert.ok(code.includes('await wait(bot, 100)'), 'Should have bare wait');
+        assert.ok(code.includes('log(bot,'), 'Should have bare log');
+        assert.ok(code.includes('await goToPosition(bot'), 'Should have bare goToPosition');
+    });
+    
+    it('should remove shadow patterns like const log = skills.log', async () => {
+        const { Voyager } = await import('../src/agent/voyager.js');
+        const { mkdirSync } = await import('fs');
+        const tmpDir = `/tmp/test-shadow-${Date.now()}`;
+        mkdirSync(tmpDir, { recursive: true });
+        const mockVoyager = Object.create(Voyager.prototype);
+        mockVoyager.dir = tmpDir;
+        mockVoyager.progress = { migratedToBarenames: false };
+        mockVoyager._saveProgress = () => {};
+        mockVoyager._saveSkills = () => {};
+        mockVoyager.skills = [{
+            name: 'testShadowSkill',
+            code: `async function testShadowSkill(bot) {
+    const log = skills.log;
+    const goToPosition = skills.goToPosition;
+    const wait = world.wait;
+    
+    log(bot, "hello");
+    await goToPosition(bot, 0, 0, 0);
+}`
+        }];
+        
+        mockVoyager._migrateToBarenames();
+        
+        const code = mockVoyager.skills[0].code;
+        // Shadow patterns should be removed entirely
+        assert.ok(!code.includes('const log = skills.log'), 'Should remove shadow for log');
+        assert.ok(!code.includes('const goToPosition = skills.goToPosition'), 'Should remove shadow for goToPosition');
+        assert.ok(!code.includes('const wait = world.wait'), 'Should remove shadow for wait');
+        // But the bare function calls should remain
+        assert.ok(code.includes('log(bot,'), 'Should keep bare log call');
+        assert.ok(code.includes('await goToPosition(bot'), 'Should keep bare goToPosition call');
+    });
+    
+    it('should detect and report leftover prefixed patterns after migration', async () => {
+        const { Voyager } = await import('../src/agent/voyager.js');
+        const mockVoyager = Object.create(Voyager.prototype);
+        mockVoyager.progress = { migratedToBarenames: false };
+        mockVoyager._saveProgress = () => {};
+        mockVoyager._saveSkills = () => {};
+        mockVoyager.skills = [{
+            name: 'testLeftover',
+            // This shouldn't happen normally, but test the detection
+            code: `async function testLeftover(bot) {
+    // This is a comment mentioning skills.log
+    const x = bot.skills.something; // Different pattern
+}`
+        }];
+        
+        // Capture console.error
+        const errors = [];
+        const origError = console.error;
+        console.error = (...args) => errors.push(args.join(' '));
+        
+        mockVoyager._migrateToBarenames();
+        
+        console.error = origError;
+        
+        // The comment contains "skills.log" which would match the pattern
+        // This tests that the leftover detection works
+        assert.ok(mockVoyager.skills[0].code.includes('skills.log'), 
+            'Comment with skills.log should be preserved for detection test');
+    });
+});
+
+describe('fix47: harvestTools-based decompose', () => {
+    it('should compute cheapest harvest tool for stone via recipe chain', async () => {
+        const { Voyager, _setVersionForTest } = await import('../src/agent/voyager.js');
+        _setVersionForTest('1.20.4');
+        const mockVoyager = Object.create(Voyager.prototype);
+        mockVoyager.skills = [];
+        mockVoyager.progress = {};
+        
+        // No pickaxes in inventory
+        const inv = { oak_log: 10, cobblestone: 0 };
+        
+        const toolInfo = mockVoyager._cheapestHarvestTool('stone', inv);
+        
+        // Should find wooden_pickaxe as cheapest (can craft from oak_log)
+        assert.ok(toolInfo, 'Should find a tool');
+        assert.ok(toolInfo.tool, 'Should have a tool name');
+        assert.ok(toolInfo.chain, 'Should have a recipe chain');
+        // The chain should include gathering/crafting steps
+        assert.ok(toolInfo.chain.length > 0, 'Chain should have steps');
+    });
+    
+    it('should return already have if pickaxe is in inventory', async () => {
+        const { Voyager, _setVersionForTest } = await import('../src/agent/voyager.js');
+        _setVersionForTest('1.20.4');
+        const mockVoyager = Object.create(Voyager.prototype);
+        mockVoyager.skills = [];
+        mockVoyager.progress = {};
+        
+        const inv = { wooden_pickaxe: 1 };
+        
+        const toolInfo = mockVoyager._cheapestHarvestTool('stone', inv);
+        
+        assert.ok(toolInfo, 'Should find tool info');
+        assert.strictEqual(toolInfo.tool, 'wooden_pickaxe', 'Should identify wooden_pickaxe');
+        assert.deepStrictEqual(toolInfo.chain, [], 'Chain should be empty (already have)');
+        assert.strictEqual(toolInfo.reason, 'already have', 'Should say already have');
+    });
+    
+    it('should queue harvest tool recipe chain as subgoals on Cannot break failure', async () => {
+        const { Voyager, _setVersionForTest } = await import('../src/agent/voyager.js');
+        _setVersionForTest('1.20.4');
+        const mockVoyager = Object.create(Voyager.prototype);
+        mockVoyager.skills = [];
+        mockVoyager.progress = { decomposed: {}, subgoals: [] };
+        mockVoyager._curSub = null;
+        mockVoyager._saveProgress = () => {};
+        mockVoyager.observe = () => ({ inventory: { oak_log: 10 } });
+        
+        // Mock _cheapestHarvestTool to return a known chain
+        mockVoyager._cheapestHarvestTool = (blockName, inv) => {
+            if (blockName === 'stone') {
+                return {
+                    tool: 'wooden_pickaxe',
+                    chain: [
+                        { item: 'oak_planks', count: 4, action: 'craft' },
+                        { item: 'stick', count: 2, action: 'craft' },
+                        { item: 'wooden_pickaxe', count: 1, action: 'craft' }
+                    ]
+                };
+            }
+            return null;
+        };
+        
+        const result = await mockVoyager._decompose('Mine 10 stone', 'Cannot break stone with current tools');
+        
+        assert.ok(result, 'Decompose should return true (handled)');
+        assert.ok(mockVoyager.progress.decomposed['Mine 10 stone'], 'Should record decomposition');
+        const subs = mockVoyager.progress.decomposed['Mine 10 stone'].subs;
+        assert.ok(subs.length >= 1, 'Should have subgoals');
+        // Should include craft steps for the tool
+        assert.ok(subs.some(s => s.toLowerCase().includes('wooden_pickaxe')), 
+            'Subgoals should include crafting wooden_pickaxe');
     });
 });

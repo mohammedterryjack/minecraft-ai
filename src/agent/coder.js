@@ -73,6 +73,17 @@ export class Coder {
         });
         mkdirSync('.' + this.fp, { recursive: true });
     }
+    
+    // fix47: log prompt breakdown for debugging bloat issues
+    _logPromptBreakdown(kind, sections) {
+        const total = Object.values(sections).reduce((a, b) => a + b, 0);
+        const breakdown = Object.entries(sections).map(([k, v]) => `${k}=${v}`).join(' ');
+        console.log(`[prompt] kind=${kind} total=${total} chars: ${breakdown}`);
+        if (total > 50000) {
+            console.log(`[prompt] LOUD: ${kind} prompt is ${total} chars (>50k) - check for bloat`);
+        }
+        return total;
+    }
 
     // fix47: per-prompt breakdown logging for code generation (uses shared helper)
     _logPromptBreakdown(kind, sections) {
