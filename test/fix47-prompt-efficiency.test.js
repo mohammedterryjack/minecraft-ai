@@ -135,13 +135,13 @@ describe('fix47: prompt breakdown logging', () => {
     });
 
     it('should log breakdown with kind, total, and sections', async () => {
-        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        const promptUtilsSrc = readFileSync('./src/agent/prompt_utils.js', 'utf8');
         
-        // Check for the log format: [prompt] kind=X total=Y chars: ...
+        // Check for the log format in the shared helper: [prompt] kind=X total=Y chars: ...
         assert.ok(
-            voyagerSrc.includes('[prompt]') && 
-            voyagerSrc.includes('kind=') && 
-            voyagerSrc.includes('total='),
+            promptUtilsSrc.includes('[prompt]') && 
+            promptUtilsSrc.includes('kind=') && 
+            promptUtilsSrc.includes('total='),
             'Should log breakdown with kind, total, and sections'
         );
     });
@@ -166,15 +166,34 @@ describe('fix47: prompt breakdown logging', () => {
         );
     });
 
-    it('should log LOUD warning for large prompts (>50k)', async () => {
+    it('should use shared logPromptBreakdown helper (no magic threshold)', async () => {
         const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
         const coderSrc = readFileSync('./src/agent/coder.js', 'utf8');
+        const promptUtilsSrc = readFileSync('./src/agent/prompt_utils.js', 'utf8');
         
-        const hasLoudWarning = 
-            (voyagerSrc.includes('LOUD') && voyagerSrc.includes('50000')) ||
-            (coderSrc.includes('LOUD') && coderSrc.includes('50000'));
+        // Both should import and use the shared helper
+        assert.ok(
+            voyagerSrc.includes("import { logPromptBreakdown") ||
+            voyagerSrc.includes("import {logPromptBreakdown"),
+            'voyager.js should import logPromptBreakdown'
+        );
+        assert.ok(
+            coderSrc.includes("import { logPromptBreakdown") ||
+            coderSrc.includes("import {logPromptBreakdown"),
+            'coder.js should import logPromptBreakdown'
+        );
         
-        assert.ok(hasLoudWarning, 'Should log LOUD warning for prompts > 50k chars');
+        // prompt_utils.js should have the shared helper
+        assert.ok(
+            promptUtilsSrc.includes('export function logPromptBreakdown'),
+            'prompt_utils.js should export logPromptBreakdown'
+        );
+        
+        // No magic 50000 threshold in any file
+        assert.ok(
+            !voyagerSrc.includes('50000') && !coderSrc.includes('50000'),
+            'Should not have magic 50000 threshold'
+        );
     });
 });
 
@@ -229,17 +248,34 @@ describe('fix47: compact state format', () => {
         assert.ok(fnBody.includes('food:'), 'Should include food');
         assert.ok(fnBody.includes('inv:'), 'Should include inventory summary');
     });
+    
+    it('compact state should include FULL inventory (no slice)', async () => {
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        
+        // _compactState should NOT slice inventory (raw_iron:28 bug)
+        const compactMatch = voyagerSrc.match(/_compactState\(s\)\s*\{[\s\S]*?\n\s*\}/);
+        assert.ok(compactMatch, '_compactState method should exist');
+        
+        const fnBody = compactMatch[0];
+        
+        // Should NOT have slice(0, N) on items
+        assert.ok(
+            !fnBody.includes('.slice(0,') && !fnBody.includes('.slice(0, '),
+            'Should NOT slice inventory items (hiding items causes bugs)'
+        );
+    });
 });
 
 // ---------- Test 6: API list filtering ----------
 
 describe('fix47: API list filtering', () => {
-    it('should have CORE_API set with essential functions', async () => {
+    it('should NOT have hard-coded CORE_API set (learned, not hard-coded)', async () => {
         const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
         
+        // CORE_API was removed - built-ins are derived from skill deps
         assert.ok(
-            voyagerSrc.includes('CORE_API') && voyagerSrc.includes('new Set'),
-            'Should have CORE_API set defined'
+            !voyagerSrc.includes('static CORE_API'),
+            'Should NOT have hard-coded CORE_API set'
         );
     });
 
@@ -276,12 +312,22 @@ describe('fix47: API list filtering', () => {
         );
     });
 
-    it('should always include core APIs regardless of relevance score', async () => {
+    it('should include built-ins called by shown skills (usedByShown)', async () => {
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        
+        // Check for usedByShown pattern instead of hard-coded core
+        assert.ok(
+            voyagerSrc.includes('usedByShown') && voyagerSrc.includes('[built-in, used]'),
+            'Should mark built-ins used by shown skills'
+        );
+    });
+    
+    it('should derive needed built-ins from skill code via extractBareCalls', async () => {
         const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
         
         assert.ok(
-            voyagerSrc.includes('isCore') && voyagerSrc.includes('[built-in, core]'),
-            'Should mark core APIs distinctly'
+            voyagerSrc.includes('extractBareCalls'),
+            'Should use extractBareCalls to find built-ins called by skills'
         );
     });
 });
@@ -315,6 +361,74 @@ describe('fix47: settings respected', () => {
             voyagerSrc.includes("require('settings')") ||
             voyagerSrc.includes("require('./settings')"),
             'voyager.js should import settings'
+        );
+    });
+    
+    it('should throw if skill_topk or api_topk missing (no fallback)', async () => {
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        
+        // Should NOT have || fallbacks for these settings
+        assert.ok(
+            !voyagerSrc.includes('skill_topk || ') && !voyagerSrc.includes('api_topk || '),
+            'Should NOT have fallback defaults for skill_topk/api_topk'
+        );
+        
+        // Should throw if settings missing
+        assert.ok(
+            voyagerSrc.includes('typeof settings.skill_topk') &&
+            voyagerSrc.includes('typeof settings.api_topk') &&
+            voyagerSrc.includes('throw new Error'),
+            'Should throw if settings.skill_topk or api_topk is not a number'
+        );
+    });
+});
+
+// ---------- Test 8: Built-in called by retrieved skill always included ----------
+
+describe('fix47: skill-called built-ins included', () => {
+    it('should have extractBareCalls helper in prompt_utils.js', async () => {
+        const promptUtilsSrc = readFileSync('./src/agent/prompt_utils.js', 'utf8');
+        
+        assert.ok(
+            promptUtilsSrc.includes('export function extractBareCalls'),
+            'prompt_utils.js should export extractBareCalls'
+        );
+    });
+    
+    it('extractBareCalls should extract function calls from code', async () => {
+        // Test the actual function
+        const { extractBareCalls } = await import('../src/agent/prompt_utils.js');
+        
+        const testCode = `
+async function testSkill(bot) {
+    const pos = getNearestBlock(bot, 'stone');
+    await goToPosition(bot, pos.x, pos.y, pos.z);
+    log(bot, 'Done');
+}
+`;
+        const calls = extractBareCalls(testCode);
+        
+        assert.ok(calls.includes('getNearestBlock'), 'Should extract getNearestBlock');
+        assert.ok(calls.includes('goToPosition'), 'Should extract goToPosition');
+        assert.ok(calls.includes('log'), 'Should extract log');
+    });
+    
+    it('_relevantBuiltInAPI should accept shownSkillNames parameter', async () => {
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        
+        // Check that _relevantBuiltInAPI takes shownSkillNames
+        assert.ok(
+            voyagerSrc.includes('_relevantBuiltInAPI(query, k, shownSkillNames)'),
+            '_relevantBuiltInAPI should accept shownSkillNames parameter'
+        );
+    });
+    
+    it('should mark skill-used built-ins with [built-in, used]', async () => {
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        
+        assert.ok(
+            voyagerSrc.includes('[built-in, used]'),
+            'Should mark used built-ins distinctly'
         );
     });
 });

@@ -22,6 +22,7 @@ import minecraftData from 'minecraft-data';
 import { Ollama } from '../models/ollama.js';
 import { signatureOf, depsOf, missingCalls, findCycle, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf } from './skill_graph.js';
 import { getBareAPI } from './coder.js';   // fix40: unified bare-name API helper
+import { logPromptBreakdown, extractBareCalls } from './prompt_utils.js';   // fix47: shared prompt utilities
 const LOCAL = { model: 'qwen3:4b-instruct-2507-q4_K_M', url: 'http://192.168.1.215:11434', params: { format: 'json', options: { num_ctx: 8192, num_predict: 512 } } };   // fix38: raised from 150 to 512 - short JSON replies still need room for reasoning; truncation fails loudly (fix31)
 export const CALLS = { local: 0, code: 0, replay: 0 };
 
@@ -871,13 +872,14 @@ Use only c; no other globals.`;
         return result;
     }
     // fix47: compact state format for efficient prompts (one line, critical info only)
+    // Includes full inventory as k:v pairs (no slice - hiding items causes bugs like raw_iron:28 invisible)
     _compactState(s) {
         const inv = s.inventory || {};
-        const items = Object.entries(inv).sort((a, b) => b[1] - a[1]).slice(0, 6);
+        const items = Object.entries(inv).sort((a, b) => b[1] - a[1]);
         const invSummary = items.length ? items.map(([k, v]) => `${k}:${v}`).join(',') : 'empty';
         const eq = s.equipment || {};
         const held = eq.hand !== 'empty' ? eq.hand : '';
-        return `pos:(${s.position}) biome:${s.biome} time:${(s.time || '').split(' ')[0]} hp:${s.health_value}/${s.health_max} food:${s.food_value}/${s.food_max} inv:${s.inventory_slots},${s.empty_inventory_slots}empty${held ? ` held:${held}` : ''} threats:${s.threats || 'none'} top_items:[${invSummary}]`;
+        return `pos:(${s.position}) biome:${s.biome} time:${(s.time || '').split(' ')[0]} hp:${s.health_value}/${s.health_max} food:${s.food_value}/${s.food_max} inv:${s.inventory_slots},${s.empty_inventory_slots}empty${held ? ` held:${held}` : ''} threats:${s.threats || 'none'} items:[${invSummary}]`;
     }
     _stateText(s) {
         // fix34: present inventory facts prominently as exact counts (not just JSON blob)
@@ -1406,17 +1408,30 @@ Use only c; no other globals.`;
             return s.name;
         });
     }
-    // fix47: core primitives that are always included (essential for any code generation)
-    static CORE_API = new Set(['log', 'sleep', 'goToPosition', 'getNearestBlock', 'getInventoryCounts', 'placeBlock', 'breakBlockAt', 'craftRecipe', 'equip', 'consume', 'wait']);
-    
-    // fix47: retrieve relevant built-in API functions by embedding search
-    // Returns top-k relevant signatures plus core primitives
-    async _relevantBuiltInAPI(query, k = 15) {
+    // fix47: retrieve relevant built-in API functions by embedding search + skill deps
+    // Returns top-k relevant signatures plus built-ins that shown skills actually call
+    // No hard-coded CORE_API: derived from what the skill library uses (learned, not hard-coded)
+    async _relevantBuiltInAPI(query, k, shownSkillNames) {
+        if (typeof k !== 'number' || k < 1) {
+            throw new Error('[fix47] FAIL LOUD: api_topk must be a positive number in settings.js');
+        }
         const bare = getBareAPI();
         const em = this.agent.prompter.embedding_model;
         if (!em) {
             console.error('[fix47] FAIL LOUD: embedding model required for API filtering - no fallback');
             throw new Error('[fix47] embedding model required for API filtering');
+        }
+        
+        // Collect built-ins that the shown skills (and their deps) actually call
+        const usedBySkills = new Set();
+        const shownSet = shownSkillNames instanceof Set ? shownSkillNames : new Set(shownSkillNames || []);
+        for (const skillName of shownSet) {
+            const skill = this.skills.find(s => s.name === skillName);
+            if (skill?.code) {
+                for (const call of extractBareCalls(skill.code)) {
+                    if (bare.names.has(call)) usedBySkills.add(call);
+                }
+            }
         }
         
         const q = await this._embed(query);
@@ -1430,32 +1445,34 @@ Use only c; no other globals.`;
                 apiCache.set(sig, await this._embed(sig));
             }
             const score = cosineSimilarity(q, apiCache.get(sig));
-            scored.push({ sig, name, score, isCore: Voyager.CORE_API.has(name) });
+            const usedByShown = usedBySkills.has(name);
+            scored.push({ sig, name, score, usedByShown });
         }
         
-        // Sort by relevance, but ensure core APIs are always included
+        // Sort by relevance
         scored.sort((a, b) => b.score - a.score);
         const selected = new Set();
         const result = [];
         
-        // First add core APIs (always needed)
+        // First add built-ins that shown skills actually call (required for those skills to work)
         for (const s of scored) {
-            if (s.isCore && !selected.has(s.name)) {
+            if (s.usedByShown && !selected.has(s.name)) {
                 selected.add(s.name);
-                result.push(`- ${s.sig} [built-in, core]`);
+                result.push(`- ${s.sig} [built-in, used]`);
             }
         }
+        const usedCount = result.length;
         
-        // Then add top-k relevant APIs
+        // Then add top-k relevant APIs by embedding
         for (const s of scored) {
-            if (result.length >= k) break;
+            if (result.length >= k + usedCount) break;
             if (!selected.has(s.name)) {
                 selected.add(s.name);
                 result.push(`- ${s.sig} [built-in]`);
             }
         }
         
-        console.log(`[fix47] relevant API: ${result.length} of ${bare.sigs.length} built-in (${Voyager.CORE_API.size} core + ${result.length - Voyager.CORE_API.size} by embedding)`);
+        console.log(`[fix47] relevant API: ${result.length} of ${bare.sigs.length} built-in (${usedCount} used by skills + ${result.length - usedCount} by embedding)`);
         return result.join('\n');
     }
     
@@ -1477,18 +1494,9 @@ Use only c; no other globals.`;
         return bare.sigs.join('\n');
     }
     
-    // fix47: per-prompt breakdown logging for code model and curriculum calls
-    // Logs section sizes to help diagnose prompt bloat
+    // fix47: per-prompt breakdown logging (uses shared helper, no magic threshold)
     _logPromptBreakdown(kind, sections) {
-        const total = Object.values(sections).reduce((a, b) => a + b, 0);
-        const breakdown = Object.entries(sections).map(([k, v]) => `${k}=${v}`).join(' ');
-        console.log(`[prompt] kind=${kind} total=${total} chars: ${breakdown}`);
-        
-        // Loud warning if prompt is unusually large
-        if (total > 50000) {
-            console.log(`[prompt] LOUD: ${kind} prompt is ${total} chars (>50k) - check for bloat`);
-        }
-        return total;
+        return logPromptBreakdown(kind, sections);
     }
     _recordRun(entry, task, ok, trial) {
         if (trial) {
@@ -2926,16 +2934,22 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
         if (this._cursorLimited()) { console.log(`[voyager] skipped "${task}": needs new code but Cursor is at its limit (replay-only mode)`); return; }
         this.agent.openChat?.(`New goal: ${task}`);
         // fix28 (B): the prompt carries only the skills nomic-embed-text ranks relevant, plus their dependency closures (all skills stay defined in scope)
-        // fix47: use configurable skill_topk from settings
-        const skillTopK = settings.skill_topk || 8;
-        const apiTopK = settings.api_topk || 15;
+        // fix47: use configurable skill_topk and api_topk from settings (no fallback - must be set)
+        if (typeof settings.skill_topk !== 'number') {
+            throw new Error('[fix47] FAIL LOUD: skill_topk must be set in settings.js (number)');
+        }
+        if (typeof settings.api_topk !== 'number') {
+            throw new Error('[fix47] FAIL LOUD: api_topk must be set in settings.js (number)');
+        }
+        const skillTopK = settings.skill_topk;
+        const apiTopK = settings.api_topk;
         const related = await this.retrieveSkills(task + ' ' + (proposal.context || ''), skillTopK);
         for (const n of (proposal.context || '').match(/\b[a-z][A-Za-z0-9]+\b/g) || []) { const e = this.skills.find(s => s.name === n && !s.demoted); if (e && !related.includes(e)) related.push(e); }
         const shown = new Set(related.map(s => s.name)); for (const s of related) for (const d of this._closure(s.name)) shown.add(d);
         const prompter = this.agent.prompter;
         
-        // fix47: get relevant built-in API functions via embedding search
-        const relevantBuiltIn = await this._relevantBuiltInAPI(task + ' ' + (proposal.context || ''), apiTopK);
+        // fix47: get relevant built-in API functions via embedding search + skill deps
+        const relevantBuiltIn = await this._relevantBuiltInAPI(task + ' ' + (proposal.context || ''), apiTopK, shown);
         
         let system = await prompter.replaceStrings(prompter.profile.coding, [{ role: "user", content: `!newAction(${task})` }], prompter.coding_examples);
         // fix40: unified bare-name API - all functions called by bare name

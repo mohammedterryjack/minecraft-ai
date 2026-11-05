@@ -8,6 +8,7 @@ import { Vec3 } from 'vec3';
 import {ESLint} from "eslint";
 import * as acorn from "acorn";
 import pf from 'mineflayer-pathfinder';
+import { logPromptBreakdown } from './prompt_utils.js';
 
 // fix38: expose pathfinder goals to generated code (fail loud if missing)
 const pathfinderGoals = pf.goals;
@@ -73,15 +74,9 @@ export class Coder {
         mkdirSync('.' + this.fp, { recursive: true });
     }
 
-    // fix47: per-prompt breakdown logging for code generation
+    // fix47: per-prompt breakdown logging for code generation (uses shared helper)
     _logPromptBreakdown(kind, sections) {
-        const total = Object.values(sections).reduce((a, b) => a + b, 0);
-        const breakdown = Object.entries(sections).map(([k, v]) => `${k}=${v}`).join(' ');
-        console.log(`[prompt] kind=${kind} total=${total} chars: ${breakdown}`);
-        if (total > 50000) {
-            console.log(`[prompt] LOUD: ${kind} prompt is ${total} chars (>50k) - check for bloat`);
-        }
-        return total;
+        return logPromptBreakdown(kind, sections);
     }
     
     async generateCode(agent_history) {

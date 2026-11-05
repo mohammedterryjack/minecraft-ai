@@ -442,7 +442,9 @@ describe('smoke: full step loop', { skip: !DEPS_AVAILABLE ? `Dependencies not in
     it('should call _relevantBuiltInAPI() without ReferenceError/TypeError', async () => {
         let error = null;
         try {
-            const relevantAPI = await voyager._relevantBuiltInAPI('craft stone pickaxe', 10);
+            // Pass shownSkillNames (Set) as third parameter
+            const shown = new Set(['craftStonePickaxe']);
+            const relevantAPI = await voyager._relevantBuiltInAPI('craft stone pickaxe', 10, shown);
             assert.ok(typeof relevantAPI === 'string', '_relevantBuiltInAPI should return a string');
             assert.ok(relevantAPI.includes('[built-in'), 'should include built-in markers');
         } catch (e) {
