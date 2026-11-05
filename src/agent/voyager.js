@@ -748,7 +748,7 @@ Use only c; no other globals.`;
         // are not progress); health/food are not progress (drowning damage + regen kept resetting the timer)
         const seen = new Set(), cell = p => `${Math.floor(p.x / 2)},${Math.floor(p.y / 2)},${Math.floor(p.z / 2)}`; let fresh = 0;
         const sig = () => { const p = bot.entity?.position; if (!p) return ''; const w = bot.currentWindow, c = cell(p); if (!seen.has(c)) { seen.add(c); fresh++; }
-            return `${fresh}|${JSON.stringify(getInventoryCounts(bot))}|${w ? w.type + ':' + w.slots.map(i => i ? i.name + i.count : '').join(',') : ''}|${lit() ? Date.now() : ''}`; };
+            return `${fresh}|${JSON.stringify(world.getInventoryCounts(bot))}|${w ? w.type + ':' + w.slots.map(i => i ? i.name + i.count : '').join(',') : ''}|${lit() ? Date.now() : ''}`; };  // fix41: host code uses world. prefix
         let last = sig(), since = Date.now(); this._stall = null;
         const iv = setInterval(() => { try { const s = sig(); if (s !== last) { last = s; since = Date.now(); return; }
             if (Date.now() - since >= 60e3 && this.agent.actions.executing && !this._stall) { const p = bot.entity.position; this._stall = { t: Date.now(), pos: `${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}` }; console.log(`[stall] ${label}: no progress (no new ground reached, inventory, window, lit furnace) for 60s at ${this._stall.pos}; stopping the action`); this.agent.actions.stop(); } } catch (e) { console.log('[stall] watchdog error: ' + e.message); } }, 5000);
@@ -813,6 +813,7 @@ Use only c; no other globals.`;
         const t0 = Date.now(), c0 = { ...CALLS };
         this.step().then(() => { this._errStreak = 0; }, e => {
             console.error('[voyager] step failed: ' + (e?.message ?? e));
+            if (e?.stack) console.error('[voyager] stack:', e.stack);  // fix41: log stack for debugging
             // fix31 runaway guard: consecutive failing steps back off exponentially, scaled by the failing step's own duration
             this._errStreak = (this._errStreak || 0) + 1; const ms = Math.max(Date.now() - t0, 1000) * 2 ** this._errStreak;
             this._backoffUntil = Date.now() + ms; console.log(`[voyager] ${this._errStreak} failing step(s) in a row; next step in ${Math.round(ms / 1000)}s`);
@@ -835,7 +836,7 @@ Use only c; no other globals.`;
             biome: world.getBiomeName(bot),
             time: t < 12000 ? `day (${t})` : t < 13000 ? `dusk (${t}, hostiles about to spawn)` : t < 23000 ? `night (${t}, hostiles spawn outdoors)` : `dawn (${t})`,
             health: `${Math.round(bot.health)}/20`, food: `${bot.food}/20`,
-            inventory: getInventoryCounts(bot),
+            inventory: world.getInventoryCounts(bot),  // fix41: host code uses world. prefix
             inventory_slots: `${usedSlots}/${totalSlots}`,
             empty_inventory_slots: emptySlots,
             // fix38: full equipment (6 slots, not just held item)
