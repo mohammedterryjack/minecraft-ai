@@ -2,7 +2,7 @@ import { wordOverlapScore } from '../utils/text.js';
 // Voyager-style lifelong learning loop (after MineDojo/Voyager):
 // automatic curriculum -> iterative code generation with env feedback -> self-verification critic -> skill library.
 import { AsyncLocalStorage } from 'async_hooks';
-import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, renameSync } from 'fs';
+import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, renameSync, statSync, copyFileSync, truncateSync } from 'fs';
 // fix14: crash-safe writes (tmp file + rename)
 export function writeAtomic(fp, text) { const tmp = `${fp}.tmp-${process.pid}`; writeFileSync(tmp, text); renameSync(tmp, fp); }
 import * as world from './library/world.js';
@@ -114,6 +114,13 @@ function extractCode(text) {
     return m ? m[1].trim() : null;
 }
 
+// fix28: size-based log rotation: mindcraft.log -> .1 -> .2 -> .3 (oldest dropped), then truncate in place
+function rotateLog(fp, max, keep) {
+    try { if (!existsSync(fp) || statSync(fp).size < max) return;
+        for (let i = keep; i >= 1; i--) { const src = i === 1 ? fp : `${fp}.${i - 1}`; if (existsSync(src)) copyFileSync(src, `${fp}.${i}`); }
+        truncateSync(fp, 0); console.log(`[log] rotated ${fp} (> ${Math.round(max / 1e6)} MB; keeping ${keep})`);
+    } catch (e) { console.log('[log] rotation failed: ' + e.message); }
+}
 export class Voyager {
     constructor(agent) {
         this.agent = agent;
@@ -139,6 +146,7 @@ export class Voyager {
             process.on('uncaughtException', onErr('UNCAUGHT EXCEPTION'));
             process.on('unhandledRejection', onErr('UNHANDLED REJECTION'));
         }
+        if (!globalThis.__logRotate) { globalThis.__logRotate = setInterval(() => rotateLog('./logs/mindcraft.log', 25e6, 3), 60e3); rotateLog('./logs/mindcraft.log', 25e6, 3); }   // fix28
         this._relink();
         this._polyMerge();
         this._extractShared();
@@ -316,10 +324,13 @@ Use only c; no other globals.`;
     // fix19 (6): did the bot die during the current run? (agent.lastDeath set by the death message handler)
     // fix27: an action with no position/inventory change for 60s is stopped and traced as a failure (no waiting out the 5-min timeout)
     async _run(label, fn, timeout) {
-        const bot = this.agent.bot, sig = () => { const p = bot.entity?.position; return p ? `${Math.round(p.x * 2)},${Math.round(p.y * 2)},${Math.round(p.z * 2)}|${JSON.stringify(world.getInventoryCounts(bot))}` : ''; };
+        // fix28: progress = position, inventory, health, food, open-window contents (crafting/furnace UI) or a lit furnace/smoker nearby (smelting wait)
+        const lit = () => !!bot.findBlock({ matching: b => /furnace|smoker/.test(b.name) && b.getProperties?.().lit === true, maxDistance: 6 });
+        const sig = () => { const p = bot.entity?.position; if (!p) return ''; const w = bot.currentWindow;
+            return `${Math.round(p.x * 2)},${Math.round(p.y * 2)},${Math.round(p.z * 2)}|${JSON.stringify(world.getInventoryCounts(bot))}|${bot.health}|${bot.food}|${w ? w.type + ':' + w.slots.map(i => i ? i.name + i.count : '').join(',') : ''}|${lit() ? Date.now() : ''}`; };
         let last = sig(), since = Date.now(); this._stall = null;
         const iv = setInterval(() => { try { const s = sig(); if (s !== last) { last = s; since = Date.now(); return; }
-            if (Date.now() - since >= 60e3 && this.agent.actions.executing && !this._stall) { const p = bot.entity.position; this._stall = { t: Date.now(), pos: `${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}` }; console.log(`[stall] ${label}: no position or inventory change for 60s at ${this._stall.pos}; stopping the action`); this.agent.actions.stop(); } } catch (e) { console.log('[stall] watchdog error: ' + e.message); } }, 5000);
+            if (Date.now() - since >= 60e3 && this.agent.actions.executing && !this._stall) { const p = bot.entity.position; this._stall = { t: Date.now(), pos: `${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}` }; console.log(`[stall] ${label}: no progress (position, inventory, health, food, window, lit furnace) for 60s at ${this._stall.pos}; stopping the action`); this.agent.actions.stop(); } } catch (e) { console.log('[stall] watchdog error: ' + e.message); } }, 5000);
         try { return await this.agent.actions.runAction(label, fn, { timeout }); } finally { clearInterval(iv); }
     }
     _stalledInRun() { const s = this._stall; return s && s.t >= (this._runStart || Infinity) ? s : null; }
@@ -618,7 +629,9 @@ Use only c; no other globals.`;
         gateLog(`regression rerun of candidate ${entry.name} on past task "${past}"`);
         const staged = await this.agent.coder._stageCode(this._libSrc({ [entry.name]: code }) + `\n\nawait ${entry.name}(bot);`);
         if (!staged) return false;
-        const res = await this.agent.actions.runAction(`voyager:gate:${entry.name}`, async () => { this.agent.bot.__psnALS = globalThis.__psnALS; await staged.func.main(this.agent.bot); }, { timeout: 4 });
+        this._runStart = Date.now();
+        const res = await this._run(`voyager:gate:${entry.name}`, async () => { this.agent.bot.__psnALS = globalThis.__psnALS; await staged.func.main(this.agent.bot); }, 4);   // fix28: stall watchdog on gate runs
+        if (this._stalledInRun()) { gateLog(`regression rerun of ${entry.name} stalled; counted as a failed rerun`); return false; }
         if (res.interrupted || this.abort) return null;
         return gainedFor(goal, before, this.observe()) >= goal.count;
     }
