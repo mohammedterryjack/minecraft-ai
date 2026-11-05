@@ -993,8 +993,9 @@ Use only c; no other globals.`;
     // fix37 (B): check if a goal is already satisfied BEFORE running any task, using learned postconditions/contracts
     // Returns { satisfied: boolean, reason: string, noLearnedCheck?: boolean }
     // Uses learned skill contracts (postconditions) and learned effects - no hard-coded special cases
+    // fix25: prefer smeltGoal so "Smelt X into Y" checks Y (product), not X (ingredient)
     _goalAlreadySatisfied(task, state) {
-        const goal = countGoal(task) || smeltGoal(task);
+        const goal = smeltGoal(task) || countGoal(task);  // fix25: smelt first (product)
         if (!goal) return { satisfied: false, reason: 'goal not parseable as count/smelt', noLearnedCheck: true };
 
         const inv = state.inventory || {};
@@ -1426,11 +1427,12 @@ Use only c; no other globals.`;
         return top[Math.floor(Math.random() * top.length)]?.s || null;
     }
     // fix42: get items needed by pending/failed tasks (from learned needs/produces, not hard-coded)
+    // fix25: prefer smeltGoal so "Smelt X into Y" prioritizes Y (product), ingredients come from consumes
     _getPendingGoalItems() {
         const items = new Set();
         // extract items from failed and pending tasks
         for (const task of [...(this.progress.failed || []).slice(-10), ...(this.progress.pending || []).slice(-5)]) {
-            const goal = countGoal(task) || smeltGoal(task);
+            const goal = smeltGoal(task) || countGoal(task);  // fix25: smelt first (product)
             if (goal?.item) items.add(goal.item);
             if (goal?.items) goal.items.forEach(it => items.add(it));
         }
@@ -1850,8 +1852,9 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
 
     // fix37 (D): detect if inventory-full caused a gather/craft/pickup failure
     // Returns a fact string if detected, null otherwise. No rules, just observable facts.
+    // fix25: prefer smeltGoal so "Smelt X into Y" detects by product (Y), not ingredient (X)
     _detectInventoryFullFailure(task, before, after, output) {
-        const goal = countGoal(task) || smeltGoal(task);
+        const goal = smeltGoal(task) || countGoal(task);  // fix25: smelt first (product)
         if (!goal) return null;
 
         const emptyBefore = before.empty_inventory_slots ?? 36;
@@ -3051,5 +3054,42 @@ Voyager.SEEDED_PRIMITIVES = [
     return bot.inventory.emptySlotCount();
 }`,
         deps: ['moveAway', 'depositToChest'],
+    },
+    // fix25: ensureCraftingTable with multi-cell retry (same pattern as craftRecipe)
+    {
+        name: 'ensureCraftingTable',
+        description: 'Ensure a crafting table is placed nearby for 3x3 recipes. Uses multi-cell retry if first placement fails. Returns true if a table is available.',
+        task: 'ensure a crafting table is placed nearby',
+        code: `async function ensureCraftingTable(bot) {
+    let table = getNearestBlock(bot, 'crafting_table', 16);
+    if (table) { log(bot, \`Crafting table already nearby at \${table.position}.\`); return true; }
+    const hasTable = (getInventoryCounts(bot)['crafting_table'] || 0) > 0;
+    if (!hasTable) { log(bot, 'FAILED: no crafting_table in inventory to place'); return false; }
+    // fix25: multi-cell retry pattern (same as craftRecipe/placeBlock)
+    const freeSpaces = getAllFreeSpaces(bot, 1, 6, 5);
+    if (!freeSpaces.length) { log(bot, 'FAILED: no free space within 6 blocks to place crafting_table'); return false; }
+    let placed = false;
+    const tried = [];
+    for (const pos of freeSpaces) {
+        if (bot.interrupt_code) return false;
+        tried.push(\`(\${Math.floor(pos.x)},\${Math.floor(pos.y)},\${Math.floor(pos.z)})\`);
+        const ok = await placeBlock(bot, 'crafting_table', pos.x, pos.y, pos.z);
+        await sleep(150);
+        const check = bot.blockAt(pos.floored ? pos.floored() : pos);
+        if (ok && check && check.name === 'crafting_table') {
+            log(bot, \`Placed crafting_table at \${tried[tried.length - 1]}.\`);
+            placed = true;
+            break;
+        }
+        if (!ok) console.log(\`[ensureCraftingTable] placeBlock failed at \${tried[tried.length - 1]}, trying next cell...\`);
+        else console.log(\`[ensureCraftingTable] placeBlock returned true at \${tried[tried.length - 1]} but block is \${check?.name || 'null'}, trying next cell...\`);
+    }
+    if (!placed) {
+        log(bot, \`FAILED: could not place crafting_table at any of \${tried.length} free space(s): \${tried.join(', ')}\`);
+        return false;
+    }
+    return true;
+}`,
+        deps: ['placeBlock'],
     },
 ];
