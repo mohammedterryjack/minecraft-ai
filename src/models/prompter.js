@@ -1,6 +1,4 @@
-import { CodeModelWithFallback } from './code_fallback.js';
-import { OpenAIStrict } from './openai_strict.js';
-import { hasKey } from '../utils/keys.js';
+import { CodeModel } from './code_model.js';
 import { readFileSync, mkdirSync, writeFileSync, renameSync} from 'fs';
 import { Examples } from '../utils/examples.js';
 import { getCommandDocs } from '../agent/commands/index.js';
@@ -61,20 +59,13 @@ export class Prompter {
 
         let chat_model_profile = selectAPI(this.profile.model);
         this.chat_model = createModel(chat_model_profile);
-        // Gemini only: on 429/quota the wrapper pauses for 60 min and fails loudly (no local fallback).
-        this.chat_model = new CodeModelWithFallback(this.chat_model, null, 60 * 60 * 1000, 'chat-model');
+        // fix32: one path; on 429/quota the wrapper pauses 60 min and throws
+        this.chat_model = new CodeModel(this.chat_model, 60 * 60 * 1000, 'chat-model');
 
         if (this.profile.code_model) {
             let code_model_profile = selectAPI(this.profile.code_model);
-            this.code_model = createModel(code_model_profile);
-            // usage limit: pause and re-check every 60 min (no fallback; OpenAI backup disabled by Mo)
-            const isCursor = code_model_profile.api === 'cursor';
-            // cursor usage limit -> OpenAI backup (profile.code_backup) if configured; retry cursor hourly while on backup
-            const bk = this.profile.code_backup;
-            const backup = (isCursor && bk && hasKey('OPENAI_API_KEY')) ? new OpenAIStrict(bk.model, bk.params || {}) : null;
-            this.code_model = new CodeModelWithFallback(this.code_model, backup, 60 * 60 * 1000, 'code-model');
-            if (backup) { this.code_model.switchOn = /usage limit|limit reached|quota/i; console.log(`[code-model] backup on cursor usage limit: openai ${bk.model}`); }
-            this.code_model.timeoutMs = isCursor ? 180 * 1000 : this.code_model.timeoutMs;
+            this.code_model = new CodeModel(createModel(code_model_profile), 60 * 60 * 1000, 'code-model');
+            if (code_model_profile.api === 'cursor') this.code_model.timeoutMs = 180 * 1000;
         }
         else {
             this.code_model = this.chat_model;
