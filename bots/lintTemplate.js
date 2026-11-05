@@ -3,6 +3,7 @@ import * as world from '../../../src/agent/library/world.js';
 import Vec3 from 'vec3';
 
 const log = skills.log;
+const sleep = ms => new Promise(r => globalThis.setTimeout(r, ms));   // fix27: mirrors the sandbox endowment
 
 export async function main(bot) {
     /* CODE HERE */

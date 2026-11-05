@@ -327,10 +327,20 @@ Use only c; no other globals.`;
     }
     // fix14: why an action was cut off, for failure feedback (critic, code writer, blame)
     // fix19 (6): did the bot die during the current run? (agent.lastDeath set by the death message handler)
+    // fix27: an action with no position/inventory change for 60s is stopped and traced as a failure (no waiting out the 5-min timeout)
+    async _run(label, fn, timeout) {
+        const bot = this.agent.bot, sig = () => { const p = bot.entity?.position; return p ? `${Math.round(p.x * 2)},${Math.round(p.y * 2)},${Math.round(p.z * 2)}|${JSON.stringify(world.getInventoryCounts(bot))}` : ''; };
+        let last = sig(), since = Date.now(); this._stall = null;
+        const iv = setInterval(() => { try { const s = sig(); if (s !== last) { last = s; since = Date.now(); return; }
+            if (Date.now() - since >= 60e3 && this.agent.actions.executing && !this._stall) { const p = bot.entity.position; this._stall = { t: Date.now(), pos: `${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}` }; console.log(`[stall] ${label}: no position or inventory change for 60s at ${this._stall.pos}; stopping the action`); this.agent.actions.stop(); } } catch (e) { console.log('[stall] watchdog error: ' + e.message); } }, 5000);
+        try { return await this.agent.actions.runAction(label, fn, { timeout }); } finally { clearInterval(iv); }
+    }
+    _stalledInRun() { const s = this._stall; return s && s.t >= (this._runStart || Infinity) ? s : null; }
     _diedInRun() { const d = this.agent.lastDeath; return d && d.t >= (this._runStart || Infinity) ? d : null; }
     _interruptReason(output = '') {
         const died = this._diedInRun();
         if (died) return `died: ${died.message} at ${died.pos}`;
+        const st = this._stalledInRun(); if (st) return `stalled: no position or inventory change for 60s at ${st.pos}`;
         const bot = this.agent.bot, p = bot.entity.position, by = this.agent.actions.lastInterruptBy || 'unknown';
         const s = this._surfaceY(p.x, p.z), under = s !== null && p.y < s - 4;
         const travelling = /travelTo|goToPosition|goToSurface|path|Moving|travell/i.test(String(output).slice(-800));
@@ -440,7 +450,7 @@ Use only c; no other globals.`;
     // small local model (Mac Studio Ollama) for curriculum + critic judgment; unloads after 5 min idle
     async _askLocal(system, user) {
         CALLS.local++;
-        const r = await this._local().sendRequest([{ role: 'user', content: user }], system);
+        const t0 = Date.now(); const r = await this._local().sendRequest([{ role: 'user', content: user }], system); console.log(`[timing] ${new Date().toISOString().slice(11,19)}Z local call took ${Date.now() - t0}ms`);   // fix27
         console.log(`[voyager] local model call #${CALLS.local}`);
         return r;
     }
@@ -551,11 +561,11 @@ Use only c; no other globals.`;
         const staged = await this.agent.coder._stageCode(full);
         if (!staged) return { ok: false };
         this._runStart = Date.now();
-        const res = await this.agent.actions.runAction(`voyager:replay:${task}`, async () => { this.agent.bot.__psnALS = globalThis.__psnALS; await staged.func.main(this.agent.bot); }, { timeout: 5 });
+        const res = await this._run(`voyager:replay:${task}`, async () => { this.agent.bot.__psnALS = globalThis.__psnALS; await staged.func.main(this.agent.bot); }, 5);
         if (this.abort) return { ok: false, interrupted: true };
         const after = this.observe();
         let ok;
-        const cut = res.interrupted || this._diedInRun() ? this._interruptReason(res.message) : '';   // fix14: a cut-off replay is a failure
+        const cut = res.interrupted || this._diedInRun() || this._stalledInRun() ? this._interruptReason(res.message) : '';   // fix14: a cut-off replay is a failure
         if (this._diedInRun()) this._noteDeath(this._diedInRun(), task);
         if (cut) { ok = false; console.log(`[voyager] replay ${r.name} ${cut}; counting as a failure`); } else
         if (r.free) { const e = this.agent.bot.inventory.emptySlotCount(); ok = e >= r.free; console.log(`[voyager] inventory check: ${e} empty slots (need ${r.free})`); }
@@ -629,7 +639,8 @@ Use only c; no other globals.`;
         // If the limit is (or becomes) active, abandon this step.
         const cm = this.agent.prompter.code_model;
         if (Date.now() < (cm.quotaUntil || 0)) throw new Error('code model quota/usage-limit pause active; voyager step abandoned');
-        const r = await cm.sendRequest([{ role: 'user', content: user }], system);
+        const t0 = Date.now(); console.log(`[timing] ${new Date().toISOString().slice(11,19)}Z composer call #${CALLS.code} start (prompt ${system.length + user.length} chars)`);   // fix27
+        let r; try { r = await cm.sendRequest([{ role: 'user', content: user }], system); } finally { console.log(`[timing] ${new Date().toISOString().slice(11,19)}Z composer call #${CALLS.code} took ${Date.now() - t0}ms (reply ${String(r ?? '').length} chars)`); }
         if (Date.now() < (cm.quotaUntil || 0)) throw new Error('code model quota/usage limit hit; voyager step abandoned');
         return r;
     }
@@ -910,6 +921,8 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         // fix19 (6): a death is a failure of the call that was running (deepest open call) and all its ancestors
         const died = this._diedInRun();
         if (died) { let i = -1; for (let k = 0; k < trace.length; k++) if ((trace[k].t0 || 0) <= died.t && (trace[k].t1 ?? Infinity) >= died.t - 1500 && (i < 0 || trace[k].depth >= trace[i].depth)) i = k; if (i < 0) i = trace.length - 1; console.log(`[psn] death attributed to the call running at death time: ${trace[i].name} (depth ${trace[i].depth})`); trace[i].ownFail = [`DIED: ${died.message} at ${died.pos}`]; for (; i >= 0; i = trace[i].parent) { trace[i].intr = false; trace[i].ok = false; trace[i].fail = true; } ok = false; }
+        const stalled = !died && this._stalledInRun();   // fix27: a stall is a failure of the deepest call open at stall time
+        if (stalled) { let i = -1; for (let k = 0; k < trace.length; k++) if ((trace[k].t0 || 0) <= stalled.t && (trace[k].t1 ?? Infinity) >= stalled.t - 1500 && (i < 0 || trace[k].depth >= trace[i].depth)) i = k; if (i < 0) i = trace.length - 1; console.log(`[psn] stall attributed to the call running at stall time: ${trace[i].name} (depth ${trace[i].depth})`); trace[i].ownFail = [`FAILED: STALLED: no position or inventory change for 60s at ${stalled.pos}`]; for (; i >= 0; i = trace[i].parent) { trace[i].intr = false; trace[i].ok = false; trace[i].fail = true; } ok = false; }
         // fix26: a call that moved the bot from outside into an active hotspot failed its contract (deepest such call); blame/repair learns avoidance
         for (let k = trace.length - 1; k >= 0; k--) { const r = trace[k]; if (r.intr || !r.s0?.pos || !r.s1?.pos) continue;
             const c = this._hotCell(r.s1.pos); if (!c || this._cellKey(r.s0.pos) === this._cellKey(r.s1.pos)) continue;
@@ -941,8 +954,9 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
     // targeted repair of the blamed skill via the code model, through the normal regression gate (saveSkill)
     // fix26: a skipped repair is deferred (persisted) and re-queued when ripe, not dropped; dropped loudly after 6 deferrals
     _deferRepair(q, ms, why) {
-        const d = (this.progress.deferredRepairs ||= []); q.defers = (q.defers || 0) + 1;
-        if (q.defers > 6) { console.log(`[psn] repair of ${q.target} DROPPED after ${q.defers - 1} deferrals (${why})`); this._saveProgress(); return; }
+        const d = (this.progress.deferredRepairs ||= []), dc = (this.progress.deferCounts ||= {}), key = `${q.target}:${q.kind}`;   // fix27: counter per skill+kind, persisted
+        q.defers = dc[key] = (dc[key] || 0) + 1;
+        if (q.defers > 6) { console.log(`[psn] repair of ${q.target} [${q.kind}] DROPPED after ${q.defers - 1} deferrals (${why})`); delete dc[key]; this.progress.deferredRepairs = d.filter(x => !(x.target === q.target && x.kind === q.kind)); this._saveProgress(); return; }
         if (!d.some(x => x.target === q.target && x.kind === q.kind)) d.push({ ...q, notBefore: Date.now() + ms }); this._saveProgress();
         console.log(`[psn] repair of ${q.target} deferred ${Math.round(ms / 60e3)} min (${why}; deferral ${q.defers}/6)`);
     }
@@ -962,7 +976,8 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         this._repairs = (this.progress.repairs ||= {});   // fix11 (B8): repair cap persisted in progress.json
         if (q.kind === 'contract_fix') {   // fix25b: contract-only repair is independent of code candidates and the code-repair cap
             if (this._cursorLimited()) { console.log(`[psn] contract repair of ${e.name} deferred: code model at its limit`); this._deferRepair(q, 10 * 60e3, 'code model at its limit'); return false; }
-                        console.log(`[psn] REPAIR contract of ${e.name} (${q.evidence})`);
+            delete (this.progress.deferCounts || {})[`${e.name}:contract_fix`];
+            console.log(`[psn] REPAIR contract of ${e.name} (${q.evidence})`);
             const n = await this._learnContracts([e], 'contract repair', q.evidence);
             this._noteProposal(e, { task: q.task, kind: q.kind, evidence: q.evidence.slice(0, 200), desc: n ? `contract -> ${e.contract.text}` : 'contract repair failed', outcome: n ? 'contract replaced' : 'failed' });
             return n > 0;
@@ -971,7 +986,7 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         if (e.candidate) { console.log(`[psn] repair of ${e.name} skipped: a candidate is already under trial`); this._deferRepair(q, 10 * 60e3, 'a candidate is already under trial'); return false; }
         if (this._cursorLimited()) { console.log(`[psn] repair of ${e.name} skipped: code model at its limit`); this._deferRepair(q, 10 * 60e3, 'code model at its limit'); return false; }
         if (!this._updateAllowed(e, `repair after ${q.kind}`)) { console.log(`[psn] repair of ${e.name} skipped: maturity gate froze it`); return false; }
-        this._repairs[e.name] = Date.now(); this._saveProgress();
+        this._repairs[e.name] = Date.now(); delete (this.progress.deferCounts || {})[`${e.name}:${q.kind}`]; this._saveProgress();   // fix27: counter resets when the repair actually runs
         const kids = [...this._closure(e.name)].map(n => this.skills.find(s => s.name === n)).filter(Boolean);
         const system = `You repair ONE skill in a Minecraft mineflayer skill library (PSN-style targeted fix). Return a single \`\`\`javascript code block containing ONLY the fixed function, with the SAME name and a compatible signature. First line inside the block: // DESCRIPTION: <one sentence>. Call other library skills by name (they are in scope); never redefine them. Every loop must check bot.interrupt_code. If something still cannot be done, log(bot, 'FAILED: <reason>') and return a falsy value; no silent fallbacks.\nLIBRARY:\n${this.catalogue()}`;
         const user = `Blamed skill: ${e.name} (${q.kind === 'caller_fix' ? 'it calls the leaf ' + q.leaf + ' in a situation where the leaf cannot succeed: fix how/when it calls it, e.g. obtain the missing prerequisite first' : 'its own logic failed'})\nTask that failed: ${q.task}\nFailure path: ${q.path.join(' > ')}\nEvidence: ${q.evidence}\n--- execution trace (indent = call depth) ---\n${q.trace}\n${e.contract ? `--- learned contract of ${e.name} (must hold after your fix) ---\npre: ${e.contract.pre}\npost: ${e.contract.post}\n` : ''}--- current code of ${e.name} ---\n${e.code}\n--- skills it uses ---\n${kids.map(k => '// ' + k.description + '\n' + signatureOf(k.code, k.name)).join('\n')}\n${(e.repairHistory || []).length ? `\n--- your last ${e.repairHistory.length} repair proposal(s) for ${e.name} (do not repeat what failed) ---\n` + e.repairHistory.map((h, i) => `${i + 1}. [${h.outcome || 'pending'}] ${h.kind}: ${h.evidence}\n   change: ${h.desc}`).join('\n') : ''}${q.peers?.length > 1 ? `\nOther skills blamed on the same failure (repaired children-first): ${q.peers.join(', ')}` : ''}\nWrite the fixed ${e.name}:`;
@@ -1048,6 +1063,10 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
     }
 
     async step() {
+        const now = Date.now(); console.log(`[timing] ${new Date().toISOString().slice(11,19)}Z step start (gap since last step end ${this._stepEnd ? now - this._stepEnd : 0}ms)`);   // fix27
+        try { return await this._step(); } finally { this._stepEnd = Date.now(); console.log(`[timing] ${new Date().toISOString().slice(11,19)}Z step end (took ${this._stepEnd - now}ms)`); }
+    }
+    async _step() {
         this._watchWindows();
         this._watchDimension();
         if (this.agent.bot.currentWindow) { const w = this.agent.bot.currentWindow; if (/CHOICE/.test(JSON.stringify(w.title))) { if (!this._choiceNoted) { this._choiceNoted = 1; console.log("[window] datapack dialog CHOICE (A Breach Happened multi_action dialog via ViaProxy) left open; not answering"); } } else console.log(`[window] STRAY ${w.type} id=${w.id} still open at step start (opened ${Math.round((Date.now() - (this._winOpenedAt || 0)) / 1000)}s ago); closing`); if (!/CHOICE/.test(JSON.stringify(w.title))) try { this.agent.bot.closeWindow(w); } catch (e) { console.log('[window] close failed: ' + e.message); } }
@@ -1100,7 +1119,7 @@ COMPOSE: build your function out of these skills (they can take arguments). Your
 SHARED CODE: these fragments are repeated in several skills; if you need this logic, put it in its own small reusable async function skill (named, with parameters) and call it, instead of inlining it again:
 ${this.sharedHints.map(h => '// used in ' + h.skills.join(', ') + '\n' + h.fragment).join('\n')}` : ''}
 Recommended building blocks (robust, already handle pathfinding, full inventory and drop pickup; compose them inside your own function rather than hand-rolling dig/findBlocks loops): mineBlocks(bot, blockName, count) mines ores/stone/logs and picks up drops; gatherItem(bot, itemName, target) gathers until the inventory has target; collectDrops(bot) picks up nearby items; goToBlockAndInteract(bot, blockName, range) walks to and uses a chest/furnace/table.
-Interrupts: the bot may be interrupted at any time (danger, getting stuck, a player talking). Every loop must start with \`if (bot.interrupt_code) return;\` and you must return immediately after any await when bot.interrupt_code is true. Every async function must contain an await. Never catch an error and keep looping; no unbounded loops (always cap attempts).`;
+Interrupts: the bot may be interrupted at any time (danger, getting stuck, a player talking). Every loop must start with \`if (bot.interrupt_code) return;\` and you must return immediately after any await when bot.interrupt_code is true. Every async function must contain an await. Never catch an error and keep looping; no unbounded loops (always cap attempts). There is no setTimeout/setInterval in scope; to wait use \`await sleep(ms)\`.`;
         // define every library skill so calls to any known skill lint/run; only `related` are shown as context
         const learnedSrc = this.skills.map(s => s.code).join('\n\n');
         const ctx = related.map(s => `// ${s.description}\n${s.code}`).join('\n\n');
@@ -1124,7 +1143,7 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             const over = {}; for (const s of libOthers) if (s.candidate) over[s.name] = s.candidate.code;   // fix24: candidates get trial runs in every task
             const full = libOthers.map(s => over[s.name] ?? s.code).join('\n\n') + '\n\n' + code;
             const plain = await this.agent.coder._stageCode(full);
-            const lint = plain ? await this.agent.coder._lintCode(plain.src_lint_copy) : 'staging failed';
+            const lint = /\b(setTimeout|setInterval)\s*\(/.test(code) ? 'setTimeout/setInterval are not available in the sandbox; use `await sleep(ms)`' : plain ? await this.agent.coder._lintCode(plain.src_lint_copy) : 'staging failed';   // fix27
             // fix11 (B7): run the generated code with the PSN trace wrapper (rebinding happens before the code's own top-level call)
             const traced = [...libOthers.map(s => s.name), own];
             const staged = lint ? null : await this.agent.coder._stageCode(libOthers.map(s => over[s.name] ?? s.code).join('\n\n') + '\n\n' + instrumentSrc(traced) + '\n\n' + code);
@@ -1132,12 +1151,12 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             if (lint) { console.log('[voyager] lint failed: ' + String(lint).slice(0, 300)); feedback = 'Lint error:\n' + lint; lastCode = code; continue; }
 
             this._runStart = Date.now();
-            const res = await this.agent.actions.runAction(`voyager:${task}`, async () => {
+            const res = await this._run(`voyager:${task}`, async () => {
                 this.agent.bot.__psnALS = globalThis.__psnALS; await staged.func.main(this.agent.bot);
-            }, { timeout: 5 });
+            }, 5);
             console.log(`[timing] game action attempt ${i} took ${Date.now() - this._runStart}ms`);   // fix23: measurement
             if (this.abort) { console.log('[voyager] task interrupted'); return; }
-            const cut = res.interrupted || this._diedInRun() ? this._interruptReason(res.message) : '';   // fix14: cut-off code counts as a failed attempt
+            const cut = res.interrupted || this._diedInRun() || this._stalledInRun() ? this._interruptReason(res.message) : '';   // fix14: cut-off code counts as a failed attempt
             if (this._diedInRun()) this._noteDeath(this._diedInRun(), task);
             if (cut) anyCut = cut;
             if (cut) console.log(`[voyager] attempt ${i} ${cut}; counting as a failure`);

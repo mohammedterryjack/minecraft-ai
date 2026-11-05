@@ -168,7 +168,7 @@ export class Coder {
         code = code.replaceAll('console.log(', 'log(bot,');
         code = code.replaceAll('log("', 'log(bot,"');
 
-        console.log(`Generated code: """${code}"""`);
+        console.log(`Generated code (${code.length} chars, ${code.split('\n').length} lines): """${code.length > 400 ? code.slice(-400) + '\n...[truncated]' : code}"""`);   // fix27: tail only (the new code is at the end)
 
         // this may cause problems in callback functions
         code = code.replaceAll(';\n', '; if(bot.interrupt_code) {log(bot, "Code interrupted.");return;}\n');
@@ -204,6 +204,7 @@ export class Coder {
             log: skills.log,
             world,
             Vec3,
+            sleep: ms => new Promise(r => setTimeout(r, ms)),   // fix27: the only way to wait; setTimeout itself is not in scope
         });
         const mainFn = compartment.evaluate(src);
         
