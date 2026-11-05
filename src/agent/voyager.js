@@ -713,13 +713,26 @@ Use only c; no other globals.`;
     _stateText(s) {
         // fix34: present inventory facts prominently as exact counts (not just JSON blob)
         // fix36: facts only, no imperatives (Mo principle: everything learned, not hard-coded)
+        // fix37 (D): surface inventory fullness as facts (not rules) with exact counts
         const lines = [];
+        const inv = s.inventory || {};
+        const emptySlots = s.empty_inventory_slots ?? 0;
+        const totalItems = Object.values(inv).reduce((a, b) => a + b, 0);
+
         for (const [k, v] of Object.entries(s)) {
             if (k === 'inventory' && typeof v === 'object') {
-                const items = Object.entries(v).map(([item, count]) => `${item}: ${count}`);
-                lines.push(`inventory (exact counts): ${items.length ? items.join(', ') : '(empty)'}`);
+                // Sort by count descending to show largest stacks first (hoarding visibility)
+                const items = Object.entries(v).sort((a, b) => b[1] - a[1]).map(([item, count]) => `${item}: ${count}`);
+                lines.push(`inventory (exact counts, ${totalItems} total items): ${items.length ? items.join(', ') : '(empty)'}`);
             } else if (k === 'empty_inventory_slots') {
-                lines.push(`empty_inventory_slots: ${v}${v === 0 ? ' (0 means inventory is full; new items cannot be picked up until space is freed)' : ''}`);
+                // fix37 (D): state inventory fullness as a fact, not a rule
+                if (v === 0) {
+                    lines.push(`empty_inventory_slots: 0 (inventory is full)`);
+                } else if (v <= 3) {
+                    lines.push(`empty_inventory_slots: ${v} (inventory is nearly full)`);
+                } else {
+                    lines.push(`empty_inventory_slots: ${v}`);
+                }
             } else {
                 lines.push(`${k}: ${typeof v === 'object' ? JSON.stringify(v) : v}`);
             }
@@ -887,11 +900,19 @@ Use only c; no other globals.`;
         // ADAM-style: record inventory delta for needs/produces learning
         if (ok) this.npGraph.recordDelta(r.name, before.inventory, after.inventory);
         this._attribute(r.name, task, ok, over);   // fix10: per-call trace -> contract results -> blame -> targeted repair
-        console.log(`[voyager] replay ${r.name}: ${ok ? 'PASSED' : 'failed'}${goal ? ` (+${gainedFor(goal, before, after)} ${goal.items.join('/')})` : ''}`);
+
+        // fix37 (D): detect and log inventory-full as a fact for learning
+        const invFullFact = !ok ? this._detectInventoryFullFailure(task, before, after, String(res.message || '')) : null;
+        const gained = goal ? gainedFor(goal, before, after) : 0;
+
+        console.log(`[voyager] replay ${r.name}: ${ok ? 'PASSED' : 'failed'}${goal ? ` (+${gained} ${goal.items.join('/')})` : ''}`);
         if (r.free) console.log(`[voyager] storage replay ${r.name} output: ${String(res.message || '(none)').split(/\n|\|/).filter(l => /\[(toss|chest)\]/.test(l)).join(' | ').slice(-800)}; inv now ${JSON.stringify(after.inventory)}`);
-        if (!ok) console.log(`[voyager] replay ${r.name} inv: ${this.agent.bot.inventory.emptySlotCount()} empty slots; ${JSON.stringify(after.inventory)}`);
+        if (!ok) {
+            console.log(`[voyager] replay ${r.name} inv: ${this.agent.bot.inventory.emptySlotCount()} empty slots; ${JSON.stringify(after.inventory)}`);
+            if (invFullFact) console.log(`[voyager] replay ${r.name} INVENTORY FULL DETECTED: ${invFullFact}`);
+        }
         if (!ok) console.log(`[voyager] replay ${r.name} output: ${String(res.message || '(none)').slice(-600).replace(/\n+/g, ' | ')}`);
-        return { ok, name: r.name, output: String(res.message || ''), cut };
+        return { ok, name: r.name, output: String(res.message || ''), cut, invFullFact };
     }
     // library source with optional per-name code overrides (candidates under test)
     _libSrc(over = {}) { return this.skills.map(s => over[s.name] ?? s.code).join('\n\n'); }
@@ -1571,13 +1592,59 @@ current_health: ${Math.round(bot.health)}/20\ncurrent_food: ${bot.food}/20 (20/2
 
     // ---------- critic ----------
     async critique(task, before, after, output, label) {
+        // fix37 (D): detect inventory-full as a cause of failure (stated as fact, not rule)
+        const invFullFact = this._detectInventoryFullFailure(task, before, after, output);
+
         const system = `You are an assistant that checks whether a Minecraft bot completed its task, using its state before and after and the code output.
 Be strict: success only if the evidence (inventory/position/output) shows the task is done.
 Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false, "critique": "how to fix it if failed (1-2 sentences), else empty"}`;
-        const user = `task: ${task}\n${recipeFacts(task)}\n--- before ---\n${this._stateText(before)}\n--- after ---\n${this._stateText(after)}\n--- code output ---\n${output}`;
+        const user = `task: ${task}\n${recipeFacts(task)}\n--- before ---\n${this._stateText(before)}\n--- after ---\n${this._stateText(after)}\n--- code output ---\n${output}${invFullFact ? `\n--- observed fact ---\n${invFullFact}` : ''}`;
         const v = parseLocalJSON(await this._askLocal(system, user), ['reasoning', 'success', 'critique']);
-        try { appendFileSync(`./bots/${this.agent.name}/critic_cases.jsonl`, JSON.stringify({ at: new Date().toISOString(), task, system, user, verdict: v, label: label ?? null }) + '\n'); } catch (e) { console.log('[critic] case log failed: ' + e.message); }   // fix32: eval set for critic-model trials
+
+        // fix37 (D): if inventory full was detected as a cause, ensure it's in the critique for contract/decompose learning
+        if (invFullFact && !v.success && v.critique && !v.critique.toLowerCase().includes('inventory')) {
+            v.critique = `${invFullFact}. ${v.critique}`;
+        }
+
+        try { appendFileSync(`./bots/${this.agent.name}/critic_cases.jsonl`, JSON.stringify({ at: new Date().toISOString(), task, system, user, verdict: v, label: label ?? null, invFullFact }) + '\n'); } catch (e) { console.log('[critic] case log failed: ' + e.message); }   // fix32: eval set for critic-model trials
         return v;
+    }
+
+    // fix37 (D): detect if inventory-full caused a gather/craft/pickup failure
+    // Returns a fact string if detected, null otherwise. No rules, just observable facts.
+    _detectInventoryFullFailure(task, before, after, output) {
+        const goal = countGoal(task) || smeltGoal(task);
+        if (!goal) return null;
+
+        const emptyBefore = before.empty_inventory_slots ?? 36;
+        const emptyAfter = after.empty_inventory_slots ?? 36;
+        const invBefore = before.inventory || {};
+        const invAfter = after.inventory || {};
+
+        // Calculate how many items were gained
+        const gained = goal.items
+            ? goal.items.reduce((a, it) => a + (invAfter[it] || 0) - (invBefore[it] || 0), 0)
+            : (invAfter[goal.item] || 0) - (invBefore[goal.item] || 0);
+
+        // Detect inventory-full failure: gained +0 (or very few) with 0-2 empty slots
+        if (gained < goal.count && emptyAfter <= 2) {
+            const totalItems = Object.values(invAfter).reduce((a, b) => a + b, 0);
+            const topItems = Object.entries(invAfter).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([k, v]) => `${k}: ${v}`).join(', ');
+
+            if (emptyAfter === 0) {
+                return `Inventory is full (0 empty slots, ${totalItems} total items). Gained +${gained} ${goal.item} (needed ${goal.count}). Largest stacks: ${topItems}`;
+            } else {
+                return `Inventory nearly full (${emptyAfter} empty slots, ${totalItems} total items). Gained +${gained} ${goal.item} (needed ${goal.count}). Largest stacks: ${topItems}`;
+            }
+        }
+
+        // Also detect if output mentions inventory full
+        if (/inventory.*full|no.*space|cannot.*pick/i.test(output) && emptyAfter <= 3) {
+            const totalItems = Object.values(invAfter).reduce((a, b) => a + b, 0);
+            return `Code output indicates inventory space issue (${emptyAfter} empty slots, ${totalItems} total items)`;
+        }
+
+        return null;
     }
 
     // fix12: is there a hut at HOME? roof over the centre plus walls on both sides, at any floor level within HOME.y±4 (unloaded chunk = not built)
@@ -2248,7 +2315,8 @@ Interrupts: the bot may be interrupted at any time (danger, getting stuck, a pla
         const learnedSrc = this.skills.map(s => s.code).join('\n\n');
         const ctx = related.slice(0, 3).map(s => `// ${s.description}\n${s.code}`).join('\n\n');   // fix32: full code for the top 3; the rest are signatures in the catalogue
 
-        let feedback = rp?.cut ? `Replay of ${rp.name} failed: ${rp.cut}\nExecution output:\n${String(rp.output).slice(-800)}` : '';
+        // fix37 (D): include inventory-full fact from replay failure in feedback for code gen
+        let feedback = rp?.cut ? `Replay of ${rp.name} failed: ${rp.cut}\nExecution output:\n${String(rp.output).slice(-800)}${rp.invFullFact ? `\nInventory fact: ${rp.invFullFact}` : ''}` : '';
         let lastCode = '', anyCut = rp?.cut || '', prevCrit = null;
         // fix37: duplicate-reply detection state
         let prevReplyHash = null, consecutiveDupes = 0;
@@ -2342,18 +2410,28 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
                 this._afterSuccess();
                 return;
             }
-            feedback = `${cut ? `Attempt ${cut}\n` : ''}Execution output:\n${output}\nCritic: ${verdict.critique}\nChat/behaviour log: ${this.agent.bot.modes.flushBehaviorLog().slice(-400)}`;
+            // fix37 (D): detect inventory-full when code gen fails
+            const invFullFact = !verdict.success ? this._detectInventoryFullFailure(task, before, after, output) : null;
+            if (invFullFact) console.log(`[voyager] attempt ${i} INVENTORY FULL DETECTED: ${invFullFact}`);
+
+            feedback = `${cut ? `Attempt ${cut}\n` : ''}Execution output:\n${output}\nCritic: ${verdict.critique}${invFullFact ? `\nInventory fact: ${invFullFact}` : ''}\nChat/behaviour log: ${this.agent.bot.modes.flushBehaviorLog().slice(-400)}`;
             lastCode = code;
             if (lastTry) { if (i < MAX_ATTEMPTS) console.log(`[voyager] stopping after attempt ${i}: ${same ? 'critique unchanged from the previous attempt' : `${cut} (travel/death cut-off)`}`); break; }
         }
         this.progress.failed.push(task);
         this._saveProgress(); this._windowCheck(false);
         console.log(`[voyager] task failed after ${MAX_ATTEMPTS} attempts: ${task}`);
+
         // SkillWeaver-style: record gap for idle practice
         this.idlePractice.recordGap(task, anyCut || `failed ${MAX_ATTEMPTS}x`);
+
+        // fix37 (D): include inventory-full in decomposition reason if relevant
+        const finalInvFull = this._detectInventoryFullFailure(task, before, this.observe(), '');
+        const invFullReason = finalInvFull ? ` Inventory state: ${finalInvFull}` : '';
+
         // fix19 (1): failed twice (recently) or cut off -> decompose
         const fails = this.progress.failed.slice(-20).filter(t => t === task).length;
-        if (fails >= 2 || anyCut || this._decomposeQueue?.task === task) { if (this._decomposeQueue?.task === task) this._decomposeQueue = null; await this._decompose(task, anyCut || `failed ${fails}x; last critic: ${String(feedback).slice(-300)}`); }
+        if (fails >= 2 || anyCut || this._decomposeQueue?.task === task) { if (this._decomposeQueue?.task === task) this._decomposeQueue = null; await this._decompose(task, anyCut || `failed ${fails}x; last critic: ${String(feedback).slice(-300)}${invFullReason}`); }
         else if (this._curSub?.parent) console.log(`[psn] subgoal "${task}" failed; moving on`);
     }
 }
