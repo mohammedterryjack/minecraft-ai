@@ -649,6 +649,28 @@ Use only c; no other globals.`;
     }
 
     // ---------- automatic curriculum ----------
+    // fix29: restored fix19 PSN decomposition (removed with the milestone planner in fix27c while its callers stayed):
+    // a goal that keeps failing is split by the local model into 2-4 subgoals (depth <= 2, 30-min cooldown per goal);
+    // each subgoal is learned as a skill, then the parent is retried composing those skills
+    async _decompose(task, reason) {
+        const d = (this.progress.decomposed ||= {}), q = (this.progress.subgoals ||= []);
+        const depth = (this._curSub?.task === task ? this._curSub.depth : 0);
+        if (depth >= 2) { console.log(`[psn] decompose skipped for "${task}": already a depth-${depth} subgoal`); return false; }
+        if (d[task] && Date.now() - d[task].at < 30 * 60e3) { console.log(`[psn] decompose skipped for "${task}": decomposed ${Math.round((Date.now() - d[task].at) / 60e3)} min ago`); return false; }
+        const system = `You break a Minecraft bot's failing goal into smaller steps (Voyager/PSN-style task decomposition).
+Return 2-4 concrete, verifiable subgoals, in order, that together achieve the goal; each must be doable in a few minutes by ONE small reusable skill. Use the failure reason and the state. Do not repeat the goal itself.
+Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
+        const user = `goal: ${task}\nwhy it failed: ${String(reason).slice(0, 600)}\ndeath_hotspots: ${this._deathHotspots()}\n${this._stateText(this.observe())}\nknown_skills: ${JSON.stringify(this.skills.filter(s => !s.demoted).map(s => s.name))}`;
+        let subs = [];
+        try { subs = (parseJSON(await this._askLocal(system, user)).subgoals || []).map(t => String(t).trim()).filter(t => t && t !== task && !validateTask(t)).slice(0, 4); }
+        catch (e) { console.log(`[psn] decompose FAILED for "${task}": ${e.message}`); return false; }
+        if (subs.length < 2) { console.log(`[psn] decompose FAILED for "${task}": model gave ${subs.length} valid subgoal(s)`); d[task] = { subs, skills: [], at: Date.now(), reason: String(reason).slice(0, 200) }; this._saveProgress(); return false; }
+        d[task] = { subs, skills: [], at: Date.now(), reason: String(reason).slice(0, 200) };
+        q.unshift(...subs.map(t => ({ task: t, parent: task, depth: depth + 1 })), { task, retry: true, depth });
+        this._saveProgress();
+        console.log(`[psn] DECOMPOSE "${task}" (${String(reason).slice(0, 120)}) -> ${subs.map((t, i) => `${i + 1}) ${t}`).join(' ')}; then retry the parent with the learned skills`);
+        return true;
+    }
     _subgoalTask() {
         const q = this.progress.subgoals || []; if (!q.length) return null;
         const it = q.shift(); this._saveProgress(); this._curSub = it;
@@ -702,7 +724,8 @@ Rules:
 - Do not repeat completed tasks unless needed for progress; avoid tasks that failed recently unless prerequisites are now met.
 - The bot must survive: dying loses its inventory. Nothing keeps it alive automatically (no eating, fleeing, fighting or sheltering reflexes), so survival is your job too: read time, health, food, threats and inventory space in the state and decide.
 Reply ONLY with JSON: {"reasoning": "...", "task": "...", "context": "short hint how to do it"}`;
-        const user = `${this._stateText(state)}
+        const bot = this.agent.bot;   // fix29: current vitals as plain facts, read now (an overlapped plan's state may be minutes old)
+        const user = `current_health: ${Math.round(bot.health)}/20\ncurrent_food: ${bot.food}/20 (20/20 = full)\n${this._stateText(state)}
 completed_tasks: ${JSON.stringify(this.progress.completed.slice(-30))}
 failed_tasks: ${JSON.stringify(this.progress.failed.slice(-15))}
 known_skills: ${JSON.stringify(this.skills.map(s => s.name))}
