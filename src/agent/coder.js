@@ -17,6 +17,17 @@ if (!pathfinderGoals || !pathfinderGoals.GoalNear) {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+// fix39: exported standalone helper for the real skills.*/world.* API surface (from module exports, not JSDoc)
+// Used by voyager.js repair prompts to inject the API catalogue (avoids goToBlock hallucinations)
+let _realAPICache = null;
+export function getRealAPI() {
+    if (_realAPICache) return _realAPICache;
+    const realSkillsAPI = Object.keys(skills).filter(k => typeof skills[k] === 'function').map(k => `skills.${k}`);
+    const realWorldAPI = Object.keys(world).filter(k => typeof world[k] === 'function').map(k => `world.${k}`);
+    _realAPICache = { set: new Set([...realSkillsAPI, ...realWorldAPI]), list: [...realSkillsAPI, ...realWorldAPI] };
+    return _realAPICache;
+}
+
 export class Coder {
     constructor(agent) {
         this.agent = agent;

@@ -20,6 +20,7 @@ import { cosineSimilarity } from '../utils/math.js';
 import minecraftData from 'minecraft-data';
 import { Ollama } from '../models/ollama.js';
 import { signatureOf, depsOf, missingCalls, findCycle, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf } from './skill_graph.js';
+import { getRealAPI } from './coder.js';   // fix39: shared API surface helper for repair prompts
 const LOCAL = { model: 'qwen3:4b-instruct-2507-q4_K_M', url: 'http://192.168.1.215:11434', params: { format: 'json', options: { num_ctx: 8192, num_predict: 512 } } };   // fix38: raised from 150 to 512 - short JSON replies still need room for reasoning; truncation fails loudly (fix31)
 export const CALLS = { local: 0, code: 0, replay: 0 };
 
@@ -1287,14 +1288,29 @@ Use only c; no other globals.`;
     catalogue(only) {
         return this.skills.filter(s => !s.demoted && !s.mergedInto && (!only || only.has(s.name))).map(s => `- ${signatureOf(s.code, s.name)}${s.handwritten ? ' [handwritten]' : ''}: ${s.description}`).join('\n');
     }
+    // fix39: enriched known_skills for decompose/curriculum - includes descriptions for primitives and space-freeing skills
+    // so the local model can propose free-space subgoals when inventory is full (learned path, not hard-coded rules)
+    _knownSkillsFacts() {
+        const freeSpaceKeywords = /deposit|toss|clutter|chest|discard|free.*space|store.*item/i;
+        const importantSkills = new Set(['depositToChest', 'tossClutter', 'tossItem', 'ensureChest']);
+        return this.skills.filter(s => !s.demoted && !s.mergedInto).map(s => {
+            const desc = s.description || '';
+            const isFreeSpace = importantSkills.has(s.name) || freeSpaceKeywords.test(s.name) || freeSpaceKeywords.test(desc);
+            const isPrimitive = s.primitive || s.seeded;
+            if (isFreeSpace || isPrimitive) return `${s.name}: ${desc.slice(0, 120)}`;
+            return s.name;
+        });
+    }
     _recordRun(entry, task, ok, trial) {
         if (trial) {
             const c = entry.candidate; recordRun(c.stats, task, ok);
             const n = c.stats.success + c.stats.fail;
             // fix38: detailed logging for joint repair trial runs (show refactor id to correlate with joint context)
             const jointCtx = c.refactor?.startsWith('jr') ? ` [joint repair ${c.refactor}]` : '';
+            // fix39: add inventory context to gate logs when trial fails (helps ops diagnose invent-full root cause)
+            const invCtx = !ok && this.agent?.bot?.inventory ? ` [inv: ${this.agent.bot.inventory.emptySlotCount()} empty]` : '';
             if (!ok && c.stats.fail >= 2) {
-                gateLog(`REJECT candidate ${entry.name}${jointCtx}: failed ${c.stats.fail}/${n} trial runs; keeping current version`);
+                gateLog(`REJECT candidate ${entry.name}${jointCtx}: failed ${c.stats.fail}/${n} trial runs${invCtx}; keeping current version`);
                 this._proposalOutcome(entry, `rejected ${c.stats.success}/${n}`);
                 const rf = c.refactor;
                 delete entry.candidate;
@@ -1304,7 +1320,7 @@ Use only c; no other globals.`;
                 }
             }
             else if (c.stats.success >= 2 && rate(c.stats) >= rate(entry.stats || newStats())) { gateLog(`PROMOTE candidate ${entry.name}${jointCtx}: ${c.stats.success} passes, trial ${c.stats.success}/${n} >= current rate ${rate(entry.stats || newStats()).toFixed(2)}`); this._promote(entry, c); }
-            else gateLog(`candidate ${entry.name}${jointCtx} trial ${ok ? 'passed' : 'failed'} (${c.stats.success}/${n}); waiting for more runs`);
+            else gateLog(`candidate ${entry.name}${jointCtx} trial ${ok ? 'passed' : 'failed'} (${c.stats.success}/${n})${invCtx}; waiting for more runs`);
         } else {
             entry.stats = recordRun(entry.stats || newStats(), task, ok);
             if (!ok && entry.stats.streakFail >= 3 && entry.handwritten_original && entry.code !== entry.handwritten_original.code) { gateLog(`ROLLBACK ${entry.name}: promoted replacement failed 3 times in a row`); this.restoreHandwritten(entry.name); }
@@ -1566,7 +1582,8 @@ Use only c; no other globals.`;
         const system = `You break a Minecraft bot's failing goal into smaller steps (Voyager/PSN-style task decomposition).
 Return 2-4 concrete, verifiable subgoals, in order, that together achieve the goal; each must be doable in a few minutes by ONE small reusable skill. Use the failure reason and the state. Do not repeat the goal itself.
 Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
-        const user = `goal: ${task}\nwhy it failed: ${String(reason).slice(0, 600)}\ndeath_hotspots: ${this._deathHotspots()}\n${this._stateText(this.observe())}\nknown_skills: ${JSON.stringify(this.skills.filter(s => !s.demoted).map(s => s.name))}`;
+        // fix39: enriched known_skills with descriptions for primitives and space-freeing skills
+        const user = `goal: ${task}\nwhy it failed: ${String(reason).slice(0, 600)}\ndeath_hotspots: ${this._deathHotspots()}\n${this._stateText(this.observe())}\nknown_skills: ${JSON.stringify(this._knownSkillsFacts())}`;
         let subs = [];
         try { subs = (parseLocalJSON(await this._askLocal(system, user), ['subgoals']).subgoals || []).map(t => String(t).trim()).filter(t => t && t !== task && !validateTask(t)).slice(0, 4); }
         catch (e) { console.log(`[psn] decompose FAILED for "${task}": ${e.message}`); return false; }
@@ -1642,7 +1659,8 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "task": "...", "contex
         const taskContext = state.note || '';
         const relevantWorkflows = this.repairMemory.getWorkflowsForTask(taskContext || this.progress.failed.slice(-3).join(' '), 2);
         const workflowHints = this.repairMemory.formatWorkflowHints(relevantWorkflows);
-        const user = `known_skills: ${JSON.stringify(this.skills.map(s => s.name))}
+        // fix39: enriched known_skills with descriptions for primitives and space-freeing skills
+        const user = `known_skills: ${JSON.stringify(this._knownSkillsFacts())}
 replayable_tasks (cheap, no new code needed): ${JSON.stringify(this.skills.filter(s => s.task && !s.primitive).map(s => s.task.split(/\s+(?:within|at|using|from)\b/i)[0]).slice(-25))} plus any "Mine N <block or ore>", "Collect N <log>", "Get N <item>", "Smelt N <raw> into N <out>", "Kill N <mob>", "Harvest N <crop>"
 completed_tasks: ${JSON.stringify(this.progress.completed.slice(-30))}
 failed_tasks: ${JSON.stringify(this.progress.failed.slice(-15))}
@@ -1994,7 +2012,9 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         // AWM-style: retrieve similar past repair lessons
         const pastLessons = await this.repairMemory.retrieveSimilar(q.evidence, 3);
         const awmHints = this.repairMemory.formatHintsForCoder(pastLessons);
-        const system = `You repair ONE skill in a Minecraft mineflayer skill library (PSN-style targeted fix). Return a single \`\`\`javascript code block containing ONLY the fixed function, with the SAME name and a compatible signature. First line inside the block: // DESCRIPTION: <one sentence>. Call other library skills by name (they are in scope); never redefine them. Every loop must check bot.interrupt_code. If something still cannot be done, log(bot, 'FAILED: <reason>') and return a falsy value; no silent fallbacks. findBlock/findBlocks/nearestEntity/bot.entities/blockAt results can be null or empty: always null-check them before reading .position/.x or calling methods on them.\nLIBRARY (the blamed skill's dependencies and callers):\n${this.catalogue(new Set([e.name, ...this._closure(e.name), ...parentsOf(e.name, this._graph())]))}`;
+        // fix39: add real API surface to prevent hallucinated API calls (e.g. goToBlock -> goToNearestBlock)
+        const { list: realAPI } = getRealAPI();
+        const system = `You repair ONE skill in a Minecraft mineflayer skill library (PSN-style targeted fix). Return a single \`\`\`javascript code block containing ONLY the fixed function, with the SAME name and a compatible signature. First line inside the block: // DESCRIPTION: <one sentence>. Call other library skills by name (they are in scope); never redefine them. Every loop must check bot.interrupt_code. If something still cannot be done, log(bot, 'FAILED: <reason>') and return a falsy value; no silent fallbacks. findBlock/findBlocks/nearestEntity/bot.entities/blockAt results can be null or empty: always null-check them before reading .position/.x or calling methods on them.\nLIBRARY (the blamed skill's dependencies and callers):\n${this.catalogue(new Set([e.name, ...this._closure(e.name), ...parentsOf(e.name, this._graph())]))}\nREAL API (only these skills.*/world.* functions exist):\n${realAPI.join(', ')}`;
         const user = `Blamed skill: ${e.name} (${q.kind === 'caller_fix' ? 'it calls the leaf ' + q.leaf + ' in a situation where the leaf cannot succeed: fix how/when it calls it, e.g. obtain the missing prerequisite first' : 'its own logic failed'})\nTask that failed: ${q.task}\nFailure path: ${q.path.join(' > ')}\nEvidence: ${q.evidence}\n--- execution trace (indent = call depth) ---\n${q.trace}\n${e.contract ? `--- learned contract of ${e.name} (must hold after your fix) ---\npre: ${e.contract.pre}\npost: ${e.contract.post}\n` : ''}--- current code of ${e.name} ---\n${e.code}\n--- skills it uses ---\n${kids.map(k => '// ' + k.description + '\n' + signatureOf(k.code, k.name)).join('\n')}\n${(e.repairHistory || []).length ? `\n--- your last ${e.repairHistory.length} repair proposal(s) for ${e.name} (do not repeat what failed) ---\n` + e.repairHistory.map((h, i) => `${i + 1}. [${h.outcome || 'pending'}] ${h.kind}: ${h.evidence}\n   change: ${h.desc}`).join('\n') : ''}${q.peers?.length > 1 ? `\nOther skills blamed on the same failure (repaired children-first): ${q.peers.join(', ')}` : ''}${awmHints ? `\n${awmHints}` : ''}\nWrite the fixed ${e.name}:`;
         console.log(`[psn] repair memory for ${e.name}: ${(e.repairHistory || []).length} past proposal(s) in the prompt${pastLessons.length ? `, ${pastLessons.length} AWM lesson(s)` : ''}`);
         console.log(`[psn] REPAIR ${e.name} [${q.kind}] with the code model (evidence: ${q.evidence.slice(0, 160)})`);
@@ -2155,6 +2175,8 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         const pastLessons = await this.repairMemory.retrieveSimilar(q.evidence, 2);
         const awmHints = this.repairMemory.formatHintsForCoder(pastLessons);
         const relevantSkills = new Set([e.name, pe.name, ...this._closure(e.name), ...this._closure(pe.name), ...parentsOf(e.name, this._graph()), ...parentsOf(pe.name, this._graph())]);
+        // fix39: add real API surface to prevent hallucinated API calls (e.g. goToBlock -> goToNearestBlock)
+        const { list: realAPI } = getRealAPI();
         const system = `You repair TWO skills of a Minecraft mineflayer skill library together (PSN joint repair): a child skill and the caller that uses it failed on the same path.
 
 REQUIRED FORMAT: Return ONE \`\`\`javascript code block containing EXACTLY two async function definitions:
@@ -2169,7 +2191,9 @@ Each function must:
 Call other library skills by name (they are in scope); never redefine them. Every loop must check bot.interrupt_code. If something cannot be done, log(bot, 'FAILED: <reason>') and return a falsy value; no silent fallbacks. findBlock/findBlocks/nearestEntity/bot.entities/blockAt results can be null or empty: always null-check them.
 Fix the child's own logic and how/when the caller uses it. No top-level call, no extra functions.
 SKILL LIBRARY (available skills to call):
-${this.catalogue(relevantSkills)}`;
+${this.catalogue(relevantSkills)}
+REAL API (only these skills.*/world.* functions exist):
+${realAPI.join(', ')}`;
         const user = `Task that failed: ${q.task}\nEvidence: ${q.evidence}\n--- current bot state ---\n${this._stateText(this.observe())}\n--- execution trace ---\n${extractFeedback(q.trace || '', 2500)}\n--- child ${e.name} ---\n${e.code}\n--- caller ${pe.name} ---\n${pe.code}${e.contract ? `\n--- contract of ${e.name} ---\npre: ${e.contract.pre}\npost: ${e.contract.post}` : ''}${pe.contract ? `\n--- contract of ${pe.name} ---\npre: ${pe.contract.pre}\npost: ${pe.contract.post}` : ''}${awmHints ? `\n${awmHints}` : ''}\nWrite both fixed functions (${e.name} first, then ${pe.name}):`;
         console.log(`[psn] REPAIR JOINT ${e.name} + ${pe.name} with the code model (evidence: ${String(q.evidence).slice(0, 160)})`);
         let reply; try { reply = await this._ask(system, user); } catch (err) { console.log(`[psn] joint repair FAILED: ${err.message}`); return false; }
