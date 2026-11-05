@@ -7,6 +7,13 @@ import * as world from './library/world.js';
 import { Vec3 } from 'vec3';
 import {ESLint} from "eslint";
 import * as acorn from "acorn";
+import pf from 'mineflayer-pathfinder';
+
+// fix38: expose pathfinder goals to generated code (fail loud if missing)
+const pathfinderGoals = pf.goals;
+if (!pathfinderGoals || !pathfinderGoals.GoalNear) {
+    throw new Error('[coder] FATAL: mineflayer-pathfinder goals not available - GoalNear and siblings will be undefined at runtime');
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -125,7 +132,10 @@ export class Coder {
         catch (e) { return `syntax error: ${e.message}`; }
         const bot = this.agent.bot, reg = bot.registry;
         const declared = new Set(knownNames), assigned = new Set(), errs = new Set();
-        const sandbox = new Set(['skills', 'world', 'log', 'sleep', 'Vec3']);
+        // fix38: include pathfinder goals in sandbox (they are exposed in the compartment)
+        const sandbox = new Set(['skills', 'world', 'log', 'sleep', 'Vec3', 'goals',
+            'GoalNear', 'GoalFollow', 'GoalInvert', 'GoalBlock', 'GoalXZ', 'GoalNearXZ',
+            'GoalGetToBlock', 'GoalLookAtBlock', 'GoalBreakBlock', 'GoalCompositeAny', 'GoalCompositeAll']);
         const nodes = [];
         (function walk(n) { if (!n || typeof n.type !== 'string') return; nodes.push(n); for (const k in n) { const v = n[k]; if (Array.isArray(v)) v.forEach(walk); else if (v && typeof v.type === 'string') walk(v); } })(ast);
         const decl = p => { if (!p) return; if (p.type === 'Identifier') declared.add(p.name); else if (p.type === 'AssignmentPattern') decl(p.left); else if (p.type === 'RestElement') decl(p.argument); else if (p.type === 'ObjectPattern') p.properties.forEach(q => decl(q.value || q.argument)); else if (p.type === 'ArrayPattern') p.elements.forEach(decl); };
@@ -323,11 +333,37 @@ export class Coder {
         const guardedSkills = {};
         for (const [k, f] of Object.entries(skills))
             guardedSkills[k] = typeof f === 'function' ? (...a) => (a[0]?.interrupt_code ? Promise.resolve(false) : f(...a)) : f;
+        // fix38: expose pathfinder goals so generated code can use GoalNear, GoalFollow, etc.
+        const goals = {
+            GoalNear: pathfinderGoals.GoalNear,
+            GoalFollow: pathfinderGoals.GoalFollow,
+            GoalInvert: pathfinderGoals.GoalInvert,
+            GoalBlock: pathfinderGoals.GoalBlock,
+            GoalXZ: pathfinderGoals.GoalXZ,
+            GoalNearXZ: pathfinderGoals.GoalNearXZ,
+            GoalGetToBlock: pathfinderGoals.GoalGetToBlock,
+            GoalLookAtBlock: pathfinderGoals.GoalLookAtBlock,
+            GoalBreakBlock: pathfinderGoals.GoalBreakBlock,
+            GoalCompositeAny: pathfinderGoals.GoalCompositeAny,
+            GoalCompositeAll: pathfinderGoals.GoalCompositeAll,
+        };
         const compartment = makeCompartment({
             skills: guardedSkills,
             log: skills.log,
             world,
             Vec3,
+            goals,
+            GoalNear: goals.GoalNear,
+            GoalFollow: goals.GoalFollow,
+            GoalInvert: goals.GoalInvert,
+            GoalBlock: goals.GoalBlock,
+            GoalXZ: goals.GoalXZ,
+            GoalNearXZ: goals.GoalNearXZ,
+            GoalGetToBlock: goals.GoalGetToBlock,
+            GoalLookAtBlock: goals.GoalLookAtBlock,
+            GoalBreakBlock: goals.GoalBreakBlock,
+            GoalCompositeAny: goals.GoalCompositeAny,
+            GoalCompositeAll: goals.GoalCompositeAll,
             sleep: ms => new Promise(r => setTimeout(r, ms)),   // fix27: the only way to wait; setTimeout itself is not in scope
         });
         const mainFn = compartment.evaluate(src);

@@ -414,6 +414,51 @@ export class Voyager {
 }`,
                 deps: [],
             },
+            // fix38: seeded primitives for inventory management (freeing space)
+            // These are basic building blocks; WHICH items and WHEN stay learned by the agent
+            {
+                name: 'depositToChest',
+                description: 'Deposit items to a nearby chest to free inventory space. Parameters (which item, how many) are chosen by the agent.',
+                task: 'deposit items to free inventory space',
+                code: `async function depositToChest(bot, itemName, count = 64) {
+    if (!itemName) { log(bot, 'FAILED: depositToChest requires an item name'); return false; }
+    const chest = world.getNearestBlock(bot, b => /chest|barrel|shulker/.test(b.name), 32);
+    if (!chest) { log(bot, 'FAILED: no chest/barrel/shulker_box within 32 blocks to deposit items'); return false; }
+    const item = bot.inventory.items().find(it => it.name === itemName);
+    if (!item) { log(bot, \`Don't have any \${itemName} to deposit.\`); return false; }
+    const toDeposit = Math.min(count, item.count);
+    if (bot.entity.position.distanceTo(chest.position) > 4) {
+        await skills.goToPosition(bot, chest.position.x, chest.position.y, chest.position.z, 3);
+    }
+    const containerWindow = await bot.openContainer(chest);
+    if (!containerWindow) { log(bot, 'FAILED: could not open chest'); return false; }
+    try {
+        const slot = bot.inventory.items().find(it => it.name === itemName);
+        if (!slot) { containerWindow.close(); log(bot, \`Item \${itemName} not found after opening chest\`); return false; }
+        await containerWindow.deposit(slot.type, null, toDeposit);
+        log(bot, \`[chest] Deposited \${toDeposit} \${itemName} to chest.\`);
+    } finally {
+        containerWindow.close();
+    }
+    return true;
+}`,
+                deps: [],
+            },
+            {
+                name: 'tossItem',
+                description: 'Toss (drop) items from inventory to free space. Parameters (which item, how many) are chosen by the agent.',
+                task: 'toss items to free inventory space',
+                code: `async function tossItem(bot, itemName, count = 64) {
+    if (!itemName) { log(bot, 'FAILED: tossItem requires an item name'); return false; }
+    const item = bot.inventory.items().find(it => it.name === itemName);
+    if (!item) { log(bot, \`Don't have any \${itemName} to toss.\`); return false; }
+    const toToss = Math.min(count, item.count);
+    await bot.toss(item.type, null, toToss);
+    log(bot, \`[toss] Tossed \${toToss} \${itemName}.\`);
+    return true;
+}`,
+                deps: [],
+            },
         ];
         let seeded = 0, rehealed = 0;
         for (const prim of SEEDED_PRIMITIVES) {
@@ -1246,9 +1291,20 @@ Use only c; no other globals.`;
         if (trial) {
             const c = entry.candidate; recordRun(c.stats, task, ok);
             const n = c.stats.success + c.stats.fail;
-            if (!ok && c.stats.fail >= 2) { gateLog(`REJECT candidate ${entry.name}: failed ${c.stats.fail}/${n} trial runs; keeping current version`); this._proposalOutcome(entry, `rejected ${c.stats.success}/${n}`); const rf = c.refactor; delete entry.candidate; if (rf) this._rollbackRefactor(rf, entry.name); }
-            else if (c.stats.success >= 2 && rate(c.stats) >= rate(entry.stats || newStats())) { gateLog(`PROMOTE candidate ${entry.name}: ${c.stats.success} passes, trial ${c.stats.success}/${n} >= current rate ${rate(entry.stats || newStats()).toFixed(2)}`); this._promote(entry, c); }
-            else gateLog(`candidate ${entry.name} trial ${ok ? 'passed' : 'failed'} (${c.stats.success}/${n}); waiting for more runs`);
+            // fix38: detailed logging for joint repair trial runs (show refactor id to correlate with joint context)
+            const jointCtx = c.refactor?.startsWith('jr') ? ` [joint repair ${c.refactor}]` : '';
+            if (!ok && c.stats.fail >= 2) {
+                gateLog(`REJECT candidate ${entry.name}${jointCtx}: failed ${c.stats.fail}/${n} trial runs; keeping current version`);
+                this._proposalOutcome(entry, `rejected ${c.stats.success}/${n}`);
+                const rf = c.refactor;
+                delete entry.candidate;
+                if (rf) {
+                    console.log(`[psn] ROLLBACK triggered: candidate ${entry.name} rejected after trial runs -> rolling back refactor ${rf}`);
+                    this._rollbackRefactor(rf, `${entry.name} failed ${c.stats.fail} trial runs`);
+                }
+            }
+            else if (c.stats.success >= 2 && rate(c.stats) >= rate(entry.stats || newStats())) { gateLog(`PROMOTE candidate ${entry.name}${jointCtx}: ${c.stats.success} passes, trial ${c.stats.success}/${n} >= current rate ${rate(entry.stats || newStats()).toFixed(2)}`); this._promote(entry, c); }
+            else gateLog(`candidate ${entry.name}${jointCtx} trial ${ok ? 'passed' : 'failed'} (${c.stats.success}/${n}); waiting for more runs`);
         } else {
             entry.stats = recordRun(entry.stats || newStats(), task, ok);
             if (!ok && entry.stats.streakFail >= 3 && entry.handwritten_original && entry.code !== entry.handwritten_original.code) { gateLog(`ROLLBACK ${entry.name}: promoted replacement failed 3 times in a row`); this.restoreHandwritten(entry.name); }
@@ -2137,10 +2193,21 @@ ${this.catalogue(relevantSkills)}`;
         if (lint) { console.log(`[psn] joint repair FAILED lint: ${String(lint).slice(0, 300)}`); return false; }
         const id = `jr${Date.now()}`;
         this.progress.refactors = { ...(this.progress.refactors || {}), [id]: { helper: null, skills: [e.name, pe.name], at: Date.now(), joint: true } }; this._saveProgress();
-        for (const x of [e, pe]) { this._lastEffects = x.effects || []; this._noteProposal(x, { task: q.task, kind: 'joint', evidence: String(q.evidence).slice(0, 200), desc: `joint with ${x === e ? pe.name : e.name}` });
-            if (!(await this.saveSkill(x.name, desc(fns[x.name], x.description), strip(fns[x.name]), `repair: ${q.task}`, { repair: true, refactor: id }))) { console.log(`[psn] joint repair ${id}: ${x.name} rejected at submit; rolling back the pair`); this._rollbackRefactor(id, `${x.name} rejected at submit`); return false; } }
+        // fix38: detailed logging when joint repair skills go through the gate
+        for (const x of [e, pe]) {
+            this._lastEffects = x.effects || [];
+            this._noteProposal(x, { task: q.task, kind: 'joint', evidence: String(q.evidence).slice(0, 200), desc: `joint with ${x === e ? pe.name : e.name}` });
+            console.log(`[psn] joint repair ${id}: submitting ${x.name} to gate (deps check, cycle check, regression rerun if past tasks exist)`);
+            const saved = await this.saveSkill(x.name, desc(fns[x.name], x.description), strip(fns[x.name]), `repair: ${q.task}`, { repair: true, refactor: id });
+            if (!saved) {
+                // saveSkill logs the gate reason via gateLog; summarize the failure context here
+                console.log(`[psn] joint repair ${id}: GATE REJECTED ${x.name}. Check gateLog above for specific reason (unknown skill calls, dependency cycle, or failed regression rerun). Rolling back the pair.`);
+                this._rollbackRefactor(id, `${x.name} rejected at gate`);
+                return false;
+            }
+        }
         if (pe.candidate) { pe.candidate.trialTask = q.task; pe.candidate.trialAfter = Date.now(); this._saveSkills(); }
-        console.log(`[psn] joint repair ${id}: ${e.name} + ${pe.name} submitted to the gate together (both rolled back if either is rejected)`);
+        console.log(`[psn] joint repair ${id}: ${e.name} + ${pe.name} both passed gate checks and submitted as candidates (both rolled back if either fails trial runs)`);
         return true;
     }
 
