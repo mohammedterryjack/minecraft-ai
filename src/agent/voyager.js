@@ -557,8 +557,8 @@ Use only c; no other globals.`;
     _libSrc(over = {}) { return this.skills.map(s => over[s.name] ?? s.code).join('\n\n'); }
     _graph(exclude) { const g = {}; for (const s of this.skills) if (s.name !== exclude) g[s.name] = s.deps || []; return g; }
     // PSN-style catalogue: every skill with its signature, one line each
-    catalogue() {
-        return this.skills.filter(s => !s.demoted && !s.mergedInto).map(s => `- ${signatureOf(s.code, s.name)}${s.handwritten ? ' [handwritten]' : ''}: ${s.description}`).join('\n');
+    catalogue(only) {
+        return this.skills.filter(s => !s.demoted && !s.mergedInto && (!only || only.has(s.name))).map(s => `- ${signatureOf(s.code, s.name)}${s.handwritten ? ' [handwritten]' : ''}: ${s.description}`).join('\n');
     }
     _recordRun(entry, task, ok, trial) {
         if (trial) {
@@ -877,7 +877,7 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         if (!this._updateAllowed(e, `repair after ${q.kind}`)) { console.log(`[psn] repair of ${e.name} skipped: maturity gate froze it`); return false; }
         this._repairs[e.name] = Date.now(); delete (this.progress.deferCounts || {})[`${e.name}:${q.kind}`]; this._saveProgress();   // fix27: counter resets when the repair actually runs
         const kids = [...this._closure(e.name)].map(n => this.skills.find(s => s.name === n)).filter(Boolean);
-        const system = `You repair ONE skill in a Minecraft mineflayer skill library (PSN-style targeted fix). Return a single \`\`\`javascript code block containing ONLY the fixed function, with the SAME name and a compatible signature. First line inside the block: // DESCRIPTION: <one sentence>. Call other library skills by name (they are in scope); never redefine them. Every loop must check bot.interrupt_code. If something still cannot be done, log(bot, 'FAILED: <reason>') and return a falsy value; no silent fallbacks. findBlock/findBlocks/nearestEntity/bot.entities/blockAt results can be null or empty: always null-check them before reading .position/.x or calling methods on them.\nLIBRARY:\n${this.catalogue()}`;
+        const system = `You repair ONE skill in a Minecraft mineflayer skill library (PSN-style targeted fix). Return a single \`\`\`javascript code block containing ONLY the fixed function, with the SAME name and a compatible signature. First line inside the block: // DESCRIPTION: <one sentence>. Call other library skills by name (they are in scope); never redefine them. Every loop must check bot.interrupt_code. If something still cannot be done, log(bot, 'FAILED: <reason>') and return a falsy value; no silent fallbacks. findBlock/findBlocks/nearestEntity/bot.entities/blockAt results can be null or empty: always null-check them before reading .position/.x or calling methods on them.\nLIBRARY (the blamed skill's dependencies and callers):\n${this.catalogue(new Set([e.name, ...this._closure(e.name), ...parentsOf(e.name, this._graph())]))}`;
         const user = `Blamed skill: ${e.name} (${q.kind === 'caller_fix' ? 'it calls the leaf ' + q.leaf + ' in a situation where the leaf cannot succeed: fix how/when it calls it, e.g. obtain the missing prerequisite first' : 'its own logic failed'})\nTask that failed: ${q.task}\nFailure path: ${q.path.join(' > ')}\nEvidence: ${q.evidence}\n--- execution trace (indent = call depth) ---\n${q.trace}\n${e.contract ? `--- learned contract of ${e.name} (must hold after your fix) ---\npre: ${e.contract.pre}\npost: ${e.contract.post}\n` : ''}--- current code of ${e.name} ---\n${e.code}\n--- skills it uses ---\n${kids.map(k => '// ' + k.description + '\n' + signatureOf(k.code, k.name)).join('\n')}\n${(e.repairHistory || []).length ? `\n--- your last ${e.repairHistory.length} repair proposal(s) for ${e.name} (do not repeat what failed) ---\n` + e.repairHistory.map((h, i) => `${i + 1}. [${h.outcome || 'pending'}] ${h.kind}: ${h.evidence}\n   change: ${h.desc}`).join('\n') : ''}${q.peers?.length > 1 ? `\nOther skills blamed on the same failure (repaired children-first): ${q.peers.join(', ')}` : ''}\nWrite the fixed ${e.name}:`;
         console.log(`[psn] repair memory for ${e.name}: ${(e.repairHistory || []).length} past proposal(s) in the prompt`);
         console.log(`[psn] REPAIR ${e.name} [${q.kind}] with the code model (evidence: ${q.evidence.slice(0, 160)})`);
@@ -1013,14 +1013,16 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         if (rp && !rp.ok && !rp.interrupted && this._findReplay(task)) { this.progress.failed.push(task); this._saveProgress(); }
         if (this._cursorLimited()) { console.log(`[voyager] skipped "${task}": needs new code but Cursor is at its limit (replay-only mode)`); return; }
         this.agent.openChat?.(`New goal: ${task}`);
-        const related = await this.retrieveSkills(task + ' ' + (proposal.context || ''));
-        for (const p of this.skills.filter(s => s.primitive)) if (!related.includes(p)) related.push(p);
+        // fix28 (B): the prompt carries only the skills nomic-embed-text ranks relevant, plus their dependency closures (all skills stay defined in scope)
+        const related = await this.retrieveSkills(task + ' ' + (proposal.context || ''), 8);
+        for (const n of (proposal.context || '').match(/\b[a-z][A-Za-z0-9]+\b/g) || []) { const e = this.skills.find(s => s.name === n && !s.demoted); if (e && !related.includes(e)) related.push(e); }
+        const shown = new Set(related.map(s => s.name)); for (const s of related) for (const d of this._closure(s.name)) shown.add(d);
         const prompter = this.agent.prompter;
         let system = await prompter.replaceStrings(prompter.profile.coding, [{ role: "user", content: `!newAction(${task})` }], prompter.coding_examples);
         system += `\n\nVOYAGER MODE: write ONE reusable async function \`async function camelCaseName(bot) {...}\` that completes the task, then call it at the end with \`await camelCaseName(bot);\`.
 The first line of the code block must be a comment: // DESCRIPTION: <one sentence of what the function does>.
 SKILL LIBRARY (already defined as plain async functions in scope; call them directly by name, e.g. \`await mineOre(bot, 'iron_ore', 3)\`; do NOT redefine or copy them, and do not invent other bare function names):
-${this.catalogue()}
+${this.catalogue(shown)}
 COMPOSE: build your function out of these skills (they can take arguments). Your new skill may take extra parameters with defaults, e.g. \`async function makeIronTools(bot, count = 1)\`. Prefer obtainItem / mineOre / collectLogs / smeltWithFuel / killMob / ensureCraftingTable / ensureFurnace over hand-rolled loops. Do not create call cycles between skills.${this.sharedHints?.length ? `
 SHARED CODE: these fragments are repeated in several skills; if you need this logic, put it in its own small reusable async function skill (named, with parameters) and call it, instead of inlining it again:
 ${this.sharedHints.map(h => '// used in ' + h.skills.join(', ') + '\n' + h.fragment).join('\n')}` : ''}
@@ -1028,7 +1030,7 @@ Recommended building blocks (robust, already handle pathfinding, full inventory 
 Interrupts: the bot may be interrupted at any time (danger, getting stuck, a player talking). Every loop must start with \`if (bot.interrupt_code) return;\` and you must return immediately after any await when bot.interrupt_code is true. Every async function must contain an await. Never catch an error and keep looping; no unbounded loops (always cap attempts). There is no setTimeout/setInterval in scope; to wait use \`await sleep(ms)\`. findBlock/findBlocks/nearestEntity/bot.entities/blockAt results can be null or empty: always null-check them before reading .position/.x or calling methods on them.`;
         // define every library skill so calls to any known skill lint/run; only `related` are shown as context
         const learnedSrc = this.skills.map(s => s.code).join('\n\n');
-        const ctx = related.map(s => `// ${s.description}\n${s.code}`).join('\n\n');
+        const ctx = related.slice(0, 5).map(s => `// ${s.description}\n${s.code}`).join('\n\n');
 
         let feedback = rp?.cut ? `Replay of ${rp.name} failed: ${rp.cut}\nExecution output:\n${String(rp.output).slice(-800)}` : '';
         let lastCode = '', anyCut = rp?.cut || '';
@@ -1037,7 +1039,7 @@ Interrupts: the bot may be interrupted at any time (danger, getting stuck, a pla
             const user = `Task: ${task}\nHint: ${proposal.context || ''}\n${recipeFacts(task)}\n--- state ---\n${this._stateText(this.observe())}
 --- learned skills you can call ---\n${ctx || '(none)'}
 ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- feedback from last attempt ---\n${feedback}\n` : ''}Attempt ${i}/${MAX_ATTEMPTS}. Write the code block:`;
-            if (i === 1) console.log(`[voyager] code prompt includes skill catalogue (${this.skills.filter(s => !s.demoted).length} skills)`);
+            if (i === 1) console.log(`[voyager] code prompt: ${shown.size} of ${this.skills.filter(s => !s.demoted).length} skills in the catalogue (relevant + deps), ${Math.min(5, related.length)} with source; prompt ${system.length + user.length} chars`);
             const reply = await this._ask(system, user);
             const code = extractCode(reply);
             if (!code) { feedback = 'Error: no code block. Reply with a ```javascript``` code block.'; continue; }
