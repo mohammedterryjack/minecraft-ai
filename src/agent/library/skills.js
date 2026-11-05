@@ -11,6 +11,37 @@ export function log(bot, message) {
     bot.output += message + '\n';
 }
 
+// fix44: close any non-inventory window before equip/consume operations
+// Open crafting_table / furnace / chest windows block equip() and consume()
+async function ensureInventoryWindowClosed(bot) {
+    const win = bot.currentWindow;
+    if (win && win.type !== 'minecraft:inventory' && win.type !== 'minecraft:crafting') {
+        try {
+            await bot.closeWindow(win);
+            await new Promise(r => setTimeout(r, 100));
+        } catch (e) {
+            console.log(`[fix44] closeWindow failed (non-fatal): ${e.message}`);
+        }
+    }
+}
+
+// fix44: simple async mutex for serializing equip/consume/clickWindow operations
+// Prevents interleaving that causes Window.acceptClick invalid operation errors
+let _invMutexQueue = Promise.resolve();
+async function withInventoryMutex(bot, label, fn) {
+    let release;
+    const prev = _invMutexQueue;
+    _invMutexQueue = new Promise(r => release = r);
+    try {
+        await prev;
+    } catch (e) { /* previous error doesn't block us */ }
+    try {
+        return await fn();
+    } finally {
+        release();
+    }
+}
+
 async function autoLight(bot) {
     if (world.shouldPlaceTorch(bot)) {
         try {
@@ -968,42 +999,55 @@ export async function equip(bot, itemName) {
      * @example
      * await skills.equip(bot, "iron_pickaxe");
      **/
-    if (itemName === 'hand') {
-        await bot.unequip('hand');
-        log(bot, `Unequipped hand.`);
-        return true;
-    }
-    let item = bot.inventory.slots.find(slot => slot && slot.name === itemName);
-    if (!item) {
-        if (bot.game.gameMode === "creative") {
-            try { await bot.creative.setInventorySlot(36, mc.makeItem(itemName, 1)); } catch (e) { console.log('[creative] setInventorySlot not confirmed (ViaProxy):', e.message); await new Promise(r => setTimeout(r, 300)); }
-            item = bot.inventory.findInventoryItem(itemName);
+    // fix44: serialize inventory operations and close non-inventory windows
+    return await withInventoryMutex(bot, 'equip', async () => {
+        try {
+            // Close any open crafting/furnace/chest window first
+            await ensureInventoryWindowClosed(bot);
+            
+            if (itemName === 'hand') {
+                await bot.unequip('hand');
+                log(bot, `Unequipped hand.`);
+                return true;
+            }
+            let item = bot.inventory.slots.find(slot => slot && slot.name === itemName);
+            if (!item) {
+                if (bot.game.gameMode === "creative") {
+                    try { await bot.creative.setInventorySlot(36, mc.makeItem(itemName, 1)); } catch (e) { console.log('[creative] setInventorySlot not confirmed (ViaProxy):', e.message); await new Promise(r => setTimeout(r, 300)); }
+                    item = bot.inventory.findInventoryItem(itemName);
+                }
+                else {
+                    log(bot, `You do not have any ${itemName} to equip.`);
+                    return false;
+                }
+            }
+            if (itemName.includes('leggings')) {
+                await bot.equip(item, 'legs');
+            }
+            else if (itemName.includes('boots')) {
+                await bot.equip(item, 'feet');
+            }
+            else if (itemName.includes('helmet')) {
+                await bot.equip(item, 'head');
+            }
+            else if (itemName.includes('chestplate') || itemName.includes('elytra')) {
+                await bot.equip(item, 'torso');
+            }
+            else if (itemName.includes('shield')) {
+                await bot.equip(item, 'off-hand');
+            }
+            else {
+                await bot.equip(item, 'hand');
+            }
+            log(bot, `Equipped ${itemName}.`);
+            return true;
+        } finally {
+            // fix44: ensure window cleanup on all paths (success, throw, timeout, interrupt)
+            if (bot.currentWindow && bot.currentWindow.type !== 'minecraft:inventory') {
+                try { await bot.closeWindow(bot.currentWindow); } catch (e) {}
+            }
         }
-        else {
-            log(bot, `You do not have any ${itemName} to equip.`);
-            return false;
-        }
-    }
-    if (itemName.includes('leggings')) {
-        await bot.equip(item, 'legs');
-    }
-    else if (itemName.includes('boots')) {
-        await bot.equip(item, 'feet');
-    }
-    else if (itemName.includes('helmet')) {
-        await bot.equip(item, 'head');
-    }
-    else if (itemName.includes('chestplate') || itemName.includes('elytra')) {
-        await bot.equip(item, 'torso');
-    }
-    else if (itemName.includes('shield')) {
-        await bot.equip(item, 'off-hand');
-    }
-    else {
-        await bot.equip(item, 'hand');
-    }
-    log(bot, `Equipped ${itemName}.`);
-    return true;
+    });
 }
 
 export async function discard(bot, itemName, num=-1) {
@@ -1177,10 +1221,67 @@ export async function consume(bot, itemName="") {
         log(bot, `You do not have any ${name} to eat.`);
         return false;
     }
-    await bot.equip(item, 'hand');
-    await bot.consume();
-    log(bot, `Consumed ${item.name}.`);
-    return true;
+    
+    // fix44: serialize inventory operations and close non-inventory windows
+    return await withInventoryMutex(bot, 'consume', async () => {
+        const CONSUME_TIMEOUT = 3000;
+        const foodBefore = bot.food;
+        let consumeErr = null;
+        let timedOut = false;
+        
+        try {
+            // Close any open crafting/furnace/chest window first
+            await ensureInventoryWindowClosed(bot);
+            
+            // Verify item is still available after potential window close
+            item = bot.inventory.findInventoryItem(itemName);
+            if (!item) {
+                log(bot, `FAILED to consume ${itemName}: item no longer in inventory after closing window.`);
+                return false;
+            }
+            
+            // Equip the food item
+            await bot.equip(item, 'hand');
+            
+            // Verify heldItem matches intended food before activating consume
+            const held = bot.heldItem;
+            if (!held || held.name !== item.name) {
+                log(bot, `FAILED to consume ${itemName}: held item is ${held?.name || 'empty'}, not ${item.name}. Window state: ${bot.currentWindow?.type || 'none'}`);
+                return false;
+            }
+            
+            // Consume with timeout
+            await Promise.race([
+                bot.consume(),
+                new Promise((_, rej) => setTimeout(() => { timedOut = true; rej(new Error('consume timed out')); }, CONSUME_TIMEOUT))
+            ]).catch(e => { consumeErr = e; });
+            
+        } finally {
+            // fix44: ensure window cleanup on all paths (success, throw, timeout, interrupt)
+            if (bot.currentWindow && bot.currentWindow.type !== 'minecraft:inventory') {
+                try { await bot.closeWindow(bot.currentWindow); } catch (e) {}
+            }
+        }
+        
+        // Check food rise to determine success even if consume threw/timed out
+        const foodAfter = bot.food;
+        const foodRose = foodAfter > foodBefore;
+        
+        if (consumeErr) {
+            if (foodRose) {
+                // Timeout but food did rise - count as success
+                log(bot, `Consumed ${item.name} (food ${foodBefore} -> ${foodAfter}, server confirmed despite client timeout).`);
+                return true;
+            } else {
+                // Timeout with no food rise - loud FAILED
+                log(bot, `FAILED to consume ${itemName}: ${consumeErr.message}. Food stayed at ${foodBefore}. Window state: ${bot.currentWindow?.type || 'none'}`);
+                return false;
+            }
+        }
+        
+        log(bot, `Consumed ${item.name} (food ${foodBefore} -> ${foodAfter}).`);
+        return true;
+    });
 }
 
 

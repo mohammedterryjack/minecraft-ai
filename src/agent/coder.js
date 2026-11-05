@@ -247,6 +247,33 @@ export class Coder {
             isLearned: learnedNames.has(best)
         };
     }
+    // fix44: check for variable declarations that shadow the `log` helper (lint feedback only, NO auto-rename)
+    // Returns array of { line, text } for each shadowing declaration found
+    _checkLogShadowing(code) {
+        let ast;
+        try { ast = acorn.parse(code, { ecmaVersion: 'latest', sourceType: 'module', allowAwaitOutsideFunction: true, locations: true }); }
+        catch (e) { return []; }
+        const warnings = [];
+        const codeLines = code.split('\n');
+        const walk = (node) => {
+            if (!node || typeof node.type !== 'string') return;
+            if (node.type === 'VariableDeclarator' && node.id?.type === 'Identifier' && node.id.name === 'log') {
+                const line = node.loc?.start?.line || 0;
+                warnings.push({ line, text: codeLines[line - 1]?.trim() || `const/let/var log = ...` });
+            }
+            if (node.type === 'FunctionDeclaration' && node.id?.name === 'log') {
+                const line = node.loc?.start?.line || 0;
+                warnings.push({ line, text: codeLines[line - 1]?.trim() || `function log(...)` });
+            }
+            for (const key in node) {
+                const val = node[key];
+                if (Array.isArray(val)) val.forEach(walk);
+                else if (val && typeof val.type === 'string') walk(val);
+            }
+        };
+        walk(ast);
+        return warnings;
+    }
     // fix40: extract skills.*/world.* calls from code using acorn - these are NOW FORBIDDEN
     // All functions must be called by bare name, not with skills.*/world.* prefix
     _extractOldStyleCalls(code) {
@@ -332,13 +359,27 @@ export class Coder {
             return result;
         }
 
+        // fix44: lint check for shadowing `log` - explicit feedback only, NO auto-renaming of user locals
+        // This warns when generated code does e.g. `const log = getNearestBlock(...)` which would break
+        // the bare `log()` helper. The interrupt guard is safe (uses __mcLog__), but user code calling log() is not.
+        const shadowLogWarnings = this._checkLogShadowing(code);
+        if (shadowLogWarnings.length > 0) {
+            result += 'WARNING: Variable(s) shadowing the built-in `log` helper detected.\n';
+            result += 'This will prevent log(bot, ...) calls from working in that scope.\n';
+            result += 'Consider renaming your variable to avoid collision (e.g., `logBlock`, `targetBlock`, `nearestLog`):\n';
+            for (const w of shadowLogWarnings) {
+                result += `  Line ${w.line}: ${w.text}\n`;
+            }
+            result += '\n';
+        }
+
         const eslint = new ESLint();
         const results = await eslint.lintText(code);
         const codeLines = code.split('\n');
         let exceptions = results.map(r => r.messages).flat();
         
         // fix26: filter out lint messages about inserted interrupt return statements
-        // These are inserted by _stageCode as `if(bot.interrupt_code) {log(bot, "Code interrupted.");return;}`
+        // These are inserted by _stageCode as `if(bot.interrupt_code) {__mcLog__(bot, "Code interrupted.");return;}`
         // and may trigger lint warnings about ReturnStatement usage. Per Mo: feedback-only, not blocking.
         const isInterruptReturnError = (exc) => {
             if (!exc.line) return false;
@@ -401,12 +442,13 @@ export class Coder {
 
         console.log(`Staged code (library + generated; the raw model reply size is in the [timing] composer line) (${code.length} chars, ${code.split('\n').length} lines): """${code.length > 400 ? code.slice(-400) + '\n...[truncated]' : code}"""`);   // fix27: tail only (the new code is at the end)
 
-        // this may cause problems in callback functions
-        code = code.replaceAll(';\n', '; if(bot.interrupt_code) {log(bot, "Code interrupted.");return;}\n');
+        // fix44: interrupt guard uses __mcLog__ (collision-safe binding injected into endowments)
+        // instead of bare `log` which user code can shadow (e.g. `const log = getNearestBlock(...)`)
+        code = code.replaceAll(';\n', '; if(bot.interrupt_code) {__mcLog__(bot, "Code interrupted.");return;}\n');
         for (let line of code.split('\n')) {
             // every loop iteration checks for an interrupt
-            line = line.replace(/^(\s*(?:\}\s*)?(?:for|while)\s*\(.*\)\s*\{)\s*$/, '$1 if (bot.interrupt_code) {log(bot, "Code interrupted.");return;}');
-            line = line.replace(/^(\s*do\s*\{)\s*$/, '$1 if (bot.interrupt_code) {log(bot, "Code interrupted.");return;}');
+            line = line.replace(/^(\s*(?:\}\s*)?(?:for|while)\s*\(.*\)\s*\{)\s*$/, '$1 if (bot.interrupt_code) {__mcLog__(bot, "Code interrupted.");return;}');
+            line = line.replace(/^(\s*do\s*\{)\s*$/, '$1 if (bot.interrupt_code) {__mcLog__(bot, "Code interrupted.");return;}');
             src += `    ${line}\n`;
         }
         // fix41: generate const bindings for bare API names so ESLint no-undef can see them
@@ -433,6 +475,8 @@ export class Coder {
         // Note that the code may be able to modify the exposed objects.
         // Generated code gets interrupt-aware functions: once an interrupt is requested every call returns false at once
         const endowments = {};
+        // fix44: __mcLog__ is a collision-safe binding for interrupt guards (user code cannot shadow it)
+        endowments.__mcLog__ = skills.log;
         // Inject all skills.* functions as bare names (e.g., goToPosition instead of skills.goToPosition)
         for (const [k, f] of Object.entries(skills)) {
             if (typeof f === 'function') {
