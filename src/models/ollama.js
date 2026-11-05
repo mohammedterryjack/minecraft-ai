@@ -94,19 +94,14 @@ export class Ollama {
         let method = 'POST';
         let headers = new Headers();
         const request = new Request(url, { method, headers, body: JSON.stringify(body) });
-        let data = null;
-        try {
-            const res = await fetch(request);
-            if (res.ok) {
-                data = await res.json();
-            } else {
-                throw new Error(`Ollama Status: ${res.status}`);
-            }
-        } catch (err) {
-            console.error('Failed to send Ollama request.');
-            console.error(err);
+        const res = await fetch(request);
+        if (!res.ok) {
+            const errText = await res.text().catch(() => '');
+            const errMsg = `Ollama ${res.status}: ${errText || res.statusText}`;
+            console.error(`[ollama] ${this.model_name} request FAILED: ${errMsg}`);
+            throw new Error(errMsg);
         }
-        return data;
+        return await res.json();
     }
 
     async sendVisionRequest(messages, systemMessage, imageBuffer) {

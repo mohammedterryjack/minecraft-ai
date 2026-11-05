@@ -68,7 +68,7 @@ export class Prompter {
             let freeFallback = null;
             if (code_model_profile.api === 'cursor') {
                 // fix33: default fallback is a coder-class model, not the chat model
-                const freeConfig = this.profile.code_model_free || { api: 'ollama', model: 'qwen2.5-coder:7b-instruct-q4_K_M', url: 'http://192.168.1.215:11434', params: { keep_alive: -1, options: { num_ctx: 8192 } } };
+                const freeConfig = this.profile.code_model_free || { api: 'ollama', model: 'qwen2.5-coder:7b', url: 'http://192.168.1.215:11434', params: { keep_alive: -1, options: { num_ctx: 8192 } } };
                 try { freeFallback = new Ollama(freeConfig.model, freeConfig.url, freeConfig.params); console.log(`[prompter] configured FREE fallback coder: ${freeFallback.model_name} at ${freeFallback.url}`); }
                 catch (e) { console.warn(`[prompter] failed to configure free fallback coder: ${e.message}`); }
             }
