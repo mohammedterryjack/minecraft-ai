@@ -71,6 +71,8 @@ export class Coder {
                 continue;
             }
             code = res.substring(res.indexOf('```')+3, res.lastIndexOf('```'));
+            // fix34: formatting-only auto-fix before lint (whitespace, semicolons, quotes - nothing semantic)
+            code = this._autoFixFormatting(code);
             const result = await this._stageCode(code);
             const executionModule = result.func;
             const lintResult = await this._lintCode(result.src_lint_copy);
@@ -149,27 +151,93 @@ export class Coder {
         }
         return errs.size ? `API gate: ${[...errs].slice(0, 8).join('; ')}` : null;
     }
+    // fix34: Levenshtein distance for API name matching
+    _lev(a, b) {
+        if (Math.abs(a.length - b.length) > 6) return 99;
+        let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+        for (let i = 1; i <= a.length; i++) {
+            const cur = [i];
+            for (let j = 1; j <= b.length; j++)
+                cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+            prev = cur;
+        }
+        return prev[b.length];
+    }
+    // fix34: get the real API surface from module exports (not JSDoc docs)
+    _getRealAPI() {
+        if (this._realAPICache) return this._realAPICache;
+        const realSkillsAPI = Object.keys(skills).filter(k => typeof skills[k] === 'function').map(k => `skills.${k}`);
+        const realWorldAPI = Object.keys(world).filter(k => typeof world[k] === 'function').map(k => `world.${k}`);
+        this._realAPICache = { set: new Set([...realSkillsAPI, ...realWorldAPI]), list: [...realSkillsAPI, ...realWorldAPI] };
+        return this._realAPICache;
+    }
+    // fix34: find nearest real API call by edit distance; returns { match, dist } or null
+    _nearestAPI(call) {
+        const { list } = this._getRealAPI();
+        const fnName = call.split('.').pop().toLowerCase();
+        const prefix = call.startsWith('world.') ? 'world.' : 'skills.';
+        const sameModule = list.filter(r => r.startsWith(prefix));
+        let best = null, bestDist = Infinity;
+        for (const r of sameModule) {
+            const dist = this._lev(fnName, r.split('.').pop().toLowerCase());
+            if (dist < bestDist) { best = r; bestDist = dist; }
+        }
+        return best ? { match: best, dist: bestDist } : null;
+    }
+    // fix34: extract skills.*/world.* calls from code using acorn (avoids false positives in strings/comments)
+    _extractApiCalls(code) {
+        let ast;
+        try { ast = acorn.parse(code, { ecmaVersion: 'latest', sourceType: 'module', allowAwaitOutsideFunction: true }); }
+        catch (e) { return { calls: [], positions: [], error: e.message }; }
+        const calls = [], positions = [];
+        const walk = (node) => {
+            if (!node || typeof node.type !== 'string') return;
+            if (node.type === 'CallExpression' && node.callee.type === 'MemberExpression' &&
+                node.callee.object.type === 'Identifier' && ['skills', 'world'].includes(node.callee.object.name) &&
+                node.callee.property.type === 'Identifier') {
+                const call = `${node.callee.object.name}.${node.callee.property.name}`;
+                calls.push(call);
+                positions.push({ call, start: node.callee.start, end: node.callee.end });
+            }
+            for (const key in node) {
+                const val = node[key];
+                if (Array.isArray(val)) val.forEach(walk);
+                else if (val && typeof val.type === 'string') walk(val);
+            }
+        };
+        walk(ast);
+        return { calls, positions, error: null };
+    }
+    // fix34: formatting-only auto-fix (whitespace, semicolons, quotes, code fences - nothing semantic)
+    _autoFixFormatting(code) {
+        let fixed = code.trim();
+        if (fixed.startsWith('javascript') || fixed.startsWith('js')) {
+            fixed = fixed.replace(/^(?:javascript|js)\s*/, '');
+        }
+        fixed = fixed.replace(/\r\n/g, '\n').replace(/\t/g, '    ');
+        fixed = fixed.replace(/[ \t]+$/gm, '');
+        return fixed;
+    }
     async  _lintCode(code) {
         let result = '#### CODE ERROR INFO ###\n';
-        const codeNoComments = code.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');
-        const skillRegex = /((?:skills|world)\.(.*?))\(/g;
-        const skills = [];
-        let match;
-        while ((match = skillRegex.exec(codeNoComments)) !== null) {
-            skills.push(match[1]);
+        // fix34: use acorn to extract actual API calls (not regex on strings/comments)
+        const { calls, error: parseError } = this._extractApiCalls(code);
+        if (parseError) {
+            result += `Syntax error (cannot parse): ${parseError}\n`;
+            return result;
         }
-        const allDocs = await this.agent.prompter.skill_libary.getAllSkillDocs();
-        const knownSkills = new Set(allDocs.map(doc => doc.split('\n')[0]));
-        const missingSkills = skills.filter(skill => !knownSkills.has(skill));
-        if (missingSkills.length > 0) {
+        const { set, list } = this._getRealAPI();
+        const missingCalls = [...new Set(calls.filter(c => !set.has(c)))];
+        if (missingCalls.length > 0) {
             result += 'These functions do not exist:\n';
-            const known = [...knownSkills];
-            result += missingSkills.map(m => {
-                const base = m.split('.').pop().toLowerCase();
-                const close = known.filter(k => k.split('.').pop().toLowerCase().includes(base.slice(0, 5)) || base.includes(k.split('.').pop().toLowerCase().slice(0, 6))).slice(0, 5);
+            result += missingCalls.map(m => {
+                const nearest = this._nearestAPI(m);
+                const scored = list.map(r => ({ r, dist: this._lev(m.split('.').pop().toLowerCase(), r.split('.').pop().toLowerCase()) }))
+                    .sort((a, b) => a.dist - b.dist);
+                const close = scored.filter(s => s.dist <= 8).slice(0, 5).map(s => s.r);
                 return `${m}  -> did you mean: ${close.length ? close.join(', ') : '(none close)'}`;
             }).join('\n');
-            result += '\nOnly these functions exist: ' + known.join(', ');
+            result += '\nOnly these functions exist: ' + list.join(', ');
             console.log(result)
             return result;
         }
