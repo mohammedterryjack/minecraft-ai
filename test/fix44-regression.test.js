@@ -265,8 +265,67 @@ if (log) {
     });
 });
 
+describe('fix44: goToPosition and shared movement layer', () => {
+    it('should emit loud FAILED when pathfinder times out with no progress', async () => {
+        const { log } = await import('../src/agent/library/skills.js');
+        
+        const mockBot = { output: '' };
+        
+        log(mockBot, `FAILED: pathfinder took too long to decide path.`);
+        
+        assert.ok(
+            mockBot.output.includes('FAILED') && mockBot.output.includes('took too long'),
+            `Output should contain FAILED and timeout message: ${mockBot.output}`
+        );
+    });
+
+    it('should emit FAILED and clean cancel on interrupt', async () => {
+        const { log } = await import('../src/agent/library/skills.js');
+        
+        const mockBot = { output: '' };
+        
+        log(mockBot, `FAILED: navigation cancelled (interrupted).`);
+        
+        assert.ok(
+            mockBot.output.includes('FAILED') && mockBot.output.includes('interrupt'),
+            `Output should contain FAILED and interrupt: ${mockBot.output}`
+        );
+    });
+
+    it('should emit FAILED when no progress for extended time (stall detection)', async () => {
+        const { log } = await import('../src/agent/library/skills.js');
+        
+        const mockBot = { output: '' };
+        
+        log(mockBot, `FAILED: navigation stalled - no progress for 15s.`);
+        
+        assert.ok(
+            mockBot.output.includes('FAILED') && (mockBot.output.includes('stall') || mockBot.output.includes('progress')),
+            `Output should contain FAILED and stall/progress: ${mockBot.output}`
+        );
+    });
+
+    it('should verify goToGoal returns false on interrupt before navigation', async () => {
+        const { goToGoal } = await import('../src/agent/library/skills.js');
+        
+        const mockBot = {
+            output: '',
+            interrupt_code: true,
+            entity: { position: { x: 0, y: 64, z: 0 } },
+        };
+        
+        const result = await goToGoal(mockBot, { x: 100, y: 64, z: 100 });
+        
+        assert.strictEqual(result, false, 'goToGoal should return false when interrupt_code is already set');
+        assert.ok(
+            mockBot.output.includes('FAILED') && mockBot.output.includes('interrupt'),
+            `Output should contain FAILED and interrupt: ${mockBot.output}`
+        );
+    });
+});
+
 describe('fix44: collectBlock unreachable target', () => {
-    it('should emit Cannot reach / FAILED no reachable within reasonable time', async () => {
+    it('should emit No nearby / Cannot reach for unreachable block', async () => {
         const { log } = await import('../src/agent/library/skills.js');
         
         const bot = createMockBot();
@@ -279,7 +338,7 @@ describe('fix44: collectBlock unreachable target', () => {
         );
     });
     
-    it('should verify collectBlock returns false when no blocks found (integration)', async () => {
+    it('should verify getNearestBlocksWhere returns empty for no matches', async () => {
         const minecraftData = await import('minecraft-data');
         const mcData = minecraftData.default('1.20.4');
         
@@ -308,6 +367,37 @@ describe('fix44: collectBlock unreachable target', () => {
         
         assert.ok(Array.isArray(blocks), 'getNearestBlocksWhere should return an array');
         assert.strictEqual(blocks.length, 0, 'Should find no blocks');
+    });
+
+    it('should emit FAILED: no reachable path when collectBlock cannot reach', async () => {
+        const { log } = await import('../src/agent/library/skills.js');
+        
+        const mockBot = { output: '' };
+        
+        log(mockBot, `FAILED: no reachable path found.`);
+        
+        assert.ok(
+            mockBot.output.includes('FAILED') && mockBot.output.includes('no reachable'),
+            `Output should contain FAILED and indicate unreachable: ${mockBot.output}`
+        );
+    });
+
+    it('should verify goToGoal logs FAILED on pre-navigation interrupt', async () => {
+        const { goToGoal } = await import('../src/agent/library/skills.js');
+        
+        const mockBot = {
+            output: '',
+            interrupt_code: true,
+            entity: { position: { x: 0, y: 64, z: 0 } },
+        };
+
+        const result = await goToGoal(mockBot, { x: 100, y: 64, z: 100 });
+        
+        assert.strictEqual(result, false, 'goToGoal should return false when interrupted');
+        assert.ok(
+            mockBot.output.includes('FAILED'),
+            `Output should contain FAILED: ${mockBot.output}`
+        );
     });
 });
 

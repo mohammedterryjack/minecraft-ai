@@ -1362,9 +1362,16 @@ export async function goToGoal(bot, goal) {
      * Navigate to the given goal. Use doors and attempt minimally destructive movements.
      * @param {MinecraftBot} bot, reference to the minecraft bot.
      * @param {pf.goals.Goal} goal, the goal to navigate to.
+     * @returns {Promise<boolean>} true if goal reached, false on failure/interrupt.
      **/
 
-    bot.pathfinder.thinkTimeout = 20000; // was 5000 default -> "Took to long to decide path"
+    // fix44: interrupt check with clean return and FAILED signal
+    if (bot.interrupt_code) {
+        log(bot, `FAILED: navigation cancelled (interrupted).`);
+        return false;
+    }
+
+    bot.pathfinder.thinkTimeout = 10000; // fix44: reduced from 20s to 10s for faster failure feedback
     bot.pathfinder.tickTimeout = 40;
     const nonDestructiveMovements = _survivalMovements(bot);
     const dontBreakBlocks = ['glass', 'glass_pane'];
@@ -1379,47 +1386,157 @@ export async function goToGoal(bot, goal) {
     let final_movements = destructiveMovements;
 
     const pathfind_timeout = 4000;
-    if (bot.interrupt_code) return;
-    if (await bot.pathfinder.getPathTo(nonDestructiveMovements, goal, pathfind_timeout).status === 'success') {
-        final_movements = nonDestructiveMovements;
-        log(bot, `Found non-destructive path.`);
+    if (bot.interrupt_code) {
+        log(bot, `FAILED: navigation cancelled (interrupted).`);
+        return false;
     }
-    else if (await bot.pathfinder.getPathTo(destructiveMovements, goal, pathfind_timeout).status === 'success') {
-        log(bot, `Found destructive path.`);
-    }
-    else {
-        log(bot, `Path not found, but attempting to navigate anyway using destructive movements.`);
+    
+    try {
+        const nonDestructivePath = await bot.pathfinder.getPathTo(nonDestructiveMovements, goal, pathfind_timeout);
+        if (nonDestructivePath.status === 'success') {
+            final_movements = nonDestructiveMovements;
+            log(bot, `Found non-destructive path.`);
+        }
+        else {
+            const destructivePath = await bot.pathfinder.getPathTo(destructiveMovements, goal, pathfind_timeout);
+            if (destructivePath.status === 'success') {
+                log(bot, `Found destructive path.`);
+            }
+            else {
+                log(bot, `Path not found, but attempting to navigate anyway using destructive movements.`);
+            }
+        }
+    } catch (pathErr) {
+        log(bot, `FAILED: path calculation error: ${pathErr.message}`);
+        return false;
     }
 
     const doorCheckInterval = startDoorInterval(bot);
+    
+    // fix44: progress monitoring - detect stalls where bot makes no progress
+    let lastPos = bot.entity.position.clone();
+    let noProgressTime = 0;
+    const PROGRESS_CHECK_INTERVAL = 1000;
+    const NO_PROGRESS_TIMEOUT = 15000; // 15s without movement = stall
+    let progressInterval = null;
+    let progressTimedOut = false;
 
     bot.pathfinder.setMovements(final_movements);
     try {
+        // fix44: wrap pathfinder.goto with progress monitoring
+        const gotoWithProgress = async (targetGoal) => {
+            return new Promise((resolve, reject) => {
+                progressInterval = setInterval(() => {
+                    // Check for interrupt
+                    if (bot.interrupt_code) {
+                        clearInterval(progressInterval);
+                        progressInterval = null;
+                        try { bot.pathfinder.stop(); } catch (e) {}
+                        reject(new Error('interrupted'));
+                        return;
+                    }
+                    
+                    // Check for progress
+                    const currentPos = bot.entity.position;
+                    const moved = currentPos.distanceTo(lastPos);
+                    if (moved < 0.5) {
+                        noProgressTime += PROGRESS_CHECK_INTERVAL;
+                        if (noProgressTime >= NO_PROGRESS_TIMEOUT) {
+                            clearInterval(progressInterval);
+                            progressInterval = null;
+                            progressTimedOut = true;
+                            try { bot.pathfinder.stop(); } catch (e) {}
+                            reject(new Error(`no progress for ${NO_PROGRESS_TIMEOUT / 1000}s (stalled)`));
+                        }
+                    } else {
+                        noProgressTime = 0;
+                        lastPos = currentPos.clone();
+                    }
+                }, PROGRESS_CHECK_INTERVAL);
+
+                bot.pathfinder.goto(targetGoal)
+                    .then(() => {
+                        if (progressInterval) { clearInterval(progressInterval); progressInterval = null; }
+                        resolve(true);
+                    })
+                    .catch((err) => {
+                        if (progressInterval) { clearInterval(progressInterval); progressInterval = null; }
+                        reject(err);
+                    });
+            });
+        };
+
         try {
-            await bot.pathfinder.goto(goal);
+            await gotoWithProgress(goal);
         } catch (err) {
+            // fix44: check for interrupt first
+            if (bot.interrupt_code || /interrupted/i.test(String(err?.message))) {
+                clearInterval(doorCheckInterval);
+                if (progressInterval) clearInterval(progressInterval);
+                try { bot.pathfinder.stop(); } catch (e) {}
+                log(bot, `FAILED: navigation cancelled (interrupted).`);
+                return false;
+            }
+            
+            // fix44: check for progress timeout (stall)
+            if (progressTimedOut || /no progress|stalled/i.test(String(err?.message))) {
+                clearInterval(doorCheckInterval);
+                log(bot, `FAILED: navigation stalled - no progress for ${NO_PROGRESS_TIMEOUT / 1000}s.`);
+                return false;
+            }
+            
             // long/complex path: hop via intermediate waypoints toward the goal, then retry
-            if (!/Took to long|No path|Timeout/i.test(String(err?.message)) || goal.x == null || bot.interrupt_code) throw err;
+            if (!/Took to long|No path|Timeout/i.test(String(err?.message)) || goal.x == null) {
+                throw err;
+            }
+            
+            log(bot, `Path decision timeout, trying intermediate waypoints...`);
             for (let hop = 0; hop < 3; hop++) {
+                if (bot.interrupt_code) {
+                    clearInterval(doorCheckInterval);
+                    try { bot.pathfinder.stop(); } catch (e) {}
+                    log(bot, `FAILED: navigation cancelled (interrupted).`);
+                    return false;
+                }
                 const p = bot.entity.position;
                 const dx = goal.x - p.x, dz = goal.z - p.z, dist = Math.hypot(dx, dz);
                 if (dist < 6) break;
                 const step = Math.min(16, dist / 2);
                 const wx = Math.floor(p.x + dx / dist * step), wz = Math.floor(p.z + dz / dist * step);
                 const wy = goal.y != null ? Math.floor(p.y + Math.sign(goal.y - p.y) * Math.min(6, Math.abs(goal.y - p.y))) : Math.floor(p.y);
-                log(bot, `Path too long, trying waypoint ${wx}, ${wy}, ${wz}.`);
+                log(bot, `Trying waypoint ${wx}, ${wy}, ${wz}.`);
                 bot.pathfinder.setMovements(destructiveMovements);
                 try { await bot.pathfinder.goto(new pf.goals.GoalNear(wx, wy, wz, 2)); } catch (e) {}
             }
             bot.pathfinder.setMovements(destructiveMovements);
-            await bot.pathfinder.goto(goal);
+            
+            // Reset progress tracking for final attempt
+            lastPos = bot.entity.position.clone();
+            noProgressTime = 0;
+            progressTimedOut = false;
+            
+            await gotoWithProgress(goal);
         }
         clearInterval(doorCheckInterval);
         return true;
     } catch (err) {
         clearInterval(doorCheckInterval);
-        // we need to catch so we can clean up the door check interval, then rethrow the error
-        throw err;
+        if (progressInterval) clearInterval(progressInterval);
+        try { bot.pathfinder.stop(); } catch (e) {}
+        
+        // fix44: loud FAILED for all path failures
+        if (bot.interrupt_code || /interrupted/i.test(String(err?.message))) {
+            log(bot, `FAILED: navigation cancelled (interrupted).`);
+        } else if (/Took to long/i.test(String(err?.message))) {
+            log(bot, `FAILED: pathfinder took too long to decide path.`);
+        } else if (/No path/i.test(String(err?.message))) {
+            log(bot, `FAILED: no reachable path found.`);
+        } else if (/stalled|no progress/i.test(String(err?.message))) {
+            log(bot, `FAILED: navigation stalled - no progress.`);
+        } else {
+            log(bot, `FAILED: navigation error: ${err.message}`);
+        }
+        return false;
     }
 }
 
@@ -1527,8 +1644,17 @@ export async function goToPosition(bot, x, y, z, min_distance=2) {
     const progressInterval = setInterval(checkDigProgress, 1000);
     
     try {
-        await goToGoal(bot, new pf.goals.GoalNear(x, y, z, min_distance));
+        // fix44: goToGoal now returns false on failure instead of always throwing
+        const reached = await goToGoal(bot, new pf.goals.GoalNear(x, y, z, min_distance));
         clearInterval(progressInterval);
+        
+        if (!reached) {
+            // goToGoal already logged FAILED, add distance context
+            const d = Math.round(bot.entity.position.distanceTo(new Vec3(x, y, z)));
+            log(bot, `Still ${d} blocks from ${x}, ${y}, ${z}. ${_pathHint(bot, x, y, z)}`);
+            return false;
+        }
+        
         const distance = bot.entity.position.distanceTo(new Vec3(x, y, z));
         if (distance <= min_distance+1) {
             log(bot, `You have reached at ${x}, ${y}, ${z}.`);
