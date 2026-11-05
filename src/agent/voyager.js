@@ -387,20 +387,40 @@ Use only c; no other globals.`;
     }
     // fix19 (6): places where the bot died 2+ times (16-block cells): a problem for the curriculum to learn to handle, no reflex
     _deathHotspots() {
-        const hs = Object.values(this.progress.deathSpots || {}).filter(c => c.n >= 2).sort((a, b) => b.n - a.n).slice(0, 3);
-        return hs.length ? hs.map(c => `${c.n} deaths near ${c.pos} (${c.causes.slice(-2).join('; ')}) during "${c.tasks.slice(-1)[0] || 'idle'}"`).join(' | ') + ' -> propose a task that learns to survive/avoid this' : 'none';
+        const hs = Object.values(this.progress.deathSpots || {}).filter(c => c.n >= 2).map(c => ({ ...c, hot: !!this._hotCell({ x: +c.pos.split(',')[0], z: +c.pos.split(',')[2] }) })).sort((a, b) => b.n - a.n).slice(0, 3);
+        return hs.length ? hs.map(c => `${c.n} deaths near ${c.pos} (${c.causes.slice(-2).join('; ')}) during "${c.tasks.slice(-1)[0] || 'idle'}"${c.hot ? ' [ACTIVE: tasks targeting/crossing it are rejected, entering it fails the running skill]' : ''}`).join(' | ') + ' -> propose a task that learns to survive/avoid this' : 'none';
     }
-    // fix23: a curriculum task aimed at a cell with 3+ deaths (latest within 30 min) is rejected with the reason fed back to the curriculum
+    // fix26: death hotspots decay by count and time (no fixed cooldown): weight = sum over deaths of 0.5^(age/6h); hot when n>=3 and weight>=1.5
+    _cellKey(p) { return `${Math.floor(p.x / 16)},${Math.floor(p.z / 16)}`; }
+    _hotCell(p) {
+        if (!p || !Number.isFinite(p.x)) return null;
+        const c = (this.progress.deathSpots || {})[this._cellKey(p)]; if (!c || c.n < 3) return null;
+        const ts = c.times?.length ? c.times : Array(c.n).fill(c.last ?? Date.now());
+        const w = ts.reduce((a, t) => a + Math.pow(0.5, (Date.now() - t) / (6 * 3600e3)), 0) + Math.max(0, c.n - ts.length) * Math.pow(0.5, (Date.now() - (c.last ?? Date.now())) / (6 * 3600e3));
+        return w >= 1.5 ? { ...c, w } : null;
+    }
+    _hsText(c) { return `${c.n} deaths near ${c.pos}: ${c.causes.slice(-2).join('; ')}; weight ${c.w.toFixed(1)}`; }
+    // first hot cell on the straight route a->b (8-block samples), excluding the start cell
+    _hotOnRoute(a, b) {
+        const n = Math.max(1, Math.ceil(Math.hypot(b.x - a.x, b.z - a.z) / 8)), k0 = this._cellKey(a);
+        for (let i = 1; i <= n; i++) { const p = { x: a.x + (b.x - a.x) * i / n, z: a.z + (b.z - a.z) * i / n }; if (this._cellKey(p) === k0) continue; const c = this._hotCell(p); if (c) return c; }
+        return null;
+    }
+    // fix26: a task is checked against the resolved target (explicit coords, else home if it says home), the route there, and the bot's own position
     _hotspotOf(task) {
-        const m = String(task).match(/(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)/); if (!m) return null;
-        const c = (this.progress.deathSpots || {})[`${Math.floor(+m[1] / 16)},${Math.floor(+m[3] / 16)}`];
-        if (!c || c.n < 3 || Date.now() - (c.last ?? Date.now()) > 30 * 60e3) return null;
-        return `it targets a death hotspot (${c.n} deaths near ${c.pos}: ${c.causes.slice(-2).join('; ')}); choose a goal away from there or one that first learns to survive it from a safe distance`;
+        const m = String(task).match(/(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)/), m2 = !m && String(task).match(/\(\s*(-?\d+)\s*,\s*(-?\d+)\s*\)/);
+        const tgt = m ? { x: +m[1], z: +m[3] } : m2 ? { x: +m2[1], z: +m2[2] } : /\bhome\b|\bhut\b|\bbase\b/i.test(task) ? { x: HOME.x, z: HOME.z } : null;
+        const me = this.agent.bot?.entity?.position, here = me ? { x: me.x, z: me.z } : null;
+        let c = tgt && this._hotCell(tgt);
+        if (c) return `its target (${tgt.x}, ${tgt.z}) is in a death hotspot (${this._hsText(c)}); choose a goal away from there or one that first learns to survive it from a safe distance`;
+        if (tgt && here && (c = this._hotOnRoute(here, tgt))) return `the route from the bot (${Math.round(here.x)}, ${Math.round(here.z)}) to its target (${tgt.x}, ${tgt.z}) crosses a death hotspot (${this._hsText(c)}); choose a goal reachable without crossing it`;
+        if (here && (c = this._hotCell(here)) && !tgt) return `the bot is standing in a death hotspot (${this._hsText(c)}) and the task has no explicit target; give a task with explicit x, y, z coordinates outside that area`;
+        return null;
     }
     _noteDeath(d, task) {
         const [x, y, z] = d.pos.split(',').map(Number), k = `${Math.floor(x / 16)},${Math.floor(z / 16)}`;
         const c = ((this.progress.deathSpots ||= {})[k] ||= { n: 0, pos: d.pos, causes: [], tasks: [] });
-        c.n++; c.last = Date.now(); c.pos = d.pos; c.causes = [...c.causes, d.message].slice(-5); c.tasks = [...c.tasks, task].slice(-5); this._saveProgress();
+        c.n++; c.last = Date.now(); c.times = [...(c.times || []), c.last].slice(-20); c.pos = d.pos; c.causes = [...c.causes, d.message].slice(-5); c.tasks = [...c.tasks, task].slice(-5); this._saveProgress();
         console.log(`[psn] death during "${task}": ${d.message} at ${d.pos} (death #${c.n} in this area)${c.n >= 2 ? '; surfaced to the curriculum as a death hotspot' : ''}`);
     }
     // fix18: perception only (no policy): hostiles within 32 blocks, nearest first
@@ -890,6 +910,13 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         // fix19 (6): a death is a failure of the call that was running (deepest open call) and all its ancestors
         const died = this._diedInRun();
         if (died) { let i = -1; for (let k = 0; k < trace.length; k++) if ((trace[k].t0 || 0) <= died.t && (trace[k].t1 ?? Infinity) >= died.t - 1500 && (i < 0 || trace[k].depth >= trace[i].depth)) i = k; if (i < 0) i = trace.length - 1; console.log(`[psn] death attributed to the call running at death time: ${trace[i].name} (depth ${trace[i].depth})`); trace[i].ownFail = [`DIED: ${died.message} at ${died.pos}`]; for (; i >= 0; i = trace[i].parent) { trace[i].intr = false; trace[i].ok = false; trace[i].fail = true; } ok = false; }
+        // fix26: a call that moved the bot from outside into an active hotspot failed its contract (deepest such call); blame/repair learns avoidance
+        for (let k = trace.length - 1; k >= 0; k--) { const r = trace[k]; if (r.intr || !r.s0?.pos || !r.s1?.pos) continue;
+            const c = this._hotCell(r.s1.pos); if (!c || this._cellKey(r.s0.pos) === this._cellKey(r.s1.pos)) continue;
+            if (trace.some((q, j) => j > k && q.depth > r.depth && q.ownFail?.some(l => /HOTSPOT/.test(l)))) continue;
+            console.log(`[psn] hotspot entry: ${r.name} moved the bot into a death hotspot (${this._hsText(c)}) -> contract failure`);
+            r.ownFail = [...(r.ownFail || []), `FAILED: HOTSPOT entered: moved from ${Math.round(r.s0.pos.x)},${Math.round(r.s0.pos.z)} into a death hotspot at ${c.pos} (${c.n} deaths: ${c.causes.slice(-1)[0]})`];
+            for (let i = k; i >= 0; i = trace[i].parent) { trace[i].intr = false; trace[i].ok = false; trace[i].fail = true; } ok = false; }
         // fix19 (5): an explicit FAILED line from a skill is a contract failure even if the task check passed (e.g. ensureChest inside a storage task)
         const explicit = trace.some(r => !r.intr && (r.ownFail || []).some(l => /FAILED|CONDITION violated/.test(l)));   // fix22: contract violations count
         if (ok && !revalFail && !explicit) return;
@@ -912,6 +939,21 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         rq.sort((a, b) => (b.depth ?? 0) - (a.depth ?? 0)); this._repairQueue = rq;
     }
     // targeted repair of the blamed skill via the code model, through the normal regression gate (saveSkill)
+    // fix26: a skipped repair is deferred (persisted) and re-queued when ripe, not dropped; dropped loudly after 6 deferrals
+    _deferRepair(q, ms, why) {
+        const d = (this.progress.deferredRepairs ||= []); q.defers = (q.defers || 0) + 1;
+        if (q.defers > 6) { console.log(`[psn] repair of ${q.target} DROPPED after ${q.defers - 1} deferrals (${why})`); this._saveProgress(); return; }
+        if (!d.some(x => x.target === q.target && x.kind === q.kind)) d.push({ ...q, notBefore: Date.now() + ms }); this._saveProgress();
+        console.log(`[psn] repair of ${q.target} deferred ${Math.round(ms / 60e3)} min (${why}; deferral ${q.defers}/6)`);
+    }
+    _requeueDeferred() {
+        const d = this.progress.deferredRepairs || []; if (!d.length) return;
+        const ripe = d.filter(x => Date.now() >= x.notBefore && !this.skills.find(s => s.name === x.target)?.candidate || (x.kind === 'contract_fix' && Date.now() >= x.notBefore));
+        if (!ripe.length) return;
+        this.progress.deferredRepairs = d.filter(x => !ripe.includes(x));
+        const rq = [...(this._repairQueue || [])]; for (const x of ripe) if (!rq.some(y => y.target === x.target && y.kind === x.kind)) { delete x.notBefore; rq.push(x); console.log(`[psn] deferred repair of ${x.target} [${x.kind}] re-queued`); }
+        this._repairQueue = rq;
+    }
     async _repair() {
         const rq = [...(this._repairQueue || [])], q = rq.shift(); this._repairQueue = rq;
         if (!q) return false;
@@ -919,15 +961,15 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         if (!e) { console.log(`[psn] repair FAILED: blamed skill ${q.target} not in library`); return false; }
         this._repairs = (this.progress.repairs ||= {});   // fix11 (B8): repair cap persisted in progress.json
         if (q.kind === 'contract_fix') {   // fix25b: contract-only repair is independent of code candidates and the code-repair cap
-            if (this._cursorLimited()) { console.log(`[psn] contract repair of ${e.name} deferred: code model at its limit`); this._queueContractFix(e, q.evidence); return false; }
+            if (this._cursorLimited()) { console.log(`[psn] contract repair of ${e.name} deferred: code model at its limit`); this._deferRepair(q, 10 * 60e3, 'code model at its limit'); return false; }
                         console.log(`[psn] REPAIR contract of ${e.name} (${q.evidence})`);
             const n = await this._learnContracts([e], 'contract repair', q.evidence);
             this._noteProposal(e, { task: q.task, kind: q.kind, evidence: q.evidence.slice(0, 200), desc: n ? `contract -> ${e.contract.text}` : 'contract repair failed', outcome: n ? 'contract replaced' : 'failed' });
             return n > 0;
         }
-        if (Date.now() - (this._repairs[e.name] || 0) < 30 * 60e3) { console.log(`[psn] repair of ${e.name} skipped: already repaired in the last 30 min (cap)`); return false; }
-        if (e.candidate) { console.log(`[psn] repair of ${e.name} skipped: a candidate is already under trial`); return false; }
-        if (this._cursorLimited()) { console.log(`[psn] repair of ${e.name} skipped: code model at its limit`); return false; }
+        if (Date.now() - (this._repairs[e.name] || 0) < 30 * 60e3) { console.log(`[psn] repair of ${e.name} skipped: already repaired in the last 30 min (cap)`); this._deferRepair(q, Math.max(60e3, 30 * 60e3 - (Date.now() - (this._repairs[e.name] || 0))), 'already repaired in the last 30 min (cap)'); return false; }
+        if (e.candidate) { console.log(`[psn] repair of ${e.name} skipped: a candidate is already under trial`); this._deferRepair(q, 10 * 60e3, 'a candidate is already under trial'); return false; }
+        if (this._cursorLimited()) { console.log(`[psn] repair of ${e.name} skipped: code model at its limit`); this._deferRepair(q, 10 * 60e3, 'code model at its limit'); return false; }
         if (!this._updateAllowed(e, `repair after ${q.kind}`)) { console.log(`[psn] repair of ${e.name} skipped: maturity gate froze it`); return false; }
         this._repairs[e.name] = Date.now(); this._saveProgress();
         const kids = [...this._closure(e.name)].map(n => this.skills.find(s => s.name === n)).filter(Boolean);
@@ -1012,6 +1054,7 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         this._oneshot();
         // fix18: no hard-coded survival/housekeeping policy; the curriculum proposes it and the PSN learns it
         if (await this._leash()) return;
+        this._requeueDeferred();   // fix26
         if (this._repairQueue?.length) { await this._repair(); return; }
         if (this._decomposeQueue) { const dq = this._decomposeQueue; this._decomposeQueue = null; await this._decompose(dq.task, dq.reason); return; }
         if (!this.progress.fix25) this._fix25Migrate();
