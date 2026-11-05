@@ -142,6 +142,8 @@ function countGoal(task) {
     return { count: parseInt(m[2]), item, items, verb };
 }
 let VERSION = null;
+// fix46: test-only setter for VERSION (parseVerboseGoal requires VERSION to be set)
+export function _setVersionForTest(v) { VERSION = v; }
 // "Smelt 6 raw_iron into 6 iron_ingot" -> verify by output gained
 function smeltGoal(task) {
     const m = task.match(/^(?:smelt|cook)\s+(\d+)\s+([a-z_]+)\s+into\s+(\d+)\s+([a-z_]+)/i);
@@ -167,9 +169,9 @@ export function parseVerboseGoal(task) {
     }
     
     let md;
-    try { md = minecraftData(version); } 
+    try { md = minecraftData(VERSION); } 
     catch (e) { 
-        console.error(`[fix46] LOUD FAIL: minecraft-data unavailable for version ${version}: ${e.message}`);
+        console.error(`[fix46] LOUD FAIL: minecraft-data unavailable for version ${VERSION}: ${e.message}`);
         return null;
     }
     
