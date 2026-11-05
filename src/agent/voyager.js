@@ -918,16 +918,16 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         const e = this.skills.find(s => s.name === q.target);
         if (!e) { console.log(`[psn] repair FAILED: blamed skill ${q.target} not in library`); return false; }
         this._repairs = (this.progress.repairs ||= {});   // fix11 (B8): repair cap persisted in progress.json
-        if (Date.now() - (this._repairs[e.name] || 0) < 30 * 60e3) { console.log(`[psn] repair of ${e.name} skipped: already repaired in the last 30 min (cap)`); return false; }
-        if (e.candidate) { console.log(`[psn] repair of ${e.name} skipped: a candidate is already under trial`); return false; }
-        if (this._cursorLimited()) { console.log(`[psn] repair of ${e.name} skipped: code model at its limit`); return false; }
-        if (q.kind === 'contract_fix') {
-            this._repairs[e.name] = Date.now(); this._saveProgress();
-            console.log(`[psn] REPAIR contract of ${e.name} (${q.evidence})`);
+        if (q.kind === 'contract_fix') {   // fix25b: contract-only repair is independent of code candidates and the code-repair cap
+            if (this._cursorLimited()) { console.log(`[psn] contract repair of ${e.name} deferred: code model at its limit`); this._queueContractFix(e, q.evidence); return false; }
+                        console.log(`[psn] REPAIR contract of ${e.name} (${q.evidence})`);
             const n = await this._learnContracts([e], 'contract repair', q.evidence);
             this._noteProposal(e, { task: q.task, kind: q.kind, evidence: q.evidence.slice(0, 200), desc: n ? `contract -> ${e.contract.text}` : 'contract repair failed', outcome: n ? 'contract replaced' : 'failed' });
             return n > 0;
         }
+        if (Date.now() - (this._repairs[e.name] || 0) < 30 * 60e3) { console.log(`[psn] repair of ${e.name} skipped: already repaired in the last 30 min (cap)`); return false; }
+        if (e.candidate) { console.log(`[psn] repair of ${e.name} skipped: a candidate is already under trial`); return false; }
+        if (this._cursorLimited()) { console.log(`[psn] repair of ${e.name} skipped: code model at its limit`); return false; }
         if (!this._updateAllowed(e, `repair after ${q.kind}`)) { console.log(`[psn] repair of ${e.name} skipped: maturity gate froze it`); return false; }
         this._repairs[e.name] = Date.now(); this._saveProgress();
         const kids = [...this._closure(e.name)].map(n => this.skills.find(s => s.name === n)).filter(Boolean);
