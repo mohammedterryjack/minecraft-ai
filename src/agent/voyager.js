@@ -382,9 +382,22 @@ export class Voyager {
                 deps: [],
             },
         ];
-        let seeded = 0;
+        let seeded = 0, rehealed = 0;
         for (const prim of SEEDED_PRIMITIVES) {
-            if (this.skills.some(s => s.name === prim.name)) continue;
+            const existing = this.skills.find(s => s.name === prim.name);
+            if (existing) {
+                // fix36: reheal stale seeded primitives when their code changes (e.g. empty catch fixes)
+                if (existing.seeded && existing.code !== prim.code) {
+                    console.log(`[psn] rehealing seeded primitive ${prim.name}: code updated`);
+                    existing.code = prim.code;
+                    existing.deps = prim.deps;
+                    existing.description = prim.description;
+                    existing.saved = new Date().toISOString();
+                    writeAtomic(`${this.dir}/${prim.name}.js`, `// ${prim.description}\n${prim.code}\n`);
+                    rehealed++;
+                }
+                continue;
+            }
             const entry = {
                 name: prim.name,
                 description: prim.description,
@@ -400,7 +413,8 @@ export class Voyager {
             seeded++;
             console.log(`[psn] seeded primitive ${prim.name}: ${prim.description.slice(0, 60)}...`);
         }
-        if (seeded) this._saveSkills();
+        if (seeded || rehealed) this._saveSkills();
+        if (rehealed) console.log(`[psn] rehealed ${rehealed} seeded primitive(s) with updated code`);
     }
     // fix11: recompute every skill's dependency edges from its code at startup (catches hand edits of skill files)
     _relink() {
