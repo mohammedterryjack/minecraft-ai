@@ -259,6 +259,19 @@ Use only c; no other globals.`;
             }
         }
     }
+    // fix25 one-off: equipStonePickaxe was promoted with 1 pass (old rule); put the incumbent back and the promoted code back under trial
+    _fix25Migrate() {
+        const e = this.skills.find(s => s.name === 'equipStonePickaxe');
+        if (e?.prev && (e.stats?.success || 0) < 2) {
+            const c = { code: e.code, description: e.description, deps: e.deps, effects: e.effects, embedding: e.embedding, stats: e.stats, task: e.task };
+            Object.assign(e, { code: e.prev.code, description: e.prev.description, deps: e.prev.deps, stats: e.prev.stats, saved: e.prev.saved });
+            delete e.prev; e.candidate = c;
+            writeAtomic(`${this.dir}/${e.name}.js`, `// ${e.description}\n${e.code}\n`);
+            gateLog(`UNPROMOTE equipStonePickaxe: promoted with ${c.stats?.success || 0} pass(es) < 2; incumbent restored, new version back to candidate (${c.stats.success}/${c.stats.success + c.stats.fail})`);
+        } else console.log(`[fix25] equipStonePickaxe: no unpromote needed (passes ${e?.stats?.success})`);
+        const fb = this.skills.find(s => s.name === 'fillBucket'); if (fb && !fb.contract) { delete fb.contractTried; console.log('[fix25] fillBucket contract retry queued'); }
+        this.progress.fix25 = true; this._saveProgress(); this._saveSkills();
+    }
     _queueContractFix(e, why) {
         const rq = [...(this._repairQueue || [])];
         if (rq.some(x => x.target === e.name && x.kind === 'contract_fix')) return;
@@ -554,7 +567,7 @@ Use only c; no other globals.`;
             const c = entry.candidate; recordRun(c.stats, task, ok);
             const n = c.stats.success + c.stats.fail;
             if (!ok && c.stats.fail >= 2) { gateLog(`REJECT candidate ${entry.name}: failed ${c.stats.fail}/${n} trial runs; keeping current version`); this._proposalOutcome(entry, `rejected ${c.stats.success}/${n}`); const rf = c.refactor; delete entry.candidate; if (rf) this._rollbackRefactor(rf, entry.name); }
-            else if (n >= 2 && rate(c.stats) >= rate(entry.stats || newStats())) { gateLog(`PROMOTE candidate ${entry.name}: trial ${c.stats.success}/${n} >= current rate ${rate(entry.stats || newStats()).toFixed(2)}`); this._promote(entry, c); }
+            else if (c.stats.success >= 2 && rate(c.stats) >= rate(entry.stats || newStats())) { gateLog(`PROMOTE candidate ${entry.name}: ${c.stats.success} passes, trial ${c.stats.success}/${n} >= current rate ${rate(entry.stats || newStats()).toFixed(2)}`); this._promote(entry, c); }
             else gateLog(`candidate ${entry.name} trial ${ok ? 'passed' : 'failed'} (${c.stats.success}/${n}); waiting for more runs`);
         } else {
             entry.stats = recordRun(entry.stats || newStats(), task, ok);
@@ -1001,6 +1014,7 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         if (await this._leash()) return;
         if (this._repairQueue?.length) { await this._repair(); return; }
         if (this._decomposeQueue) { const dq = this._decomposeQueue; this._decomposeQueue = null; await this._decompose(dq.task, dq.reason); return; }
+        if (!this.progress.fix25) this._fix25Migrate();
         if (await this._backfillContracts()) return;   // fix22
         if (await this._refactor()) return;
         const before = this.observe();
