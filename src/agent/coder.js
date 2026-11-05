@@ -184,7 +184,18 @@ export class Coder {
                 if (exc.line && exc.column ) {
                     const errorLine = codeLines[exc.line - 1]?.trim() || 'Unable to retrieve error line content';
                     result += `#ERROR ${index + 1}\n`;
-                    result += `Message: ${exc.message}\n`;
+                    // Actionable feedback for empty catch blocks (Mo fail-loud principle)
+                    if (exc.ruleId === 'no-empty' && /catch\s*\([^)]*\)\s*\{\s*\}/.test(errorLine)) {
+                        result += `Message: EMPTY CATCH BLOCK - swallowing errors hides failures and breaks the repair loop.\n`;
+                        result += `Why rejected: Mo fail-loud principle - every error must propagate so the skill library can learn what went wrong. An empty catch silently discards the failure, leaving no trace for diagnosis or repair.\n`;
+                        result += `How to fix: Either rethrow the error, or log then rethrow:\n`;
+                        result += `  WRONG:  } catch (e) {}\n`;
+                        result += `  RIGHT:  } catch (e) { throw e; }\n`;
+                        result += `  RIGHT:  } catch (e) { log(bot, \`Step failed: \${e.message}\`); throw e; }\n`;
+                        result += `If the error is truly recoverable, log it and return a falsy value - never silently continue.\n`;
+                    } else {
+                        result += `Message: ${exc.message}\n`;
+                    }
                     result += `Location: Line ${exc.line}, Column ${exc.column}\n`;
                     result += `Related Code Line: ${errorLine}\n`;
                 }
