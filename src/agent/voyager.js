@@ -506,6 +506,17 @@ Use only c; no other globals.`;
                 catch (err) { console.log(`!!! [contract] ${e.name}.${k} THREW: ${err.message}; queued contract repair`); this._queueContractFix(e, `${k} threw: ${err.message}`); continue; }
                 if (ok !== false) continue;
                 if (k === 'pre' && !r.fail && r.rv !== false && r.rv !== null) { console.log(`[contract] ${e.name} precondition violated but the call succeeded -> precondition is wrong; queued contract repair`); this._queueContractFix(e, `precondition ${e.contract.pre} was false but the call succeeded (ret ${r.ret})`); continue; }
+                // fix45: when task passed and the skill's delta shows positive gain for its effects, don't attribute VIOLATED
+                // The delta is the ground truth; if the contract formula disagrees, the contract is wrong, not the skill
+                if (taskOk && k === 'post') {
+                    const effects = e.effects || [];
+                    const deltaGained = effects.some(eff => (r.delta?.[eff] || 0) > 0);
+                    if (deltaGained) {
+                        console.log(`[contract] fix45: ${e.name} postcondition disagreed but delta shows gain for effects [${effects.join(',')}]; queuing contract repair, not skill repair`);
+                        this._queueContractFix(e, `postcondition ${e.contract.post} was false but delta shows gain (effects: ${effects.join(',')})`);
+                        continue;
+                    }
+                }
                 r.ok = false; r.fail = true; if (k === 'pre') r.preFail = true;
                 r.ownFail = [...(r.ownFail || []), `${k === 'pre' ? 'PRECONDITION' : 'POSTCONDITION'} violated: ${e.contract.text || e.contract[k]} (post pos ${r.s1.pos ? [r.s1.pos.x, r.s1.pos.y, r.s1.pos.z].map(Math.round).join(',') : '?'}, sky ${r.s1.sky}, alive ${r.s1.alive})`];
                 console.log(`[contract] ${e.name}(${(r.argv || []).join(',')}) ${k}condition VIOLATED: ${e.contract[k].slice(0, 160)}`);
@@ -691,6 +702,11 @@ Use only c; no other globals.`;
             biome: world.getBiomeName(bot),
             time: t < 12000 ? `day (${t})` : t < 13000 ? `dusk (${t}, hostiles about to spawn)` : t < 23000 ? `night (${t}, hostiles spawn outdoors)` : `dawn (${t})`,
             health: `${Math.round(bot.health)}/20`, food: `${bot.food}/20`,
+            // fix45: expose food/health as plain numeric facts for planner/curriculum to pick restore goals
+            food_value: bot.food,
+            food_max: 20,
+            health_value: Math.round(bot.health),
+            health_max: 20,
             inventory: world.getInventoryCounts(bot),  // fix41: host code uses world. prefix
             inventory_slots: `${usedSlots}/${totalSlots}`,
             empty_inventory_slots: emptySlots,
@@ -1109,10 +1125,11 @@ Use only c; no other globals.`;
             return { satisfied: true, reason: `already have ${have}/${goal.count} ${goal.item} (learned producers: ${skillNames})` };
         }
 
-        // 3) If we have the items but no learned producer skill, we can't verify satisfaction the learned way
-        // This is the "fail loud" case - we don't silently assume success without learned evidence
+        // fix45: if inventory count >= goal count, the goal is satisfied regardless of producer graph
+        // Rule from #15/#25: inventory count is the ground truth; we don't need a learned producer to verify
+        // The "no learned skill produces it" case proceeds but is still satisfied - no failed attempts
         if (have >= goal.count) {
-            return { satisfied: false, reason: `have ${have}/${goal.count} ${goal.item} but no learned skill produces it`, noLearnedCheck: true };
+            return { satisfied: true, reason: `already have ${have}/${goal.count} ${goal.item} (inventory check; no learned producer)` };
         }
 
         // 4) Not satisfied: don't have enough items
@@ -1688,6 +1705,9 @@ Use only c; no other globals.`;
     }
     // fix37: run a practice skill safely - returns { message } on success, false on context-fail, null on abort
     // Fail-loud: all skips and failures are logged clearly
+    // fix45: removed hard-coded health/food thresholds (bot.health < 10, bot.food < 8) per owner rule
+    // "nothing hard-coded" - low vitals must not stop the bot from acting; risks are expressed as
+    // learned facts (e.g. skill failure rates when vitals are low), not fixed numbers
     async _runPracticeSkill(skill) {
         if (this._idlePracticeAbort) return null;
         const bot = this.agent.bot;
@@ -1696,14 +1716,7 @@ Use only c; no other globals.`;
             console.log(`[idle-practice] SKIPPED ${skill.name}: bot is not idle`);
             return false;
         }
-        if (bot.health < 10) {
-            console.log(`[idle-practice] SKIPPED ${skill.name}: health too low (${Math.round(bot.health)}/20 < 10)`);
-            return false;
-        }
-        if (bot.food < 8) {
-            console.log(`[idle-practice] SKIPPED ${skill.name}: food too low (${bot.food}/20 < 8)`);
-            return false;
-        }
+        // fix45: threats are a real-time danger (learned from environment), keep this gate
         const threats = this._threats();
         if (threats !== 'none') {
             console.log(`[idle-practice] SKIPPED ${skill.name}: threats nearby (${threats})`);
