@@ -335,19 +335,23 @@ Use only c; no other globals.`;
         // fix28: progress = position, inventory, health, food, open-window contents (crafting/furnace UI) or a lit furnace/smoker nearby (smelting wait)
         const bot = this.agent.bot;
         const lit = () => !!bot.findBlock({ matching: b => /furnace|smoker/.test(b.name) && b.getProperties?.().lit === true, maxDistance: 6 });
-        const sig = () => { const p = bot.entity?.position; if (!p) return ''; const w = bot.currentWindow;
-            return `${Math.round(p.x * 2)},${Math.round(p.y * 2)},${Math.round(p.z * 2)}|${JSON.stringify(world.getInventoryCounts(bot))}|${bot.health}|${bot.food}|${w ? w.type + ':' + w.slots.map(i => i ? i.name + i.count : '').join(',') : ''}|${lit() ? Date.now() : ''}`; };
+        // fix33: position progress = reaching a 2-block cell not visited in this run (swimming/bobbing jitter and pacing back and forth
+        // are not progress); health/food are not progress (drowning damage + regen kept resetting the timer)
+        const seen = new Set(), cell = p => `${Math.floor(p.x / 2)},${Math.floor(p.y / 2)},${Math.floor(p.z / 2)}`; let fresh = 0;
+        const sig = () => { const p = bot.entity?.position; if (!p) return ''; const w = bot.currentWindow, c = cell(p); if (!seen.has(c)) { seen.add(c); fresh++; }
+            return `${fresh}|${JSON.stringify(world.getInventoryCounts(bot))}|${w ? w.type + ':' + w.slots.map(i => i ? i.name + i.count : '').join(',') : ''}|${lit() ? Date.now() : ''}`; };
         let last = sig(), since = Date.now(); this._stall = null;
         const iv = setInterval(() => { try { const s = sig(); if (s !== last) { last = s; since = Date.now(); return; }
-            if (Date.now() - since >= 60e3 && this.agent.actions.executing && !this._stall) { const p = bot.entity.position; this._stall = { t: Date.now(), pos: `${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}` }; console.log(`[stall] ${label}: no progress (position, inventory, health, food, window, lit furnace) for 60s at ${this._stall.pos}; stopping the action`); this.agent.actions.stop(); } } catch (e) { console.log('[stall] watchdog error: ' + e.message); } }, 5000);
-        try { return await this.agent.actions.runAction(label, fn, { timeout }); } finally { clearInterval(iv); }
+            if (Date.now() - since >= 60e3 && this.agent.actions.executing && !this._stall) { const p = bot.entity.position; this._stall = { t: Date.now(), pos: `${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}` }; console.log(`[stall] ${label}: no progress (no new ground reached, inventory, window, lit furnace) for 60s at ${this._stall.pos}; stopping the action`); this.agent.actions.stop(); } } catch (e) { console.log('[stall] watchdog error: ' + e.message); } }, 5000);
+        this._lastRunMsg = '';
+        try { const r = await this.agent.actions.runAction(label, fn, { timeout }); this._lastRunMsg = String(r?.message || ''); return r; } finally { clearInterval(iv); }
     }
     _stalledInRun() { const s = this._stall; return s && s.t >= (this._runStart || Infinity) ? s : null; }
     _diedInRun() { const d = this.agent.lastDeath; return d && d.t >= (this._runStart || Infinity) ? d : null; }
     _interruptReason(output = '') {
         const died = this._diedInRun();
         if (died) return `died: ${died.message} at ${died.pos}${this._deathDetail(died)}`;
-        const st = this._stalledInRun(); if (st) return `stalled: no progress (position, inventory, health, food, window, lit furnace) for 60s at ${st.pos}`;
+        const st = this._stalledInRun(); if (st) return `stalled: no progress (no new ground reached, inventory, window, lit furnace) for 60s at ${st.pos}`;
         const bot = this.agent.bot, p = bot.entity.position, by = this.agent.actions.lastInterruptBy || 'unknown';
         const s = this._surfaceY(p.x, p.z), under = s !== null && p.y < s - 4;
         const travelling = /travelTo|goToPosition|goToSurface|path|Moving|travell/i.test(String(output).slice(-800));
@@ -1007,7 +1011,7 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
     // fix11 (B1): only hand-written/primitive skills with no skill deps are fixed leaves; learned skills stay repairable.
     // Names outside the library (freshly generated code) are not leaves.
     _isLeaf(name) { if (name.startsWith('skills.')) return true;   // fix21: traced primitives are fixed leaves
-        const e = this.skills.find(s => s.name === name); return !!e && !!e.primitive && !(e.deps || []).length; }   // fix24: hand-written skills are repairable
+        return false; }   // fix33: seeded primitives are library skills: blamed and repaired like learned ones (e.g. travelTo learns to leave water)   // fix24: hand-written skills are repairable
     _attribute(root, task, ok, over) {
         const bot = this.agent.bot, trace = bot.__psnTrace;
         bot.__psnTrace = null;
@@ -1034,14 +1038,20 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         const died = this._diedInRun();
         if (died) { let i = -1; for (let k = 0; k < trace.length; k++) if ((trace[k].t0 || 0) <= died.t && (trace[k].t1 ?? Infinity) >= died.t - 1500 && (i < 0 || trace[k].depth >= trace[i].depth)) i = k; if (i < 0) i = trace.length - 1; console.log(`[psn] death attributed to the call running at death time: ${trace[i].name} (depth ${trace[i].depth})`); trace[i].ownFail = [`DIED: ${died.message} at ${died.pos}${this._deathDetail(died)}`]; for (; i >= 0; i = trace[i].parent) { trace[i].intr = false; trace[i].ok = false; trace[i].fail = true; } ok = false; }
         const stalled = !died && this._stalledInRun();   // fix27: a stall is a failure of the deepest call open at stall time
-        if (stalled) { let i = -1; for (let k = 0; k < trace.length; k++) if ((trace[k].t0 || 0) <= stalled.t && (trace[k].t1 ?? Infinity) >= stalled.t - 1500 && (i < 0 || trace[k].depth >= trace[i].depth)) i = k; if (i < 0) i = trace.length - 1; console.log(`[psn] stall attributed to the call running at stall time: ${trace[i].name} (depth ${trace[i].depth})`); trace[i].ownFail = [`FAILED: STALLED: no progress (position, inventory, health, food, window, lit furnace) for 60s at ${stalled.pos}`]; for (; i >= 0; i = trace[i].parent) { trace[i].intr = false; trace[i].ok = false; trace[i].fail = true; } ok = false; }
+        if (stalled) { let i = -1; for (let k = 0; k < trace.length; k++) if ((trace[k].t0 || 0) <= stalled.t && (trace[k].t1 ?? Infinity) >= stalled.t - 1500 && (i < 0 || trace[k].depth >= trace[i].depth)) i = k; if (i < 0) i = trace.length - 1; console.log(`[psn] stall attributed to the call running at stall time: ${trace[i].name} (depth ${trace[i].depth})`); trace[i].ownFail = [`FAILED: STALLED: no progress (no new ground reached, inventory, window, lit furnace) for 60s at ${stalled.pos}`]; for (; i >= 0; i = trace[i].parent) { trace[i].intr = false; trace[i].ok = false; trace[i].fail = true; } ok = false; }
+        const timedOut = !died && !stalled && /timed out/i.test(this._lastRunMsg || '');   // fix33: a timeout is a failure of the deepest call running at the cut
+        if (timedOut) { const ix = trace.map((r, k) => k).filter(k => trace[k].intr && trace[k].t1); const cutT = Math.min(...ix.map(k => trace[k].t1)); let i = -1;
+            for (const k of ix) if (trace[k].t1 <= cutT + 1500 && (i < 0 || trace[k].depth >= trace[i].depth)) i = k;
+            if (i < 0) i = trace.length - 1; while (i >= 0 && trace[i].name.startsWith('skills.') && trace[i].parent >= 0) i = trace[i].parent;   // raw API -> the library skill that called it
+            console.log(`[psn] timeout attributed to the call running at the cut: ${trace[i].name} (depth ${trace[i].depth})`);
+            trace[i].ownFail = [`FAILED: TIMED OUT while running (${String(trace[i].ownFail?.join(' | ') || '').slice(0, 200)})`]; for (; i >= 0; i = trace[i].parent) { trace[i].intr = false; trace[i].ok = false; trace[i].fail = true; } ok = false; }
         // fix27: no hotspot filter; deaths stay traced failures (above) and blame/repair learns avoidance
         // fix19 (5): an explicit FAILED line from a skill is a contract failure even if the task check passed (e.g. ensureChest inside a storage task)
         const explicit = trace.some(r => !r.intr && (r.ownFail || []).some(l => /FAILED|CONDITION violated/.test(l)));   // fix22: contract violations count
         if (ok && !revalFail && !explicit) return;
         if (ok && explicit) console.log(`[psn] task check passed but a skill reported FAILED; attributing that contract failure`);
         console.log(`[psn] execution trace of ${root} (${trace.length} calls):\n${traceText(trace)}`);
-        const learned = n => { const e = this.skills.find(s => s.name === n); return !!e && !e.primitive; };   // fix24: includes hand-written (repairs become learned candidates)
+        const learned = n => !!this.skills.find(s => s.name === n);   // fix33: seeded primitives included   // fix24: includes hand-written (repairs become learned candidates)
         let bs = blameAll(trace, n => this._isLeaf(n), learned).slice(0, 3);   // at most 3 patches per failure (deepest first)
         // fix19 (2): no learned skill on a failure path: the root's own composition is at fault
         if (!bs.length) {
