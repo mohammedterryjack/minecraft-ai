@@ -66,6 +66,104 @@ describe('fix45: hunger/health as planner facts', () => {
         const result = practice.isReadyForPractice(false, false);
         assert.strictEqual(result.ready, true, 'Should be ready for practice when conditions met');
     });
+
+    it('should NOT have hard-coded numeric vital thresholds in _runPracticeSkill idle gate', async () => {
+        const { readFileSync } = await import('fs');
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        
+        const runPracticeMatch = voyagerSrc.match(/_runPracticeSkill\s*\([^)]*\)\s*\{[\s\S]*?(?=\n    async\s+\w|\n    \/\/\s*-{5,}|\n\s*\}$)/);
+        assert.ok(runPracticeMatch, '_runPracticeSkill function should exist');
+        
+        const runPracticeBody = runPracticeMatch[0];
+        
+        assert.ok(!/bot\.health\s*<\s*\d+/.test(runPracticeBody), 
+            'Should NOT have hard-coded health threshold like "bot.health < 10"');
+        assert.ok(!/bot\.food\s*<\s*\d+/.test(runPracticeBody), 
+            'Should NOT have hard-coded food threshold like "bot.food < 8"');
+        assert.ok(!/health.*too.*low.*<\s*\d+/.test(runPracticeBody), 
+            'Should NOT have health threshold skip message');
+        assert.ok(!/food.*too.*low.*<\s*\d+/.test(runPracticeBody), 
+            'Should NOT have food threshold skip message');
+    });
+
+    it('should include food/health facts in curriculum proposeTask prompt', async () => {
+        const { readFileSync } = await import('fs');
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        
+        const proposeTaskMatch = voyagerSrc.match(/async\s+proposeTask\s*\([^)]*\)\s*\{[\s\S]*?return\s+parseLocalJSON/);
+        assert.ok(proposeTaskMatch, 'proposeTask function should exist');
+        
+        const proposeTaskBody = proposeTaskMatch[0];
+        
+        assert.ok(/current_health.*bot\.health|bot\.health.*current_health/.test(proposeTaskBody), 
+            'proposeTask should include current_health from bot.health');
+        assert.ok(/current_food.*bot\.food|bot\.food.*current_food/.test(proposeTaskBody), 
+            'proposeTask should include current_food from bot.food');
+        assert.ok(/_stateText\s*\(\s*state\s*\)/.test(proposeTaskBody), 
+            'proposeTask should pass state through _stateText which includes food_value/health_value');
+    });
+
+    it('should have curriculum system prompt mention survival and reading health/food', async () => {
+        const { readFileSync } = await import('fs');
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        
+        const proposeTaskStart = voyagerSrc.indexOf('async proposeTask');
+        assert.ok(proposeTaskStart !== -1, 'proposeTask function should exist');
+        
+        const proposeTaskSection = voyagerSrc.slice(proposeTaskStart, proposeTaskStart + 2500);
+        
+        assert.ok(/survive|survival/i.test(proposeTaskSection), 
+            'System prompt should mention survival');
+        assert.ok(/health.*food|food.*health/i.test(proposeTaskSection), 
+            'System prompt should mention health and food');
+        assert.ok(/survival is your job/i.test(proposeTaskSection),
+            'System prompt should tell the curriculum that survival is its job');
+    });
+});
+
+describe('fix45: food/health restoration via learned skills', () => {
+    it('should allow actions when food is low (6/20) with food-restoring item in inventory', async () => {
+        const { readFileSync } = await import('fs');
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        
+        const runPracticeMatch = voyagerSrc.match(/_runPracticeSkill\s*\([^)]*\)\s*\{[\s\S]*?(?=\n    async\s+\w|\n    \/\/\s*-{5,})/);
+        assert.ok(runPracticeMatch, '_runPracticeSkill should exist');
+        
+        const runPracticeBody = runPracticeMatch[0];
+        
+        assert.ok(!/bot\.food\s*<\s*\d+/.test(runPracticeBody),
+            'Should NOT skip based on food level - low food must not block actions');
+        
+        assert.ok(runPracticeBody.includes('isIdle'), 
+            'Should only skip if bot is not idle (legitimate gate)');
+        assert.ok(runPracticeBody.includes('threats'), 
+            'Should only skip if threats nearby (legitimate learned-from-environment gate)');
+    });
+
+    it('should have learned effects/consumes structure for food items (no hard-coded food list)', async () => {
+        const { readFileSync } = await import('fs');
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        
+        assert.ok(/s\.effects|e\.effects/.test(voyagerSrc), 
+            'Skills should have learned effects');
+        assert.ok(/s\.consumes|e\.consumes/.test(voyagerSrc), 
+            'Skills should have learned consumes');
+        
+        assert.ok(/npGraph|NeedsProducesGraph/.test(voyagerSrc), 
+            'Should have needs/produces graph for learning item relationships');
+    });
+
+    it('should surface food_value in _stateText output for curriculum', async () => {
+        const { readFileSync } = await import('fs');
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        
+        const stateTextMatch = voyagerSrc.match(/_stateText\s*\([^)]*\)\s*\{[\s\S]*?\n    \}/);
+        assert.ok(stateTextMatch, '_stateText function should exist');
+        
+        assert.ok(/for\s*\(\s*const\s*\[\s*k\s*,\s*v\s*\]\s*of\s*Object\.entries\s*\(\s*s\s*\)/.test(stateTextMatch[0]) ||
+                  /Object\.entries\s*\(\s*s\s*\)/.test(stateTextMatch[0]),
+            '_stateText should iterate over state entries including food_value/health_value');
+    });
 });
 
 // ============================================================================
@@ -309,6 +407,58 @@ describe('fix45: contract attribution accuracy', () => {
         const shouldAttributeViolated = !taskPassed || (skillDelegatedToSmelt && smeltGained <= 0);
         
         assert.strictEqual(shouldAttributeViolated, false, 'Should not attribute VIOLATED when task passed and smelt gained items');
+    });
+
+    it('should still mark VIOLATED when skill delta truly fails even if task passed', async () => {
+        const { readFileSync } = await import('fs');
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        
+        const checkContractsMatch = voyagerSrc.match(/_checkContracts\(trace,\s*taskOk\)\s*\{[\s\S]*?\n    \}/);
+        assert.ok(checkContractsMatch, '_checkContracts should exist');
+        
+        const checkContractsBody = checkContractsMatch[0];
+        
+        assert.ok(/r\.ok\s*=\s*false/.test(checkContractsBody), 
+            '_checkContracts should still be able to mark r.ok = false');
+        assert.ok(/r\.fail\s*=\s*true/.test(checkContractsBody), 
+            '_checkContracts should still be able to mark r.fail = true');
+        assert.ok(/ownFail/.test(checkContractsBody), 
+            '_checkContracts should still populate ownFail for violations');
+        
+        assert.ok(/deltaGained/.test(checkContractsBody) || /delta.*gained/i.test(checkContractsBody),
+            '_checkContracts should check if delta shows gain before skipping violation');
+        
+        assert.ok(/if\s*\(\s*deltaGained\s*\)[\s\S]*?continue/.test(checkContractsBody) ||
+                  /deltaGained[\s\S]*?continue/.test(checkContractsBody),
+            '_checkContracts should only skip violation when delta shows gain (continue), otherwise still mark VIOLATED');
+    });
+
+    it('should mark VIOLATED when delta shows NO gain for effects (true failure)', async () => {
+        const taskPassed = true;
+        const skillEffects = ['iron_ingot'];
+        const skillDelta = { coal: 2 };
+        
+        const deltaGained = skillEffects.some(eff => (skillDelta[eff] || 0) > 0);
+        
+        assert.strictEqual(deltaGained, false, 'Delta should NOT show gain for iron_ingot when only coal gained');
+        
+        const shouldMarkViolated = !deltaGained;
+        assert.strictEqual(shouldMarkViolated, true, 
+            'Should mark VIOLATED when skill delta does not show gain for its expected effects');
+    });
+
+    it('should NOT mark VIOLATED when delta shows gain for effects (task and skill both succeeded)', async () => {
+        const taskPassed = true;
+        const skillEffects = ['iron_ingot'];
+        const skillDelta = { iron_ingot: 1 };
+        
+        const deltaGained = skillEffects.some(eff => (skillDelta[eff] || 0) > 0);
+        
+        assert.strictEqual(deltaGained, true, 'Delta SHOULD show gain for iron_ingot');
+        
+        const shouldMarkViolated = !deltaGained;
+        assert.strictEqual(shouldMarkViolated, false, 
+            'Should NOT mark VIOLATED when skill delta shows gain for its expected effects');
     });
 });
 

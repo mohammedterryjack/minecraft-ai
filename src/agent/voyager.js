@@ -1687,6 +1687,9 @@ Use only c; no other globals.`;
     }
     // fix37: run a practice skill safely - returns { message } on success, false on context-fail, null on abort
     // Fail-loud: all skips and failures are logged clearly
+    // fix45: removed hard-coded health/food thresholds (bot.health < 10, bot.food < 8) per owner rule
+    // "nothing hard-coded" - low vitals must not stop the bot from acting; risks are expressed as
+    // learned facts (e.g. skill failure rates when vitals are low), not fixed numbers
     async _runPracticeSkill(skill) {
         if (this._idlePracticeAbort) return null;
         const bot = this.agent.bot;
@@ -1695,14 +1698,7 @@ Use only c; no other globals.`;
             console.log(`[idle-practice] SKIPPED ${skill.name}: bot is not idle`);
             return false;
         }
-        if (bot.health < 10) {
-            console.log(`[idle-practice] SKIPPED ${skill.name}: health too low (${Math.round(bot.health)}/20 < 10)`);
-            return false;
-        }
-        if (bot.food < 8) {
-            console.log(`[idle-practice] SKIPPED ${skill.name}: food too low (${bot.food}/20 < 8)`);
-            return false;
-        }
+        // fix45: threats are a real-time danger (learned from environment), keep this gate
         const threats = this._threats();
         if (threats !== 'none') {
             console.log(`[idle-practice] SKIPPED ${skill.name}: threats nearby (${threats})`);
