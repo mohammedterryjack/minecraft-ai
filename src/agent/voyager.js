@@ -710,6 +710,7 @@ Use only c; no other globals.`;
     }
     // fix32 (PSN refactor triggers): after a success, re-run the canonical refactor detectors
     // (parametric coverage -> variant merge, duplication -> dedup, common subskill -> extraction next step)
+    // fix34: added prune, generalise, split detection
     _afterSuccess() {
         this._polyMerge();
         let n = 0;
@@ -724,8 +725,41 @@ Use only c; no other globals.`;
         if (n) this._saveSkills();
         const before = JSON.stringify(this.sharedHints || []); this._extractShared();
         if ((this.sharedHints || []).length && JSON.stringify(this.sharedHints) !== before) { this._refactorDue = true; console.log('[psn] refactor due: a new shared fragment appeared after a success'); }
+        this._detectPrune();
+        this._detectGeneralise();
+        this._detectSplit();
         this._windowCheck(true);
         this._retentionTick();
+    }
+    // fix34 (PSN prune): detect unused low-maturity skills that can be pruned
+    _detectPrune() {
+        const recent = (this.progress.outcomes || []).slice(-20);
+        if (recent.length < 10) return;
+        const unused = this.skills.filter(s => !s.primitive && !s.handwritten && !s.demoted && !s.mergedInto && !s.candidate
+            && this._maturity(s).V < 0.25 && (s.stats?.success || 0) + (s.stats?.fail || 0) >= 3
+            && !this.skills.some(o => !o.demoted && !o.mergedInto && (o.deps || []).includes(s.name)));
+        if (unused.length && !this._pruneDue) { this._pruneDue = true; console.log(`[psn] prune due: ${unused.length} unused low-V skill(s) detected`); }
+    }
+    // fix34 (PSN generalise): detect groups of similar specific skills that could become parameterized
+    _detectGeneralise() {
+        if (this._generaliseDue) return;
+        const cands = this.skills.filter(s => !s.primitive && !s.handwritten && !s.demoted && !s.mergedInto && !s.candidate
+            && (s.effects || []).length && !/\(bot\s*,/.test(signatureOf(s.code, s.name)));
+        const groups = new Map();
+        for (const s of cands) {
+            const base = s.name.replace(/^(craft|mine|get|make|collect)/, '').replace(/(Wooden|Stone|Iron|Golden|Diamond|Netherite|Oak|Birch|Spruce|Dark_?Oak|Jungle|Acacia|Mangrove|Cherry|Bamboo)/i, '').toLowerCase();
+            if (base.length < 3) continue;
+            if (!groups.has(base)) groups.set(base, []);
+            groups.get(base).push(s);
+        }
+        for (const [base, g] of groups) if (g.length >= 3 && !this._generaliseDue) { this._generaliseHint = g.map(s => s.name); this._generaliseDue = true; console.log(`[psn] generalise due: ${g.length} skills share base "${base}"`); }
+    }
+    // fix34 (PSN split): detect large monolithic skills that could be split
+    _detectSplit() {
+        if (this._splitDue) return;
+        const large = this.skills.filter(s => !s.primitive && !s.handwritten && !s.demoted && !s.mergedInto && !s.candidate
+            && (s.code || '').split('\n').length > 40 && this._maturity(s).V < 0.5);
+        if (large.length) { this._splitHint = large[0].name; this._splitDue = true; console.log(`[psn] split due: ${large[0].name} has ${large[0].code.split('\n').length} lines and V < 0.5`); }
     }
     // fix32: windowed rollback - a promoted skill is rolled back when the task success rate over the 3 tasks after the
     // promotion is more than 20 points below the 3 before it
@@ -1278,6 +1312,89 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         if (rf) { const h = this.skills.find(s => s.name === rf.helper); if (h && !this.skills.some(s => !s.mergedInto && (s.deps || []).includes(rf.helper))) h.demoted = true; rf.rolledBack = by; this._saveProgress(); }
         this._saveSkills(); gateLog(`ROLLBACK refactor ${id} (rejected: ${by}): ${n} rewritten skill(s) restored; helper ${rf?.helper || '?'} retired if unused`);
     }
+    // fix34 (PSN prune): demote unused low-maturity skills; no code model call, just mark demoted
+    async _prune() {
+        if (!this._pruneDue || this._cursorLimited()) return false;
+        this._pruneDue = false;
+        const unused = this.skills.filter(s => !s.primitive && !s.handwritten && !s.demoted && !s.mergedInto && !s.candidate
+            && this._maturity(s).V < 0.25 && (s.stats?.success || 0) + (s.stats?.fail || 0) >= 3
+            && !this.skills.some(o => !o.demoted && !o.mergedInto && (o.deps || []).includes(s.name)));
+        if (!unused.length) { console.log('[psn] prune skipped: no unused low-V skills'); return false; }
+        let n = 0;
+        for (const s of unused.slice(0, 3)) {
+            s.demoted = true; s.prunedAt = Date.now(); n++;
+            gateLog(`PRUNE ${s.name}: V=${this._maturity(s).V.toFixed(2)} unused by other skills`);
+        }
+        this._saveSkills();
+        this._windowCheck(true);
+        console.log(`[psn] PRUNE: ${n} low-V unused skill(s) demoted`);
+        return n > 0;
+    }
+    // fix34 (PSN generalise): convert similar specific skills into one parameterized skill
+    async _generalise() {
+        if (!this._generaliseDue || this._cursorLimited()) return false;
+        this._generaliseDue = false;
+        const names = this._generaliseHint || [];
+        const ents = names.map(n => this.skills.find(s => s.name === n)).filter(e => e && !e.handwritten && !e.primitive && !e.candidate && !e.demoted && !e.mergedInto);
+        if (ents.length < 3) { console.log(`[psn] generalise skipped: <3 eligible skills from hint`); return false; }
+        const id = `gn${Date.now()}`;
+        const system = `You refactor a Minecraft mineflayer skill library (PSN generalise: combine similar specific skills into one parameterized skill). Return ONE \`\`\`javascript block with: first a NEW parameterized async function (bot, param) that generalises the common pattern, preceded by // DESCRIPTION: <one sentence>; then each listed skill rewritten as a thin wrapper calling the new function with the appropriate argument. Keep SAME names and signatures for wrappers. Every loop checks bot.interrupt_code.\nLIBRARY:\n${this.catalogue()}`;
+        const user = `Similar skills to generalise:\n${ents.map(e => `--- ${e.name} ---\n${e.description}\n${e.code}`).join('\n')}\nWrite the parameterized helper then the wrapper skills:`;
+        console.log(`[psn] GENERALISE ${id}: parameterising ${ents.map(e => e.name).join(', ')}`);
+        let reply; try { reply = await this._ask(system, user); } catch (err) { console.log(`[psn] generalise FAILED: ${err.message}`); return false; }
+        const code = extractCode(reply) || '';
+        const fns = []; const re = /(?:^|\n)async\s+function\s+([A-Za-z_]\w*)\s*\(/g; let mm, idx = [];
+        while ((mm = re.exec(code))) idx.push([mm[1], mm.index]);
+        for (let i = 0; i < idx.length; i++) fns.push([idx[i][0], code.slice(idx[i][1], i + 1 < idx.length ? idx[i + 1][1] : code.length).trim()]);
+        const helper = fns.find(([n]) => !this.skills.some(s => s.name === n));
+        const wrappers = fns.filter(([n]) => ents.some(e => e.name === n));
+        if (!helper || wrappers.length < 2) { console.log(`[psn] generalise ${id} FAILED: reply had ${helper ? 'a' : 'no'} new helper and ${wrappers.length} wrapper(s)`); return false; }
+        const hdesc = ((code.match(/\/\/\s*DESCRIPTION:\s*(.+)/) || [])[1] || `parameterized helper generalising ${wrappers.map(r => r[0]).join(', ')}`).trim();
+        const over = { [helper[0]]: helper[1] }; for (const [n, c] of wrappers) over[n] = c;
+        const staged = await this.agent.coder._stageCode(this._libSrc(over) + `\n\n${helper[1]}\n\nawait Promise.resolve();`);
+        const lint = staged ? await this.agent.coder._lintCode(staged.src_lint_copy) : 'staging failed';
+        if (lint) { console.log(`[psn] generalise ${id} FAILED lint: ${String(lint).slice(0, 300)}`); return false; }
+        this._lastEffects = [];
+        if (!(await this.saveSkill(helper[0], hdesc, helper[1], `generalise ${id}`))) { console.log(`[psn] generalise ${id} FAILED: helper rejected`); return false; }
+        this.progress.refactors = { ...(this.progress.refactors || {}), [id]: { helper: helper[0], skills: wrappers.map(r => r[0]), kind: 'generalise', at: Date.now() } }; this._saveProgress();
+        for (const [n, c] of wrappers) { const e = this.skills.find(s => s.name === n); this._lastEffects = e.effects || []; await this.saveSkill(n, e.description, c, `generalise ${id}`, { refactor: id }); }
+        console.log(`[psn] generalise ${id}: helper ${helper[0]} added; ${wrappers.length} wrapper(s) under verification`);
+        return true;
+    }
+    // fix34 (PSN split): split large monolithic skills into sub-skills
+    async _split() {
+        if (!this._splitDue || this._cursorLimited()) return false;
+        this._splitDue = false;
+        const name = this._splitHint;
+        const e = this.skills.find(s => s.name === name && !s.demoted && !s.mergedInto && !s.candidate);
+        if (!e || (e.code || '').split('\n').length <= 40) { console.log(`[psn] split skipped: ${name} no longer qualifies`); return false; }
+        const id = `sp${Date.now()}`;
+        const system = `You refactor a Minecraft mineflayer skill library (PSN split: break a large skill into smaller reusable sub-skills). Return ONE \`\`\`javascript block with: first 2-3 NEW sub-skill async functions (bot) that each do one logical piece of the work, each preceded by // DESCRIPTION: <one sentence>; then the original skill rewritten to call those sub-skills. Keep the SAME name and signature for the original. Every loop checks bot.interrupt_code.\nLIBRARY:\n${this.catalogue()}`;
+        const user = `Large skill to split:\n--- ${e.name} ---\n${e.description}\n${e.code}\nWrite the sub-skills then the rewritten main skill:`;
+        console.log(`[psn] SPLIT ${id}: breaking ${e.name} (${e.code.split('\n').length} lines) into sub-skills`);
+        let reply; try { reply = await this._ask(system, user); } catch (err) { console.log(`[psn] split FAILED: ${err.message}`); return false; }
+        const code = extractCode(reply) || '';
+        const fns = []; const re = /(?:^|\n)async\s+function\s+([A-Za-z_]\w*)\s*\(/g; let mm, idx = [];
+        while ((mm = re.exec(code))) idx.push([mm[1], mm.index]);
+        for (let i = 0; i < idx.length; i++) fns.push([idx[i][0], code.slice(idx[i][1], i + 1 < idx.length ? idx[i + 1][1] : code.length).trim()]);
+        const subs = fns.filter(([n]) => !this.skills.some(s => s.name === n));
+        const main = fns.find(([n]) => n === e.name);
+        if (subs.length < 2 || !main) { console.log(`[psn] split ${id} FAILED: reply had ${subs.length} sub-skill(s) and ${main ? 'the' : 'no'} rewritten main`); return false; }
+        const over = { [main[0]]: main[1] }; for (const [n, c] of subs) over[n] = c;
+        const staged = await this.agent.coder._stageCode(this._libSrc(over) + `\n\n${subs.map(s => s[1]).join('\n\n')}\n\nawait Promise.resolve();`);
+        const lint = staged ? await this.agent.coder._lintCode(staged.src_lint_copy) : 'staging failed';
+        if (lint) { console.log(`[psn] split ${id} FAILED lint: ${String(lint).slice(0, 300)}`); return false; }
+        this._lastEffects = [];
+        for (const [n, c] of subs) {
+            const desc = ((c.match(/\/\/\s*DESCRIPTION:\s*(.+)/) || [])[1] || `sub-skill of ${e.name}`).trim();
+            if (!(await this.saveSkill(n, desc, c, `split ${id}`))) { console.log(`[psn] split ${id} FAILED: sub-skill ${n} rejected`); return false; }
+        }
+        this.progress.refactors = { ...(this.progress.refactors || {}), [id]: { main: e.name, subs: subs.map(s => s[0]), kind: 'split', at: Date.now() } }; this._saveProgress();
+        this._lastEffects = e.effects || [];
+        await this.saveSkill(e.name, e.description, main[1], `split ${id}`, { refactor: id });
+        console.log(`[psn] split ${id}: ${subs.length} sub-skill(s) added; ${e.name} rewritten and under verification`);
+        return true;
+    }
 
     async step() {
         const now = Date.now(); console.log(`[timing] ${new Date().toISOString().slice(11,19)}Z step start (gap since last step end ${this._stepEnd ? now - this._stepEnd : 0}ms)`);   // fix27
@@ -1297,6 +1414,9 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         if (await this._gateTrial()) return;   // fix28
         if (await this._backfillContracts()) return;   // fix22
         if (await this._refactor()) return;
+        if (await this._prune()) return;   // fix34
+        if (await this._generalise()) return;   // fix34
+        if (await this._split()) return;   // fix34
         if (await this._retention()) return;   // fix32
         const before = this.observe();
         this._curSub = null;
