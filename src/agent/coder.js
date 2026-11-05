@@ -266,6 +266,15 @@ export class Coder {
                     }
                     result += `Location: Line ${exc.line}, Column ${exc.column}\n`;
                     result += `Related Code Line: ${errorLine}\n`;
+                    // fix36: add surrounding context to help identify which skill contains the error (especially for joined skill code)
+                    const start = Math.max(0, exc.line - 4);
+                    const end = Math.min(codeLines.length, exc.line + 2);
+                    const context = codeLines.slice(start, end).map((l, i) => {
+                        const ln = start + i + 1;
+                        const marker = ln === exc.line ? '>>>' : '   ';
+                        return `${marker} ${ln}: ${l}`;
+                    }).join('\n');
+                    result += `Context:\n${context}\n`;
                 }
             });
             result += 'The code contains exceptions and cannot continue execution.';
