@@ -1127,7 +1127,7 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
     }
     _requeueDeferred() {
         const d = this.progress.deferredRepairs || []; if (!d.length) return;
-        const ripe = d.filter(x => Date.now() >= x.notBefore && !this.skills.find(s => s.name === x.target)?.candidate || (x.kind === 'contract_fix' && Date.now() >= x.notBefore));
+        const ripe = d.filter(x => Date.now() >= x.notBefore);
         if (!ripe.length) return;
         this.progress.deferredRepairs = d.filter(x => !ripe.includes(x));
         const rq = [...(this._repairQueue || [])]; for (const x of ripe) if (!rq.some(y => y.target === x.target && y.kind === x.kind)) { delete x.notBefore; rq.push(x); console.log(`[psn] deferred repair of ${x.target} [${x.kind}] re-queued`); }
@@ -1195,7 +1195,8 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         if (!pe) return single('caller not in library', e, 'callee_fix');
         if (this._cursorLimited()) { this._deferRepair(q, 10 * 60e3, 'code model at its limit'); return false; }
         if (e.candidate || pe.candidate) { this._deferRepair(q, 10 * 60e3, 'a candidate is already under trial'); return false; }
-        if (Date.now() - Math.max(this._repairs[e.name] || 0, this._repairs[pe.name] || 0) < 30 * 60e3) { this._deferRepair(q, 30 * 60e3, 'one of the pair was repaired in the last 30 min'); return false; }
+        const lastPairRepair = Math.max(this._repairs[e.name] || 0, this._repairs[pe.name] || 0);
+        if (Date.now() - lastPairRepair < 30 * 60e3) { this._deferRepair(q, Math.max(60e3, 30 * 60e3 - (Date.now() - lastPairRepair)), 'one of the pair was repaired in the last 30 min'); return false; }
         const okKid = this._updateAllowed(e, 'joint repair (child)'), okPar = this._updateAllowed(pe, 'joint repair (caller)');
         if (!okKid && !okPar) { console.log(`[psn] joint repair ${e.name}+${pe.name} skipped: maturity gate froze both`); return false; }
         if (!okPar) return single('caller frozen by the maturity gate', e, 'callee_fix');
