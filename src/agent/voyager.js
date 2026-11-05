@@ -20,7 +20,7 @@ import { cosineSimilarity } from '../utils/math.js';
 import minecraftData from 'minecraft-data';
 import { Ollama } from '../models/ollama.js';
 import { signatureOf, depsOf, missingCalls, findCycle, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf } from './skill_graph.js';
-import { getRealAPI } from './coder.js';   // fix39: shared API surface helper for repair prompts
+import { getBareAPI } from './coder.js';   // fix40: unified bare-name API helper
 const LOCAL = { model: 'qwen3:4b-instruct-2507-q4_K_M', url: 'http://192.168.1.215:11434', params: { format: 'json', options: { num_ctx: 8192, num_predict: 512 } } };   // fix38: raised from 150 to 512 - short JSON replies still need room for reasoning; truncation fails loudly (fix31)
 export const CALLS = { local: 0, code: 0, replay: 0 };
 
@@ -202,10 +202,49 @@ export class Voyager {
             process.on('unhandledRejection', onErr('UNHANDLED REJECTION'));
         }
         if (!globalThis.__logRotate) { globalThis.__logRotate = setInterval(() => rotateLog('./logs/mindcraft.log', 25e6, 3), 60e3); rotateLog('./logs/mindcraft.log', 25e6, 3); }   // fix28
+        this._migrateToBarenames();  // fix40: one-time migration from skills.*/world.* to bare names
         this._seedPrimitives();
         this._relink();
         this._polyMerge();
         this._extractShared();
+    }
+    // fix40: one-time migration from skills.*/world.* to bare names
+    // Rewrites all saved skill code to use bare function names instead of skills.X/world.Y
+    _migrateToBarenames() {
+        if (this.progress.migratedToBarenames) return;  // already migrated
+        const bare = getBareAPI();
+        const skillNames = new Set(bare.names);
+        let migrated = 0, totalChanges = 0;
+        for (const s of this.skills) {
+            if (!s.code) continue;
+            let code = s.code;
+            let changes = 0;
+            // Replace skills.X(... -> X(... for known function names
+            for (const name of skillNames) {
+                const re = new RegExp(`\\bskills\\.${name}\\s*\\(`, 'g');
+                const newCode = code.replace(re, `${name}(`);
+                if (newCode !== code) { changes++; code = newCode; }
+            }
+            // Replace world.X(... -> X(... for known function names
+            for (const name of skillNames) {
+                const re = new RegExp(`\\bworld\\.${name}\\s*\\(`, 'g');
+                const newCode = code.replace(re, `${name}(`);
+                if (newCode !== code) { changes++; code = newCode; }
+            }
+            if (changes > 0) {
+                console.log(`[fix40] migrate ${s.name}: ${changes} skills.*/world.* -> bare name changes`);
+                s.code = code;
+                writeAtomic(`${this.dir}/${s.name}.js`, `// ${s.description}\n${s.code}\n`);
+                migrated++;
+                totalChanges += changes;
+            }
+        }
+        if (migrated > 0) {
+            this._saveSkills();
+            console.log(`[fix40] MIGRATION COMPLETE: ${migrated} skills updated, ${totalChanges} total changes`);
+        }
+        this.progress.migratedToBarenames = true;
+        this._saveProgress();
     }
     // fix33: seed primitives into the skill library so they are blamable/repairable (learned path, not hard-coded)
     // These are skills from skills.js that need to be in the skill graph to enable learning (e.g. water escape)
@@ -222,11 +261,11 @@ export class Voyager {
         const p = bot.entity.position;
         const dx = x - p.x, dz = z - p.z, d = Math.hypot(dx, dz);
         if (d <= 4) { log(bot, \`Arrived near \${x}, \${y}, \${z}.\`); return true; }
-        if (d <= 32) { if (await skills.goToPosition(bot, x, y, z, 3)) continue; }
+        if (d <= 32) { if (await goToPosition(bot, x, y, z, 3)) continue; }
         const step = Math.min(32, d);
         const side = fails ? (fails % 2 ? 1 : -1) * 10 * fails : 0;
         const tx = Math.round(p.x + dx / d * step - dz / d * side), tz = Math.round(p.z + dz / d * step + dx / d * side);
-        try { await skills.goToGoal(bot, new Vec3(tx, p.y, tz), 3); fails = 0; }
+        try { await goToGoal(bot, new Vec3(tx, p.y, tz), 3); fails = 0; }
         catch (err) {
             if (bot.interrupt_code) return false;
             if (++fails >= 6) { log(bot, \`travelTo gave up at \${p.floored()} after 6 failed hops: \${err?.message}\`); return false; }
@@ -251,18 +290,18 @@ export class Voyager {
     let collected = 0;
     for (let i = 0; i < num; i++) {
         if (bot.interrupt_code) break;
-        const block = world.getNearestBlock(bot, b => types.includes(b.name), 64);
+        const block = getNearestBlock(bot, b => types.includes(b.name), 64);
         if (!block) { log(bot, collected ? \`No more \${blockType} nearby.\` : \`No \${blockType} nearby.\`); break; }
         await bot.tool.equipForBlock(block);
         const itemId = bot.heldItem ? bot.heldItem.type : null;
         if (!block.canHarvest(itemId)) { log(bot, \`Don't have right tools to harvest \${blockType}.\`); return false; }
-        const before = world.getInventoryCounts(bot);
+        const before = getInventoryCounts(bot);
         try {
-            await skills.goToPosition(bot, block.position.x, block.position.y, block.position.z, 4);
+            await goToPosition(bot, block.position.x, block.position.y, block.position.z, 4);
             await bot.dig(block, true);
-            await skills.pickupNearbyItems(bot);
+            await pickupNearbyItems(bot);
         } catch (err) { log(bot, \`Failed to collect \${blockType}: \${err.message}\`); continue; }
-        const after = world.getInventoryCounts(bot);
+        const after = getInventoryCounts(bot);
         if (Object.keys(after).some(k => (after[k] || 0) > (before[k] || 0))) collected++;
     }
     log(bot, \`Collected \${collected} \${blockType}.\`);
@@ -281,25 +320,25 @@ export class Voyager {
     if (!recipes || !recipes.length) {
         recipes = bot.recipesFor(bot.registry.itemsByName[itemName]?.id, null, 1, true);
         if (!recipes || !recipes.length) { log(bot, \`No recipe for \${itemName} or missing ingredients.\`); return false; }
-        craftingTable = world.getNearestBlock(bot, 'crafting_table', 16);
+        craftingTable = getNearestBlock(bot, 'crafting_table', 16);
         if (!craftingTable) {
-            const hasTable = (world.getInventoryCounts(bot)['crafting_table'] || 0) > 0;
+            const hasTable = (getInventoryCounts(bot)['crafting_table'] || 0) > 0;
             if (hasTable) {
-                const pos = world.getNearestFreeSpace(bot, 1, 6);
-                await skills.placeBlock(bot, 'crafting_table', pos.x, pos.y, pos.z);
-                craftingTable = world.getNearestBlock(bot, 'crafting_table', 16);
+                const pos = getNearestFreeSpace(bot, 1, 6);
+                await placeBlock(bot, 'crafting_table', pos.x, pos.y, pos.z);
+                craftingTable = getNearestBlock(bot, 'crafting_table', 16);
                 placedTable = true;
             } else { log(bot, \`Crafting \${itemName} requires a crafting table.\`); return false; }
         }
         if (craftingTable) recipes = bot.recipesFor(bot.registry.itemsByName[itemName]?.id, null, 1, craftingTable);
     }
-    if (!recipes || !recipes.length) { log(bot, \`Cannot craft \${itemName}: missing ingredients.\`); if (placedTable) await skills.collectBlock(bot, 'crafting_table', 1); return false; }
-    if (craftingTable) await skills.goToPosition(bot, craftingTable.position.x, craftingTable.position.y, craftingTable.position.z, 3);
-    const before = world.getInventoryCounts(bot)[itemName] || 0;
+    if (!recipes || !recipes.length) { log(bot, \`Cannot craft \${itemName}: missing ingredients.\`); if (placedTable) await collectBlock(bot, 'crafting_table', 1); return false; }
+    if (craftingTable) await goToPosition(bot, craftingTable.position.x, craftingTable.position.y, craftingTable.position.z, 3);
+    const before = getInventoryCounts(bot)[itemName] || 0;
     try { await bot.craft(recipes[0], Math.min(num, 64), craftingTable); }
-    catch (err) { log(bot, \`Crafting \${itemName} failed: \${err.message}\`); if (placedTable) await skills.collectBlock(bot, 'crafting_table', 1); return false; }
-    const after = world.getInventoryCounts(bot)[itemName] || 0;
-    if (placedTable) await skills.collectBlock(bot, 'crafting_table', 1);
+    catch (err) { log(bot, \`Crafting \${itemName} failed: \${err.message}\`); if (placedTable) await collectBlock(bot, 'crafting_table', 1); return false; }
+    const after = getInventoryCounts(bot)[itemName] || 0;
+    if (placedTable) await collectBlock(bot, 'crafting_table', 1);
     if (after > before) { log(bot, \`Crafted \${itemName}, now have \${after}.\`); return true; }
     log(bot, \`Crafting \${itemName} produced no items.\`); return false;
 }`,
@@ -314,21 +353,21 @@ export class Voyager {
     bot.modes.pause('cowardice');
     const waterMobs = ['drowned', 'cod', 'salmon', 'tropical_fish', 'squid'];
     if (waterMobs.includes(mobType)) bot.modes.pause('self_preservation');
-    const mob = world.getNearbyEntities(bot, 24).find(e => e.name === mobType);
+    const mob = getNearbyEntities(bot, 24).find(e => e.name === mobType);
     if (!mob) { log(bot, \`Could not find any \${mobType} to attack.\`); return false; }
     const weapons = bot.inventory.items().filter(it => it.name.includes('sword') || (it.name.includes('axe') && !it.name.includes('pickaxe')));
     if (weapons.length) { weapons.sort((a, b) => (b.attackDamage || 0) - (a.attackDamage || 0)); await bot.equip(weapons[0], 'hand'); }
     if (!kill) {
-        if (bot.entity.position.distanceTo(mob.position) > 5) await skills.goToPosition(bot, mob.position.x, mob.position.y, mob.position.z, 2);
+        if (bot.entity.position.distanceTo(mob.position) > 5) await goToPosition(bot, mob.position.x, mob.position.y, mob.position.z, 2);
         await bot.attack(mob); return true;
     }
     bot.pvp.attack(mob);
-    while (world.getNearbyEntities(bot, 24).includes(mob)) {
+    while (getNearbyEntities(bot, 24).includes(mob)) {
         await sleep(1000);
         if (bot.interrupt_code) { bot.pvp.stop(); return false; }
     }
     log(bot, \`Successfully killed \${mob.name}.\`);
-    await skills.pickupNearbyItems(bot);
+    await pickupNearbyItems(bot);
     return true;
 }`,
                 deps: ['pickupNearbyItems'],
@@ -344,7 +383,7 @@ export class Voyager {
     if (existing && existing.name === blockType) { log(bot, \`\${blockType} already at \${target}.\`); return false; }
     const empty = ['air', 'water', 'lava', 'grass', 'short_grass', 'tall_grass', 'snow', 'dead_bush', 'fern'];
     if (existing && !empty.includes(existing.name)) {
-        await skills.breakBlockAt(bot, x, y, z);
+        await breakBlockAt(bot, x, y, z);
         await sleep(200);
     }
     let itemName = blockType === 'redstone_wire' ? 'redstone' : blockType;
@@ -359,7 +398,7 @@ export class Voyager {
         if (adj && !empty.includes(adj.name)) { buildOff = adj; faceVec = new Vec3(-d[0], -d[1], -d[2]); break; }
     }
     if (!buildOff) { log(bot, \`Cannot place \${blockType}: no adjacent block to build off.\`); return false; }
-    if (bot.entity.position.distanceTo(target) > 4) await skills.goToPosition(bot, target.x, target.y, target.z, 3);
+    if (bot.entity.position.distanceTo(target) > 4) await goToPosition(bot, target.x, target.y, target.z, 3);
     await bot.equip(block, 'hand');
     await bot.lookAt(buildOff.position.offset(0.5, 0.5, 0.5));
     try { await bot.placeBlock(buildOff, faceVec); log(bot, \`Placed \${blockType} at \${target}.\`); return true; }
@@ -378,7 +417,7 @@ export class Voyager {
         log(bot, \`No solid block at \${x}, \${y}, \${z}.\`); return false;
     }
     if (bot.entity.position.distanceTo(block.position) > 4.5) {
-        await skills.goToPosition(bot, block.position.x, block.position.y, block.position.z, 4);
+        await goToPosition(bot, block.position.x, block.position.y, block.position.z, 4);
     }
     if (bot.game.gameMode !== 'creative') {
         await bot.tool.equipForBlock(block);
@@ -402,7 +441,7 @@ export class Voyager {
     let nearestItem = getNearestItem();
     let pickedUp = 0;
     for (let tries = 0; nearestItem && tries < 12; tries++) {
-        try { await skills.goToPosition(bot, nearestItem.position.x, nearestItem.position.y, nearestItem.position.z, 0.5); }
+        try { await goToPosition(bot, nearestItem.position.x, nearestItem.position.y, nearestItem.position.z, 0.5); }
         catch (e) { log(bot, \`Failed to reach item: \${e.message}\`); throw e; }
         await sleep(500);
         const prev = nearestItem;
@@ -423,13 +462,13 @@ export class Voyager {
                 task: 'deposit items to free inventory space',
                 code: `async function depositToChest(bot, itemName, count = 64) {
     if (!itemName) { log(bot, 'FAILED: depositToChest requires an item name'); return false; }
-    const chest = world.getNearestBlock(bot, b => /chest|barrel|shulker/.test(b.name), 32);
+    const chest = getNearestBlock(bot, b => /chest|barrel|shulker/.test(b.name), 32);
     if (!chest) { log(bot, 'FAILED: no chest/barrel/shulker_box within 32 blocks to deposit items'); return false; }
     const item = bot.inventory.items().find(it => it.name === itemName);
     if (!item) { log(bot, \`Don't have any \${itemName} to deposit.\`); return false; }
     const toDeposit = Math.min(count, item.count);
     if (bot.entity.position.distanceTo(chest.position) > 4) {
-        await skills.goToPosition(bot, chest.position.x, chest.position.y, chest.position.z, 3);
+        await goToPosition(bot, chest.position.x, chest.position.y, chest.position.z, 3);
     }
     const containerWindow = await bot.openContainer(chest);
     if (!containerWindow) { log(bot, 'FAILED: could not open chest'); return false; }
@@ -684,7 +723,7 @@ Use only c; no other globals.`;
         // are not progress); health/food are not progress (drowning damage + regen kept resetting the timer)
         const seen = new Set(), cell = p => `${Math.floor(p.x / 2)},${Math.floor(p.y / 2)},${Math.floor(p.z / 2)}`; let fresh = 0;
         const sig = () => { const p = bot.entity?.position; if (!p) return ''; const w = bot.currentWindow, c = cell(p); if (!seen.has(c)) { seen.add(c); fresh++; }
-            return `${fresh}|${JSON.stringify(world.getInventoryCounts(bot))}|${w ? w.type + ':' + w.slots.map(i => i ? i.name + i.count : '').join(',') : ''}|${lit() ? Date.now() : ''}`; };
+            return `${fresh}|${JSON.stringify(getInventoryCounts(bot))}|${w ? w.type + ':' + w.slots.map(i => i ? i.name + i.count : '').join(',') : ''}|${lit() ? Date.now() : ''}`; };
         let last = sig(), since = Date.now(); this._stall = null;
         const iv = setInterval(() => { try { const s = sig(); if (s !== last) { last = s; since = Date.now(); return; }
             if (Date.now() - since >= 60e3 && this.agent.actions.executing && !this._stall) { const p = bot.entity.position; this._stall = { t: Date.now(), pos: `${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}` }; console.log(`[stall] ${label}: no progress (no new ground reached, inventory, window, lit furnace) for 60s at ${this._stall.pos}; stopping the action`); this.agent.actions.stop(); } } catch (e) { console.log('[stall] watchdog error: ' + e.message); } }, 5000);
@@ -771,7 +810,7 @@ Use only c; no other globals.`;
             biome: world.getBiomeName(bot),
             time: t < 12000 ? `day (${t})` : t < 13000 ? `dusk (${t}, hostiles about to spawn)` : t < 23000 ? `night (${t}, hostiles spawn outdoors)` : `dawn (${t})`,
             health: `${Math.round(bot.health)}/20`, food: `${bot.food}/20`,
-            inventory: world.getInventoryCounts(bot),
+            inventory: getInventoryCounts(bot),
             inventory_slots: `${usedSlots}/${totalSlots}`,
             empty_inventory_slots: emptySlots,
             // fix38: full equipment (6 slots, not just held item)
@@ -828,7 +867,7 @@ Use only c; no other globals.`;
             if (!window || !window.title) return;
             const title = typeof window.title === 'string' ? window.title : JSON.stringify(window.title);
             if (!title.toLowerCase().includes('chest') && !title.toLowerCase().includes('barrel')) return;
-            const nearestChest = world.getNearestBlock(bot, b => b.name === 'chest' || b.name === 'trapped_chest' || b.name === 'barrel', 6);
+            const nearestChest = getNearestBlock(bot, b => b.name === 'chest' || b.name === 'trapped_chest' || b.name === 'barrel', 6);
             if (!nearestChest) return;
             const pos = nearestChest.position;
             const key = `${pos.x},${pos.y},${pos.z}`;
@@ -1307,21 +1346,20 @@ Use only c; no other globals.`;
             return s.name;
         });
     }
-    // fix39: built-in API list (skills.*/world.*) with exact call signatures from JSDoc
-    // Separate from learned skills to prevent confusion (learned skills use bare names, built-in use skills.*/world.*)
+    // fix40: unified bare-name API list (built-in + learned) with exact call signatures
+    // ALL functions use bare names (e.g., goToPosition(bot, x, y, z) NOT skills.goToPosition)
+    unifiedAPIList(only) {
+        const bare = getBareAPI();
+        const builtInSigs = bare.sigs.map(s => `- ${s} [built-in]`);
+        const learnedSigs = this.skills
+            .filter(s => !s.demoted && !s.mergedInto && (!only || only.has(s.name)))
+            .map(s => `- ${signatureOf(s.code, s.name)}${s.handwritten ? ' [handwritten]' : ''}: ${s.description}`);
+        return [...builtInSigs, ...learnedSigs].join('\n');
+    }
+    // fix40: legacy builtInAPIList for backward compatibility - returns bare names now
     builtInAPIList() {
-        const extractSig = (fn, mod) => {
-            const str = fn.toString();
-            const match = str.match(/function\s+\w+\s*\(([^)]*)\)/);
-            if (!match) return null;
-            const params = match[1].trim();
-            return `${mod}.${fn.name}(${params})`;
-        };
-        const skillsFns = Object.keys(skills).filter(k => typeof skills[k] === 'function' && k !== 'log')
-            .map(k => extractSig(skills[k], 'skills')).filter(Boolean);
-        const worldFns = Object.keys(world).filter(k => typeof world[k] === 'function')
-            .map(k => extractSig(world[k], 'world')).filter(Boolean);
-        return [...skillsFns, ...worldFns].join('\n');
+        const bare = getBareAPI();
+        return bare.sigs.join('\n');
     }
     _recordRun(entry, task, ok, trial) {
         if (trial) {
@@ -2048,17 +2086,14 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         // AWM-style: retrieve similar past repair lessons
         const pastLessons = await this.repairMemory.retrieveSimilar(q.evidence, 3);
         const awmHints = this.repairMemory.formatHintsForCoder(pastLessons);
-        // fix39: clearly separate built-in API (skills.*/world.*) from learned skills (bare names)
-        // This prevents the model from inventing calls like skills.goToBlock when it should call goToBlockAndInteract
+        // fix40: unified bare-name API - all functions called by bare name (no skills.*/world.* prefix)
+        const relevantSkills = new Set([e.name, ...this._closure(e.name), ...parentsOf(e.name, this._graph())]);
         const system = `You repair ONE skill in a Minecraft mineflayer skill library (PSN-style targeted fix). Return a single \`\`\`javascript code block containing ONLY the fixed function, with the SAME name and a compatible signature. First line inside the block: // DESCRIPTION: <one sentence>. Every loop must check bot.interrupt_code. If something still cannot be done, log(bot, 'FAILED: <reason>') and return a falsy value; no silent fallbacks. findBlock/findBlocks/nearestEntity/bot.entities/blockAt results can be null or empty: always null-check them before reading .position/.x or calling methods on them.
 
-BUILT-IN API (call with skills.* or world.* prefix - these are the ONLY functions under skills.* and world.*):
-${this.builtInAPIList()}
+AVAILABLE FUNCTIONS (call by bare name, e.g. goToPosition(bot, x, y, z) - do NOT use skills.* or world.* prefix):
+${this.unifiedAPIList(relevantSkills)}
 
-LEARNED LIBRARY SKILLS (call by BARE NAME directly, NOT skills.* - these are already in scope as plain functions):
-${this.catalogue(new Set([e.name, ...this._closure(e.name), ...parentsOf(e.name, this._graph())]))}
-
-IMPORTANT: Do NOT invent skills.* calls. If you need functionality not in the built-in API above, use a learned skill by its bare name.`;
+IMPORTANT: All functions use bare names. Do NOT write skills.goToPosition - write goToPosition. Do NOT write world.getNearestBlock - write getNearestBlock.`;
         const user = `Blamed skill: ${e.name} (${q.kind === 'caller_fix' ? 'it calls the leaf ' + q.leaf + ' in a situation where the leaf cannot succeed: fix how/when it calls it, e.g. obtain the missing prerequisite first' : 'its own logic failed'})\nTask that failed: ${q.task}\nFailure path: ${q.path.join(' > ')}\nEvidence: ${q.evidence}\n--- execution trace (indent = call depth) ---\n${q.trace}\n${e.contract ? `--- learned contract of ${e.name} (must hold after your fix) ---\npre: ${e.contract.pre}\npost: ${e.contract.post}\n` : ''}--- current code of ${e.name} ---\n${e.code}\n--- skills it uses ---\n${kids.map(k => '// ' + k.description + '\n' + signatureOf(k.code, k.name)).join('\n')}\n${(e.repairHistory || []).length ? `\n--- your last ${e.repairHistory.length} repair proposal(s) for ${e.name} (do not repeat what failed) ---\n` + e.repairHistory.map((h, i) => `${i + 1}. [${h.outcome || 'pending'}] ${h.kind}: ${h.evidence}\n   change: ${h.desc}`).join('\n') : ''}${q.peers?.length > 1 ? `\nOther skills blamed on the same failure (repaired children-first): ${q.peers.join(', ')}` : ''}${awmHints ? `\n${awmHints}` : ''}\nWrite the fixed ${e.name}:`;
         console.log(`[psn] repair memory for ${e.name}: ${(e.repairHistory || []).length} past proposal(s) in the prompt${pastLessons.length ? `, ${pastLessons.length} AWM lesson(s)` : ''}`);
         console.log(`[psn] REPAIR ${e.name} [${q.kind}] with the code model (evidence: ${q.evidence.slice(0, 160)})`);
@@ -2219,7 +2254,7 @@ IMPORTANT: Do NOT invent skills.* calls. If you need functionality not in the bu
         const pastLessons = await this.repairMemory.retrieveSimilar(q.evidence, 2);
         const awmHints = this.repairMemory.formatHintsForCoder(pastLessons);
         const relevantSkills = new Set([e.name, pe.name, ...this._closure(e.name), ...this._closure(pe.name), ...parentsOf(e.name, this._graph()), ...parentsOf(pe.name, this._graph())]);
-        // fix39: clearly separate built-in API from learned skills
+        // fix40: unified bare-name API - all functions called by bare name
         const system = `You repair TWO skills of a Minecraft mineflayer skill library together (PSN joint repair): a child skill and the caller that uses it failed on the same path.
 
 REQUIRED FORMAT: Return ONE \`\`\`javascript code block containing EXACTLY two async function definitions:
@@ -2234,13 +2269,10 @@ Each function must:
 Every loop must check bot.interrupt_code. If something cannot be done, log(bot, 'FAILED: <reason>') and return a falsy value; no silent fallbacks. findBlock/findBlocks/nearestEntity/bot.entities/blockAt results can be null or empty: always null-check them.
 Fix the child's own logic and how/when the caller uses it. No top-level call, no extra functions.
 
-BUILT-IN API (call with skills.* or world.* prefix - these are the ONLY functions under skills.* and world.*):
-${this.builtInAPIList()}
+AVAILABLE FUNCTIONS (call by bare name, e.g. goToPosition(bot, x, y, z) - do NOT use skills.* or world.* prefix):
+${this.unifiedAPIList(relevantSkills)}
 
-LEARNED LIBRARY SKILLS (call by BARE NAME directly, NOT skills.* - already in scope as plain functions):
-${this.catalogue(relevantSkills)}
-
-IMPORTANT: Do NOT invent skills.* calls. If you need functionality not in the built-in API above, use a learned skill by its bare name.`;
+IMPORTANT: All functions use bare names. Do NOT write skills.goToPosition - write goToPosition. Do NOT write world.getNearestBlock - write getNearestBlock.`;
         const user = `Task that failed: ${q.task}\nEvidence: ${q.evidence}\n--- current bot state ---\n${this._stateText(this.observe())}\n--- execution trace ---\n${extractFeedback(q.trace || '', 2500)}\n--- child ${e.name} ---\n${e.code}\n--- caller ${pe.name} ---\n${pe.code}${e.contract ? `\n--- contract of ${e.name} ---\npre: ${e.contract.pre}\npost: ${e.contract.post}` : ''}${pe.contract ? `\n--- contract of ${pe.name} ---\npre: ${pe.contract.pre}\npost: ${pe.contract.post}` : ''}${awmHints ? `\n${awmHints}` : ''}\nWrite both fixed functions (${e.name} first, then ${pe.name}):`;
         console.log(`[psn] REPAIR JOINT ${e.name} + ${pe.name} with the code model (evidence: ${String(q.evidence).slice(0, 160)})`);
         let reply; try { reply = await this._ask(system, user); } catch (err) { console.log(`[psn] joint repair FAILED: ${err.message}`); return false; }
@@ -2308,16 +2340,13 @@ IMPORTANT: Do NOT invent skills.* calls. If you need functionality not in the bu
         const ents = h.skills.map(n => this.skills.find(s => s.name === n)).filter(e => e && !e.handwritten && !e.primitive && !e.candidate);
         if (ents.length < 2) { console.log(`[psn] refactor skipped: fragment shared by ${h.skills.join(', ')} but <2 learned skills without a pending candidate`); return false; }
         const id = `rf${Date.now()}`;
-        // fix39: clearly separate built-in API from learned skills
+        // fix40: unified bare-name API
         const system = `You refactor a Minecraft mineflayer skill library (PSN canonical refactor: extract shared subroutine). Return ONE \`\`\`javascript block with: first a NEW helper async function (bot, ...params) that implements the repeated fragment, preceded by // DESCRIPTION: <one sentence>; then each listed skill rewritten to call the helper, SAME names and signatures, behaviour unchanged. Every loop checks bot.interrupt_code. No other functions.
 
-BUILT-IN API (call with skills.* or world.* prefix):
-${this.builtInAPIList()}
+AVAILABLE FUNCTIONS (call by bare name, e.g. goToPosition(bot, x, y, z) - do NOT use skills.* or world.* prefix):
+${this.unifiedAPIList()}
 
-LEARNED LIBRARY SKILLS (call by BARE NAME, NOT skills.*):
-${this.catalogue()}
-
-IMPORTANT: Do NOT invent skills.* calls. Use either a built-in API above or a learned skill by bare name.`;
+IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call functions directly by name.`;
         const user = `Repeated fragment:\n${h.fragment}\n${ents.map(e => `--- ${e.name} ---\n${e.code}`).join('\n')}\nWrite the helper then the rewritten skills:`;
         console.log(`[psn] REFACTOR ${id}: extracting the fragment shared by ${ents.map(e => e.name).join(', ')}`);
         let reply; try { reply = await this._ask(system, user); } catch (err) { console.log(`[psn] refactor FAILED: ${err.message}`); return false; }
@@ -2373,16 +2402,13 @@ IMPORTANT: Do NOT invent skills.* calls. Use either a built-in API above or a le
         const ents = names.map(n => this.skills.find(s => s.name === n)).filter(e => e && !e.handwritten && !e.primitive && !e.candidate && !e.demoted && !e.mergedInto);
         if (ents.length < 3) { console.log(`[psn] generalise skipped: <3 eligible skills from hint`); return false; }
         const id = `gn${Date.now()}`;
-        // fix39: clearly separate built-in API from learned skills
+        // fix40: unified bare-name API
         const system = `You refactor a Minecraft mineflayer skill library (PSN generalise: combine similar specific skills into one parameterized skill). Return ONE \`\`\`javascript block with: first a NEW parameterized async function (bot, param) that generalises the common pattern, preceded by // DESCRIPTION: <one sentence>; then each listed skill rewritten as a thin wrapper calling the new function with the appropriate argument. Keep SAME names and signatures for wrappers. Every loop checks bot.interrupt_code.
 
-BUILT-IN API (call with skills.* or world.* prefix):
-${this.builtInAPIList()}
+AVAILABLE FUNCTIONS (call by bare name, e.g. goToPosition(bot, x, y, z) - do NOT use skills.* or world.* prefix):
+${this.unifiedAPIList()}
 
-LEARNED LIBRARY SKILLS (call by BARE NAME, NOT skills.*):
-${this.catalogue()}
-
-IMPORTANT: Do NOT invent skills.* calls. Use either a built-in API above or a learned skill by bare name.`;
+IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call functions directly by name.`;
         const user = `Similar skills to generalise:\n${ents.map(e => `--- ${e.name} ---\n${e.description}\n${e.code}`).join('\n')}\nWrite the parameterized helper then the wrapper skills:`;
         console.log(`[psn] GENERALISE ${id}: parameterising ${ents.map(e => e.name).join(', ')}`);
         let reply; try { reply = await this._ask(system, user); } catch (err) { console.log(`[psn] generalise FAILED: ${err.message}`); return false; }
@@ -2413,16 +2439,13 @@ IMPORTANT: Do NOT invent skills.* calls. Use either a built-in API above or a le
         const e = this.skills.find(s => s.name === name && !s.demoted && !s.mergedInto && !s.candidate);
         if (!e || (e.code || '').split('\n').length <= 40) { console.log(`[psn] split skipped: ${name} no longer qualifies`); return false; }
         const id = `sp${Date.now()}`;
-        // fix39: clearly separate built-in API from learned skills
+        // fix40: unified bare-name API
         const system = `You refactor a Minecraft mineflayer skill library (PSN split: break a large skill into smaller reusable sub-skills). Return ONE \`\`\`javascript block with: first 2-3 NEW sub-skill async functions (bot) that each do one logical piece of the work, each preceded by // DESCRIPTION: <one sentence>; then the original skill rewritten to call those sub-skills. Keep the SAME name and signature for the original. Every loop checks bot.interrupt_code.
 
-BUILT-IN API (call with skills.* or world.* prefix):
-${this.builtInAPIList()}
+AVAILABLE FUNCTIONS (call by bare name, e.g. goToPosition(bot, x, y, z) - do NOT use skills.* or world.* prefix):
+${this.unifiedAPIList()}
 
-LEARNED LIBRARY SKILLS (call by BARE NAME, NOT skills.*):
-${this.catalogue()}
-
-IMPORTANT: Do NOT invent skills.* calls. Use either a built-in API above or a learned skill by bare name.`;
+IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call functions directly by name.`;
         const user = `Large skill to split:\n--- ${e.name} ---\n${e.description}\n${e.code}\nWrite the sub-skills then the rewritten main skill:`;
         console.log(`[psn] SPLIT ${id}: breaking ${e.name} (${e.code.split('\n').length} lines) into sub-skills`);
         let reply; try { reply = await this._ask(system, user); } catch (err) { console.log(`[psn] split FAILED: ${err.message}`); return false; }
@@ -2585,19 +2608,14 @@ IMPORTANT: Do NOT invent skills.* calls. Use either a built-in API above or a le
         const shown = new Set(related.map(s => s.name)); for (const s of related) for (const d of this._closure(s.name)) shown.add(d);
         const prompter = this.agent.prompter;
         let system = await prompter.replaceStrings(prompter.profile.coding, [{ role: "user", content: `!newAction(${task})` }], prompter.coding_examples);
-        // fix39: clearly separate built-in API from learned skills to prevent hallucinations like skills.goToBlock
+        // fix40: unified bare-name API - all functions called by bare name
         system += `\n\nVOYAGER MODE: write ONE reusable async function \`async function camelCaseName(bot) {...}\` that completes the task, then call it at the end with \`await camelCaseName(bot);\`.
 The first line of the code block must be a comment: // DESCRIPTION: <one sentence of what the function does>.
 
-BUILT-IN API (call with skills.* or world.* prefix - these are the ONLY functions under skills.* and world.*):
-${this.builtInAPIList()}
+AVAILABLE FUNCTIONS (call by bare name, e.g. goToPosition(bot, x, y, z) - do NOT use skills.* or world.* prefix):
+${this.unifiedAPIList(shown)}
 
-LEARNED LIBRARY SKILLS (call by BARE NAME directly, NOT skills.* - already in scope as plain async functions):
-${this.catalogue(shown)}
-
-IMPORTANT: Do NOT invent skills.* calls like skills.goToBlock - they do not exist. Use either:
-1. A built-in API from the list above (skills.goToNearestBlock, skills.collectBlock, etc.)
-2. A learned skill by its bare name (e.g., \`await mineOre(bot, 'iron_ore', 3)\`)
+IMPORTANT: All functions use bare names. Do NOT write skills.goToBlock or skills.goToPosition - write goToPosition(bot, x, y, z) directly. Do NOT write world.getNearestBlock - write getNearestBlock(bot, ...) directly.
 
 COMPOSE: build your function out of these skills (they can take arguments). Your new skill may take extra parameters with defaults, e.g. \`async function makeIronTools(bot, count = 1)\`. Do not create call cycles between skills.${this.sharedHints?.length ? `
 SHARED CODE: these fragments are repeated in several skills; if you need this logic, put it in its own small reusable async function skill (named, with parameters) and call it, instead of inlining it again:

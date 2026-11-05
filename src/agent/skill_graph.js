@@ -68,10 +68,10 @@ const __wrap = (n, f) => async function (...a) {
     catch (e) { rec.fail = true; rec.err = String(e?.message || e).slice(0, 200); throw e; }
     finally { rec.t1 = Date.now(); if (!n.startsWith('skills.')) rec.s1 = __st(); rec.o1 = (bot.output || '').length; bot.__psnOut = bot.output; const post = __inv(); rec.delta = {}; for (const k of new Set([...Object.keys(rec.pre), ...Object.keys(post)])) { const d = (post[k] || 0) - (rec.pre[k] || 0); if (d) rec.delta[k] = d; } delete rec.pre; rec.intr = !!bot.interrupt_code; }
 };`;
-    // fix21: skills.* primitives are traced too (fixed leaves: name 'skills.<fn>', status/error/timing), so a failure or death
-    // inside a primitive is attributed to the library skill that called it (PSN caller_fix). skills.log is not wrapped (it is the output channel).
-    const prim = `for (const __k of Object.keys(skills)) if (typeof skills[__k] === 'function' && __k !== 'log') skills[__k] = __wrap('skills.' + __k, skills[__k]);`;
-    return wrap + '\n' + prim + '\n' + names.map(n => `${n} = __wrap(${JSON.stringify(n)}, ${n});`).join('\n');
+    // fix40: bare-name API - builtins and learned skills both use bare names
+    // Wrap all provided names (both built-in and learned) for tracing
+    // Built-in primitives (like goToPosition) are traced with their bare name
+    return wrap + '\n' + names.map(n => `${n} = __wrap(${JSON.stringify(n)}, ${n});`).join('\n');
 }
 const FAIL_LINE = /FAILED|\bfailed\b|\bneed (?:a |an )?\w+_\w+|\bno \w+ within\b|cannot|can't|not enough/i;
 // per-call contract result: failed return/exception, or a failure line emitted by the call itself (not by its children)
