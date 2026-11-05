@@ -1073,7 +1073,7 @@ Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
         if ((this.progress.subgoals || []).length) { this._plan = null; console.log(`[plan] overlap skipped: ${this.progress.subgoals.length} subgoal(s) queued`); return; }   // fix30
         const t0 = Date.now();
         const p = this.proposeTask({ ...before, note: `The bot is now doing "${task}". Propose the task to do AFTER it, assuming it succeeds.` })
-            .then(r => { console.log(`[plan] next proposal ready in ${Date.now() - t0}ms (overlapped with "${task}"): ${r?.task}`); return r; }, e => { console.log(`[plan] prefetch failed: ${e.message}`); return null; });
+            .then(r => { console.log(`[plan] next proposal ready in ${Date.now() - t0}ms (overlapped with "${task}"): ${r?.task}`); if (r?.task) this._embed(r.task).catch(e => console.log(`[plan] embed prefetch failed: ${e.message}`)); return r; }, e => { console.log(`[plan] prefetch failed: ${e.message}`); return null; });
         this._plan = { p, task, basis: before, t: t0 };
     }
     _planStale(pl, r, now) {
