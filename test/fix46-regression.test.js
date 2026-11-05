@@ -37,11 +37,12 @@ describe('fix46: verbose goal parsing', () => {
             fs.readFileSync('./src/agent/voyager.js', 'utf8')
         );
         
-        // Should NOT have hard-coded torches/glasses special cases
-        const parseVerboseMatch = voyagerSrc.match(/parseVerboseGoal[\s\S]*?(?=\nfunction\s|\nexport\s+function\s|\n\/\/\s*fix\d)/);
-        assert.ok(parseVerboseMatch, 'parseVerboseGoal function should exist');
+        // Find parseVerboseGoal function body (from 'export function parseVerboseGoal' to 'function gainedFor')
+        const fnStart = voyagerSrc.indexOf('export function parseVerboseGoal(task)');
+        const fnEnd = voyagerSrc.indexOf('function gainedFor', fnStart);
+        assert.ok(fnStart > -1 && fnEnd > fnStart, 'parseVerboseGoal function should exist');
         
-        const fnBody = parseVerboseMatch[0];
+        const fnBody = voyagerSrc.slice(fnStart, fnEnd);
         
         // No hard-coded 'torches' special case
         assert.ok(!/'torches'/.test(fnBody) && !/torches.*torch/.test(fnBody), 
@@ -105,10 +106,12 @@ describe('fix46: verbose goal parsing', () => {
             fs.readFileSync('./src/agent/voyager.js', 'utf8')
         );
         
-        const parseVerboseMatch = voyagerSrc.match(/parseVerboseGoal[\s\S]*?(?=\nfunction\s|\nexport\s+function\s|\n\/\/\s*fix\d)/);
-        assert.ok(parseVerboseMatch, 'parseVerboseGoal function should exist');
+        // Find parseVerboseGoal function body (from 'export function parseVerboseGoal' to 'function gainedFor')
+        const fnStart = voyagerSrc.indexOf('export function parseVerboseGoal(task)');
+        const fnEnd = voyagerSrc.indexOf('function gainedFor', fnStart);
+        assert.ok(fnStart > -1 && fnEnd > fnStart, 'parseVerboseGoal function should exist');
         
-        const fnBody = parseVerboseMatch[0];
+        const fnBody = voyagerSrc.slice(fnStart, fnEnd);
         
         // Return should have count, item, items but NOT verb
         assert.ok(/return\s*\{[^}]*count[^}]*item[^}]*items[^}]*\}/.test(fnBody), 
@@ -320,6 +323,22 @@ describe('fix46: log vitals with shared VITALS_MAX constant', () => {
 // ---------- Integration tests ----------
 
 describe('fix46: integration - verbose goal satisfaction', () => {
+    it('should parse verbose craftItem goal at runtime with VERSION set', async () => {
+        const { parseVerboseGoal, _setVersionForTest } = await import('../src/agent/voyager.js');
+        
+        // Set VERSION to a valid Minecraft version
+        _setVersionForTest('1.20.4');
+        
+        const goal = 'craftItem: Craft 1 iron_pickaxe using 1 iron_ingot and 3 sticks';
+        const result = parseVerboseGoal(goal);
+        
+        assert.ok(result, 'parseVerboseGoal should return a result');
+        assert.strictEqual(result.item, 'iron_pickaxe', 'should extract item name');
+        assert.strictEqual(result.count, 1, 'should extract count');
+        assert.ok(Array.isArray(result.items), 'should have items array');
+        assert.ok(result.items.includes('iron_pickaxe'), 'items should include iron_pickaxe');
+    });
+
     it('should verify _goalAlreadySatisfied uses parseVerboseGoal as fallback', async () => {
         const voyagerSrc = await import('fs').then(fs => 
             fs.readFileSync('./src/agent/voyager.js', 'utf8')
