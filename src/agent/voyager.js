@@ -31,20 +31,7 @@ const MAX_ATTEMPTS = 4;
 const PLAYER_QUIET_MS = 90 * 1000;   // pause after any player message
 const TASK_COOLDOWN_MS = 90 * 1000;  // gap between curriculum tasks (saves Gemini quota)
 const HUT = { get x() { return HOME.x; }, get y() { return HOME.y + 1; }, get z() { return HOME.z; } };   // HUT.y - 1 = floor/feet level (interior HOME±2, walls at ±3)
-// PSN-style progression milestones (after skillnet/domains/minecraft/knowledge get_progression_milestones), extended for survival/town
-const MILESTONES = [
-    { name: 'get_wood', items: { birch_log: 4 } },
-    { name: 'wooden_tools', items: { wooden_pickaxe: 1, wooden_axe: 1 } },
-    { name: 'stone_tools', items: { stone_pickaxe: 1, stone_axe: 1, stone_sword: 1, cobblestone: 16 } },
-    { name: 'furnace', items: { furnace: 1 }, block: 'furnace' },
-    { name: 'coal_torches', items: { coal: 8, torch: 8 } },
-    { name: 'iron_ready', items: { raw_iron: 8 } },
-    { name: 'iron_tools', items: { iron_pickaxe: 1, iron_sword: 1 } },
-    { name: 'iron_armor', items: { iron_helmet: 1, iron_chestplate: 1, iron_leggings: 1, iron_boots: 1 } },
-    { name: 'bucket', items: { bucket: 1 } },
-    { name: 'diamond_found', items: { diamond: 3 } },
-    { name: 'diamond_tools', items: { diamond_pickaxe: 1 } },
-];
+// fix27: fixed milestone ordering removed; the curriculum learns what to do next
 
 // tolerant JSON: strip fences, fix stray backslashes / trailing commas, then fall back to field regexes
 export function parseJSON(text) {
@@ -434,12 +421,6 @@ Use only c; no other globals.`;
         const has = n => this.skills.some(s => s.name === n && !s.demoted);
         const kill = task.match(/^(?:kill|hunt|slay|fight)\s+(\d+)\s+([a-z_]+?)s?\b/i);
         if (kill && has('killMob')) return { name: 'killMob', call: `await killMob(bot, ${JSON.stringify(kill[2].toLowerCase())}, ${kill[1]});`, check: 'output' };
-        if (/^(store|deposit)\b.*\bchest\b/i.test(task) && has('depositToChest')) {
-            // keep what the milestones need (wood, stone, coal, ores/ingots, tools, armor, food we eat); store the rest
-            const keep = /(_log|_planks|^stick|^cobblestone|^coal|^raw_|_ingot|^diamond|pickaxe|_axe|sword|shovel|helmet|chestplate|leggings|boots|^torch|^crafting_table|^furnace|^bread|^shield)$|^cooked_/;
-            const junk = [...new Set(this.agent.bot.inventory.items().map(i => i.name).filter(n => !keep.test(n)))];
-            return { name: 'depositToChest', call: `await depositToChest(bot, ${JSON.stringify(junk)});`, free: 6 };
-        }
         const harv = task.match(/^harvest\s+(\d+)\s+([a-z_]+)/i);
         if (harv && has('harvestCrop')) return { name: 'harvestCrop', call: `await harvestCrop(bot, ${JSON.stringify(harv[2].toLowerCase())}, ${harv[1]});`, check: 'output' };
         if (goal && ['mine', 'collect', 'gather', 'chop'].includes(goal.verb) && /(_ore|^stone|^cobblestone|^deepslate)$/.test(goal.item) && has('mineOre'))
@@ -619,63 +600,6 @@ Use only c; no other globals.`;
     }
 
     // ---------- automatic curriculum ----------
-    // PSN goal planner: first unmet milestone -> deterministic "Get N item" task (obtainItem expands the prerequisite chain); LLM curriculum otherwise
-    _milestoneTask(state) {
-        this._checkHomeGround();
-        const done = this.progress.milestones ||= [];
-        const inv = state.inventory || {};
-        const empty = this.agent.bot.inventory.emptySlotCount();
-        void empty;   // fix18: full-inventory handling is learned, not forced
-        // fix12: a hut at HOME comes first (checked in-world, not by inventory)
-        if (!done.includes('home_hut')) {
-            if (this._hutBuilt()) { done.push('home_hut'); this._saveProgress(); console.log('[psn] milestone reached: home_hut'); }
-            else {
-                const task = `Build a 7x7 cobblestone hut at home (${HOME.x}, ${HOME.z})`;
-                const fails = this.progress.failed.slice(-20).filter(t => t === task).length;
-                const bo = (this.progress.milestoneBackoff ||= {});
-                if (Date.now() < (bo.home_hut || 0)) { console.log(`[psn] milestone home_hut backed off for ${Math.round((bo.home_hut - Date.now()) / 60e3)} more min; asking LLM curriculum`); }
-                else if (fails >= 2) { bo.home_hut = Date.now() + 30 * 60e3; this._saveProgress(); this._decomposeQueue ||= { task, reason: `milestone failed ${fails}x` }; console.log(`[psn] milestone home_hut blocked (${task} failed ${fails}x); backing off 30 min and decomposing it`); }
-                else {
-                console.log(`[psn] milestone home_hut: next ${task} (no curriculum model call)`);
-                return { task, reasoning: 'PSN milestone home_hut: the base moved and has no shelter yet',
-                    context: `await skills.travelTo(bot, ${HOME.x}, ${HOME.y}, ${HOME.z}); then find the ground level y (first solid block below +1) near there and call skills.buildStructure(bot, 'hut', ${HOME.x - 3}, y, ${HOME.z - 3}, 'cobblestone', 7, 7, 3)` };
-                }
-            }
-        }
-        for (const m of MILESTONES) {
-            if (done.includes(m.name)) continue;
-            const missing = Object.entries(m.items).filter(([k, n]) => (inv[k] || 0) < n && !(m.block && world.getNearestBlock(this.agent.bot, m.block, 24)));
-            if (!missing.length) { done.push(m.name); this._saveProgress(); console.log(`[psn] milestone reached: ${m.name}`); continue; }
-            const [item, n] = missing[0];
-            const task = `Get ${n} ${item}`;
-            const fails = this.progress.failed.slice(-20).filter(t => t === task).length;
-            if (fails >= 2) { console.log(`[psn] milestone ${m.name} blocked (${task} failed ${fails}x); asking LLM curriculum`); return null; }
-            console.log(`[psn] milestone ${m.name}: next ${task} (no curriculum model call)`);
-            return { task, reasoning: `PSN milestone ${m.name}`, context: `use obtainItem(bot, '${item}', ${n})` };
-        }
-        return null;
-    }
-    // fix19 (1): split a goal that keeps failing into 2-4 subgoals with the local model; each subgoal is learned as a skill,
-    // then the parent is retried with those skills in the hint (its code calls them -> deps recorded by saveSkill)
-    async _decompose(task, reason) {
-        const d = (this.progress.decomposed ||= {}), q = (this.progress.subgoals ||= []);
-        const depth = (this._curSub?.task === task ? this._curSub.depth : 0);
-        if (depth >= 2) { console.log(`[psn] decompose skipped for "${task}": already a depth-${depth} subgoal`); return false; }
-        if (d[task] && Date.now() - d[task].at < 30 * 60e3) { console.log(`[psn] decompose skipped for "${task}": decomposed ${Math.round((Date.now() - d[task].at) / 60e3)} min ago`); return false; }
-        const system = `You break a Minecraft bot's failing goal into smaller steps (Voyager/PSN-style task decomposition).
-Return 2-4 concrete, verifiable subgoals, in order, that together achieve the goal; each must be doable in a few minutes by ONE small reusable skill (e.g. "Mine 20 cobblestone", "Clear and flatten a 7x7 area at x=.., z=..", "Place a 7x7 cobblestone floor at ..."). Use the failure reason. Do not repeat the goal itself.
-Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
-        const user = `goal: ${task}\nwhy it failed: ${String(reason).slice(0, 600)}\ndeath_hotspots (places it keeps dying): ${this._deathHotspots()}\n${this._stateText(this.observe())}\nknown_skills: ${JSON.stringify(this.skills.filter(s => !s.demoted).map(s => s.name))}`;
-        let subs = [];
-        try { subs = (parseJSON(await this._askLocal(system, user)).subgoals || []).map(t => String(t).trim()).filter(t => t && t !== task && !validateTask(t)).slice(0, 4); }
-        catch (e) { console.log(`[psn] decompose FAILED for "${task}": ${e.message}`); return false; }
-        if (subs.length < 2) { console.log(`[psn] decompose FAILED for "${task}": model gave ${subs.length} valid subgoal(s)`); d[task] = { subs, skills: [], at: Date.now(), reason }; this._saveProgress(); return false; }
-        d[task] = { subs, skills: [], at: Date.now(), reason: String(reason).slice(0, 200) };
-        q.unshift(...subs.map(t => ({ task: t, parent: task, depth: depth + 1 })), { task, retry: true, depth });
-        this._saveProgress();
-        console.log(`[psn] DECOMPOSE "${task}" (${String(reason).slice(0, 120)}) -> ${subs.map((t, i) => `${i + 1}) ${t}`).join(' ')}; then retry the parent with the learned skills`);
-        return true;
-    }
     _subgoalTask() {
         const q = this.progress.subgoals || []; if (!q.length) return null;
         const it = q.shift(); this._saveProgress(); this._curSub = it;
@@ -694,7 +618,7 @@ Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
         const system = `You are the automatic curriculum for a Minecraft bot named ${this.agent.name} (Voyager-style).
 Goal: discover as many diverse things as possible and grow a small town of its own, progressing wood -> stone -> iron -> diamond tech.
 Rules:
-- The bot's town is at x=${TOWN.x}, y=${TOWN.y}, z=${TOWN.z} (the bot's home base; ${this._hutBuilt() ? `its 7x7 cobblestone hut stands at x ${HOME.x-3}..${HOME.x+3}, z ${HOME.z-3}..${HOME.z+3}` : 'NO hut exists here yet; building one is a priority'}). Stay within ~150 blocks of town.
+- The bot's town is at x=${TOWN.x}, y=${TOWN.y}, z=${TOWN.z} (the bot's home base; ${this._hutBuilt() ? `its 7x7 cobblestone hut stands at x ${HOME.x-3}..${HOME.x+3}, z ${HOME.z-3}..${HOME.z+3}` : 'no hut exists there yet'}).
 - NEVER go near the players' village around x=${VILLAGE.x}, z=${VILLAGE.z}; never take or break player builds.
 - Propose ONE concrete, verifiable task achievable in a few minutes with the current inventory and surroundings (e.g. "Mine 5 birch_log", "Craft 1 stone_pickaxe", "Smelt 3 iron_ingot", "Build a 5x5 cobblestone floor next to the hut").
 - Do not repeat completed tasks unless needed for progress; avoid tasks that failed recently unless prerequisites are now met.
@@ -845,21 +769,6 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
                 bot.chat(tpCmd());
             }
         }, 3000);
-    }
-
-    // fix10: keep the bot within LEASH blocks of town: travel home before picking the next task (max 3 failed tries, then 30 min pause, logged loudly)
-    async _leash() {
-        const bot = this.agent.bot, p = bot.entity.position, LEASH = 300;
-        if (String(bot.game.dimension || "").startsWith("abh")) return false;
-        const d = Math.hypot(p.x - TOWN.x, p.z - TOWN.z);
-        if (d <= LEASH || Date.now() < (this._leashPause || 0)) return false;
-        console.log(`[voyager] leash: ${d.toFixed(0)} blocks from town (> ${LEASH}); travelling home before the next task`);
-        const res = await this.agent.actions.runAction("voyager:leash", async () => { await skills.travelTo(bot, TOWN.x, TOWN.y, TOWN.z); }, { timeout: 15 });
-        const q = bot.entity.position, d2 = Math.hypot(q.x - TOWN.x, q.z - TOWN.z);
-        if (d2 <= LEASH) { this._leashFails = 0; console.log(`[voyager] leash: back within ${d2.toFixed(0)} blocks of town`); }
-        else if (!res?.interrupted && (this._leashFails = (this._leashFails || 0) + 1) >= 3) { this._leashFails = 0; this._leashPause = Date.now() + 30 * 60e3; console.log(`[voyager] leash FAILED 3 times (still ${d2.toFixed(0)} blocks away); pausing the leash for 30 min`); }
-        else console.log(`[voyager] leash: still ${d2.toFixed(0)} blocks from town`);
-        return true;
     }
 
     // ---------- fix10: PSN failure attribution and targeted repair ----------
@@ -1034,12 +943,12 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         try { return await this._step(); } finally { this._stepEnd = Date.now(); console.log(`[timing] ${new Date().toISOString().slice(11,19)}Z step end (took ${this._stepEnd - now}ms)`); }
     }
     async _step() {
+        this._checkHomeGround();   // fix27: perception upkeep (was called from the removed milestone planner)
         this._watchWindows();
         this._watchDimension();
         if (this.agent.bot.currentWindow) { const w = this.agent.bot.currentWindow; if (/CHOICE/.test(JSON.stringify(w.title))) { if (!this._choiceNoted) { this._choiceNoted = 1; console.log("[window] datapack dialog CHOICE (A Breach Happened multi_action dialog via ViaProxy) left open; not answering"); } } else console.log(`[window] STRAY ${w.type} id=${w.id} still open at step start (opened ${Math.round((Date.now() - (this._winOpenedAt || 0)) / 1000)}s ago); closing`); if (!/CHOICE/.test(JSON.stringify(w.title))) try { this.agent.bot.closeWindow(w); } catch (e) { console.log('[window] close failed: ' + e.message); } }
         this._oneshot();
         // fix18: no hard-coded survival/housekeeping policy; the curriculum proposes it and the PSN learns it
-        if (await this._leash()) return;
         this._requeueDeferred();   // fix26
         if (this._repairQueue?.length) { await this._repair(); return; }
         if (this._decomposeQueue) { const dq = this._decomposeQueue; this._decomposeQueue = null; await this._decompose(dq.task, dq.reason); return; }
@@ -1048,7 +957,7 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         if (await this._refactor()) return;
         const before = this.observe();
         this._curSub = null;
-        const sub = this._subgoalTask(), ms = sub ? null : this._milestoneTask(before), fromCurr = !sub && !ms;
+        const sub = this._subgoalTask(), ms = null, fromCurr = !sub && !ms;
         let proposal = sub || ms || await this.proposeTask(before);
         let task = String(proposal.task || '').trim();
         let invalid = task ? validateTask(task) : 'empty task';

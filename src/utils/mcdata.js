@@ -125,7 +125,7 @@ export function initBot(username) {
     bot.loadPlugin(pvp);
     bot.loadPlugin(collectblock);
     bot.loadPlugin(autoEat);
-    bot.loadPlugin(armorManager); // auto equip armor
+    // fix27: mineflayer-armor-manager no longer loaded (auto-equip reflex); equipping armour is learned via skills.equip
     bot.once('resourcePack', () => {
         bot.acceptResourcePack();
     });
