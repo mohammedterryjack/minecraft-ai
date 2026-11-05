@@ -912,6 +912,63 @@ Use only c; no other globals.`;
         try { return this._compileContract(e.contract.post)({ args: r.argv || [], ret: r.rv, pre: r.s0, post: r.s1, delta: r.delta || {}, dist: (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z) }) === true; }
         catch (err) { this._queueContractFix(e, `post threw: ${err.message}`); return false; }
     }
+
+    // fix37 (B): check if a goal is already satisfied BEFORE running any task, using learned postconditions/contracts
+    // Returns { satisfied: boolean, reason: string, noLearnedCheck?: boolean }
+    // Uses learned skill contracts (postconditions) and learned effects - no hard-coded special cases
+    _goalAlreadySatisfied(task, state) {
+        const goal = countGoal(task) || smeltGoal(task);
+        if (!goal) return { satisfied: false, reason: 'goal not parseable as count/smelt', noLearnedCheck: true };
+
+        const inv = state.inventory || {};
+        const have = goal.items ? goal.items.reduce((a, it) => a + (inv[it] || 0), 0) : (inv[goal.item] || 0);
+
+        // 1) Check inventory against learned skill contracts that produce the goal item
+        // Find skills whose learned effects include the goal item and have a postcondition
+        const producers = this.skills.filter(s => !s.demoted && !s.mergedInto && !s.candidate
+            && (s.effects || []).some(eff => goal.items?.includes(eff) || eff === goal.item)
+            && s.contract?.post);
+
+        for (const skill of producers) {
+            try {
+                // Build a synthetic contract context as if the skill just ran and produced the current state
+                const c = {
+                    args: [goal.item, goal.count],
+                    ret: true,
+                    pre: { inventory: {} },
+                    post: { inventory: inv, pos: state.pos || {}, alive: true, sky: true },
+                    delta: { [goal.item]: have },
+                    dist: (a, b) => Math.hypot((a?.x || 0) - (b?.x || 0), (a?.y || 0) - (b?.y || 0), (a?.z || 0) - (b?.z || 0))
+                };
+                const postOk = this._compileContract(skill.contract.post)(c);
+                if (postOk && have >= goal.count) {
+                    return { satisfied: true, reason: `learned postcondition of ${skill.name} holds (have ${have}/${goal.count} ${goal.item})` };
+                }
+            } catch (err) {
+                console.log(`[fix37] postcondition check for ${skill.name} threw: ${err.message}`);
+            }
+        }
+
+        // 2) Check learned effects: if a skill's learned effects include the item and we already have enough
+        // This is the "learned facts" approach: the skill library knows what produces what
+        const effectProducers = this.skills.filter(s => !s.demoted && !s.mergedInto && !s.candidate
+            && (s.effects || []).some(eff => goal.items?.includes(eff) || eff === goal.item));
+
+        if (effectProducers.length > 0 && have >= goal.count) {
+            const skillNames = effectProducers.slice(0, 3).map(s => s.name).join(', ');
+            return { satisfied: true, reason: `already have ${have}/${goal.count} ${goal.item} (learned producers: ${skillNames})` };
+        }
+
+        // 3) If we have the items but no learned producer skill, we can't verify satisfaction the learned way
+        // This is the "fail loud" case - we don't silently assume success without learned evidence
+        if (have >= goal.count) {
+            return { satisfied: false, reason: `have ${have}/${goal.count} ${goal.item} but no learned skill produces it`, noLearnedCheck: true };
+        }
+
+        // 4) Not satisfied: don't have enough items
+        return { satisfied: false, reason: `need ${goal.count} ${goal.item}, have ${have}` };
+    }
+
     // fix32 (PSN backward chaining): a goal item is produced by a learned skill whose learned effects contain it; the skill is
     // chosen by Boltzmann sampling over V (T = 0.3); every item that skill consumes and the bot lacks is chained the same way
     // (depth <= 3). The plan runs as replays, children first; no model call.
@@ -1769,6 +1826,82 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         return true;
     }
 
+    // fix37 (C): improved extraction of function bodies from joint repair replies
+    // Handles multiple formatting patterns the model might use: comments before/after, export keyword, whitespace variations
+    _extractJointFunctions(code, childName, parentName) {
+        const fns = {};
+        if (!code) return fns;
+
+        // Try multiple regex patterns to find the function definitions
+        const patterns = [
+            // Pattern 1: Standard async function with optional leading comments
+            /(?:^|\n)((?:\s*\/\/[^\n]*\n)*)(\s*async\s+function\s+([A-Za-z_]\w*)\s*\([^)]*\)\s*\{)/g,
+            // Pattern 2: Export async function
+            /(?:^|\n)((?:\s*\/\/[^\n]*\n)*)(\s*export\s+async\s+function\s+([A-Za-z_]\w*)\s*\([^)]*\)\s*\{)/g,
+            // Pattern 3: Async function without leading newline (start of code block)
+            /^((?:\s*\/\/[^\n]*\n)*)(\s*async\s+function\s+([A-Za-z_]\w*)\s*\([^)]*\)\s*\{)/g,
+        ];
+
+        const matches = [];
+        for (const pattern of patterns) {
+            let m;
+            while ((m = pattern.exec(code)) !== null) {
+                const name = m[3];
+                const fullMatchStart = m.index;
+                // Skip the leading newline if present
+                const funcStart = code.indexOf(m[2], fullMatchStart);
+                if (!matches.some(x => x.name === name)) {
+                    matches.push({ name, start: funcStart, comments: m[1] || '' });
+                }
+            }
+        }
+
+        // Sort by position and extract function bodies
+        matches.sort((a, b) => a.start - b.start);
+        for (let i = 0; i < matches.length; i++) {
+            const { name, start, comments } = matches[i];
+            const end = i + 1 < matches.length ? matches[i + 1].start : code.length;
+            // Extract the full function including any leading comments
+            let funcCode = code.slice(start, end).trim();
+            // If comments were before, prepend them
+            if (comments.trim()) {
+                funcCode = comments.trim() + '\n' + funcCode;
+            }
+            fns[name] = funcCode;
+        }
+
+        // Fallback: if we didn't find one of the expected functions, try a simpler approach
+        // Look for the function name directly followed by opening paren
+        for (const expected of [childName, parentName]) {
+            if (fns[expected]) continue;
+
+            const simpleRe = new RegExp(`async\\s+function\\s+${expected}\\s*\\([^)]*\\)\\s*\\{`, 'g');
+            const match = simpleRe.exec(code);
+            if (match) {
+                const start = match.index;
+                // Find the end by brace matching
+                let braceCount = 0, inStr = false, strChar = null, end = start;
+                for (let j = start; j < code.length; j++) {
+                    const ch = code[j];
+                    if (inStr) { if (ch === strChar && code[j - 1] !== '\\') inStr = false; }
+                    else if (ch === '"' || ch === "'" || ch === '`') { inStr = true; strChar = ch; }
+                    else if (ch === '{') braceCount++;
+                    else if (ch === '}') { braceCount--; if (braceCount === 0) { end = j + 1; break; } }
+                }
+                // Look for leading comments
+                let commentStart = start;
+                const lines = code.slice(0, start).split('\n');
+                for (let k = lines.length - 1; k >= 0; k--) {
+                    if (/^\s*\/\//.test(lines[k])) commentStart -= lines[k].length + 1;
+                    else break;
+                }
+                fns[expected] = code.slice(Math.max(0, commentStart), end).trim();
+            }
+        }
+
+        return fns;
+    }
+
     // fix32 (PSN joint repair): parent and child rewritten in ONE code-model call; both go through the gate as candidates
     // tagged with one id, so a rejection of either rolls both back (same mechanism as refactors)
     async _repairJoint(q, e) {
@@ -1784,14 +1917,36 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         if (!okPar) return single('caller frozen by the maturity gate', e, 'callee_fix');
         if (!okKid) return single('child frozen by the maturity gate', pe, 'caller_fix');
         this._repairs[e.name] = this._repairs[pe.name] = Date.now(); this._saveProgress();
-        const system = `You repair TWO skills of a Minecraft mineflayer skill library together (PSN joint repair): a child skill and the caller that uses it failed on the same path. Return ONE \`\`\`javascript block with exactly two functions, ${e.name} first then ${pe.name}, each with the SAME name and a compatible signature and preceded by // DESCRIPTION: <one sentence>. Fix the child's own logic and how/when the caller uses it. No top-level call.`;
+        // fix37 (C): improved prompt with clearer format instructions
+        const system = `You repair TWO skills of a Minecraft mineflayer skill library together (PSN joint repair): a child skill and the caller that uses it failed on the same path.
+
+REQUIRED FORMAT: Return ONE \`\`\`javascript code block containing EXACTLY two async function definitions:
+1. First: async function ${e.name}(bot) { ... }
+2. Second: async function ${pe.name}(bot) { ... }
+
+Each function must:
+- Keep the SAME name (${e.name} and ${pe.name} respectively)
+- Have a compatible signature
+- Be preceded by // DESCRIPTION: <one sentence>
+
+Fix the child's own logic and how/when the caller uses it. No top-level call, no extra functions.`;
         const user = `Task that failed: ${q.task}\nEvidence: ${q.evidence}\n--- execution trace ---\n${String(q.trace || '').slice(-2500)}\n--- child ${e.name} ---\n${e.code}\n--- caller ${pe.name} ---\n${pe.code}\nWrite both fixed functions:`;
         console.log(`[psn] REPAIR JOINT ${e.name} + ${pe.name} with the code model (evidence: ${String(q.evidence).slice(0, 160)})`);
         let reply; try { reply = await this._ask(system, user); } catch (err) { console.log(`[psn] joint repair FAILED: ${err.message}`); return false; }
-        const code = extractCode(reply) || '', fns = {}, re = /(?:^|\n)(?:\/\/[^\n]*\n)*async\s+function\s+([A-Za-z_]\w*)\s*\(/g; let mm, idx = [];
-        while ((mm = re.exec(code))) idx.push([mm[1], mm.index]);
-        for (let i = 0; i < idx.length; i++) fns[idx[i][0]] = code.slice(idx[i][1], i + 1 < idx.length ? idx[i + 1][1] : code.length).trim();
-        if (!fns[e.name] || !fns[pe.name]) { console.log(`[psn] joint repair FAILED: reply did not define both ${e.name} and ${pe.name}`); this._noteProposal(e, { task: q.task, kind: 'joint', evidence: String(q.evidence).slice(0, 200), desc: 'joint reply incomplete', outcome: 'failed' }); return false; }
+
+        // fix37 (C): improved extraction with better logging on failure
+        const code = extractCode(reply) || '';
+        const fns = this._extractJointFunctions(code, e.name, pe.name);
+
+        if (!fns[e.name] || !fns[pe.name]) {
+            // Log the raw reply (truncated) so we can see what came back
+            const rawSnippet = String(reply).length > 1500 ? String(reply).slice(0, 1500) + '\n...[truncated]' : String(reply);
+            console.log(`[psn] joint repair FAILED: reply did not define both ${e.name} and ${pe.name}`);
+            console.log(`[psn] extracted functions: [${Object.keys(fns).join(', ')}], expected: [${e.name}, ${pe.name}]`);
+            console.log(`[psn] raw model reply (for debugging):\n${rawSnippet}`);
+            this._noteProposal(e, { task: q.task, kind: 'joint', evidence: String(q.evidence).slice(0, 200), desc: `joint reply incomplete (got [${Object.keys(fns).join(', ')}], needed [${e.name}, ${pe.name}])`, outcome: 'failed' });
+            return false;
+        }
         const strip = c => c.replace(/^\s*\/\/[^\n]*\n/gm, '').trim(), desc = (c, d) => ((c.match(/\/\/\s*DESCRIPTION:\s*(.+)/) || [])[1] || d).trim();
         const staged = await this.agent.coder._stageCode(this._libSrc({ [e.name]: strip(fns[e.name]), [pe.name]: strip(fns[pe.name]) }) + '\n\nawait Promise.resolve();');
         const lint = staged ? await this.agent.coder._lintCode(staged.src_lint_copy) : 'staging failed';
@@ -2045,6 +2200,21 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         this.currentTask = task;
         this._prefetchPlan(task, before);   // fix28 (C): the next proposal is planned while this task runs
         VERSION = this.agent.bot.version;
+
+        // fix37 (B): check if the goal is ALREADY SATISFIED before running anything (learned postcondition check)
+        const alreadySatisfied = this._goalAlreadySatisfied(task, before);
+        if (alreadySatisfied.satisfied) {
+            console.log(`[voyager] goal already satisfied: ${task} (${alreadySatisfied.reason})`);
+            this.progress.completed.push(task);
+            this.progress.failed = this.progress.failed.filter(t => t !== task);
+            this._saveProgress();
+            this.agent.openChat?.(`Done: ${task} (already satisfied: ${alreadySatisfied.reason}).`);
+            this._afterSuccess();
+            return;
+        } else if (alreadySatisfied.noLearnedCheck) {
+            console.log(`[voyager] WARN: no learned way to check if goal "${task}" is already satisfied (${alreadySatisfied.reason}); proceeding with execution`);
+        }
+
         const route = this._findReplay(task) || await this._embedReplay(task);   // fix28 (D): replay a matching learned skill before any code-model call
         let rp = route ? await this._replay(task, before, route) : null;
         if (route?.embed) this._learnReplayThreshold(rp);
