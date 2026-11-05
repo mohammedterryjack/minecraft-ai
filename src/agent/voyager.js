@@ -13,7 +13,7 @@ import { cosineSimilarity } from '../utils/math.js';
 import minecraftData from 'minecraft-data';
 import { Ollama } from '../models/ollama.js';
 import { signatureOf, depsOf, missingCalls, findCycle, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf } from './skill_graph.js';
-const LOCAL = { model: 'qwen3:4b-instruct-2507-q4_K_M', url: 'http://192.168.1.215:11434', params: { format: 'json', options: { num_ctx: 8192 } } };
+const LOCAL = { model: 'qwen3:4b-instruct-2507-q4_K_M', url: 'http://192.168.1.215:11434', params: { format: 'json', options: { num_ctx: 8192, num_predict: 150 } } };   // fix31: replies are short JSON (one-sentence reasoning); hitting the cap fails loudly
 export const CALLS = { local: 0, code: 0, replay: 0 };
 
 globalThis.__psnALS ||= new AsyncLocalStorage();   // fix11 (B6): call-parent tracking for PSN traces
@@ -29,11 +29,16 @@ const TOWN = HOME;
 const VILLAGE = { x: -800, z: 500 };
 const MAX_ATTEMPTS = 4;
 const PLAYER_QUIET_MS = 90 * 1000;   // pause after any player message
-const TASK_COOLDOWN_MS = 90 * 1000;  // gap between curriculum tasks (saves Gemini quota)
 const HUT = { get x() { return HOME.x; }, get y() { return HOME.y + 1; }, get z() { return HOME.z; } };   // HUT.y - 1 = floor/feet level (interior HOME±2, walls at ±3)
 // fix27: fixed milestone ordering removed; the curriculum learns what to do next
 
 // tolerant JSON: strip fences, fix stray backslashes / trailing commas, then fall back to field regexes
+// fix31: local (Ollama format=json) replies must be complete JSON with the required keys - no salvage, fail loudly
+export function parseLocalJSON(text, keys) {
+    let o; try { o = JSON.parse(String(text)); } catch (e) { throw new Error('local model reply is not valid JSON: ' + String(text).slice(0, 200)); }
+    const miss = keys.filter(k => !(k in o)); if (miss.length) throw new Error(`local model reply lacks ${miss.join(', ')}: ` + String(text).slice(0, 200));
+    return o;
+}
 export function parseJSON(text) {
     const raw = String(text).replace(/```(?:json)?/g, '');
     const m = raw.match(/\{[\s\S]*\}/);
@@ -374,7 +379,7 @@ Use only c; no other globals.`;
         try { this._sample(); } catch (e) { console.log('[death] sampler error: ' + e.message); }
         if (!this.enabled || this.running) return;
         const now = Date.now();
-        if (now - this.lastPlayerMsg < PLAYER_QUIET_MS || now - this.lastTaskEnd < TASK_COOLDOWN_MS) return;
+        if (now - this.lastPlayerMsg < PLAYER_QUIET_MS || now < (this._backoffUntil || 0)) return;   // fix31: no fixed task cooldown; only an error backoff
         if (!this.agent.isIdle() || this.agent.self_prompter.isActive() || this.agent.prompter.awaiting_coding) return;
         if (false && now < (this.agent.prompter.code_model.quotaUntil || 0)) {
             if (!this._quotaNoted) { console.log(`[voyager] paused: code model (${this.agent.prompter.code_model.pName}) quota/usage limit; retrying at ${new Date(this.agent.prompter.code_model.quotaUntil).toISOString()}`); this._quotaNoted = true; }
@@ -382,9 +387,14 @@ Use only c; no other globals.`;
         }
         this._quotaNoted = false;
         this.running = true; this.abort = false;
-        this.step().catch(e => {
+        const t0 = Date.now(), c0 = { ...CALLS };
+        this.step().then(() => { this._errStreak = 0; }, e => {
             console.error('[voyager] step failed: ' + (e?.message ?? e));
-        }).finally(() => { this.running = false; this.lastTaskEnd = Date.now(); });
+            // fix31 runaway guard: consecutive failing steps back off exponentially, scaled by the failing step's own duration
+            this._errStreak = (this._errStreak || 0) + 1; const ms = Math.max(Date.now() - t0, 1000) * 2 ** this._errStreak;
+            this._backoffUntil = Date.now() + ms; console.log(`[voyager] ${this._errStreak} failing step(s) in a row; next step in ${Math.round(ms / 1000)}s`);
+        }).finally(() => { this.running = false; this.lastTaskEnd = Date.now();
+            console.log(`[timing] step model calls: local ${CALLS.local - c0.local}, code ${CALLS.code - c0.code}, replay ${CALLS.replay - c0.replay}`); });
     }
 
     observe() {
@@ -434,9 +444,12 @@ Use only c; no other globals.`;
         return this.__local;
     }
     // small local model (Mac Studio Ollama) for curriculum + critic judgment; unloads after 5 min idle
+    // fix31: one local request in flight at a time (solo decode speed; Ollama keeps a prefix-cache slot per prompt type)
     async _askLocal(system, user) {
         CALLS.local++;
-        const t0 = Date.now(); const r = await this._local().sendRequest([{ role: 'user', content: user }], system); console.log(`[timing] ${new Date().toISOString().slice(11,19)}Z local call took ${Date.now() - t0}ms`);   // fix27
+        const prev = this._localQ || Promise.resolve(); let release; this._localQ = new Promise(r => release = r);
+        const tq = Date.now(); await prev; const waited = Date.now() - tq; if (waited > 500) console.log(`[timing] local call waited ${waited}ms for the previous local call`);
+        let r; const t0 = Date.now(); try { r = await this._local().sendRequest([{ role: 'user', content: user }], system); } finally { release(); } console.log(`[timing] ${new Date().toISOString().slice(11,19)}Z local call took ${Date.now() - t0}ms`);   // fix27
         console.log(`[voyager] local model call #${CALLS.local}`);
         return r;
     }
@@ -662,7 +675,7 @@ Return 2-4 concrete, verifiable subgoals, in order, that together achieve the go
 Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
         const user = `goal: ${task}\nwhy it failed: ${String(reason).slice(0, 600)}\ndeath_hotspots: ${this._deathHotspots()}\n${this._stateText(this.observe())}\nknown_skills: ${JSON.stringify(this.skills.filter(s => !s.demoted).map(s => s.name))}`;
         let subs = [];
-        try { subs = (parseJSON(await this._askLocal(system, user)).subgoals || []).map(t => String(t).trim()).filter(t => t && t !== task && !validateTask(t)).slice(0, 4); }
+        try { subs = (parseLocalJSON(await this._askLocal(system, user), ['subgoals']).subgoals || []).map(t => String(t).trim()).filter(t => t && t !== task && !validateTask(t)).slice(0, 4); }
         catch (e) { console.log(`[psn] decompose FAILED for "${task}": ${e.message}`); return false; }
         if (subs.length < 2) { console.log(`[psn] decompose FAILED for "${task}": model gave ${subs.length} valid subgoal(s)`); d[task] = { subs, skills: [], at: Date.now(), reason: String(reason).slice(0, 200) }; this._saveProgress(); return false; }
         d[task] = { subs, skills: [], at: Date.now(), reason: String(reason).slice(0, 200) };
@@ -724,15 +737,16 @@ Rules:
 - Propose ONE concrete, verifiable task achievable in a few minutes with the current inventory and surroundings (e.g. "Mine 5 birch_log", "Craft 1 stone_pickaxe", "Smelt 3 iron_ingot", "Build a 5x5 cobblestone floor next to the hut").
 - Do not repeat completed tasks unless needed for progress; avoid tasks that failed recently unless prerequisites are now met.
 - The bot must survive: dying loses its inventory. Nothing keeps it alive automatically (no eating, fleeing, fighting or sheltering reflexes), so survival is your job too: read time, health, food, threats and inventory space in the state and decide.
-Reply ONLY with JSON: {"reasoning": "...", "task": "...", "context": "short hint how to do it"}`;
+Reply ONLY with JSON: {"reasoning": "ONE short sentence", "task": "...", "context": "short hint how to do it"}`;
         const bot = this.agent.bot;   // fix29: current vitals as plain facts, read now (an overlapped plan's state may be minutes old)
-        const user = `current_health: ${Math.round(bot.health)}/20\ncurrent_food: ${bot.food}/20 (20/20 = full)\n${this._stateText(state)}
+        const user = `known_skills: ${JSON.stringify(this.skills.map(s => s.name))}
+replayable_tasks (cheap, no new code needed): ${JSON.stringify(this.skills.filter(s => s.task && !s.primitive).map(s => s.task.split(/\s+(?:within|at|using|from)\b/i)[0]).slice(-25))} plus any "Mine N <block or ore>", "Collect N <log>", "Get N <item>", "Smelt N <raw> into N <out>", "Kill N <mob>", "Harvest N <crop>"
 completed_tasks: ${JSON.stringify(this.progress.completed.slice(-30))}
 failed_tasks: ${JSON.stringify(this.progress.failed.slice(-15))}
-known_skills: ${JSON.stringify(this.skills.map(s => s.name))}
-replayable_tasks (cheap, no new code needed): ${JSON.stringify(this.skills.filter(s => s.task && !s.primitive).map(s => s.task.split(/\s+(?:within|at|using|from)\b/i)[0]).slice(-25))} plus any "Mine N <block or ore>", "Collect N <log>", "Get N <item>", "Smelt N <raw> into N <out>", "Kill N <mob>", "Harvest N <crop>"${this._cursorLimited() ? '\nIMPORTANT: the code-writing model is unavailable right now, so ONLY propose a task from replayable_tasks or "Mine N <block>".' : ''}`;
+${this._stateText(state)}
+current_health: ${Math.round(bot.health)}/20\ncurrent_food: ${bot.food}/20 (20/20 = full)${this._cursorLimited() ? '\nIMPORTANT: the code-writing model is unavailable right now, so ONLY propose a task from replayable_tasks or "Mine N <block>".' : ''}`;   // fix31: slow-changing lists first so Ollama reuses the cached prompt prefix
         const facts = recipeFacts(this.progress.failed.slice(-5).join(' '));
-        return parseJSON(await this._askLocal(system, facts ? user + '\n' + facts : user));
+        return parseLocalJSON(await this._askLocal(system, facts ? user + '\n' + facts : user), ['reasoning', 'task', 'context']);
     }
 
     // ---------- skill library ----------
@@ -805,9 +819,9 @@ replayable_tasks (cheap, no new code needed): ${JSON.stringify(this.skills.filte
     async critique(task, before, after, output) {
         const system = `You are an assistant that checks whether a Minecraft bot completed its task, using its state before and after and the code output.
 Be strict: success only if the evidence (inventory/position/output) shows the task is done.
-If the code hand-rolled a mining/collecting loop that timed out, got 0 items or failed pathfinding, say in the critique to switch to mineBlocks / gatherItem / collectDrops (custom code is otherwise fine).\nReply ONLY with JSON: {"reasoning": "...", "success": true|false, "critique": "how to fix it if failed, else empty"}`;
+If the code hand-rolled a mining/collecting loop that timed out, got 0 items or failed pathfinding, say in the critique to switch to mineBlocks / gatherItem / collectDrops (custom code is otherwise fine).\nReply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false, "critique": "how to fix it if failed (1-2 sentences), else empty"}`;
         const user = `task: ${task}\n${recipeFacts(task)}\n--- before ---\n${this._stateText(before)}\n--- after ---\n${this._stateText(after)}\n--- code output ---\n${output}`;
-        return parseJSON(await this._askLocal(system, user));
+        return parseLocalJSON(await this._askLocal(system, user), ['reasoning', 'success', 'critique']);
     }
 
     // fix12: is there a hut at HOME? roof over the centre plus walls on both sides, at any floor level within HOME.y±4 (unloaded chunk = not built)

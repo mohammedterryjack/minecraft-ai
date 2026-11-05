@@ -21,7 +21,7 @@ export class Ollama {
         while (attempt < maxAttempts) {
             attempt++;
             console.log(`Awaiting local response... (model: ${model}, attempt: ${attempt})`);
-            let res = null;
+            let res = null, truncated = null;
             try {
                 let apiResponse = await this.send(this.chat_endpoint, {
                     model: model,
@@ -30,6 +30,7 @@ export class Ollama {
                     ...(this.params || {}),
                     keep_alive: this._keepAlive()
                 });
+                if (apiResponse?.done_reason === 'length') { truncated = apiResponse; }   // fix31
                 if (apiResponse) {
                     res = apiResponse['message']['content'];
                     console.log(`[ollama-timing] model=${this.model_name} prompt_tokens=${apiResponse.prompt_eval_count} prompt_ms=${Math.round((apiResponse.prompt_eval_duration||0)/1e6)} gen_tokens=${apiResponse.eval_count} total_ms=${Math.round((apiResponse.total_duration||0)/1e6)}`);
@@ -46,6 +47,7 @@ export class Ollama {
                 }
             }
 
+            if (truncated) throw new Error(`[ollama] ${model}: reply hit the num_predict cap (${truncated.eval_count} tokens) - incomplete: ${String(res).slice(0, 160)}`);   // fix31: fail loudly
             const hasOpenTag = res.includes("<think>");
             const hasCloseTag = res.includes("</think>");
 
