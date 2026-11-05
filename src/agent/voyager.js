@@ -18,7 +18,6 @@ import { makeCompartment } from './library/lockdown.js';
 import { getAllItems, getAllBlocks, getItemCraftingRecipes, isHostile, isDatapackHostile } from '../utils/mcdata.js';
 import { cosineSimilarity } from '../utils/math.js';
 import minecraftData from 'minecraft-data';
-import settings from '../../settings.js';  // fix46: for minecraft_version fallback
 import { Ollama } from '../models/ollama.js';
 import { signatureOf, depsOf, missingCalls, findCycle, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf } from './skill_graph.js';
 import { getBareAPI } from './coder.js';   // fix40: unified bare-name API helper
@@ -160,10 +159,9 @@ export function parseVerboseGoal(task) {
     const std = smeltGoal(task) || countGoal(task);
     if (std) return std;
     
-    // fix46: use VERSION if set, otherwise settings.minecraft_version; fail loud if both missing
-    const version = VERSION || settings.minecraft_version;
-    if (!version) {
-        console.error(`[fix46] LOUD FAIL: parseVerboseGoal called but VERSION is null and settings.minecraft_version is not configured`);
+    // fix46: VERSION is the single source (set from bot.version when task starts) - fail loud if null
+    if (!VERSION) {
+        console.error(`[fix46] LOUD FAIL: parseVerboseGoal called but VERSION is null - bot version must be set before parsing goals`);
         return null;
     }
     
@@ -773,12 +771,13 @@ Use only c; no other globals.`;
             distance_to_town: dTown,
             biome: world.getBiomeName(bot),
             time: t < 12000 ? `day (${t})` : t < 13000 ? `dusk (${t}, hostiles about to spawn)` : t < 23000 ? `night (${t}, hostiles spawn outdoors)` : `dawn (${t})`,
-            health: `${Math.round(bot.health)}/20`, food: `${bot.food}/20`,
+            // fix46: use shared VITALS_MAX from skills.js (same source as log())
+            health: `${Math.round(bot.health)}/${skills.VITALS_MAX.health}`, food: `${bot.food}/${skills.VITALS_MAX.food}`,
             // fix45: expose food/health as plain numeric facts for planner/curriculum to pick restore goals
             food_value: bot.food,
-            food_max: 20,
+            food_max: skills.VITALS_MAX.food,
             health_value: Math.round(bot.health),
-            health_max: 20,
+            health_max: skills.VITALS_MAX.health,
             inventory: world.getInventoryCounts(bot),  // fix41: host code uses world. prefix
             inventory_slots: `${usedSlots}/${totalSlots}`,
             empty_inventory_slots: emptySlots,

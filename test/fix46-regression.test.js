@@ -238,10 +238,24 @@ describe('fix46: retry prompt always uses base + latest', () => {
     });
 });
 
-// ---------- Issue 7: Log vitals with dynamic max ----------
+// ---------- Issue 7: Log vitals with shared VITALS_MAX ----------
 
-describe('fix46: log vitals with dynamic max values', () => {
-    it('should use bot game max values or settings, not hard-coded /20', async () => {
+describe('fix46: log vitals with shared VITALS_MAX constant', () => {
+    it('should export shared VITALS_MAX constant used by both log() and observe()', async () => {
+        const { VITALS_MAX, getVitalsMax } = await import('../src/agent/library/skills.js');
+        
+        // VITALS_MAX should be exported and have health/food
+        assert.ok(VITALS_MAX, 'VITALS_MAX should be exported');
+        assert.strictEqual(typeof VITALS_MAX.health, 'number', 'VITALS_MAX.health should be a number');
+        assert.strictEqual(typeof VITALS_MAX.food, 'number', 'VITALS_MAX.food should be a number');
+        assert.strictEqual(VITALS_MAX.health, 20, 'VITALS_MAX.health should be 20 (Minecraft standard)');
+        assert.strictEqual(VITALS_MAX.food, 20, 'VITALS_MAX.food should be 20 (Minecraft standard)');
+        
+        // getVitalsMax helper should exist
+        assert.strictEqual(typeof getVitalsMax, 'function', 'getVitalsMax helper should be exported');
+    });
+
+    it('should use shared VITALS_MAX in log() function', async () => {
         const skillsSrc = await import('fs').then(fs => 
             fs.readFileSync('./src/agent/library/skills.js', 'utf8')
         );
@@ -252,17 +266,34 @@ describe('fix46: log vitals with dynamic max values', () => {
         
         const logFn = logFnMatch[0];
         
-        // Should reference bot.game.maxFood/maxHealth or settings
+        // Should use getVitalsMax helper (shared source)
         assert.ok(
-            logFn.includes('game?.maxFood') || logFn.includes('game?.maxHealth') ||
-            logFn.includes('settings.max_food') || logFn.includes('settings.max_health'),
-            'Should use dynamic max values from bot.game or settings'
+            logFn.includes('getVitalsMax(bot)'),
+            'log() should use getVitalsMax helper for shared source'
+        );
+    });
+
+    it('should use shared VITALS_MAX in observe() function', async () => {
+        const voyagerSrc = await import('fs').then(fs => 
+            fs.readFileSync('./src/agent/voyager.js', 'utf8')
         );
         
-        // Should have fallback to 20 (not just hard-coded)
+        // observe() should reference skills.VITALS_MAX
         assert.ok(
-            logFn.includes('?? 20') || logFn.includes('|| 20'),
-            'Should have 20 as fallback, not primary value'
+            voyagerSrc.includes('skills.VITALS_MAX.health') && voyagerSrc.includes('skills.VITALS_MAX.food'),
+            'observe() should use skills.VITALS_MAX for shared source'
+        );
+    });
+
+    it('should log loudly once if bot reports non-standard max values', async () => {
+        const skillsSrc = await import('fs').then(fs => 
+            fs.readFileSync('./src/agent/library/skills.js', 'utf8')
+        );
+        
+        // getVitalsMax should have loud logging for non-standard values
+        assert.ok(
+            skillsSrc.includes('LOUD') && skillsSrc.includes('non-standard vitals max'),
+            'Should log loudly if bot reports non-standard vitals max'
         );
     });
 
@@ -273,7 +304,7 @@ describe('fix46: log vitals with dynamic max values', () => {
             output: '',
             health: 15,
             food: 10,
-            game: { maxHealth: 20, maxFood: 20 }
+            game: {}
         };
         
         log(mockBot, 'Test message');
@@ -282,23 +313,7 @@ describe('fix46: log vitals with dynamic max values', () => {
         assert.ok(mockBot.output.includes('health'), 'Should include health in output');
         assert.ok(mockBot.output.includes('10'), 'Should include food value');
         assert.ok(mockBot.output.includes('15'), 'Should include health value');
-    });
-
-    it('should work when bot.game is undefined (fallback to 20)', async () => {
-        const { log } = await import('../src/agent/library/skills.js');
-        
-        const mockBot = {
-            output: '',
-            health: 8,
-            food: 5,
-            game: undefined
-        };
-        
-        log(mockBot, 'Test without game');
-        
-        // Should still include vitals with /20 fallback
-        assert.ok(mockBot.output.includes('food 5/'), 'Should include food with fallback max');
-        assert.ok(mockBot.output.includes('health 8/'), 'Should include health with fallback max');
+        assert.ok(mockBot.output.includes('/20'), 'Should include /20 max (VITALS_MAX standard)');
     });
 });
 
