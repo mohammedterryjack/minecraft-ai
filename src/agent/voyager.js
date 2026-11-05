@@ -208,31 +208,50 @@ export class Voyager {
         this._polyMerge();
         this._extractShared();
     }
-    // fix40: one-time migration from skills.*/world.* to bare names
+    // fix40/41: migration from skills.*/world.* to bare names
     // Rewrites all saved skill code to use bare function names instead of skills.X/world.Y
+    // fix41: uses Object.keys for names (not extractSig), adds catch-all, re-runs on leftovers
     _migrateToBarenames() {
-        if (this.progress.migratedToBarenames) return;  // already migrated
-        const bare = getBareAPI();
-        const skillNames = new Set(bare.names);
+        const LEFTOVER_RE = /\b(?:skills|world)\.\w+\s*\(/;
+        const hasLeftovers = () => this.skills.some(s => s.code && LEFTOVER_RE.test(s.code));
+        if (this.progress.migratedToBarenames && !hasLeftovers()) return;  // fully migrated
+        if (this.progress.migratedToBarenames) {
+            console.log('[fix41] migratedToBarenames was true but leftovers remain - rerunning migration');
+        }
+        // fix41: collect rewrite names from Object.keys where typeof function (not extractSig)
+        const skillFnNames = Object.keys(skills).filter(k => typeof skills[k] === 'function' && k !== 'log');
+        const worldFnNames = Object.keys(world).filter(k => typeof world[k] === 'function');
+        const allNames = new Set([...skillFnNames, ...worldFnNames]);
         let migrated = 0, totalChanges = 0;
         for (const s of this.skills) {
             if (!s.code) continue;
             let code = s.code;
             let changes = 0;
-            // Replace skills.X(... -> X(... for known function names
-            for (const name of skillNames) {
+            // Pass 1: Replace skills.X(... -> X(... for known function names
+            for (const name of allNames) {
                 const re = new RegExp(`\\bskills\\.${name}\\s*\\(`, 'g');
-                const newCode = code.replace(re, `${name}(`);
-                if (newCode !== code) { changes++; code = newCode; }
+                const before = code;
+                code = code.replace(re, `${name}(`);
+                if (code !== before) changes++;
             }
-            // Replace world.X(... -> X(... for known function names
-            for (const name of skillNames) {
+            // Pass 2: Replace world.X(... -> X(... for known function names
+            for (const name of allNames) {
                 const re = new RegExp(`\\bworld\\.${name}\\s*\\(`, 'g');
-                const newCode = code.replace(re, `${name}(`);
-                if (newCode !== code) { changes++; code = newCode; }
+                const before = code;
+                code = code.replace(re, `${name}(`);
+                if (code !== before) changes++;
             }
+            // fix41 Pass 3: catch-all for ANY remaining skills.X( or world.X( patterns (unknown helpers)
+            const catchSkills = /\bskills\.(\w+)\s*\(/g;
+            const catchWorld = /\bworld\.(\w+)\s*\(/g;
+            let before = code;
+            code = code.replace(catchSkills, '$1(');
+            if (code !== before) changes++;
+            before = code;
+            code = code.replace(catchWorld, '$1(');
+            if (code !== before) changes++;
             if (changes > 0) {
-                console.log(`[fix40] migrate ${s.name}: ${changes} skills.*/world.* -> bare name changes`);
+                console.log(`[fix41] migrate ${s.name}: ${changes} skills.*/world.* -> bare name changes`);
                 s.code = code;
                 writeAtomic(`${this.dir}/${s.name}.js`, `// ${s.description}\n${s.code}\n`);
                 migrated++;
@@ -241,10 +260,16 @@ export class Voyager {
         }
         if (migrated > 0) {
             this._saveSkills();
-            console.log(`[fix40] MIGRATION COMPLETE: ${migrated} skills updated, ${totalChanges} total changes`);
+            console.log(`[fix41] MIGRATION COMPLETE: ${migrated} skills updated, ${totalChanges} total changes`);
         }
-        this.progress.migratedToBarenames = true;
-        this._saveProgress();
+        // fix41: only set flag when zero leftovers remain
+        if (!hasLeftovers()) {
+            this.progress.migratedToBarenames = true;
+            this._saveProgress();
+            console.log('[fix41] migratedToBarenames set to true - no leftovers remain');
+        } else {
+            console.warn('[fix41] WARNING: some skills.*/world.* patterns remain after migration');
+        }
     }
     // fix33: seed primitives into the skill library so they are blamable/repairable (learned path, not hard-coded)
     // These are skills from skills.js that need to be in the skill graph to enable learning (e.g. water escape)
