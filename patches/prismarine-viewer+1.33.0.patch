@@ -21865,13 +21865,20 @@ index ec2ccd9..16212a6 100644
 +  }
 +
 +  if (e.name === 'item' || e.name === 'item_stack' || e.name === 'Item') {
++    // fix39 (#19 + strengthened): pre-check metadata readiness to avoid spam from pre-ready entities
 +    // Item metadata arrives after entitySpawn; itemDrop re-packs once it is set.
-+    if (e.metadata[bot.registry.supportFeature('metadataIxOfItem')] === undefined) return payload
++    const metaIx = bot.registry.supportFeature('metadataIxOfItem')
++    const itemMetaSlot = e.metadata && e.metadata[metaIx]
++    if (itemMetaSlot === undefined || (typeof itemMetaSlot === 'object' && !itemMetaSlot)) return payload  // metadata not ready, skip silently
 +    let dropped
 +    try {
 +      dropped = e.getDroppedItem()
 +    } catch (err) {
-+      console.error('[viewer] getDroppedItem failed', e.id, err)
++      // fix39: only log if metadata appeared ready but getDroppedItem still failed (a real error)
++      // Silently skip pre-ready entities to stop x82+ spam; real post-metadata failures still logged
++      if (itemMetaSlot && typeof itemMetaSlot === 'object' && itemMetaSlot.present !== undefined) {
++        console.error('[viewer] getDroppedItem failed', e.id, err.message || err)
++      }
 +      return payload
 +    }
 +    if (!dropped || !dropped.name) return payload

@@ -192,8 +192,16 @@ export class Coder {
         this._realAPICache = { set: new Set([...realSkillsAPI, ...realWorldAPI]), list: [...realSkillsAPI, ...realWorldAPI] };
         return this._realAPICache;
     }
+    // fix39: get learned skill names from voyager (bare function names, not skills.* prefix)
+    // These are invoked by bare name, NOT as skills.<name>
+    _getLearnedSkillNames() {
+        const voyager = this.agent.voyager;
+        if (!voyager || !Array.isArray(voyager.skills)) return [];
+        return voyager.skills.filter(s => !s.demoted && !s.mergedInto).map(s => s.name);
+    }
     // fix34: find nearest real API call by edit distance; returns { match, dist } or null
-    _nearestAPI(call) {
+    // fix39: also searches learned skill names when the model writes skills.X that doesn't exist
+    _nearestAPI(call, includeLearnedSkills = true) {
         const { list } = this._getRealAPI();
         const fnName = call.split('.').pop().toLowerCase();
         const prefix = call.startsWith('world.') ? 'world.' : 'skills.';
@@ -203,7 +211,20 @@ export class Coder {
             const dist = this._lev(fnName, r.split('.').pop().toLowerCase());
             if (dist < bestDist) { best = r; bestDist = dist; }
         }
-        return best ? { match: best, dist: bestDist } : null;
+        // fix39: also check learned skill names (invoked by bare name, not skills.*)
+        // When model writes skills.goToBlock, suggest learned goToBlockAndInteract too
+        let learnedMatch = null, learnedDist = Infinity;
+        if (includeLearnedSkills && call.startsWith('skills.')) {
+            const learned = this._getLearnedSkillNames();
+            for (const name of learned) {
+                const dist = this._lev(fnName, name.toLowerCase());
+                if (dist < learnedDist) { learnedMatch = name; learnedDist = dist; }
+            }
+        }
+        return { 
+            builtIn: best ? { match: best, dist: bestDist } : null,
+            learned: learnedMatch ? { match: learnedMatch, dist: learnedDist } : null
+        };
     }
     // fix34: extract skills.*/world.* calls from code using acorn (avoids false positives in strings/comments)
     _extractApiCalls(code) {
@@ -248,17 +269,34 @@ export class Coder {
             return result;
         }
         const { set, list } = this._getRealAPI();
+        const learned = this._getLearnedSkillNames();
         const missingCalls = [...new Set(calls.filter(c => !set.has(c)))];
         if (missingCalls.length > 0) {
             result += 'These functions do not exist:\n';
             result += missingCalls.map(m => {
                 const nearest = this._nearestAPI(m);
-                const scored = list.map(r => ({ r, dist: this._lev(m.split('.').pop().toLowerCase(), r.split('.').pop().toLowerCase()) }))
+                const fnName = m.split('.').pop().toLowerCase();
+                // Built-in suggestions (skills.*/world.*)
+                const scoredBuiltin = list.map(r => ({ r, dist: this._lev(fnName, r.split('.').pop().toLowerCase()) }))
                     .sort((a, b) => a.dist - b.dist);
-                const close = scored.filter(s => s.dist <= 8).slice(0, 5).map(s => s.r);
-                return `${m}  -> did you mean: ${close.length ? close.join(', ') : '(none close)'}`;
+                const closeBuiltin = scoredBuiltin.filter(s => s.dist <= 8).slice(0, 4).map(s => s.r);
+                // fix39: learned skill suggestions (invoked by bare name, NOT skills.*)
+                // When model writes skills.goToBlock, also suggest learned goToBlockAndInteract
+                const scoredLearned = learned.map(name => ({ name, dist: this._lev(fnName, name.toLowerCase()) }))
+                    .sort((a, b) => a.dist - b.dist);
+                const closeLearned = scoredLearned.filter(s => s.dist <= 8).slice(0, 3).map(s => s.name);
+                // Format suggestions: built-in with prefix, learned as bare names with explicit note
+                let suggestions = [];
+                if (closeBuiltin.length) suggestions.push(`built-in: ${closeBuiltin.join(', ')}`);
+                if (closeLearned.length) suggestions.push(`learned (call by bare name, NOT skills.*): ${closeLearned.join(', ')}`);
+                const suggestionText = suggestions.length ? suggestions.join(' | ') : '(none close)';
+                return `${m}  -> did you mean: ${suggestionText}`;
             }).join('\n');
-            result += '\nOnly these functions exist: ' + list.join(', ');
+            // fix39: separate listing of built-in vs learned skills
+            result += '\n\nBUILT-IN API (call as skills.* or world.*):\n' + list.join(', ');
+            if (learned.length) {
+                result += '\n\nLEARNED SKILLS (call by BARE NAME, not skills.*):\n' + learned.slice(0, 30).join(', ') + (learned.length > 30 ? ` ... (${learned.length - 30} more)` : '');
+            }
             console.log(result)
             return result;
         }

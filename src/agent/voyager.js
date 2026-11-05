@@ -496,9 +496,15 @@ export class Voyager {
         if (rehealed) console.log(`[psn] rehealed ${rehealed} seeded primitive(s) with updated code`);
     }
     // fix11: recompute every skill's dependency edges from its code at startup (catches hand edits of skill files)
+    // fix39: seeded primitives keep their original deps (typically []) so they can't form cycles
+    // through learned skills. Basic actions like depositToChest/tossItem must not depend on learned
+    // skills like ensureChest - that creates cycles and blocks inventory freeing.
     _relink() {
         const names = new Set(this.skills.map(s => s.name)); let n = 0;
         for (const s of this.skills) {
+            // fix39: seeded primitives are basic building blocks - never recalculate their deps
+            // This prevents cycles like ensureCraftingTable -> depositToChest -> ensureChest -> ensureCraftingTable
+            if (s.seeded) continue;
             const d = depsOf(s.code, s.name, names);
             if (JSON.stringify([...d].sort()) !== JSON.stringify([...(s.deps || [])].sort())) { console.log(`[psn] relink ${s.name}: deps [${(s.deps || []).join(', ')}] -> [${d.join(', ')}]`); s.deps = d; n++; }
         }
@@ -1288,7 +1294,7 @@ Use only c; no other globals.`;
     catalogue(only) {
         return this.skills.filter(s => !s.demoted && !s.mergedInto && (!only || only.has(s.name))).map(s => `- ${signatureOf(s.code, s.name)}${s.handwritten ? ' [handwritten]' : ''}: ${s.description}`).join('\n');
     }
-    // fix39: enriched known_skills for decompose/curriculum - includes descriptions for primitives and space-freeing skills
+    // fix39 (#18): enriched known_skills for decompose/curriculum - includes descriptions for primitives and space-freeing skills
     // so the local model can propose free-space subgoals when inventory is full (learned path, not hard-coded rules)
     _knownSkillsFacts() {
         const freeSpaceKeywords = /deposit|toss|clutter|chest|discard|free.*space|store.*item/i;
@@ -1300,6 +1306,22 @@ Use only c; no other globals.`;
             if (isFreeSpace || isPrimitive) return `${s.name}: ${desc.slice(0, 120)}`;
             return s.name;
         });
+    }
+    // fix39: built-in API list (skills.*/world.*) with exact call signatures from JSDoc
+    // Separate from learned skills to prevent confusion (learned skills use bare names, built-in use skills.*/world.*)
+    builtInAPIList() {
+        const extractSig = (fn, mod) => {
+            const str = fn.toString();
+            const match = str.match(/function\s+\w+\s*\(([^)]*)\)/);
+            if (!match) return null;
+            const params = match[1].trim();
+            return `${mod}.${fn.name}(${params})`;
+        };
+        const skillsFns = Object.keys(skills).filter(k => typeof skills[k] === 'function' && k !== 'log')
+            .map(k => extractSig(skills[k], 'skills')).filter(Boolean);
+        const worldFns = Object.keys(world).filter(k => typeof world[k] === 'function')
+            .map(k => extractSig(world[k], 'world')).filter(Boolean);
+        return [...skillsFns, ...worldFns].join('\n');
     }
     _recordRun(entry, task, ok, trial) {
         if (trial) {
@@ -1731,9 +1753,23 @@ current_health: ${Math.round(bot.health)}/20\ncurrent_food: ${bot.food}/20 (20/2
     }
     async saveSkill(name, description, code, task, opts = {}) {
         const names = new Set(this.skills.map(s => s.name));
-        const deps = depsOf(code, name, names);
+        let deps = depsOf(code, name, names);
         const missing = missingCalls(code, name, names);
         if (missing.length) { gateLog(`REJECT ${name}: calls unknown skills ${missing.join(', ')}`); return false; }
+        // fix39: seeded primitives must not depend on learned skills (prevents cycles like
+        // ensureCraftingTable -> depositToChest -> ensureChest -> ensureCraftingTable)
+        // If a repair tries to add learned deps to a seeded skill, strip them and warn
+        const existingSkill = this.skills.find(s => s.name === name);
+        if (existingSkill?.seeded) {
+            const learnedDeps = deps.filter(d => {
+                const dep = this.skills.find(s => s.name === d);
+                return dep && !dep.seeded && !dep.primitive && !dep.handwritten;
+            });
+            if (learnedDeps.length) {
+                gateLog(`WARN ${name} (seeded): stripping learned deps [${learnedDeps.join(', ')}] to prevent cycles`);
+                deps = deps.filter(d => !learnedDeps.includes(d));
+            }
+        }
         const cyc = findCycle(name, deps, this._graph(name));
         if (cyc) { gateLog(`REJECT ${name}: dependency cycle ${cyc.join(' -> ')}`); return false; }
         const embedding = await this._embed(description);
@@ -2012,9 +2048,17 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         // AWM-style: retrieve similar past repair lessons
         const pastLessons = await this.repairMemory.retrieveSimilar(q.evidence, 3);
         const awmHints = this.repairMemory.formatHintsForCoder(pastLessons);
-        // fix39: add real API surface to prevent hallucinated API calls (e.g. goToBlock -> goToNearestBlock)
-        const { list: realAPI } = getRealAPI();
-        const system = `You repair ONE skill in a Minecraft mineflayer skill library (PSN-style targeted fix). Return a single \`\`\`javascript code block containing ONLY the fixed function, with the SAME name and a compatible signature. First line inside the block: // DESCRIPTION: <one sentence>. Call other library skills by name (they are in scope); never redefine them. Every loop must check bot.interrupt_code. If something still cannot be done, log(bot, 'FAILED: <reason>') and return a falsy value; no silent fallbacks. findBlock/findBlocks/nearestEntity/bot.entities/blockAt results can be null or empty: always null-check them before reading .position/.x or calling methods on them.\nLIBRARY (the blamed skill's dependencies and callers):\n${this.catalogue(new Set([e.name, ...this._closure(e.name), ...parentsOf(e.name, this._graph())]))}\nREAL API (only these skills.*/world.* functions exist):\n${realAPI.join(', ')}`;
+        // fix39: clearly separate built-in API (skills.*/world.*) from learned skills (bare names)
+        // This prevents the model from inventing calls like skills.goToBlock when it should call goToBlockAndInteract
+        const system = `You repair ONE skill in a Minecraft mineflayer skill library (PSN-style targeted fix). Return a single \`\`\`javascript code block containing ONLY the fixed function, with the SAME name and a compatible signature. First line inside the block: // DESCRIPTION: <one sentence>. Every loop must check bot.interrupt_code. If something still cannot be done, log(bot, 'FAILED: <reason>') and return a falsy value; no silent fallbacks. findBlock/findBlocks/nearestEntity/bot.entities/blockAt results can be null or empty: always null-check them before reading .position/.x or calling methods on them.
+
+BUILT-IN API (call with skills.* or world.* prefix - these are the ONLY functions under skills.* and world.*):
+${this.builtInAPIList()}
+
+LEARNED LIBRARY SKILLS (call by BARE NAME directly, NOT skills.* - these are already in scope as plain functions):
+${this.catalogue(new Set([e.name, ...this._closure(e.name), ...parentsOf(e.name, this._graph())]))}
+
+IMPORTANT: Do NOT invent skills.* calls. If you need functionality not in the built-in API above, use a learned skill by its bare name.`;
         const user = `Blamed skill: ${e.name} (${q.kind === 'caller_fix' ? 'it calls the leaf ' + q.leaf + ' in a situation where the leaf cannot succeed: fix how/when it calls it, e.g. obtain the missing prerequisite first' : 'its own logic failed'})\nTask that failed: ${q.task}\nFailure path: ${q.path.join(' > ')}\nEvidence: ${q.evidence}\n--- execution trace (indent = call depth) ---\n${q.trace}\n${e.contract ? `--- learned contract of ${e.name} (must hold after your fix) ---\npre: ${e.contract.pre}\npost: ${e.contract.post}\n` : ''}--- current code of ${e.name} ---\n${e.code}\n--- skills it uses ---\n${kids.map(k => '// ' + k.description + '\n' + signatureOf(k.code, k.name)).join('\n')}\n${(e.repairHistory || []).length ? `\n--- your last ${e.repairHistory.length} repair proposal(s) for ${e.name} (do not repeat what failed) ---\n` + e.repairHistory.map((h, i) => `${i + 1}. [${h.outcome || 'pending'}] ${h.kind}: ${h.evidence}\n   change: ${h.desc}`).join('\n') : ''}${q.peers?.length > 1 ? `\nOther skills blamed on the same failure (repaired children-first): ${q.peers.join(', ')}` : ''}${awmHints ? `\n${awmHints}` : ''}\nWrite the fixed ${e.name}:`;
         console.log(`[psn] repair memory for ${e.name}: ${(e.repairHistory || []).length} past proposal(s) in the prompt${pastLessons.length ? `, ${pastLessons.length} AWM lesson(s)` : ''}`);
         console.log(`[psn] REPAIR ${e.name} [${q.kind}] with the code model (evidence: ${q.evidence.slice(0, 160)})`);
@@ -2175,8 +2219,7 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         const pastLessons = await this.repairMemory.retrieveSimilar(q.evidence, 2);
         const awmHints = this.repairMemory.formatHintsForCoder(pastLessons);
         const relevantSkills = new Set([e.name, pe.name, ...this._closure(e.name), ...this._closure(pe.name), ...parentsOf(e.name, this._graph()), ...parentsOf(pe.name, this._graph())]);
-        // fix39: add real API surface to prevent hallucinated API calls (e.g. goToBlock -> goToNearestBlock)
-        const { list: realAPI } = getRealAPI();
+        // fix39: clearly separate built-in API from learned skills
         const system = `You repair TWO skills of a Minecraft mineflayer skill library together (PSN joint repair): a child skill and the caller that uses it failed on the same path.
 
 REQUIRED FORMAT: Return ONE \`\`\`javascript code block containing EXACTLY two async function definitions:
@@ -2188,12 +2231,16 @@ Each function must:
 - Have a compatible signature
 - Be preceded by // DESCRIPTION: <one sentence>
 
-Call other library skills by name (they are in scope); never redefine them. Every loop must check bot.interrupt_code. If something cannot be done, log(bot, 'FAILED: <reason>') and return a falsy value; no silent fallbacks. findBlock/findBlocks/nearestEntity/bot.entities/blockAt results can be null or empty: always null-check them.
+Every loop must check bot.interrupt_code. If something cannot be done, log(bot, 'FAILED: <reason>') and return a falsy value; no silent fallbacks. findBlock/findBlocks/nearestEntity/bot.entities/blockAt results can be null or empty: always null-check them.
 Fix the child's own logic and how/when the caller uses it. No top-level call, no extra functions.
-SKILL LIBRARY (available skills to call):
+
+BUILT-IN API (call with skills.* or world.* prefix - these are the ONLY functions under skills.* and world.*):
+${this.builtInAPIList()}
+
+LEARNED LIBRARY SKILLS (call by BARE NAME directly, NOT skills.* - already in scope as plain functions):
 ${this.catalogue(relevantSkills)}
-REAL API (only these skills.*/world.* functions exist):
-${realAPI.join(', ')}`;
+
+IMPORTANT: Do NOT invent skills.* calls. If you need functionality not in the built-in API above, use a learned skill by its bare name.`;
         const user = `Task that failed: ${q.task}\nEvidence: ${q.evidence}\n--- current bot state ---\n${this._stateText(this.observe())}\n--- execution trace ---\n${extractFeedback(q.trace || '', 2500)}\n--- child ${e.name} ---\n${e.code}\n--- caller ${pe.name} ---\n${pe.code}${e.contract ? `\n--- contract of ${e.name} ---\npre: ${e.contract.pre}\npost: ${e.contract.post}` : ''}${pe.contract ? `\n--- contract of ${pe.name} ---\npre: ${pe.contract.pre}\npost: ${pe.contract.post}` : ''}${awmHints ? `\n${awmHints}` : ''}\nWrite both fixed functions (${e.name} first, then ${pe.name}):`;
         console.log(`[psn] REPAIR JOINT ${e.name} + ${pe.name} with the code model (evidence: ${String(q.evidence).slice(0, 160)})`);
         let reply; try { reply = await this._ask(system, user); } catch (err) { console.log(`[psn] joint repair FAILED: ${err.message}`); return false; }
@@ -2261,7 +2308,16 @@ ${realAPI.join(', ')}`;
         const ents = h.skills.map(n => this.skills.find(s => s.name === n)).filter(e => e && !e.handwritten && !e.primitive && !e.candidate);
         if (ents.length < 2) { console.log(`[psn] refactor skipped: fragment shared by ${h.skills.join(', ')} but <2 learned skills without a pending candidate`); return false; }
         const id = `rf${Date.now()}`;
-        const system = `You refactor a Minecraft mineflayer skill library (PSN canonical refactor: extract shared subroutine). Return ONE \`\`\`javascript block with: first a NEW helper async function (bot, ...params) that implements the repeated fragment, preceded by // DESCRIPTION: <one sentence>; then each listed skill rewritten to call the helper, SAME names and signatures, behaviour unchanged. Every loop checks bot.interrupt_code. No other functions.\nLIBRARY:\n${this.catalogue()}`;
+        // fix39: clearly separate built-in API from learned skills
+        const system = `You refactor a Minecraft mineflayer skill library (PSN canonical refactor: extract shared subroutine). Return ONE \`\`\`javascript block with: first a NEW helper async function (bot, ...params) that implements the repeated fragment, preceded by // DESCRIPTION: <one sentence>; then each listed skill rewritten to call the helper, SAME names and signatures, behaviour unchanged. Every loop checks bot.interrupt_code. No other functions.
+
+BUILT-IN API (call with skills.* or world.* prefix):
+${this.builtInAPIList()}
+
+LEARNED LIBRARY SKILLS (call by BARE NAME, NOT skills.*):
+${this.catalogue()}
+
+IMPORTANT: Do NOT invent skills.* calls. Use either a built-in API above or a learned skill by bare name.`;
         const user = `Repeated fragment:\n${h.fragment}\n${ents.map(e => `--- ${e.name} ---\n${e.code}`).join('\n')}\nWrite the helper then the rewritten skills:`;
         console.log(`[psn] REFACTOR ${id}: extracting the fragment shared by ${ents.map(e => e.name).join(', ')}`);
         let reply; try { reply = await this._ask(system, user); } catch (err) { console.log(`[psn] refactor FAILED: ${err.message}`); return false; }
@@ -2317,7 +2373,16 @@ ${realAPI.join(', ')}`;
         const ents = names.map(n => this.skills.find(s => s.name === n)).filter(e => e && !e.handwritten && !e.primitive && !e.candidate && !e.demoted && !e.mergedInto);
         if (ents.length < 3) { console.log(`[psn] generalise skipped: <3 eligible skills from hint`); return false; }
         const id = `gn${Date.now()}`;
-        const system = `You refactor a Minecraft mineflayer skill library (PSN generalise: combine similar specific skills into one parameterized skill). Return ONE \`\`\`javascript block with: first a NEW parameterized async function (bot, param) that generalises the common pattern, preceded by // DESCRIPTION: <one sentence>; then each listed skill rewritten as a thin wrapper calling the new function with the appropriate argument. Keep SAME names and signatures for wrappers. Every loop checks bot.interrupt_code.\nLIBRARY:\n${this.catalogue()}`;
+        // fix39: clearly separate built-in API from learned skills
+        const system = `You refactor a Minecraft mineflayer skill library (PSN generalise: combine similar specific skills into one parameterized skill). Return ONE \`\`\`javascript block with: first a NEW parameterized async function (bot, param) that generalises the common pattern, preceded by // DESCRIPTION: <one sentence>; then each listed skill rewritten as a thin wrapper calling the new function with the appropriate argument. Keep SAME names and signatures for wrappers. Every loop checks bot.interrupt_code.
+
+BUILT-IN API (call with skills.* or world.* prefix):
+${this.builtInAPIList()}
+
+LEARNED LIBRARY SKILLS (call by BARE NAME, NOT skills.*):
+${this.catalogue()}
+
+IMPORTANT: Do NOT invent skills.* calls. Use either a built-in API above or a learned skill by bare name.`;
         const user = `Similar skills to generalise:\n${ents.map(e => `--- ${e.name} ---\n${e.description}\n${e.code}`).join('\n')}\nWrite the parameterized helper then the wrapper skills:`;
         console.log(`[psn] GENERALISE ${id}: parameterising ${ents.map(e => e.name).join(', ')}`);
         let reply; try { reply = await this._ask(system, user); } catch (err) { console.log(`[psn] generalise FAILED: ${err.message}`); return false; }
@@ -2348,7 +2413,16 @@ ${realAPI.join(', ')}`;
         const e = this.skills.find(s => s.name === name && !s.demoted && !s.mergedInto && !s.candidate);
         if (!e || (e.code || '').split('\n').length <= 40) { console.log(`[psn] split skipped: ${name} no longer qualifies`); return false; }
         const id = `sp${Date.now()}`;
-        const system = `You refactor a Minecraft mineflayer skill library (PSN split: break a large skill into smaller reusable sub-skills). Return ONE \`\`\`javascript block with: first 2-3 NEW sub-skill async functions (bot) that each do one logical piece of the work, each preceded by // DESCRIPTION: <one sentence>; then the original skill rewritten to call those sub-skills. Keep the SAME name and signature for the original. Every loop checks bot.interrupt_code.\nLIBRARY:\n${this.catalogue()}`;
+        // fix39: clearly separate built-in API from learned skills
+        const system = `You refactor a Minecraft mineflayer skill library (PSN split: break a large skill into smaller reusable sub-skills). Return ONE \`\`\`javascript block with: first 2-3 NEW sub-skill async functions (bot) that each do one logical piece of the work, each preceded by // DESCRIPTION: <one sentence>; then the original skill rewritten to call those sub-skills. Keep the SAME name and signature for the original. Every loop checks bot.interrupt_code.
+
+BUILT-IN API (call with skills.* or world.* prefix):
+${this.builtInAPIList()}
+
+LEARNED LIBRARY SKILLS (call by BARE NAME, NOT skills.*):
+${this.catalogue()}
+
+IMPORTANT: Do NOT invent skills.* calls. Use either a built-in API above or a learned skill by bare name.`;
         const user = `Large skill to split:\n--- ${e.name} ---\n${e.description}\n${e.code}\nWrite the sub-skills then the rewritten main skill:`;
         console.log(`[psn] SPLIT ${id}: breaking ${e.name} (${e.code.split('\n').length} lines) into sub-skills`);
         let reply; try { reply = await this._ask(system, user); } catch (err) { console.log(`[psn] split FAILED: ${err.message}`); return false; }
@@ -2511,10 +2585,20 @@ ${realAPI.join(', ')}`;
         const shown = new Set(related.map(s => s.name)); for (const s of related) for (const d of this._closure(s.name)) shown.add(d);
         const prompter = this.agent.prompter;
         let system = await prompter.replaceStrings(prompter.profile.coding, [{ role: "user", content: `!newAction(${task})` }], prompter.coding_examples);
+        // fix39: clearly separate built-in API from learned skills to prevent hallucinations like skills.goToBlock
         system += `\n\nVOYAGER MODE: write ONE reusable async function \`async function camelCaseName(bot) {...}\` that completes the task, then call it at the end with \`await camelCaseName(bot);\`.
 The first line of the code block must be a comment: // DESCRIPTION: <one sentence of what the function does>.
-SKILL LIBRARY (already defined as plain async functions in scope; call them directly by name, e.g. \`await mineOre(bot, 'iron_ore', 3)\`; do NOT redefine or copy them, and do not invent other bare function names):
+
+BUILT-IN API (call with skills.* or world.* prefix - these are the ONLY functions under skills.* and world.*):
+${this.builtInAPIList()}
+
+LEARNED LIBRARY SKILLS (call by BARE NAME directly, NOT skills.* - already in scope as plain async functions):
 ${this.catalogue(shown)}
+
+IMPORTANT: Do NOT invent skills.* calls like skills.goToBlock - they do not exist. Use either:
+1. A built-in API from the list above (skills.goToNearestBlock, skills.collectBlock, etc.)
+2. A learned skill by its bare name (e.g., \`await mineOre(bot, 'iron_ore', 3)\`)
+
 COMPOSE: build your function out of these skills (they can take arguments). Your new skill may take extra parameters with defaults, e.g. \`async function makeIronTools(bot, count = 1)\`. Do not create call cycles between skills.${this.sharedHints?.length ? `
 SHARED CODE: these fragments are repeated in several skills; if you need this logic, put it in its own small reusable async function skill (named, with parameters) and call it, instead of inlining it again:
 ${this.sharedHints.map(h => '// used in ' + h.skills.join(', ') + '\n' + h.fragment).join('\n')}` : ''}
