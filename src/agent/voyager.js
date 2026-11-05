@@ -470,6 +470,27 @@ Use only c; no other globals.`;
         }
         return best ? { name: best.name, call: `await ${best.name}(bot);` } : null;
     }
+    // fix28 (D): nearest learned skill by nomic-embed-text over its description; the match threshold is learned from replay outcomes
+    async _embedReplay(task) {
+        const th = this.progress.replayThreshold ??= 0.85;
+        const q = await this._embed(task);
+        let best = null, bs = -1;
+        for (const s of this.skills) {
+            if (s.primitive || s.demoted || s.mergedInto || !s.task || /^(repair|refactor)\b/.test(s.task)) continue;
+            const extra = (signatureOf(s.code, s.name).match(/\(([^)]*)\)/)?.[1] || '').split(',').slice(1).map(x => x.trim()).filter(Boolean);
+            if (extra.some(x => !x.includes('='))) continue;   // needs arguments it cannot get from the task text
+            if (!s.embedding || s.embedding.length !== q.length) continue;
+            const sc = cosineSimilarity(q, s.embedding) * (0.7 + 0.3 * rate(s.stats || newStats()));
+            if (sc > bs) { bs = sc; best = s; }
+        }
+        console.log(`[replay] embedding match for "${task}": ${best ? `${best.name} score ${bs.toFixed(3)}` : 'none'} (learned threshold ${th.toFixed(3)})${best && bs >= th ? ' -> replaying' : ' -> code model'}`);
+        return best && bs >= th ? { name: best.name, call: `await ${best.name}(bot);`, embed: bs } : null;
+    }
+    _learnReplayThreshold(rp) {
+        if (!rp || rp.interrupted) return;
+        const P = this.progress, old = P.replayThreshold; P.replayThreshold = Math.min(0.99, Math.max(0.6, old + (rp.ok ? -0.01 : 0.02))); this._saveProgress();
+        console.log(`[replay] embedding replay ${rp.ok ? 'passed' : 'failed'}; threshold ${old.toFixed(3)} -> ${P.replayThreshold.toFixed(3)}`);
+    }
     // SkillCompiler-style effect contract for a route: what must hold before (pre) and what must change after (post)
     _contract(r) {
         let args = []; try { args = JSON.parse('[' + (r.call.match(/\(bot(?:,\s*(.*))?\);?$/)?.[1] || '') + ']'); } catch (e) {}
@@ -1032,7 +1053,9 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
         this.currentTask = task;
         this._prefetchPlan(task, before);   // fix28 (C): the next proposal is planned while this task runs
         VERSION = this.agent.bot.version;
-        const rp = await this._replay(task, before);
+        const route = this._findReplay(task) || await this._embedReplay(task);   // fix28 (D): replay a matching learned skill before any code-model call
+        const rp = route ? await this._replay(task, before, route) : null;
+        if (route?.embed) this._learnReplayThreshold(rp);
         if (rp?.interrupted) { console.log('[voyager] task interrupted'); return; }
         if (rp?.ok) {
             this.progress.completed.push(task); this.progress.failed = this.progress.failed.filter(t => t !== task); this._saveProgress();
@@ -1040,7 +1063,7 @@ If the code hand-rolled a mining/collecting loop that timed out, got 0 items or 
             this.agent.openChat?.(`Done: ${task} (replayed ${rp.name}).`);
             return;
         }
-        if (rp && !rp.ok && !rp.interrupted && this._findReplay(task)) { this.progress.failed.push(task); this._saveProgress(); }
+        if (rp && !rp.ok && !rp.interrupted && route) { this.progress.failed.push(task); this._saveProgress(); }
         if (this._cursorLimited()) { console.log(`[voyager] skipped "${task}": needs new code but Cursor is at its limit (replay-only mode)`); return; }
         this.agent.openChat?.(`New goal: ${task}`);
         // fix28 (B): the prompt carries only the skills nomic-embed-text ranks relevant, plus their dependency closures (all skills stay defined in scope)
