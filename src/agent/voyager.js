@@ -713,13 +713,26 @@ Use only c; no other globals.`;
     _stateText(s) {
         // fix34: present inventory facts prominently as exact counts (not just JSON blob)
         // fix36: facts only, no imperatives (Mo principle: everything learned, not hard-coded)
+        // fix37 (D): surface inventory fullness as facts (not rules) with exact counts
         const lines = [];
+        const inv = s.inventory || {};
+        const emptySlots = s.empty_inventory_slots ?? 0;
+        const totalItems = Object.values(inv).reduce((a, b) => a + b, 0);
+
         for (const [k, v] of Object.entries(s)) {
             if (k === 'inventory' && typeof v === 'object') {
-                const items = Object.entries(v).map(([item, count]) => `${item}: ${count}`);
-                lines.push(`inventory (exact counts): ${items.length ? items.join(', ') : '(empty)'}`);
+                // Sort by count descending to show largest stacks first (hoarding visibility)
+                const items = Object.entries(v).sort((a, b) => b[1] - a[1]).map(([item, count]) => `${item}: ${count}`);
+                lines.push(`inventory (exact counts, ${totalItems} total items): ${items.length ? items.join(', ') : '(empty)'}`);
             } else if (k === 'empty_inventory_slots') {
-                lines.push(`empty_inventory_slots: ${v}${v === 0 ? ' (0 means inventory is full; new items cannot be picked up until space is freed)' : ''}`);
+                // fix37 (D): state inventory fullness as a fact, not a rule
+                if (v === 0) {
+                    lines.push(`empty_inventory_slots: 0 (inventory is full)`);
+                } else if (v <= 3) {
+                    lines.push(`empty_inventory_slots: ${v} (inventory is nearly full)`);
+                } else {
+                    lines.push(`empty_inventory_slots: ${v}`);
+                }
             } else {
                 lines.push(`${k}: ${typeof v === 'object' ? JSON.stringify(v) : v}`);
             }
@@ -887,11 +900,19 @@ Use only c; no other globals.`;
         // ADAM-style: record inventory delta for needs/produces learning
         if (ok) this.npGraph.recordDelta(r.name, before.inventory, after.inventory);
         this._attribute(r.name, task, ok, over);   // fix10: per-call trace -> contract results -> blame -> targeted repair
-        console.log(`[voyager] replay ${r.name}: ${ok ? 'PASSED' : 'failed'}${goal ? ` (+${gainedFor(goal, before, after)} ${goal.items.join('/')})` : ''}`);
+
+        // fix37 (D): detect and log inventory-full as a fact for learning
+        const invFullFact = !ok ? this._detectInventoryFullFailure(task, before, after, String(res.message || '')) : null;
+        const gained = goal ? gainedFor(goal, before, after) : 0;
+
+        console.log(`[voyager] replay ${r.name}: ${ok ? 'PASSED' : 'failed'}${goal ? ` (+${gained} ${goal.items.join('/')})` : ''}`);
         if (r.free) console.log(`[voyager] storage replay ${r.name} output: ${String(res.message || '(none)').split(/\n|\|/).filter(l => /\[(toss|chest)\]/.test(l)).join(' | ').slice(-800)}; inv now ${JSON.stringify(after.inventory)}`);
-        if (!ok) console.log(`[voyager] replay ${r.name} inv: ${this.agent.bot.inventory.emptySlotCount()} empty slots; ${JSON.stringify(after.inventory)}`);
+        if (!ok) {
+            console.log(`[voyager] replay ${r.name} inv: ${this.agent.bot.inventory.emptySlotCount()} empty slots; ${JSON.stringify(after.inventory)}`);
+            if (invFullFact) console.log(`[voyager] replay ${r.name} INVENTORY FULL DETECTED: ${invFullFact}`);
+        }
         if (!ok) console.log(`[voyager] replay ${r.name} output: ${String(res.message || '(none)').slice(-600).replace(/\n+/g, ' | ')}`);
-        return { ok, name: r.name, output: String(res.message || ''), cut };
+        return { ok, name: r.name, output: String(res.message || ''), cut, invFullFact };
     }
     // library source with optional per-name code overrides (candidates under test)
     _libSrc(over = {}) { return this.skills.map(s => over[s.name] ?? s.code).join('\n\n'); }
@@ -912,6 +933,63 @@ Use only c; no other globals.`;
         try { return this._compileContract(e.contract.post)({ args: r.argv || [], ret: r.rv, pre: r.s0, post: r.s1, delta: r.delta || {}, dist: (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z) }) === true; }
         catch (err) { this._queueContractFix(e, `post threw: ${err.message}`); return false; }
     }
+
+    // fix37 (B): check if a goal is already satisfied BEFORE running any task, using learned postconditions/contracts
+    // Returns { satisfied: boolean, reason: string, noLearnedCheck?: boolean }
+    // Uses learned skill contracts (postconditions) and learned effects - no hard-coded special cases
+    _goalAlreadySatisfied(task, state) {
+        const goal = countGoal(task) || smeltGoal(task);
+        if (!goal) return { satisfied: false, reason: 'goal not parseable as count/smelt', noLearnedCheck: true };
+
+        const inv = state.inventory || {};
+        const have = goal.items ? goal.items.reduce((a, it) => a + (inv[it] || 0), 0) : (inv[goal.item] || 0);
+
+        // 1) Check inventory against learned skill contracts that produce the goal item
+        // Find skills whose learned effects include the goal item and have a postcondition
+        const producers = this.skills.filter(s => !s.demoted && !s.mergedInto && !s.candidate
+            && (s.effects || []).some(eff => goal.items?.includes(eff) || eff === goal.item)
+            && s.contract?.post);
+
+        for (const skill of producers) {
+            try {
+                // Build a synthetic contract context as if the skill just ran and produced the current state
+                const c = {
+                    args: [goal.item, goal.count],
+                    ret: true,
+                    pre: { inventory: {} },
+                    post: { inventory: inv, pos: state.pos || {}, alive: true, sky: true },
+                    delta: { [goal.item]: have },
+                    dist: (a, b) => Math.hypot((a?.x || 0) - (b?.x || 0), (a?.y || 0) - (b?.y || 0), (a?.z || 0) - (b?.z || 0))
+                };
+                const postOk = this._compileContract(skill.contract.post)(c);
+                if (postOk && have >= goal.count) {
+                    return { satisfied: true, reason: `learned postcondition of ${skill.name} holds (have ${have}/${goal.count} ${goal.item})` };
+                }
+            } catch (err) {
+                console.log(`[fix37] postcondition check for ${skill.name} threw: ${err.message}`);
+            }
+        }
+
+        // 2) Check learned effects: if a skill's learned effects include the item and we already have enough
+        // This is the "learned facts" approach: the skill library knows what produces what
+        const effectProducers = this.skills.filter(s => !s.demoted && !s.mergedInto && !s.candidate
+            && (s.effects || []).some(eff => goal.items?.includes(eff) || eff === goal.item));
+
+        if (effectProducers.length > 0 && have >= goal.count) {
+            const skillNames = effectProducers.slice(0, 3).map(s => s.name).join(', ');
+            return { satisfied: true, reason: `already have ${have}/${goal.count} ${goal.item} (learned producers: ${skillNames})` };
+        }
+
+        // 3) If we have the items but no learned producer skill, we can't verify satisfaction the learned way
+        // This is the "fail loud" case - we don't silently assume success without learned evidence
+        if (have >= goal.count) {
+            return { satisfied: false, reason: `have ${have}/${goal.count} ${goal.item} but no learned skill produces it`, noLearnedCheck: true };
+        }
+
+        // 4) Not satisfied: don't have enough items
+        return { satisfied: false, reason: `need ${goal.count} ${goal.item}, have ${have}` };
+    }
+
     // fix32 (PSN backward chaining): a goal item is produced by a learned skill whose learned effects contain it; the skill is
     // chosen by Boltzmann sampling over V (T = 0.3); every item that skill consumes and the bot lacks is chained the same way
     // (depth <= 3). The plan runs as replays, children first; no model call.
@@ -1514,13 +1592,59 @@ current_health: ${Math.round(bot.health)}/20\ncurrent_food: ${bot.food}/20 (20/2
 
     // ---------- critic ----------
     async critique(task, before, after, output, label) {
+        // fix37 (D): detect inventory-full as a cause of failure (stated as fact, not rule)
+        const invFullFact = this._detectInventoryFullFailure(task, before, after, output);
+
         const system = `You are an assistant that checks whether a Minecraft bot completed its task, using its state before and after and the code output.
 Be strict: success only if the evidence (inventory/position/output) shows the task is done.
 Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false, "critique": "how to fix it if failed (1-2 sentences), else empty"}`;
-        const user = `task: ${task}\n${recipeFacts(task)}\n--- before ---\n${this._stateText(before)}\n--- after ---\n${this._stateText(after)}\n--- code output ---\n${output}`;
+        const user = `task: ${task}\n${recipeFacts(task)}\n--- before ---\n${this._stateText(before)}\n--- after ---\n${this._stateText(after)}\n--- code output ---\n${output}${invFullFact ? `\n--- observed fact ---\n${invFullFact}` : ''}`;
         const v = parseLocalJSON(await this._askLocal(system, user), ['reasoning', 'success', 'critique']);
-        try { appendFileSync(`./bots/${this.agent.name}/critic_cases.jsonl`, JSON.stringify({ at: new Date().toISOString(), task, system, user, verdict: v, label: label ?? null }) + '\n'); } catch (e) { console.log('[critic] case log failed: ' + e.message); }   // fix32: eval set for critic-model trials
+
+        // fix37 (D): if inventory full was detected as a cause, ensure it's in the critique for contract/decompose learning
+        if (invFullFact && !v.success && v.critique && !v.critique.toLowerCase().includes('inventory')) {
+            v.critique = `${invFullFact}. ${v.critique}`;
+        }
+
+        try { appendFileSync(`./bots/${this.agent.name}/critic_cases.jsonl`, JSON.stringify({ at: new Date().toISOString(), task, system, user, verdict: v, label: label ?? null, invFullFact }) + '\n'); } catch (e) { console.log('[critic] case log failed: ' + e.message); }   // fix32: eval set for critic-model trials
         return v;
+    }
+
+    // fix37 (D): detect if inventory-full caused a gather/craft/pickup failure
+    // Returns a fact string if detected, null otherwise. No rules, just observable facts.
+    _detectInventoryFullFailure(task, before, after, output) {
+        const goal = countGoal(task) || smeltGoal(task);
+        if (!goal) return null;
+
+        const emptyBefore = before.empty_inventory_slots ?? 36;
+        const emptyAfter = after.empty_inventory_slots ?? 36;
+        const invBefore = before.inventory || {};
+        const invAfter = after.inventory || {};
+
+        // Calculate how many items were gained
+        const gained = goal.items
+            ? goal.items.reduce((a, it) => a + (invAfter[it] || 0) - (invBefore[it] || 0), 0)
+            : (invAfter[goal.item] || 0) - (invBefore[goal.item] || 0);
+
+        // Detect inventory-full failure: gained +0 (or very few) with 0-2 empty slots
+        if (gained < goal.count && emptyAfter <= 2) {
+            const totalItems = Object.values(invAfter).reduce((a, b) => a + b, 0);
+            const topItems = Object.entries(invAfter).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([k, v]) => `${k}: ${v}`).join(', ');
+
+            if (emptyAfter === 0) {
+                return `Inventory is full (0 empty slots, ${totalItems} total items). Gained +${gained} ${goal.item} (needed ${goal.count}). Largest stacks: ${topItems}`;
+            } else {
+                return `Inventory nearly full (${emptyAfter} empty slots, ${totalItems} total items). Gained +${gained} ${goal.item} (needed ${goal.count}). Largest stacks: ${topItems}`;
+            }
+        }
+
+        // Also detect if output mentions inventory full
+        if (/inventory.*full|no.*space|cannot.*pick/i.test(output) && emptyAfter <= 3) {
+            const totalItems = Object.values(invAfter).reduce((a, b) => a + b, 0);
+            return `Code output indicates inventory space issue (${emptyAfter} empty slots, ${totalItems} total items)`;
+        }
+
+        return null;
     }
 
     // fix12: is there a hut at HOME? roof over the centre plus walls on both sides, at any floor level within HOME.y±4 (unloaded chunk = not built)
@@ -1769,6 +1893,82 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         return true;
     }
 
+    // fix37 (C): improved extraction of function bodies from joint repair replies
+    // Handles multiple formatting patterns the model might use: comments before/after, export keyword, whitespace variations
+    _extractJointFunctions(code, childName, parentName) {
+        const fns = {};
+        if (!code) return fns;
+
+        // Try multiple regex patterns to find the function definitions
+        const patterns = [
+            // Pattern 1: Standard async function with optional leading comments
+            /(?:^|\n)((?:\s*\/\/[^\n]*\n)*)(\s*async\s+function\s+([A-Za-z_]\w*)\s*\([^)]*\)\s*\{)/g,
+            // Pattern 2: Export async function
+            /(?:^|\n)((?:\s*\/\/[^\n]*\n)*)(\s*export\s+async\s+function\s+([A-Za-z_]\w*)\s*\([^)]*\)\s*\{)/g,
+            // Pattern 3: Async function without leading newline (start of code block)
+            /^((?:\s*\/\/[^\n]*\n)*)(\s*async\s+function\s+([A-Za-z_]\w*)\s*\([^)]*\)\s*\{)/g,
+        ];
+
+        const matches = [];
+        for (const pattern of patterns) {
+            let m;
+            while ((m = pattern.exec(code)) !== null) {
+                const name = m[3];
+                const fullMatchStart = m.index;
+                // Skip the leading newline if present
+                const funcStart = code.indexOf(m[2], fullMatchStart);
+                if (!matches.some(x => x.name === name)) {
+                    matches.push({ name, start: funcStart, comments: m[1] || '' });
+                }
+            }
+        }
+
+        // Sort by position and extract function bodies
+        matches.sort((a, b) => a.start - b.start);
+        for (let i = 0; i < matches.length; i++) {
+            const { name, start, comments } = matches[i];
+            const end = i + 1 < matches.length ? matches[i + 1].start : code.length;
+            // Extract the full function including any leading comments
+            let funcCode = code.slice(start, end).trim();
+            // If comments were before, prepend them
+            if (comments.trim()) {
+                funcCode = comments.trim() + '\n' + funcCode;
+            }
+            fns[name] = funcCode;
+        }
+
+        // Fallback: if we didn't find one of the expected functions, try a simpler approach
+        // Look for the function name directly followed by opening paren
+        for (const expected of [childName, parentName]) {
+            if (fns[expected]) continue;
+
+            const simpleRe = new RegExp(`async\\s+function\\s+${expected}\\s*\\([^)]*\\)\\s*\\{`, 'g');
+            const match = simpleRe.exec(code);
+            if (match) {
+                const start = match.index;
+                // Find the end by brace matching
+                let braceCount = 0, inStr = false, strChar = null, end = start;
+                for (let j = start; j < code.length; j++) {
+                    const ch = code[j];
+                    if (inStr) { if (ch === strChar && code[j - 1] !== '\\') inStr = false; }
+                    else if (ch === '"' || ch === "'" || ch === '`') { inStr = true; strChar = ch; }
+                    else if (ch === '{') braceCount++;
+                    else if (ch === '}') { braceCount--; if (braceCount === 0) { end = j + 1; break; } }
+                }
+                // Look for leading comments
+                let commentStart = start;
+                const lines = code.slice(0, start).split('\n');
+                for (let k = lines.length - 1; k >= 0; k--) {
+                    if (/^\s*\/\//.test(lines[k])) commentStart -= lines[k].length + 1;
+                    else break;
+                }
+                fns[expected] = code.slice(Math.max(0, commentStart), end).trim();
+            }
+        }
+
+        return fns;
+    }
+
     // fix32 (PSN joint repair): parent and child rewritten in ONE code-model call; both go through the gate as candidates
     // tagged with one id, so a rejection of either rolls both back (same mechanism as refactors)
     async _repairJoint(q, e) {
@@ -1784,14 +1984,36 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         if (!okPar) return single('caller frozen by the maturity gate', e, 'callee_fix');
         if (!okKid) return single('child frozen by the maturity gate', pe, 'caller_fix');
         this._repairs[e.name] = this._repairs[pe.name] = Date.now(); this._saveProgress();
-        const system = `You repair TWO skills of a Minecraft mineflayer skill library together (PSN joint repair): a child skill and the caller that uses it failed on the same path. Return ONE \`\`\`javascript block with exactly two functions, ${e.name} first then ${pe.name}, each with the SAME name and a compatible signature and preceded by // DESCRIPTION: <one sentence>. Fix the child's own logic and how/when the caller uses it. No top-level call.`;
+        // fix37 (C): improved prompt with clearer format instructions
+        const system = `You repair TWO skills of a Minecraft mineflayer skill library together (PSN joint repair): a child skill and the caller that uses it failed on the same path.
+
+REQUIRED FORMAT: Return ONE \`\`\`javascript code block containing EXACTLY two async function definitions:
+1. First: async function ${e.name}(bot) { ... }
+2. Second: async function ${pe.name}(bot) { ... }
+
+Each function must:
+- Keep the SAME name (${e.name} and ${pe.name} respectively)
+- Have a compatible signature
+- Be preceded by // DESCRIPTION: <one sentence>
+
+Fix the child's own logic and how/when the caller uses it. No top-level call, no extra functions.`;
         const user = `Task that failed: ${q.task}\nEvidence: ${q.evidence}\n--- execution trace ---\n${String(q.trace || '').slice(-2500)}\n--- child ${e.name} ---\n${e.code}\n--- caller ${pe.name} ---\n${pe.code}\nWrite both fixed functions:`;
         console.log(`[psn] REPAIR JOINT ${e.name} + ${pe.name} with the code model (evidence: ${String(q.evidence).slice(0, 160)})`);
         let reply; try { reply = await this._ask(system, user); } catch (err) { console.log(`[psn] joint repair FAILED: ${err.message}`); return false; }
-        const code = extractCode(reply) || '', fns = {}, re = /(?:^|\n)(?:\/\/[^\n]*\n)*async\s+function\s+([A-Za-z_]\w*)\s*\(/g; let mm, idx = [];
-        while ((mm = re.exec(code))) idx.push([mm[1], mm.index]);
-        for (let i = 0; i < idx.length; i++) fns[idx[i][0]] = code.slice(idx[i][1], i + 1 < idx.length ? idx[i + 1][1] : code.length).trim();
-        if (!fns[e.name] || !fns[pe.name]) { console.log(`[psn] joint repair FAILED: reply did not define both ${e.name} and ${pe.name}`); this._noteProposal(e, { task: q.task, kind: 'joint', evidence: String(q.evidence).slice(0, 200), desc: 'joint reply incomplete', outcome: 'failed' }); return false; }
+
+        // fix37 (C): improved extraction with better logging on failure
+        const code = extractCode(reply) || '';
+        const fns = this._extractJointFunctions(code, e.name, pe.name);
+
+        if (!fns[e.name] || !fns[pe.name]) {
+            // Log the raw reply (truncated) so we can see what came back
+            const rawSnippet = String(reply).length > 1500 ? String(reply).slice(0, 1500) + '\n...[truncated]' : String(reply);
+            console.log(`[psn] joint repair FAILED: reply did not define both ${e.name} and ${pe.name}`);
+            console.log(`[psn] extracted functions: [${Object.keys(fns).join(', ')}], expected: [${e.name}, ${pe.name}]`);
+            console.log(`[psn] raw model reply (for debugging):\n${rawSnippet}`);
+            this._noteProposal(e, { task: q.task, kind: 'joint', evidence: String(q.evidence).slice(0, 200), desc: `joint reply incomplete (got [${Object.keys(fns).join(', ')}], needed [${e.name}, ${pe.name}])`, outcome: 'failed' });
+            return false;
+        }
         const strip = c => c.replace(/^\s*\/\/[^\n]*\n/gm, '').trim(), desc = (c, d) => ((c.match(/\/\/\s*DESCRIPTION:\s*(.+)/) || [])[1] || d).trim();
         const staged = await this.agent.coder._stageCode(this._libSrc({ [e.name]: strip(fns[e.name]), [pe.name]: strip(fns[pe.name]) }) + '\n\nawait Promise.resolve();');
         const lint = staged ? await this.agent.coder._lintCode(staged.src_lint_copy) : 'staging failed';
@@ -2045,6 +2267,21 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         this.currentTask = task;
         this._prefetchPlan(task, before);   // fix28 (C): the next proposal is planned while this task runs
         VERSION = this.agent.bot.version;
+
+        // fix37 (B): check if the goal is ALREADY SATISFIED before running anything (learned postcondition check)
+        const alreadySatisfied = this._goalAlreadySatisfied(task, before);
+        if (alreadySatisfied.satisfied) {
+            console.log(`[voyager] goal already satisfied: ${task} (${alreadySatisfied.reason})`);
+            this.progress.completed.push(task);
+            this.progress.failed = this.progress.failed.filter(t => t !== task);
+            this._saveProgress();
+            this.agent.openChat?.(`Done: ${task} (already satisfied: ${alreadySatisfied.reason}).`);
+            this._afterSuccess();
+            return;
+        } else if (alreadySatisfied.noLearnedCheck) {
+            console.log(`[voyager] WARN: no learned way to check if goal "${task}" is already satisfied (${alreadySatisfied.reason}); proceeding with execution`);
+        }
+
         const route = this._findReplay(task) || await this._embedReplay(task);   // fix28 (D): replay a matching learned skill before any code-model call
         let rp = route ? await this._replay(task, before, route) : null;
         if (route?.embed) this._learnReplayThreshold(rp);
@@ -2078,7 +2315,8 @@ Interrupts: the bot may be interrupted at any time (danger, getting stuck, a pla
         const learnedSrc = this.skills.map(s => s.code).join('\n\n');
         const ctx = related.slice(0, 3).map(s => `// ${s.description}\n${s.code}`).join('\n\n');   // fix32: full code for the top 3; the rest are signatures in the catalogue
 
-        let feedback = rp?.cut ? `Replay of ${rp.name} failed: ${rp.cut}\nExecution output:\n${String(rp.output).slice(-800)}` : '';
+        // fix37 (D): include inventory-full fact from replay failure in feedback for code gen
+        let feedback = rp?.cut ? `Replay of ${rp.name} failed: ${rp.cut}\nExecution output:\n${String(rp.output).slice(-800)}${rp.invFullFact ? `\nInventory fact: ${rp.invFullFact}` : ''}` : '';
         let lastCode = '', anyCut = rp?.cut || '', prevCrit = null;
         // fix37: duplicate-reply detection state
         let prevReplyHash = null, consecutiveDupes = 0;
@@ -2172,18 +2410,28 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
                 this._afterSuccess();
                 return;
             }
-            feedback = `${cut ? `Attempt ${cut}\n` : ''}Execution output:\n${output}\nCritic: ${verdict.critique}\nChat/behaviour log: ${this.agent.bot.modes.flushBehaviorLog().slice(-400)}`;
+            // fix37 (D): detect inventory-full when code gen fails
+            const invFullFact = !verdict.success ? this._detectInventoryFullFailure(task, before, after, output) : null;
+            if (invFullFact) console.log(`[voyager] attempt ${i} INVENTORY FULL DETECTED: ${invFullFact}`);
+
+            feedback = `${cut ? `Attempt ${cut}\n` : ''}Execution output:\n${output}\nCritic: ${verdict.critique}${invFullFact ? `\nInventory fact: ${invFullFact}` : ''}\nChat/behaviour log: ${this.agent.bot.modes.flushBehaviorLog().slice(-400)}`;
             lastCode = code;
             if (lastTry) { if (i < MAX_ATTEMPTS) console.log(`[voyager] stopping after attempt ${i}: ${same ? 'critique unchanged from the previous attempt' : `${cut} (travel/death cut-off)`}`); break; }
         }
         this.progress.failed.push(task);
         this._saveProgress(); this._windowCheck(false);
         console.log(`[voyager] task failed after ${MAX_ATTEMPTS} attempts: ${task}`);
+
         // SkillWeaver-style: record gap for idle practice
         this.idlePractice.recordGap(task, anyCut || `failed ${MAX_ATTEMPTS}x`);
+
+        // fix37 (D): include inventory-full in decomposition reason if relevant
+        const finalInvFull = this._detectInventoryFullFailure(task, before, this.observe(), '');
+        const invFullReason = finalInvFull ? ` Inventory state: ${finalInvFull}` : '';
+
         // fix19 (1): failed twice (recently) or cut off -> decompose
         const fails = this.progress.failed.slice(-20).filter(t => t === task).length;
-        if (fails >= 2 || anyCut || this._decomposeQueue?.task === task) { if (this._decomposeQueue?.task === task) this._decomposeQueue = null; await this._decompose(task, anyCut || `failed ${fails}x; last critic: ${String(feedback).slice(-300)}`); }
+        if (fails >= 2 || anyCut || this._decomposeQueue?.task === task) { if (this._decomposeQueue?.task === task) this._decomposeQueue = null; await this._decompose(task, anyCut || `failed ${fails}x; last critic: ${String(feedback).slice(-300)}${invFullReason}`); }
         else if (this._curSub?.parent) console.log(`[psn] subgoal "${task}" failed; moving on`);
     }
 }
