@@ -2,6 +2,40 @@ import pf from 'mineflayer-pathfinder';
 import * as mc from '../../utils/mcdata.js';
 
 
+// fix42: getAllFreeSpaces returns all valid positions (for retry logic when placeBlock fails at one cell)
+export function getAllFreeSpaces(bot, size=1, distance=8, maxCount=10) {
+    /**
+     * Get all empty spaces with solid blocks beneath them of the given size, sorted by distance.
+     * @param {Bot} bot - The bot to get the free spaces for.
+     * @param {number} size - The (size x size) of the space to find, default 1.
+     * @param {number} distance - The maximum distance to search, default 8.
+     * @param {number} maxCount - Maximum number of positions to return, default 10.
+     * @returns {Vec3[]} - Array of positions, closest first.
+     **/
+    let empty_pos = bot.findBlocks({
+        matching: (block) => block && block.name === 'air',
+        maxDistance: distance,
+        count: 1000
+    });
+    const results = [];
+    for (let i = 0; i < empty_pos.length && results.length < maxCount; i++) {
+        let empty = true;
+        for (let x = 0; x < size; x++) {
+            for (let z = 0; z < size; z++) {
+                let top = bot.blockAt(empty_pos[i].offset(x, 0, z));
+                let bottom = bot.blockAt(empty_pos[i].offset(x, -1, z));
+                if (!top || top.name !== 'air' || !bottom || bottom.drops.length === 0 || !bottom.diggable) {
+                    empty = false;
+                    break;
+                }
+            }
+            if (!empty) break;
+        }
+        if (empty) results.push(empty_pos[i]);
+    }
+    return results;
+}
+
 export function getNearestFreeSpace(bot, size=1, distance=8) {
     /**
      * Get the nearest empty space with solid blocks beneath it of the given size.
@@ -12,30 +46,8 @@ export function getNearestFreeSpace(bot, size=1, distance=8) {
      * @example
      * let position = world.getNearestFreeSpace(bot, 1, 8);
      **/
-    let empty_pos = bot.findBlocks({
-        matching: (block) => {
-            return block && block.name == 'air';
-        },
-        maxDistance: distance,
-        count: 1000
-    });
-    for (let i = 0; i < empty_pos.length; i++) {
-        let empty = true;
-        for (let x = 0; x < size; x++) {
-            for (let z = 0; z < size; z++) {
-                let top = bot.blockAt(empty_pos[i].offset(x, 0, z));
-                let bottom = bot.blockAt(empty_pos[i].offset(x, -1, z));
-                if (!top || !top.name == 'air' || !bottom || bottom.drops.length == 0 || !bottom.diggable) {
-                    empty = false;
-                    break;
-                }
-            }
-            if (!empty) break;
-        }
-        if (empty) {
-            return empty_pos[i];
-        }
-    }
+    const spaces = getAllFreeSpaces(bot, size, distance, 1);
+    return spaces.length ? spaces[0] : undefined;
 }
 
 

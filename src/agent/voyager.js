@@ -555,6 +555,8 @@ Use only c; no other globals.`;
     // fix19 (6): did the bot die during the current run? (agent.lastDeath set by the death message handler)
     // fix27: an action with no position/inventory change for 60s is stopped and traced as a failure (no waiting out the 5-min timeout)
     async _run(label, fn, timeout) {
+        // fix42: populate bot.__safeToToss before any skill run (for tossClutter/freeInventory)
+        this._prepareTossSignals();
         // fix28: progress = position, inventory, health, food, open-window contents (crafting/furnace UI) or a lit furnace/smoker nearby (smelting wait)
         const bot = this.agent.bot;
         const lit = () => !!bot.findBlock({ matching: b => /furnace|smoker/.test(b.name) && b.getProperties?.().lit === true, maxDistance: 6 });
@@ -1386,9 +1388,12 @@ Use only c; no other globals.`;
         console.log(`[idle-practice] stopping (code-model call completed)`);
     }
     // fix37: select a learned skill to practice - skills must be from the library (not hard-coded)
+    // fix42: skip skills whose postcondition is already met OR would consume scarce inputs needed elsewhere
     // Uses maturity and recency to pick skills that benefit from practice
     _selectPracticeSkill() {
         // filter to learned, non-demoted, non-primitive skills that are safe to run as practice
+        const inv = this.observe().inventory || {};
+        const pending = this._getPendingGoalItems();  // fix42: items needed by pending/failed tasks
         const candidates = this.skills.filter(s =>
             !s.primitive && !s.handwritten && !s.demoted && !s.mergedInto && !s.candidate &&
             s.code && s.name && s.stats &&
@@ -1396,9 +1401,19 @@ Use only c; no other globals.`;
             /async\s+function\s+\w+\s*\(\s*bot\s*(?:,\s*\w+\s*=\s*[^,)]+)*\)/.test(s.code)
         );
         if (!candidates.length) return null;
+        // fix42: filter out skills that shouldn't be practiced right now (postcondition met or scarce inputs)
+        const filtered = candidates.filter(s => {
+            const skip = this._shouldSkipPractice(s, inv, pending);
+            if (skip) console.log(`[idle-practice] filtering out ${s.name}: ${skip}`);
+            return !skip;
+        });
+        if (!filtered.length) {
+            console.log(`[idle-practice] all ${candidates.length} candidate(s) filtered out by postcondition/scarce-input checks`);
+            return null;
+        }
         // score by: low maturity + long since last run (skills needing practice)
         const now = Date.now();
-        const scored = candidates.map(s => {
+        const scored = filtered.map(s => {
             const m = this._maturity(s);
             const lastRun = s.stats?.lastRun || 0;
             const sinceRun = now - lastRun;
@@ -1409,6 +1424,118 @@ Use only c; no other globals.`;
         // pick from top candidates with some randomization
         const top = scored.slice(0, Math.min(5, scored.length));
         return top[Math.floor(Math.random() * top.length)]?.s || null;
+    }
+    // fix42: get items needed by pending/failed tasks (from learned needs/produces, not hard-coded)
+    _getPendingGoalItems() {
+        const items = new Set();
+        // extract items from failed and pending tasks
+        for (const task of [...(this.progress.failed || []).slice(-10), ...(this.progress.pending || []).slice(-5)]) {
+            const goal = countGoal(task) || smeltGoal(task);
+            if (goal?.item) items.add(goal.item);
+            if (goal?.items) goal.items.forEach(it => items.add(it));
+        }
+        // add items that are inputs (consumes) to known producers of the pending items
+        for (const item of [...items]) {
+            const producers = this._producers(item);
+            for (const { s } of producers) {
+                for (const need of Object.keys(s.consumes || {})) items.add(need);
+            }
+        }
+        return items;
+    }
+    // fix42: check if a practice skill should be skipped (postcondition already met or would consume scarce inputs)
+    // Returns a skip reason string, or null if practice is allowed
+    _shouldSkipPractice(skill, inv, pendingItems) {
+        // 1) Check if postcondition is already satisfied (learned path: check effects + inventory)
+        const effects = skill.effects || [];
+        if (effects.length > 0) {
+            const produced = effects.filter(eff => (inv[eff] || 0) > 0);
+            // if all effects are already in inventory, postcondition is likely met
+            if (produced.length === effects.length) {
+                return `postcondition already met (has all of: ${effects.join(', ')})`;
+            }
+        }
+        // 2) Check if skill would consume scarce inputs needed by pending goals
+        const consumes = Object.keys(skill.consumes || {});
+        if (consumes.length > 0) {
+            for (const item of consumes) {
+                const have = inv[item] || 0;
+                const need = skill.consumes[item] || 0;
+                // if pending items include this consumable and we don't have much
+                if (pendingItems.has(item) && have < need * 3) {
+                    return `would consume scarce ${item} (have ${have}, need ${need}, pending goal needs it)`;
+                }
+            }
+        }
+        return null;
+    }
+    // fix42: compute safe-to-toss and deposit-candidate items based on LEARNED signals only (no hard-coded junk list)
+    // Items are safe to toss if:
+    // 1. NOT consumed by any known skill (not in any skill's consumes)
+    // 2. NOT needed as input to produce pending goal items
+    // 3. In surplus (have more than needed for any known recipe)
+    // Returns { toss: [item names], deposit: [item names for large stacks better deposited] }
+    _computeTossAndDepositLists() {
+        const inv = this.observe().inventory || {};
+        const pendingItems = this._getPendingGoalItems();
+        
+        // Collect all items that are consumed by any skill
+        const consumedBySkills = new Set();
+        for (const s of this.skills) {
+            if (s.demoted || s.mergedInto) continue;
+            for (const item of Object.keys(s.consumes || {})) {
+                consumedBySkills.add(item);
+            }
+        }
+        
+        // Essential tools/armor - always keep (minimal list, learned path should handle most)
+        const essential = /pickaxe|axe|sword|shovel|hoe|helmet|chestplate|leggings|boots|shield|bow|crossbow|trident|elytra|crafting_table|furnace/;
+        
+        const tossItems = [];
+        const depositItems = [];
+        
+        for (const [item, count] of Object.entries(inv)) {
+            if (count <= 0) continue;
+            if (essential.test(item)) continue;  // never toss/deposit essential gear
+            
+            // Skip if this is needed for pending goals
+            if (pendingItems.has(item)) continue;
+            
+            // Items consumed by skills are deposit candidates (not toss) - valuable for future crafting
+            if (consumedBySkills.has(item)) {
+                // Large stacks (>32) are better deposited than kept
+                if (count > 32) {
+                    depositItems.push({ item, count, score: count });
+                }
+                continue;
+            }
+            
+            // Items not consumed by any skill are safe to toss
+            tossItems.push({ item, count, score: count });
+            
+            // Large stacks of anything are also deposit candidates (backup if toss fails)
+            if (count > 32) {
+                depositItems.push({ item, count, score: count });
+            }
+        }
+        
+        // Sort by score (highest surplus first)
+        tossItems.sort((a, b) => b.score - a.score);
+        depositItems.sort((a, b) => b.score - a.score);
+        
+        console.log(`[toss] computed ${tossItems.length} safe-to-toss item(s) from learned signals: ${tossItems.slice(0, 5).map(x => `${x.item}(${x.count})`).join(', ')}${tossItems.length > 5 ? '...' : ''}`);
+        console.log(`[toss] computed ${depositItems.length} deposit candidate(s): ${depositItems.slice(0, 5).map(x => `${x.item}(${x.count})`).join(', ')}${depositItems.length > 5 ? '...' : ''}`);
+        
+        return {
+            toss: tossItems.map(x => x.item),
+            deposit: depositItems.map(x => x.item)
+        };
+    }
+    // fix42: populate bot.__safeToToss and bot.__depositCandidates before running tossClutter/freeInventory
+    _prepareTossSignals() {
+        const lists = this._computeTossAndDepositLists();
+        this.agent.bot.__safeToToss = lists.toss;
+        this.agent.bot.__depositCandidates = lists.deposit;
     }
     // fix37: run a practice skill safely - returns { message } on success, false on context-fail, null on abort
     // Fail-loud: all skips and failures are logged clearly
@@ -2666,6 +2793,7 @@ Voyager.SEEDED_PRIMITIVES = [
         name: 'craftRecipe',
         description: 'Craft an item using the crafting recipe. Places and retrieves crafting table if needed.',
         task: 'craft an item',
+        // fix42: retry placing crafting_table at multiple cells (no same-cell reuse on failure)
         code: `async function craftRecipe(bot, itemName, num = 1) {
     if (!itemName) { log(bot, 'craftRecipe: no item specified'); return false; }
     let recipes = bot.recipesFor(bot.registry.itemsByName[itemName]?.id, null, 1, null);
@@ -2677,10 +2805,16 @@ Voyager.SEEDED_PRIMITIVES = [
         if (!craftingTable) {
             const hasTable = (getInventoryCounts(bot)['crafting_table'] || 0) > 0;
             if (hasTable) {
-                const pos = getNearestFreeSpace(bot, 1, 6);
-                await placeBlock(bot, 'crafting_table', pos.x, pos.y, pos.z);
+                const freeSpaces = getAllFreeSpaces(bot, 1, 6, 5);
+                if (!freeSpaces.length) { log(bot, \`FAILED: no free space within 6 blocks to place crafting_table\`); return false; }
+                for (const pos of freeSpaces) {
+                    const ok = await placeBlock(bot, 'crafting_table', pos.x, pos.y, pos.z);
+                    await sleep(150);
+                    const check = bot.blockAt(pos.floored ? pos.floored() : pos);
+                    if (ok && check && check.name === 'crafting_table') { placedTable = true; break; }
+                }
+                if (!placedTable) { log(bot, \`FAILED: could not place crafting_table at any of \${freeSpaces.length} free space(s)\`); return false; }
                 craftingTable = getNearestBlock(bot, 'crafting_table', 16);
-                placedTable = true;
             } else { log(bot, \`Crafting \${itemName} requires a crafting table.\`); return false; }
         }
         if (craftingTable) recipes = bot.recipesFor(bot.registry.itemsByName[itemName]?.id, null, 1, craftingTable);
@@ -2729,6 +2863,7 @@ Voyager.SEEDED_PRIMITIVES = [
         name: 'placeBlock',
         description: 'Place a block at the given position. Finds an adjacent block to build off and handles common block types.',
         task: 'place a block',
+        // fix42: added direct state verification after bot.placeBlock (fail loud if block not placed)
         code: `async function placeBlock(bot, blockType, x, y, z, placeOn = 'bottom') {
     if (!blockType) { log(bot, 'placeBlock: no block type specified'); return false; }
     const target = new Vec3(Math.floor(x), Math.floor(y), Math.floor(z));
@@ -2754,8 +2889,11 @@ Voyager.SEEDED_PRIMITIVES = [
     if (bot.entity.position.distanceTo(target) > 4) await goToPosition(bot, target.x, target.y, target.z, 3);
     await bot.equip(block, 'hand');
     await bot.lookAt(buildOff.position.offset(0.5, 0.5, 0.5));
-    try { await bot.placeBlock(buildOff, faceVec); log(bot, \`Placed \${blockType} at \${target}.\`); return true; }
-    catch (err) { log(bot, \`Failed to place \${blockType}: \${err.message}\`); return false; }
+    try { await bot.placeBlock(buildOff, faceVec); await sleep(300);
+        const check = bot.blockAt(target);
+        if (check && check.name === blockType) { log(bot, \`Placed \${blockType} at \${target}.\`); return true; }
+        log(bot, \`FAILED: placeBlock returned but \${blockType} not at \${target} (found \${check?.name || 'null'})\`); return false;
+    } catch (err) { log(bot, \`FAILED to place \${blockType}: \${err.message}\`); return false; }
 }`,
         deps: ['breakBlockAt'],
     },
@@ -2851,5 +2989,67 @@ Voyager.SEEDED_PRIMITIVES = [
     return true;
 }`,
         deps: [],
+    },
+    {
+        // fix42: tossClutter uses LEARNED signals only - no hard-coded junk list
+        // Consults bot.__safeToToss (set by voyager before skill runs) for items safe to toss
+        // Fail loud if no learned signal says what is safe to toss
+        // fix42: actually tasks depositToChest when toss alone is insufficient (not just log)
+        name: 'tossClutter',
+        description: 'Toss surplus/low-value items to free inventory space using LEARNED signals (needs/produces, not hard-coded lists). If toss is insufficient, calls depositToChest. Fails loud if nothing is safe to toss/deposit.',
+        task: 'toss clutter to free inventory space',
+        code: `async function tossClutter(bot, minFree = 4) {
+    const start = bot.entity.position.clone();
+    let tossed = 0;
+    const safeList = bot.__safeToToss || [];
+    const depositList = bot.__depositCandidates || [];
+    
+    // Phase 1: toss safe items
+    if (safeList.length) {
+        const inv = getInventoryCounts(bot);
+        for (let i = 0; i < 40 && bot.inventory.emptySlotCount() < minFree; i++) {
+            if (bot.interrupt_code) break;
+            const pick = safeList.find(n => (inv[n] || 0) > 0);
+            if (!pick) break;
+            const it = bot.inventory.items().find(x => x.name === pick);
+            if (!it) { inv[pick] = 0; continue; }
+            if (bot.currentWindow) { bot.closeWindow(bot.currentWindow); await sleep(500); }
+            await bot.tossStack(it);
+            inv[pick] = Math.max(0, (inv[pick] || 0) - it.count);
+            tossed++;
+            console.log(\`[toss] tossed \${it.count} \${pick} (empty slots now \${bot.inventory.emptySlotCount()})\`);
+        }
+        if (tossed && !bot.interrupt_code) {
+            await moveAway(bot, 6);
+            console.log(\`[toss] moved away from \${tossed} dropped stack(s) to avoid re-pickup\`);
+        }
+    }
+    
+    // Phase 2: if still low on space, actually run depositToChest (not just log)
+    if (bot.inventory.emptySlotCount() < minFree && !bot.interrupt_code) {
+        if (depositList.length) {
+            console.log(\`[toss] still only \${bot.inventory.emptySlotCount()} empty after tossing \${tossed} stacks; depositing \${depositList.length} candidate(s) to chest\`);
+            let deposited = 0;
+            for (const itemName of depositList) {
+                if (bot.interrupt_code) break;
+                if (bot.inventory.emptySlotCount() >= minFree) break;
+                const ok = await depositToChest(bot, itemName);
+                if (ok) deposited++;
+            }
+            if (deposited) console.log(\`[toss] deposited \${deposited} item type(s) to chest (empty slots now \${bot.inventory.emptySlotCount()})\`);
+            if (bot.inventory.emptySlotCount() < minFree && !bot.interrupt_code) {
+                log(bot, \`FAILED tossClutter: still only \${bot.inventory.emptySlotCount()} empty after tossing \${tossed} + depositing \${deposited} items\`);
+            }
+        } else {
+            log(bot, \`FAILED tossClutter: only \${bot.inventory.emptySlotCount()} empty after tossing \${tossed} stacks; no deposit candidates (no chest nearby or nothing to deposit)\`);
+        }
+    }
+    
+    if (!safeList.length && !depositList.length) {
+        log(bot, 'FAILED tossClutter: no learned signal indicates what is safe to toss/deposit (needs/produces empty or all items are inputs to known skills)');
+    }
+    return bot.inventory.emptySlotCount();
+}`,
+        deps: ['moveAway', 'depositToChest'],
     },
 ];

@@ -61,11 +61,33 @@ export async function craftRecipe(bot, itemName, num=1) {
         craftingTable = world.getNearestBlock(bot, 'crafting_table', craftingTableRange);
         if (craftingTable === null){
 
-            // Try to place crafting table
+            // fix42: Try to place crafting table with retry on multiple cells (no same-cell reuse)
             let hasTable = world.getInventoryCounts(bot)['crafting_table'] > 0;
             if (hasTable) {
-                let pos = world.getNearestFreeSpace(bot, 1, 6);
-                await placeBlock(bot, 'crafting_table', pos.x, pos.y, pos.z);
+                const freeSpaces = world.getAllFreeSpaces(bot, 1, 6, 5);
+                if (!freeSpaces.length) {
+                    log(bot, `FAILED: no free space within 6 blocks to place crafting_table`);
+                    return false;
+                }
+                let placed = false;
+                const tried = [];
+                for (const pos of freeSpaces) {
+                    tried.push(`(${Math.floor(pos.x)},${Math.floor(pos.y)},${Math.floor(pos.z)})`);
+                    const ok = await placeBlock(bot, 'crafting_table', pos.x, pos.y, pos.z);
+                    // fix42: verify block state directly (fail loud if place returns true but block is not there)
+                    await new Promise(r => setTimeout(r, 150));
+                    const check = bot.blockAt(pos.floored ? pos.floored() : pos);
+                    if (ok && check && check.name === 'crafting_table') {
+                        placed = true;
+                        break;
+                    }
+                    if (!ok) console.log(`[craftRecipe] placeBlock failed at ${tried[tried.length - 1]}, trying next cell...`);
+                    else console.log(`[craftRecipe] placeBlock returned true at ${tried[tried.length - 1]} but block is ${check?.name || 'null'}, trying next cell...`);
+                }
+                if (!placed) {
+                    log(bot, `FAILED: could not place crafting_table at any of ${tried.length} free space(s) tried: ${tried.join(', ')}`);
+                    return false;
+                }
                 craftingTable = world.getNearestBlock(bot, 'crafting_table', craftingTableRange);
                 if (craftingTable) {
                     recipes = bot.recipesFor(mc.getItemId(itemName), null, 1, craftingTable);
@@ -173,13 +195,33 @@ export async function smeltItem(bot, itemName, num=1) {
     const furnaceRange = 16;
     furnaceBlock = world.getNearestBlock(bot, 'furnace', furnaceRange);
     if (!furnaceBlock){
-        // Try to place furnace
+        // fix42: Try to place furnace with retry on multiple cells (consistent with craftRecipe)
         let hasFurnace = world.getInventoryCounts(bot)['furnace'] > 0;
         if (hasFurnace) {
-            let pos = world.getNearestFreeSpace(bot, 1, furnaceRange);
-            await placeBlock(bot, 'furnace', pos.x, pos.y, pos.z);
+            const freeSpaces = world.getAllFreeSpaces(bot, 1, furnaceRange, 5);
+            if (!freeSpaces.length) {
+                log(bot, `FAILED: no free space within ${furnaceRange} blocks to place furnace`);
+                return false;
+            }
+            let placed = false;
+            const tried = [];
+            for (const pos of freeSpaces) {
+                tried.push(`(${Math.floor(pos.x)},${Math.floor(pos.y)},${Math.floor(pos.z)})`);
+                const ok = await placeBlock(bot, 'furnace', pos.x, pos.y, pos.z);
+                await new Promise(r => setTimeout(r, 150));
+                const check = bot.blockAt(pos.floored ? pos.floored() : pos);
+                if (ok && check && check.name === 'furnace') {
+                    placed = true;
+                    placedFurnace = true;
+                    break;
+                }
+                if (!ok) console.log(`[smeltItem] placeBlock failed at ${tried[tried.length - 1]}, trying next cell...`);
+            }
+            if (!placed) {
+                log(bot, `FAILED: could not place furnace at any of ${tried.length} free space(s) tried: ${tried.join(', ')}`);
+                return false;
+            }
             furnaceBlock = world.getNearestBlock(bot, 'furnace', furnaceRange);
-            placedFurnace = true;
         }
     }
     if (!furnaceBlock){
@@ -427,21 +469,56 @@ export async function defendSelf(bot, range=9) {
 
 
 
-const _JUNK = ['dirt','cobblestone','cobbled_deepslate','granite','diorite','andesite','tuff','gravel','netherrack','sand','calcite','rotten_flesh','poisonous_potato','flint','deepslate'];
+// fix42: _freeInventory uses LEARNED signals only (bot.__safeToToss set by voyager)
+// NO hard-coded junk list - what's safe to toss is determined by needs/produces
+// fix42: actually tasks depositToChest when toss alone is insufficient (not just log)
 async function _freeInventory(bot, keepName) {
-    // survival-only: toss surplus junk (keeps 32 dirt/cobble for scaffolding) when nearly full
+    // survival-only: toss surplus items when nearly full
     if (bot.inventory.emptySlotCount() >= 2) return;
+    
+    // fix42: use learned safe-to-toss signals (populated by voyager._prepareTossSignals)
+    const safeList = bot.__safeToToss || [];
+    const depositList = bot.__depositCandidates || [];
+    
+    // Phase 1: toss safe items
     let freed = 0;
-    for (const it of bot.inventory.items()) {
-        if (it.name === keepName || !_JUNK.includes(it.name)) continue;
-        const keep = (it.name === 'cobblestone' || it.name === 'dirt') ? 32 : 0;
-        const total = bot.inventory.items().filter(i => i.name === it.name).reduce((a, i) => a + i.count, 0);
-        const n = Math.min(it.count, total - keep);
+    for (const tossName of safeList) {
+        if (tossName === keepName) continue;
+        const it = bot.inventory.items().find(i => i.name === tossName);
+        if (!it) continue;
+        
+        // Keep some scaffolding materials (minimal, not item-specific deny list)
+        const keepCount = /^(cobblestone|dirt)$/.test(tossName) ? 32 : 0;
+        const total = bot.inventory.items().filter(i => i.name === tossName).reduce((a, i) => a + i.count, 0);
+        const n = Math.min(it.count, total - keepCount);
         if (n <= 0) continue;
+        
         try { await bot.toss(it.type, null, n); freed++; } catch (e) {}
         if (bot.inventory.emptySlotCount() >= 4) break;
     }
-    if (freed) log(bot, `Inventory nearly full: dropped ${freed} stacks of junk blocks.`);
+    if (freed) log(bot, `[_freeInventory] dropped ${freed} stacks using learned safe-to-toss signals.`);
+    
+    // Phase 2: if still low on space, actually run depositToChest (not just log)
+    if (bot.inventory.emptySlotCount() < 2 && depositList.length) {
+        console.log(`[_freeInventory] still only ${bot.inventory.emptySlotCount()} empty after tossing ${freed} stacks; depositing to chest`);
+        let deposited = 0;
+        for (const itemName of depositList) {
+            if (itemName === keepName) continue;
+            if (bot.inventory.emptySlotCount() >= 4) break;
+            // Call putInChest (the built-in deposit function) - bare name
+            try {
+                const ok = await putInChest(bot, itemName);
+                if (ok) deposited++;
+            } catch (e) {
+                console.log(`[_freeInventory] depositToChest failed for ${itemName}: ${e.message}`);
+            }
+        }
+        if (deposited) console.log(`[_freeInventory] deposited ${deposited} item type(s) to chest (empty slots now ${bot.inventory.emptySlotCount()})`);
+    }
+    
+    if (bot.inventory.emptySlotCount() < 2 && !safeList.length && !depositList.length) {
+        console.log('[_freeInventory] FAILED to free inventory: no learned safe-to-toss/deposit signals available');
+    }
 }
 
 function _survivalMovements(bot, {dig = true} = {}) {
@@ -836,7 +913,7 @@ export async function placeBlock(bot, blockType, x, y, z, placeOn='bottom', dont
     }
     if (!bot.canSeeBlock(targetBlock) || bot.entity.position.distanceTo(targetBlock.position) > 4) await _reachBlock(bot, targetBlock);
 
-    // will throw error if an entity is in the way, and sometimes even if the block was placed
+    // fix42: place block with direct state verification (fail loud with clear reason)
     try {
         if (item_name.includes('bucket')) {
             await useToolOnBlock(bot, item_name, buildOffBlock);
@@ -845,12 +922,21 @@ export async function placeBlock(bot, blockType, x, y, z, placeOn='bottom', dont
             await bot.equip(block_item, 'hand');
             await bot.lookAt(buildOffBlock.position.offset(0.5, 0.5, 0.5));
             await bot.placeBlock(buildOffBlock, faceVec);
-            log(bot, `Placed ${blockType} at ${target_dest}.`);
-            await new Promise(resolve => setTimeout(resolve, 200));
-            return true;
+            // fix42: direct state verification (don't rely solely on blockUpdate timeout)
+            await new Promise(resolve => setTimeout(resolve, 300));
+            const check = bot.blockAt(target_dest);
+            if (check && check.name === blockType) {
+                log(bot, `Placed ${blockType} at ${target_dest}.`);
+                return true;
+            }
+            // block not where expected - log clearly (fail loud)
+            log(bot, `FAILED: placeBlock returned but ${blockType} not at ${target_dest} (found ${check?.name || 'null'})`);
+            return false;
         }
     } catch (err) {
-        log(bot, `Failed to place ${blockType} at ${target_dest}.`);
+        // fix42: include error details in the failure message
+        const errMsg = String(err?.message || err).slice(0, 100);
+        log(bot, `FAILED to place ${blockType} at ${target_dest}: ${errMsg}`);
         return false;
     }
 }
