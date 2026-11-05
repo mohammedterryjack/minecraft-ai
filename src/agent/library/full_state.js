@@ -86,12 +86,14 @@ export function getFullState(agent) {
             counts: getInventoryCounts(bot),
             stacksUsed: bot.inventory.items().length,
             totalSlots: bot.inventory.slots.length,
+            slotsUsedOf36: `${bot.inventory.items().length}/36`,
             equipment: {
                 helmet: helmet ? helmet.name : null,
                 chestplate: chestplate ? chestplate.name : null,
                 leggings: leggings ? leggings.name : null,
                 boots: boots ? boots.name : null,
-                mainHand: bot.heldItem ? bot.heldItem.name : null
+                mainHand: bot.heldItem ? bot.heldItem.name : null,
+                offHand: bot.inventory.slots[45] ? bot.inventory.slots[45].name : null
             }
         },
         nearby: {
