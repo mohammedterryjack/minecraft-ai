@@ -107,6 +107,43 @@ export function findCycle(name, deps, graph) {
     };
     return dfs(name, [name]);
 }
+
+// fix47: find ALL cycles in the skill graph (not just from one skill)
+// Used at load time to detect and report all dependency cycles before any skill runs
+export function findAllCycles(graph) {
+    const cycles = [];
+    const visited = new Set();
+    const onStack = new Set();
+    
+    const dfs = (node, path) => {
+        if (onStack.has(node)) {
+            const cycleStart = path.indexOf(node);
+            if (cycleStart >= 0) {
+                cycles.push([...path.slice(cycleStart), node]);
+            }
+            return;
+        }
+        if (visited.has(node)) return;
+        
+        visited.add(node);
+        onStack.add(node);
+        
+        for (const dep of graph[node] || []) {
+            dfs(dep, [...path, node]);
+        }
+        
+        onStack.delete(node);
+    };
+    
+    for (const node of Object.keys(graph)) {
+        if (!visited.has(node)) {
+            dfs(node, []);
+        }
+    }
+    
+    return cycles;
+}
+
 export function newStats() { return { success: 0, fail: 0, streakFail: 0, tasks: [] }; }
 export function recordRun(stats, task, ok) {
     if (ok) { stats.success++; stats.streakFail = 0; if (task && !stats.tasks.includes(task)) { stats.tasks.push(task); stats.tasks = stats.tasks.slice(-10); } }

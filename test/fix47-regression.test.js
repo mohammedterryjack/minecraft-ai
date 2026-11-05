@@ -784,3 +784,117 @@ describe('fix47: harvestTools-based decompose', () => {
             'Subgoals should include crafting wooden_pickaxe');
     });
 });
+
+describe('fix47: call-graph cycle detection', () => {
+    it('should detect self-recursive skill code', async () => {
+        const { findAllCycles } = await import('../src/agent/skill_graph.js');
+        
+        // A graph where skillA calls itself (direct self-recursion)
+        // This would be detected by code analysis, but we test the graph checker too
+        const graph = {
+            skillA: ['skillA'],  // Self-loop
+            skillB: ['skillC'],
+            skillC: []
+        };
+        
+        const cycles = findAllCycles(graph);
+        assert.ok(cycles.length > 0, 'Should detect self-loop cycle');
+        assert.ok(cycles.some(c => c.includes('skillA')), 'Cycle should include skillA');
+    });
+    
+    it('should detect mutual recursion (A->B->A)', async () => {
+        const { findAllCycles } = await import('../src/agent/skill_graph.js');
+        
+        const graph = {
+            equipBestAxeAndPickaxe: ['equipBestTool'],
+            equipBestTool: ['equipBestAxeAndPickaxe'],  // Mutual recursion
+            collectBlock: []
+        };
+        
+        const cycles = findAllCycles(graph);
+        assert.ok(cycles.length > 0, 'Should detect mutual recursion cycle');
+        const cycleStr = cycles.map(c => c.join('->')).join('; ');
+        assert.ok(
+            cycleStr.includes('equipBestAxeAndPickaxe') && cycleStr.includes('equipBestTool'),
+            `Cycle should include both skills: ${cycleStr}`
+        );
+    });
+    
+    it('should detect longer cycles (A->B->C->A)', async () => {
+        const { findAllCycles } = await import('../src/agent/skill_graph.js');
+        
+        const graph = {
+            collectBlock: ['equipToolOrCraft'],
+            equipToolOrCraft: ['obtainItem'],
+            obtainItem: ['collectBlock'],  // Creates A->B->C->A cycle
+            craftRecipe: []
+        };
+        
+        const cycles = findAllCycles(graph);
+        assert.ok(cycles.length > 0, 'Should detect longer cycle');
+    });
+    
+    it('should return empty array for acyclic graph', async () => {
+        const { findAllCycles } = await import('../src/agent/skill_graph.js');
+        
+        const graph = {
+            craftRecipe: ['placeBlock', 'collectBlock'],
+            placeBlock: ['goToPosition'],
+            collectBlock: ['pickupNearbyItems'],
+            goToPosition: [],
+            pickupNearbyItems: []
+        };
+        
+        const cycles = findAllCycles(graph);
+        assert.strictEqual(cycles.length, 0, 'Should have no cycles');
+    });
+});
+
+describe('fix47: blocker tracking in curriculum', () => {
+    it('should track blockers when harvestTools decompose happens', async () => {
+        const { Voyager, _setVersionForTest } = await import('../src/agent/voyager.js');
+        _setVersionForTest('1.20.4');
+        
+        const mockVoyager = Object.create(Voyager.prototype);
+        mockVoyager.skills = [];
+        mockVoyager.progress = { decomposed: {}, subgoals: [], blockers: [] };
+        mockVoyager._curSub = null;
+        mockVoyager._saveProgress = () => {};
+        mockVoyager.observe = () => ({ inventory: {} });
+        
+        // Mock _cheapestHarvestTool
+        mockVoyager._cheapestHarvestTool = (blockName, inv) => {
+            if (blockName === 'stone') {
+                return {
+                    tool: 'wooden_pickaxe',
+                    chain: [
+                        { item: 'oak_planks', count: 4, action: 'craft' },
+                        { item: 'wooden_pickaxe', count: 1, action: 'craft' }
+                    ]
+                };
+            }
+            return null;
+        };
+        
+        await mockVoyager._decompose('Mine 10 stone', 'Cannot break stone with current tools');
+        
+        assert.ok(mockVoyager.progress.blockers.length > 0, 'Should have blockers');
+        const blocker = mockVoyager.progress.blockers[0];
+        assert.strictEqual(blocker.tool, 'wooden_pickaxe', 'Blocker should track the needed tool');
+        assert.strictEqual(blocker.block, 'stone', 'Blocker should track the blocked block');
+    });
+    
+    it('should include blockers in curriculum prompt facts', async () => {
+        const { readFileSync } = await import('fs');
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        
+        // Check that proposeTask includes blockers in the user prompt
+        const proposeTaskMatch = voyagerSrc.match(/async\s+proposeTask[\s\S]*?return\s+parseLocalJSON/);
+        assert.ok(proposeTaskMatch, 'proposeTask function should exist');
+        
+        const proposeTaskBody = proposeTaskMatch[0];
+        assert.ok(proposeTaskBody.includes('blockers'), 'proposeTask should reference blockers');
+        assert.ok(proposeTaskBody.includes('BLOCKERS') || proposeTaskBody.includes('blockerHint'), 
+            'proposeTask should include blocker hint in prompt');
+    });
+});

@@ -20,7 +20,7 @@ import { getAllItems, getAllBlocks, getItemCraftingRecipes, isHostile, isDatapac
 import { cosineSimilarity } from '../utils/math.js';
 import minecraftData from 'minecraft-data';
 import { Ollama } from '../models/ollama.js';
-import { signatureOf, depsOf, missingCalls, findCycle, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf } from './skill_graph.js';
+import { signatureOf, depsOf, missingCalls, findCycle, findAllCycles, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf } from './skill_graph.js';
 import { getBareAPI } from './coder.js';   // fix40: unified bare-name API helper
 import { logPromptBreakdown, extractBareCalls } from './prompt_utils.js';   // fix47: shared prompt utilities
 const LOCAL = { model: 'qwen3:4b-instruct-2507-q4_K_M', url: 'http://192.168.1.215:11434', params: { format: 'json', options: { num_ctx: 8192, num_predict: 512 } } };   // fix38: raised from 150 to 512 - short JSON replies still need room for reasoning; truncation fails loudly (fix31)
@@ -425,9 +425,28 @@ export class Voyager {
                 console.error(`[fix47] LEFTOVER OLD-STYLE PATTERNS in ${s.name}: ${leftover.join(', ')} - these will fail at runtime (SES has no skills/world objects)`);
             }
         }
-        if (migrated > 0) {
+        // fix47: also migrate standalone .js files in the skills directory
+        let fileMigrated = 0;
+        try {
+            const files = readdirSync(this.dir).filter(f => f.endsWith('.js'));
+            for (const file of files) {
+                const filePath = `${this.dir}/${file}`;
+                let content = readFileSync(filePath, 'utf8');
+                const fnMatch = content.match(/(?:async\s+)?function\s+([A-Za-z_]\w*)\s*\(/);
+                const fnName = fnMatch ? fnMatch[1] : file.replace('.js', '');
+                const r = rewriteCode(content, fnName);
+                if (r.changes > 0) {
+                    writeFileSync(filePath, r.code);
+                    fileMigrated++;
+                    console.log(`[fix47] migrated standalone file ${file}: ${r.changes} changes`);
+                }
+            }
+        } catch (e) {
+            console.log(`[fix47] standalone file migration skipped: ${e.message}`);
+        }
+        if (migrated > 0 || fileMigrated > 0) {
             this._saveSkills();
-            console.log(`[fix41] MIGRATION COMPLETE: ${migrated} skills updated, ${totalChanges} code changes, ${candidateChanges} candidate changes`);
+            console.log(`[fix41] MIGRATION COMPLETE: ${migrated} skills updated, ${totalChanges} code changes, ${candidateChanges} candidate changes, ${fileMigrated} files migrated`);
         }
         // fix42: pass needsReheal to _seedPrimitives
         if (needsReheal.size > 0) {
@@ -515,6 +534,37 @@ export class Voyager {
             const d = depsOf(s.code, s.name, names);
             if (JSON.stringify([...d].sort()) !== JSON.stringify([...(s.deps || [])].sort())) { console.log(`[psn] relink ${s.name}: deps [${(s.deps || []).join(', ')}] -> [${d.join(', ')}]`); s.deps = d; n++; }
         }
+        // fix47: comprehensive cycle check over ALL skills (seeded + stored)
+        // Detect self-recursion (skill calls itself) and mutual recursion (A->B->A)
+        const selfRecursive = [];
+        for (const s of this.skills) {
+            if (!s.code) continue;
+            // Check if skill calls itself by name (self-recursion through bare name)
+            // Must exclude the function declaration itself (function fnName(...) or async function fnName(...))
+            const fnMatch = s.code.match(/(?:async\s+)?function\s+([A-Za-z_]\w*)\s*\(/);
+            const fnName = fnMatch ? fnMatch[1] : s.name;
+            // Remove the function declaration, then check for calls
+            const codeWithoutDecl = s.code.replace(/(?:async\s+)?function\s+[A-Za-z_]\w*\s*\([^)]*\)\s*\{/, '');
+            const callsItself = new RegExp(`(?<![.\\w])${fnName}\\s*\\(`).test(codeWithoutDecl);
+            if (callsItself) {
+                selfRecursive.push(s.name);
+            }
+        }
+        if (selfRecursive.length > 0) {
+            const msg = `[psn] SELF-RECURSION DETECTED in ${selfRecursive.length} skill(s): ${selfRecursive.join(', ')} - these will cause stack overflow at runtime`;
+            console.error(msg);
+            throw new Error(msg);
+        }
+        // Check for mutual recursion cycles in the dependency graph
+        const graph = this._graph();
+        const allCycles = findAllCycles(graph);
+        if (allCycles.length > 0) {
+            const cycleStrs = allCycles.map(c => c.join(' -> ')).join('; ');
+            const msg = `[psn] DEPENDENCY CYCLES DETECTED: ${cycleStrs}`;
+            console.error(msg);
+            throw new Error(msg);
+        }
+        // Original per-skill cycle check (kept for completeness)
         for (const s of this.skills) { const c = findCycle(s.name, s.deps, this._graph(s.name)); if (c) throw new Error(`[psn] relink: dependency cycle ${c.join(' -> ')}`); }
         console.log(`[psn] relink: ${this.skills.length} skills, ${n} edge set(s) changed`);
         if (n) this._saveSkills();
@@ -2206,6 +2256,14 @@ Use only c; no other globals.`;
                 });
                 d[task] = { subs, skills: [], at: Date.now(), reason: `need ${toolInfo.tool} to break ${blockName}` };
                 q.unshift(...subs.map(t => ({ task: t, parent: task, depth: depth + 1 })), { task, retry: true, depth });
+                // fix47: track this as a blocker so curriculum prioritizes tool acquisition
+                this.progress.blockers = this.progress.blockers || [];
+                const blockerEntry = { tool: toolInfo.tool, block: blockName, task, at: Date.now() };
+                // Remove old blockers for same block/tool, keep only recent ones
+                this.progress.blockers = this.progress.blockers.filter(b => 
+                    b.block !== blockName && Date.now() - b.at < 30 * 60e3
+                ).slice(-5);
+                this.progress.blockers.push(blockerEntry);
                 this._saveProgress();
                 console.log(`[psn] DECOMPOSE (harvestTools) "${task}" -> need ${toolInfo.tool}: ${subs.join(', ')}`);
                 return true;
@@ -2324,10 +2382,15 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "task": "...", "contex
         const compactStateText = this._compactState(state);
         const knownSkillsFacts = this._knownSkillsFacts();
         const replayableTasks = this.skills.filter(s => s.task && !s.primitive).map(s => s.task.split(/\s+(?:within|at|using|from)\b/i)[0]).slice(-25);
+        // fix47: include active blockers so curriculum prioritizes unblocking goals
+        const blockers = (this.progress.blockers || []).filter(b => Date.now() - b.at < 30 * 60e3);
+        const blockerHint = blockers.length > 0 
+            ? `\nBLOCKERS (prioritize these - recent failures need tools): ${blockers.map(b => `need ${b.tool} to break ${b.block}`).join('; ')}`
+            : '';
         const user = `known_skills: ${JSON.stringify(knownSkillsFacts)}
 replayable_tasks (cheap, no new code needed): ${JSON.stringify(replayableTasks)} plus any "Mine N <block or ore>", "Collect N <log>", "Get N <item>", "Smelt N <raw> into N <out>", "Kill N <mob>", "Harvest N <crop>"
 completed_tasks: ${JSON.stringify(this.progress.completed.slice(-30))}
-failed_tasks: ${JSON.stringify(this.progress.failed.slice(-15))}
+failed_tasks: ${JSON.stringify(this.progress.failed.slice(-15))}${blockerHint}
 --- state (compact) ---
 ${compactStateText}
 current_health: ${Math.round(bot.health)}/20\ncurrent_food: ${bot.food}/20 (20/20 = full)${this._cursorLimited() ? '\nIMPORTANT: the code-writing model is unavailable right now, so ONLY propose a task from replayable_tasks or "Mine N <block>".' : ''}${workflowHints ? '\n' + workflowHints : ''}`;   // fix31: slow-changing lists first so Ollama reuses the cached prompt prefix
