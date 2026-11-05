@@ -1469,13 +1469,13 @@ Use only c; no other globals.`;
         }
         return null;
     }
-    // fix42: compute safe-to-toss items based on LEARNED signals only (no hard-coded junk list)
+    // fix42: compute safe-to-toss and deposit-candidate items based on LEARNED signals only (no hard-coded junk list)
     // Items are safe to toss if:
     // 1. NOT consumed by any known skill (not in any skill's consumes)
     // 2. NOT needed as input to produce pending goal items
     // 3. In surplus (have more than needed for any known recipe)
-    // Returns array of item names sorted by "tossability" (most disposable first)
-    _computeSafeToToss() {
+    // Returns { toss: [item names], deposit: [item names for large stacks better deposited] }
+    _computeTossAndDepositLists() {
         const inv = this.observe().inventory || {};
         const pendingItems = this._getPendingGoalItems();
         
@@ -1488,43 +1488,54 @@ Use only c; no other globals.`;
             }
         }
         
-        // Collect items that are effects (produced) by skills we might need
-        const producedBySkills = new Set();
-        for (const s of this.skills) {
-            if (s.demoted || s.mergedInto) continue;
-            for (const eff of s.effects || []) {
-                producedBySkills.add(eff);
-            }
-        }
-        
         // Essential tools/armor - always keep (minimal list, learned path should handle most)
         const essential = /pickaxe|axe|sword|shovel|hoe|helmet|chestplate|leggings|boots|shield|bow|crossbow|trident|elytra|crafting_table|furnace/;
         
-        const safeItems = [];
+        const tossItems = [];
+        const depositItems = [];
+        
         for (const [item, count] of Object.entries(inv)) {
             if (count <= 0) continue;
-            if (essential.test(item)) continue;  // never toss essential gear
-            
-            // Skip if this is consumed by a known skill
-            if (consumedBySkills.has(item)) continue;
+            if (essential.test(item)) continue;  // never toss/deposit essential gear
             
             // Skip if this is needed for pending goals
             if (pendingItems.has(item)) continue;
             
-            // This item is safe to toss - score by surplus amount
-            safeItems.push({ item, count, score: count });
+            // Items consumed by skills are deposit candidates (not toss) - valuable for future crafting
+            if (consumedBySkills.has(item)) {
+                // Large stacks (>32) are better deposited than kept
+                if (count > 32) {
+                    depositItems.push({ item, count, score: count });
+                }
+                continue;
+            }
+            
+            // Items not consumed by any skill are safe to toss
+            tossItems.push({ item, count, score: count });
+            
+            // Large stacks of anything are also deposit candidates (backup if toss fails)
+            if (count > 32) {
+                depositItems.push({ item, count, score: count });
+            }
         }
         
         // Sort by score (highest surplus first)
-        safeItems.sort((a, b) => b.score - a.score);
+        tossItems.sort((a, b) => b.score - a.score);
+        depositItems.sort((a, b) => b.score - a.score);
         
-        console.log(`[toss] computed ${safeItems.length} safe-to-toss item(s) from learned signals: ${safeItems.slice(0, 5).map(x => `${x.item}(${x.count})`).join(', ')}${safeItems.length > 5 ? '...' : ''}`);
+        console.log(`[toss] computed ${tossItems.length} safe-to-toss item(s) from learned signals: ${tossItems.slice(0, 5).map(x => `${x.item}(${x.count})`).join(', ')}${tossItems.length > 5 ? '...' : ''}`);
+        console.log(`[toss] computed ${depositItems.length} deposit candidate(s): ${depositItems.slice(0, 5).map(x => `${x.item}(${x.count})`).join(', ')}${depositItems.length > 5 ? '...' : ''}`);
         
-        return safeItems.map(x => x.item);
+        return {
+            toss: tossItems.map(x => x.item),
+            deposit: depositItems.map(x => x.item)
+        };
     }
-    // fix42: populate bot.__safeToToss before running tossClutter/freeInventory
+    // fix42: populate bot.__safeToToss and bot.__depositCandidates before running tossClutter/freeInventory
     _prepareTossSignals() {
-        this.agent.bot.__safeToToss = this._computeSafeToToss();
+        const lists = this._computeTossAndDepositLists();
+        this.agent.bot.__safeToToss = lists.toss;
+        this.agent.bot.__depositCandidates = lists.deposit;
     }
     // fix37: run a practice skill safely - returns { message } on success, false on context-fail, null on abort
     // Fail-loud: all skips and failures are logged clearly
@@ -2983,42 +2994,62 @@ Voyager.SEEDED_PRIMITIVES = [
         // fix42: tossClutter uses LEARNED signals only - no hard-coded junk list
         // Consults bot.__safeToToss (set by voyager before skill runs) for items safe to toss
         // Fail loud if no learned signal says what is safe to toss
+        // fix42: actually tasks depositToChest when toss alone is insufficient (not just log)
         name: 'tossClutter',
-        description: 'Toss surplus/low-value items to free inventory space using LEARNED signals (needs/produces, not hard-coded lists). Fails loud if nothing is safe to toss.',
+        description: 'Toss surplus/low-value items to free inventory space using LEARNED signals (needs/produces, not hard-coded lists). If toss is insufficient, calls depositToChest. Fails loud if nothing is safe to toss/deposit.',
         task: 'toss clutter to free inventory space',
         code: `async function tossClutter(bot, minFree = 4) {
     const start = bot.entity.position.clone();
     let tossed = 0;
     const safeList = bot.__safeToToss || [];
-    if (!safeList.length) {
-        log(bot, 'FAILED tossClutter: no learned signal indicates what is safe to toss (needs/produces empty or all items are inputs to known skills)');
-        return bot.inventory.emptySlotCount();
-    }
-    const inv = getInventoryCounts(bot);
-    for (let i = 0; i < 40 && bot.inventory.emptySlotCount() < minFree; i++) {
-        if (bot.interrupt_code) break;
-        const pick = safeList.find(n => (inv[n] || 0) > 0);
-        if (!pick) {
-            log(bot, \`[toss] no more safe-to-toss items in inventory (empty slots: \${bot.inventory.emptySlotCount()})\`);
-            break;
+    const depositList = bot.__depositCandidates || [];
+    
+    // Phase 1: toss safe items
+    if (safeList.length) {
+        const inv = getInventoryCounts(bot);
+        for (let i = 0; i < 40 && bot.inventory.emptySlotCount() < minFree; i++) {
+            if (bot.interrupt_code) break;
+            const pick = safeList.find(n => (inv[n] || 0) > 0);
+            if (!pick) break;
+            const it = bot.inventory.items().find(x => x.name === pick);
+            if (!it) { inv[pick] = 0; continue; }
+            if (bot.currentWindow) { bot.closeWindow(bot.currentWindow); await sleep(500); }
+            await bot.tossStack(it);
+            inv[pick] = Math.max(0, (inv[pick] || 0) - it.count);
+            tossed++;
+            console.log(\`[toss] tossed \${it.count} \${pick} (empty slots now \${bot.inventory.emptySlotCount()})\`);
         }
-        const it = bot.inventory.items().find(x => x.name === pick);
-        if (!it) { inv[pick] = 0; continue; }
-        if (bot.currentWindow) { bot.closeWindow(bot.currentWindow); await sleep(500); }
-        await bot.tossStack(it);
-        inv[pick] = Math.max(0, (inv[pick] || 0) - it.count);
-        tossed++;
-        console.log(\`[toss] tossed \${it.count} \${pick} (empty slots now \${bot.inventory.emptySlotCount()})\`);
+        if (tossed && !bot.interrupt_code) {
+            await moveAway(bot, 6);
+            console.log(\`[toss] moved away from \${tossed} dropped stack(s) to avoid re-pickup\`);
+        }
     }
-    if (tossed && !bot.interrupt_code) {
-        await moveAway(bot, 6);
-        console.log(\`[toss] moved away from \${tossed} dropped stack(s) to avoid re-pickup\`);
+    
+    // Phase 2: if still low on space, actually run depositToChest (not just log)
+    if (bot.inventory.emptySlotCount() < minFree && !bot.interrupt_code) {
+        if (depositList.length) {
+            console.log(\`[toss] still only \${bot.inventory.emptySlotCount()} empty after tossing \${tossed} stacks; depositing \${depositList.length} candidate(s) to chest\`);
+            let deposited = 0;
+            for (const itemName of depositList) {
+                if (bot.interrupt_code) break;
+                if (bot.inventory.emptySlotCount() >= minFree) break;
+                const ok = await depositToChest(bot, itemName);
+                if (ok) deposited++;
+            }
+            if (deposited) console.log(\`[toss] deposited \${deposited} item type(s) to chest (empty slots now \${bot.inventory.emptySlotCount()})\`);
+            if (bot.inventory.emptySlotCount() < minFree && !bot.interrupt_code) {
+                log(bot, \`FAILED tossClutter: still only \${bot.inventory.emptySlotCount()} empty after tossing \${tossed} + depositing \${deposited} items\`);
+            }
+        } else {
+            log(bot, \`FAILED tossClutter: only \${bot.inventory.emptySlotCount()} empty after tossing \${tossed} stacks; no deposit candidates (no chest nearby or nothing to deposit)\`);
+        }
     }
-    if (bot.inventory.emptySlotCount() < minFree) {
-        log(bot, \`[toss] FAILED to free \${minFree} slots; only \${bot.inventory.emptySlotCount()} empty after tossing \${tossed} stacks. Consider depositToChest.\`);
+    
+    if (!safeList.length && !depositList.length) {
+        log(bot, 'FAILED tossClutter: no learned signal indicates what is safe to toss/deposit (needs/produces empty or all items are inputs to known skills)');
     }
     return bot.inventory.emptySlotCount();
 }`,
-        deps: ['moveAway'],
+        deps: ['moveAway', 'depositToChest'],
     },
 ];
