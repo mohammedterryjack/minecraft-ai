@@ -187,6 +187,184 @@ export class Voyager {
 }`,
                 deps: [],
             },
+            {
+                name: 'collectBlock',
+                description: 'Collect blocks of the given type. Handles ore variants (iron->iron_ore, deepslate_iron_ore), equips proper tools, and picks up drops.',
+                task: 'collect blocks or ores',
+                code: `async function collectBlock(bot, blockType, num = 1) {
+    if (!blockType || typeof blockType !== 'string') { log(bot, 'collectBlock: invalid blockType'); return false; }
+    let types = [blockType];
+    if (['coal','diamond','emerald','iron','gold','lapis_lazuli','redstone'].includes(blockType)) types.push(blockType + '_ore');
+    if (blockType.endsWith('ore')) types.push('deepslate_' + blockType);
+    if (blockType === 'dirt') types.push('grass_block');
+    if (blockType === 'cobblestone') types.push('stone');
+    let collected = 0;
+    for (let i = 0; i < num; i++) {
+        if (bot.interrupt_code) break;
+        const block = world.getNearestBlock(bot, b => types.includes(b.name), 64);
+        if (!block) { log(bot, collected ? \`No more \${blockType} nearby.\` : \`No \${blockType} nearby.\`); break; }
+        await bot.tool.equipForBlock(block);
+        const itemId = bot.heldItem ? bot.heldItem.type : null;
+        if (!block.canHarvest(itemId)) { log(bot, \`Don't have right tools to harvest \${blockType}.\`); return false; }
+        const before = world.getInventoryCounts(bot);
+        try {
+            await skills.goToPosition(bot, block.position.x, block.position.y, block.position.z, 4);
+            await bot.dig(block, true);
+            await skills.pickupNearbyItems(bot);
+        } catch (err) { log(bot, \`Failed to collect \${blockType}: \${err.message}\`); continue; }
+        const after = world.getInventoryCounts(bot);
+        if (Object.keys(after).some(k => (after[k] || 0) > (before[k] || 0))) collected++;
+    }
+    log(bot, \`Collected \${collected} \${blockType}.\`);
+    return collected > 0;
+}`,
+                deps: ['pickupNearbyItems'],
+            },
+            {
+                name: 'craftRecipe',
+                description: 'Craft an item using the crafting recipe. Places and retrieves crafting table if needed.',
+                task: 'craft an item',
+                code: `async function craftRecipe(bot, itemName, num = 1) {
+    if (!itemName) { log(bot, 'craftRecipe: no item specified'); return false; }
+    let recipes = bot.recipesFor(bot.registry.itemsByName[itemName]?.id, null, 1, null);
+    let craftingTable = null, placedTable = false;
+    if (!recipes || !recipes.length) {
+        recipes = bot.recipesFor(bot.registry.itemsByName[itemName]?.id, null, 1, true);
+        if (!recipes || !recipes.length) { log(bot, \`No recipe for \${itemName} or missing ingredients.\`); return false; }
+        craftingTable = world.getNearestBlock(bot, 'crafting_table', 16);
+        if (!craftingTable) {
+            const hasTable = (world.getInventoryCounts(bot)['crafting_table'] || 0) > 0;
+            if (hasTable) {
+                const pos = world.getNearestFreeSpace(bot, 1, 6);
+                await skills.placeBlock(bot, 'crafting_table', pos.x, pos.y, pos.z);
+                craftingTable = world.getNearestBlock(bot, 'crafting_table', 16);
+                placedTable = true;
+            } else { log(bot, \`Crafting \${itemName} requires a crafting table.\`); return false; }
+        }
+        if (craftingTable) recipes = bot.recipesFor(bot.registry.itemsByName[itemName]?.id, null, 1, craftingTable);
+    }
+    if (!recipes || !recipes.length) { log(bot, \`Cannot craft \${itemName}: missing ingredients.\`); if (placedTable) await skills.collectBlock(bot, 'crafting_table', 1); return false; }
+    if (craftingTable) await skills.goToPosition(bot, craftingTable.position.x, craftingTable.position.y, craftingTable.position.z, 3);
+    const before = world.getInventoryCounts(bot)[itemName] || 0;
+    try { await bot.craft(recipes[0], Math.min(num, 64), craftingTable); }
+    catch (err) { log(bot, \`Crafting \${itemName} failed: \${err.message}\`); if (placedTable) await skills.collectBlock(bot, 'crafting_table', 1); return false; }
+    const after = world.getInventoryCounts(bot)[itemName] || 0;
+    if (placedTable) await skills.collectBlock(bot, 'crafting_table', 1);
+    if (after > before) { log(bot, \`Crafted \${itemName}, now have \${after}.\`); return true; }
+    log(bot, \`Crafting \${itemName} produced no items.\`); return false;
+}`,
+                deps: ['placeBlock', 'collectBlock'],
+            },
+            {
+                name: 'attackNearest',
+                description: 'Attack the nearest mob of the given type. Equips best weapon and fights until the mob is dead or bot is interrupted.',
+                task: 'attack a mob',
+                code: `async function attackNearest(bot, mobType, kill = true) {
+    if (!mobType) { log(bot, 'attackNearest: no mob type specified'); return false; }
+    bot.modes.pause('cowardice');
+    const waterMobs = ['drowned', 'cod', 'salmon', 'tropical_fish', 'squid'];
+    if (waterMobs.includes(mobType)) bot.modes.pause('self_preservation');
+    const mob = world.getNearbyEntities(bot, 24).find(e => e.name === mobType);
+    if (!mob) { log(bot, \`Could not find any \${mobType} to attack.\`); return false; }
+    const weapons = bot.inventory.items().filter(it => it.name.includes('sword') || (it.name.includes('axe') && !it.name.includes('pickaxe')));
+    if (weapons.length) { weapons.sort((a, b) => (b.attackDamage || 0) - (a.attackDamage || 0)); await bot.equip(weapons[0], 'hand'); }
+    if (!kill) {
+        if (bot.entity.position.distanceTo(mob.position) > 5) await skills.goToPosition(bot, mob.position.x, mob.position.y, mob.position.z, 2);
+        await bot.attack(mob); return true;
+    }
+    bot.pvp.attack(mob);
+    while (world.getNearbyEntities(bot, 24).includes(mob)) {
+        await sleep(1000);
+        if (bot.interrupt_code) { bot.pvp.stop(); return false; }
+    }
+    log(bot, \`Successfully killed \${mob.name}.\`);
+    await skills.pickupNearbyItems(bot);
+    return true;
+}`,
+                deps: ['pickupNearbyItems'],
+            },
+            {
+                name: 'placeBlock',
+                description: 'Place a block at the given position. Finds an adjacent block to build off and handles common block types.',
+                task: 'place a block',
+                code: `async function placeBlock(bot, blockType, x, y, z, placeOn = 'bottom') {
+    if (!blockType) { log(bot, 'placeBlock: no block type specified'); return false; }
+    const target = new Vec3(Math.floor(x), Math.floor(y), Math.floor(z));
+    const existing = bot.blockAt(target);
+    if (existing && existing.name === blockType) { log(bot, \`\${blockType} already at \${target}.\`); return false; }
+    const empty = ['air', 'water', 'lava', 'grass', 'short_grass', 'tall_grass', 'snow', 'dead_bush', 'fern'];
+    if (existing && !empty.includes(existing.name)) {
+        await skills.breakBlockAt(bot, x, y, z);
+        await sleep(200);
+    }
+    let itemName = blockType === 'redstone_wire' ? 'redstone' : blockType;
+    let block = bot.inventory.findInventoryItem(itemName);
+    if (!block) { log(bot, \`Don't have any \${itemName} to place.\`); return false; }
+    const dirs = { top: [0,1,0], bottom: [0,-1,0], north: [0,0,-1], south: [0,0,1], east: [1,0,0], west: [-1,0,0] };
+    const order = placeOn === 'side' ? ['north','south','east','west','bottom','top'] : [placeOn, 'bottom','top','north','south','east','west'];
+    let buildOff = null, faceVec = null;
+    for (const dir of order) {
+        const d = dirs[dir]; if (!d) continue;
+        const adj = bot.blockAt(target.offset(d[0], d[1], d[2]));
+        if (adj && !empty.includes(adj.name)) { buildOff = adj; faceVec = new Vec3(-d[0], -d[1], -d[2]); break; }
+    }
+    if (!buildOff) { log(bot, \`Cannot place \${blockType}: no adjacent block to build off.\`); return false; }
+    if (bot.entity.position.distanceTo(target) > 4) await skills.goToPosition(bot, target.x, target.y, target.z, 3);
+    await bot.equip(block, 'hand');
+    await bot.lookAt(buildOff.position.offset(0.5, 0.5, 0.5));
+    try { await bot.placeBlock(buildOff, faceVec); log(bot, \`Placed \${blockType} at \${target}.\`); return true; }
+    catch (err) { log(bot, \`Failed to place \${blockType}: \${err.message}\`); return false; }
+}`,
+                deps: ['breakBlockAt'],
+            },
+            {
+                name: 'breakBlockAt',
+                description: 'Break the block at the given position. Equips the right tool and moves within range if needed.',
+                task: 'break a block',
+                code: `async function breakBlockAt(bot, x, y, z) {
+    if (x == null || y == null || z == null) { log(bot, 'breakBlockAt: invalid coordinates'); return false; }
+    const block = bot.blockAt(new Vec3(x, y, z));
+    if (!block || block.name === 'air' || block.name === 'water' || block.name === 'lava') {
+        log(bot, \`No solid block at \${x}, \${y}, \${z}.\`); return false;
+    }
+    if (bot.entity.position.distanceTo(block.position) > 4.5) {
+        await skills.goToPosition(bot, block.position.x, block.position.y, block.position.z, 4);
+    }
+    if (bot.game.gameMode !== 'creative') {
+        await bot.tool.equipForBlock(block);
+        const itemId = bot.heldItem ? bot.heldItem.type : null;
+        if (!block.canHarvest(itemId)) { log(bot, \`Don't have right tools to break \${block.name}.\`); return false; }
+    }
+    await bot.dig(block, true);
+    log(bot, \`Broke \${block.name} at \${x.toFixed(1)}, \${y.toFixed(1)}, \${z.toFixed(1)}.\`);
+    return true;
+}`,
+                deps: [],
+            },
+            {
+                name: 'pickupNearbyItems',
+                description: 'Pick up all nearby dropped items within 8 blocks. Waits for drops to settle first.',
+                task: 'pick up items',
+                code: `async function pickupNearbyItems(bot) {
+    const distance = 8;
+    await sleep(400);
+    const getNearestItem = () => bot.nearestEntity(e => e.name === 'item' && bot.entity.position.distanceTo(e.position) < distance);
+    let nearestItem = getNearestItem();
+    let pickedUp = 0;
+    for (let tries = 0; nearestItem && tries < 12; tries++) {
+        try { await skills.goToPosition(bot, nearestItem.position.x, nearestItem.position.y, nearestItem.position.z, 0.5); }
+        catch (e) {}
+        await sleep(500);
+        const prev = nearestItem;
+        nearestItem = getNearestItem();
+        if (prev === nearestItem && prev.isValid) break;
+        pickedUp++;
+    }
+    log(bot, \`Picked up \${pickedUp} items.\`);
+    return true;
+}`,
+                deps: [],
+            },
         ];
         let seeded = 0;
         for (const prim of SEEDED_PRIMITIVES) {
