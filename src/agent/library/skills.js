@@ -122,9 +122,15 @@ export async function craftRecipe(bot, itemName, num=1) {
     const requiredIngredients = mc.ingredientsFromPrismarineRecipe(recipe); //Items required to use the recipe once.
     const craftLimit = mc.calculateLimitingResource(inventory, requiredIngredients);
     
-    if (bot.inventory.emptySlotCount() === 0 && !bot.inventory.items().some(it => it.name === itemName && it.count < it.stackSize)) {
-        log(bot, `Cannot craft ${itemName}: inventory is full (0 empty slots), the result would be stuck in the crafting grid. Store items in a chest first (depositToChest).`);
-        return false;
+    // fix25: when inventory is nearly full, attempt to free space using learned toss/deposit signals
+    if (bot.inventory.emptySlotCount() < 2) {
+        console.log(`[craftRecipe] inventory nearly full (${bot.inventory.emptySlotCount()} empty), calling _freeInventory`);
+        await _freeInventory(bot, itemName);
+        // Re-check after attempting to free space
+        if (bot.inventory.emptySlotCount() === 0 && !bot.inventory.items().some(it => it.name === itemName && it.count < it.stackSize)) {
+            log(bot, `FAILED: Cannot craft ${itemName}: inventory still full after toss/deposit attempt (0 empty slots). Use depositToChest or tossClutter to free more space.`);
+            return false;
+        }
     }
     const beforeCount = world.getInventoryCounts(bot)[itemName] || 0;
     let craftErr = null;
@@ -472,9 +478,10 @@ export async function defendSelf(bot, range=9) {
 // fix42: _freeInventory uses LEARNED signals only (bot.__safeToToss set by voyager)
 // NO hard-coded junk list - what's safe to toss is determined by needs/produces
 // fix42: actually tasks depositToChest when toss alone is insufficient (not just log)
+// fix25: raised threshold from >= 2 to < 4 so it runs when 2-3 empty (not just 0-1)
 async function _freeInventory(bot, keepName) {
     // survival-only: toss surplus items when nearly full
-    if (bot.inventory.emptySlotCount() >= 2) return;
+    if (bot.inventory.emptySlotCount() >= 4) return;  // fix25: was >= 2
     
     // fix42: use learned safe-to-toss signals (populated by voyager._prepareTossSignals)
     const safeList = bot.__safeToToss || [];
@@ -493,7 +500,8 @@ async function _freeInventory(bot, keepName) {
         const n = Math.min(it.count, total - keepCount);
         if (n <= 0) continue;
         
-        try { await bot.toss(it.type, null, n); freed++; } catch (e) {}
+        try { await bot.toss(it.type, null, n); freed++; console.log(`[_freeInventory] tossed ${n} ${tossName}`); }
+        catch (e) { console.log(`[_freeInventory] FAILED to toss ${tossName}: ${e.message}`); }  // fix25: fail loud
         if (bot.inventory.emptySlotCount() >= 4) break;
     }
     if (freed) log(bot, `[_freeInventory] dropped ${freed} stacks using learned safe-to-toss signals.`);
