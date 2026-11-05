@@ -152,9 +152,61 @@ export class Voyager {
             process.on('unhandledRejection', onErr('UNHANDLED REJECTION'));
         }
         if (!globalThis.__logRotate) { globalThis.__logRotate = setInterval(() => rotateLog('./logs/mindcraft.log', 25e6, 3), 60e3); rotateLog('./logs/mindcraft.log', 25e6, 3); }   // fix28
+        this._seedPrimitives();
         this._relink();
         this._polyMerge();
         this._extractShared();
+    }
+    // fix33: seed primitives into the skill library so they are blamable/repairable (learned path, not hard-coded)
+    // These are skills from skills.js that need to be in the skill graph to enable learning (e.g. water escape)
+    _seedPrimitives() {
+        const SEEDED_PRIMITIVES = [
+            {
+                name: 'travelTo',
+                description: 'Travel long distances (hundreds of blocks) in short hops of up to 32 blocks, so chunks load and paths stay short. Returns true once within 4 blocks (horizontally) of the target.',
+                task: 'travel to a distant location',
+                code: `async function travelTo(bot, x, y, z, maxHops = 120) {
+    let fails = 0;
+    for (let hop = 0; hop < maxHops; hop++) {
+        if (bot.interrupt_code) return false;
+        const p = bot.entity.position;
+        const dx = x - p.x, dz = z - p.z, d = Math.hypot(dx, dz);
+        if (d <= 4) { log(bot, \`Arrived near \${x}, \${y}, \${z}.\`); return true; }
+        if (d <= 32) { if (await skills.goToPosition(bot, x, y, z, 3)) continue; }
+        const step = Math.min(32, d);
+        const side = fails ? (fails % 2 ? 1 : -1) * 10 * fails : 0;
+        const tx = Math.round(p.x + dx / d * step - dz / d * side), tz = Math.round(p.z + dz / d * step + dx / d * side);
+        try { await skills.goToGoal(bot, new Vec3(tx, p.y, tz), 3); fails = 0; }
+        catch (err) {
+            if (bot.interrupt_code) return false;
+            if (++fails >= 6) { log(bot, \`travelTo gave up at \${p.floored()} after 6 failed hops: \${err?.message}\`); return false; }
+        }
+    }
+    log(bot, \`travelTo ran out of hops; still \${Math.round(Math.hypot(x - bot.entity.position.x, z - bot.entity.position.z))} blocks away.\`);
+    return false;
+}`,
+                deps: [],
+            },
+        ];
+        let seeded = 0;
+        for (const prim of SEEDED_PRIMITIVES) {
+            if (this.skills.some(s => s.name === prim.name)) continue;
+            const entry = {
+                name: prim.name,
+                description: prim.description,
+                task: prim.task,
+                code: prim.code,
+                deps: prim.deps,
+                seeded: true,
+                stats: newStats(),
+                saved: new Date().toISOString(),
+            };
+            this.skills.push(entry);
+            writeAtomic(`${this.dir}/${prim.name}.js`, `// ${prim.description}\n${prim.code}\n`);
+            seeded++;
+            console.log(`[psn] seeded primitive ${prim.name}: ${prim.description.slice(0, 60)}...`);
+        }
+        if (seeded) this._saveSkills();
     }
     // fix11: recompute every skill's dependency edges from its code at startup (catches hand edits of skill files)
     _relink() {

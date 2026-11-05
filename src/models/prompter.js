@@ -10,6 +10,7 @@ import { promises as fs } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { selectAPI, createModel } from './_model_map.js';
+import { Ollama } from './ollama.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -64,7 +65,13 @@ export class Prompter {
 
         if (this.profile.code_model) {
             let code_model_profile = selectAPI(this.profile.code_model);
-            this.code_model = new CodeModel(createModel(code_model_profile), 60 * 60 * 1000, 'code-model');
+            let freeFallback = null;
+            if (code_model_profile.api === 'cursor') {
+                const freeConfig = this.profile.code_model_free || { api: 'ollama', model: 'qwen3:4b-instruct-2507-q4_K_M', url: 'http://192.168.1.215:11434', params: { keep_alive: -1, options: { num_ctx: 8192 } } };
+                try { freeFallback = new Ollama(freeConfig.model, freeConfig.url, freeConfig.params); console.log(`[prompter] configured FREE fallback coder: ${freeFallback.model_name} at ${freeFallback.url}`); }
+                catch (e) { console.warn(`[prompter] failed to configure free fallback coder: ${e.message}`); }
+            }
+            this.code_model = new CodeModel(createModel(code_model_profile), 60 * 60 * 1000, 'code-model', freeFallback);
             if (code_model_profile.api === 'cursor') this.code_model.timeoutMs = 180 * 1000;
         }
         else {
