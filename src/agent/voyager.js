@@ -1099,6 +1099,7 @@ Use only c; no other globals.`;
         return gainedFor(goal, before, this.observe()) >= goal.count;
     }
     // fix35: serialized code-model calls with loud logging (one in flight at a time; no dual same-model Ollama generate)
+    // fix37: idle practice runs during code-model waits (no separate 30s idle required)
     async _ask(system, user) {
         CALLS.code++;
         const callNum = CALLS.code;
@@ -1115,8 +1116,21 @@ Use only c; no other globals.`;
         const t0 = Date.now(); console.log(`[timing] ${new Date().toISOString().slice(11,19)}Z composer call #${callNum} start (prompt ${system.length + user.length} chars)`);
         // fix35: overlap CPU-only maintenance with code-model wait (flush debounced saves, extract shared fragments)
         this._overlapCpuMaintenance();
-        let r; try { r = await cm.sendRequest([{ role: 'user', content: user }], system); } finally { release(); console.log(`[timing] ${new Date().toISOString().slice(11,19)}Z composer call #${callNum} took ${Date.now() - t0}ms (reply ${String(r ?? '').length} chars)`); }
+        // fix37: start idle practice in background during code-model wait (learned skills, no 30s idle required)
+        const practicePromise = this._startIdlePractice(callNum);
+        let r; try { r = await cm.sendRequest([{ role: 'user', content: user }], system); } finally {
+            this._stopIdlePractice();
+            release();
+            console.log(`[timing] ${new Date().toISOString().slice(11,19)}Z composer call #${callNum} took ${Date.now() - t0}ms (reply ${String(r ?? '').length} chars)`);
+        }
         return r;
+    }
+    // fix37: hash a model reply for duplicate detection (djb2 algorithm, fast and deterministic)
+    _hashReply(text) {
+        const str = String(text).trim();
+        let h = 5381;
+        for (let i = 0; i < str.length; i++) h = ((h << 5) + h + str.charCodeAt(i)) | 0;
+        return h.toString(36);
     }
     // fix35: CPU-only maintenance that can run overlapped with code-model waits (no model calls)
     _overlapCpuMaintenance() {
@@ -1130,6 +1144,170 @@ Use only c; no other globals.`;
         if (JSON.stringify(this.sharedHints || []) !== prevHints) did.push('extract-shared');
         // recompute shared hints if needed
         if (did.length) console.log(`[overlap] CPU maintenance overlapped with code-model: ${did.join(', ')} (${Date.now() - t0}ms)`);
+    }
+    // fix37: idle practice during code-model waits - runs learned skills without requiring 30s of true idle
+    // Skills to practise are selected from the learned skill library (not hard-coded); eligibility is context-dependent
+    // Fail-loud: failures are logged, consecutive failures trigger backoff (no silent infinite loops)
+    async _startIdlePractice(callNum) {
+        if (this._idlePracticeActive) return;
+        this._idlePracticeActive = true;
+        this._idlePracticeAbort = false;
+        const t0 = Date.now();
+        console.log(`[idle-practice] starting during code-model call #${callNum} (no 30s idle required)`);
+        const practice = async () => {
+            let consecutiveSkips = 0;
+            let practiceCount = 0;
+            const MAX_CONSECUTIVE_SKIPS = 3;
+            while (this._idlePracticeActive && !this._idlePracticeAbort) {
+                // select a learned skill to practice (from skill library, not hard-coded)
+                const skill = this._selectPracticeSkill();
+                if (!skill) {
+                    console.log(`[idle-practice] no eligible skill to practice; pausing 5s`);
+                    await new Promise(r => setTimeout(r, 5000));
+                    consecutiveSkips++;
+                    if (consecutiveSkips >= MAX_CONSECUTIVE_SKIPS) {
+                        console.log(`[idle-practice] no eligible skills after ${MAX_CONSECUTIVE_SKIPS} attempts; stopping practice loop`);
+                        break;
+                    }
+                    continue;
+                }
+                consecutiveSkips = 0;
+                // run the skill in a safe, interruptible way
+                const ok = await this._runPracticeSkill(skill);
+                if (ok && ok.message) {
+                    console.log(`[idle-practice] SUCCESS ${skill.name}: ${ok.message}`);
+                    practiceCount++;
+                } else if (ok === null) {
+                    // aborted or interrupted (already logged in _runPracticeSkill)
+                    break;
+                } else {
+                    // context-dependent fail logged in _runPracticeSkill; skill stays eligible
+                    consecutiveSkips++;
+                    if (consecutiveSkips >= MAX_CONSECUTIVE_SKIPS) {
+                        console.log(`[idle-practice] ${MAX_CONSECUTIVE_SKIPS} consecutive skips/failures; pausing practice loop`);
+                        await new Promise(r => setTimeout(r, 5000));
+                        consecutiveSkips = 0;
+                    }
+                }
+                // brief pause between practice attempts
+                if (this._idlePracticeActive && !this._idlePracticeAbort) {
+                    await new Promise(r => setTimeout(r, 2000));
+                }
+            }
+            return practiceCount;
+        };
+        this._idlePracticePromise = practice().then(count => {
+            console.log(`[idle-practice] completed ${count} practice run(s) during code-model call #${callNum}`);
+        }).catch(e => {
+            console.error(`[idle-practice] ERROR: ${e.message}; stopping practice`);
+        }).finally(() => {
+            const elapsed = Date.now() - t0;
+            console.log(`[idle-practice] stopped after ${elapsed}ms`);
+            this._idlePracticeActive = false;
+        });
+        return this._idlePracticePromise;
+    }
+    _stopIdlePractice() {
+        if (!this._idlePracticeActive) return;
+        this._idlePracticeAbort = true;
+        console.log(`[idle-practice] stopping (code-model call completed)`);
+    }
+    // fix37: select a learned skill to practice - skills must be from the library (not hard-coded)
+    // Uses maturity and recency to pick skills that benefit from practice
+    _selectPracticeSkill() {
+        // filter to learned, non-demoted, non-primitive skills that are safe to run as practice
+        const candidates = this.skills.filter(s =>
+            !s.primitive && !s.handwritten && !s.demoted && !s.mergedInto && !s.candidate &&
+            s.code && s.name && s.stats &&
+            // parameterless skills only (can be called without arguments)
+            /async\s+function\s+\w+\s*\(\s*bot\s*(?:,\s*\w+\s*=\s*[^,)]+)*\)/.test(s.code)
+        );
+        if (!candidates.length) return null;
+        // score by: low maturity + long since last run (skills needing practice)
+        const now = Date.now();
+        const scored = candidates.map(s => {
+            const m = this._maturity(s);
+            const lastRun = s.stats?.lastRun || 0;
+            const sinceRun = now - lastRun;
+            // prefer low-V skills that haven't run recently (need practice)
+            const score = (1 - m.V) * 0.6 + Math.min(1, sinceRun / (60 * 60 * 1000)) * 0.4;
+            return { s, score };
+        }).sort((a, b) => b.score - a.score);
+        // pick from top candidates with some randomization
+        const top = scored.slice(0, Math.min(5, scored.length));
+        return top[Math.floor(Math.random() * top.length)]?.s || null;
+    }
+    // fix37: run a practice skill safely - returns { message } on success, false on context-fail, null on abort
+    // Fail-loud: all skips and failures are logged clearly
+    async _runPracticeSkill(skill) {
+        if (this._idlePracticeAbort) return null;
+        const bot = this.agent.bot;
+        // safety gates: log clearly when skipped (not silent)
+        if (!this.agent.isIdle()) {
+            console.log(`[idle-practice] SKIPPED ${skill.name}: bot is not idle`);
+            return false;
+        }
+        if (bot.health < 10) {
+            console.log(`[idle-practice] SKIPPED ${skill.name}: health too low (${Math.round(bot.health)}/20 < 10)`);
+            return false;
+        }
+        if (bot.food < 8) {
+            console.log(`[idle-practice] SKIPPED ${skill.name}: food too low (${bot.food}/20 < 8)`);
+            return false;
+        }
+        const threats = this._threats();
+        if (threats !== 'none') {
+            console.log(`[idle-practice] SKIPPED ${skill.name}: threats nearby (${threats})`);
+            return false;
+        }
+        // stage and run the skill (fail-loud: log errors, rethrow critical ones)
+        const call = `await ${skill.name}(bot);`;
+        const full = this._libSrc() + `\n\nasync function __practice(bot) {\n    try { ${call} } catch (e) { log(bot, 'PRACTICE FAILED: ' + e.message); throw e; }\n}\nawait __practice(bot);`;
+        let staged;
+        try { staged = await this.agent.coder._stageCode(full); }
+        catch (e) { console.error(`[idle-practice] STAGING FAILED ${skill.name}: ${e.message}`); return false; }
+        if (!staged) { console.error(`[idle-practice] STAGING FAILED ${skill.name}: no staged code returned`); return false; }
+        // mark as running, cap at 10 seconds for practice runs
+        const practiceStart = Date.now();
+        const maxPracticeMs = 10000;
+        let completed = false;
+        let practiceError = null;
+        const runPromise = (async () => {
+            try {
+                await Promise.race([
+                    staged.func.main(bot),
+                    new Promise((_, rej) => setTimeout(() => rej(new Error('practice timeout')), maxPracticeMs))
+                ]);
+                completed = true;
+            } catch (e) {
+                practiceError = e;
+                if (e.message !== 'practice timeout') {
+                    console.error(`[idle-practice] EXECUTION FAILED ${skill.name}: ${e.message}`);
+                } else {
+                    console.log(`[idle-practice] TIMEOUT ${skill.name}: exceeded ${maxPracticeMs}ms`);
+                }
+            }
+        })();
+        // wait for completion or abort
+        while (!completed && !practiceError && Date.now() - practiceStart < maxPracticeMs) {
+            if (this._idlePracticeAbort) {
+                bot.interrupt_code = true;
+                console.log(`[idle-practice] ABORTED ${skill.name}: code-model call completed`);
+                return null;
+            }
+            await new Promise(r => setTimeout(r, 200));
+        }
+        try { await runPromise; } catch (e) { /* already logged above */ }
+        // record the practice run (updates stats)
+        if (skill.stats) {
+            skill.stats.lastRun = Date.now();
+            skill.stats.practiceRuns = (skill.stats.practiceRuns || 0) + 1;
+            this._saveSkills();
+        }
+        if (practiceError) {
+            return false;
+        }
+        return { message: `completed in ${Date.now() - practiceStart}ms` };
     }
 
     // ---------- automatic curriculum ----------
@@ -1531,9 +1709,28 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         console.log(`[psn] repair memory for ${e.name}: ${(e.repairHistory || []).length} past proposal(s) in the prompt${pastLessons.length ? `, ${pastLessons.length} AWM lesson(s)` : ''}`);
         console.log(`[psn] REPAIR ${e.name} [${q.kind}] with the code model (evidence: ${q.evidence.slice(0, 160)})`);
         let code, body, desc, extra = '';
+        // fix37: duplicate-reply detection state for repair loop
+        let prevRepairHash = null, repairDupes = 0;
         for (let att = 1; att <= 2; att++) {   // fix19 (3): one retry with the lint/format error fed back
+            // fix37: escalating duplicate feedback for repair loop
+            const dupeWarn = repairDupes > 0 ? `\n\n!!! CRITICAL: Your previous reply was IDENTICAL. You MUST write DIFFERENT code. !!!` : '';
             let reply;
-            try { reply = await this._ask(system, user + extra); } catch (err) { console.log(`[psn] repair FAILED for ${e.name}: ${err.message}`); return false; }
+            try { reply = await this._ask(system, user + extra + dupeWarn); } catch (err) { console.log(`[psn] repair FAILED for ${e.name}: ${err.message}`); return false; }
+            // fix37: duplicate-reply detection for repair loop
+            const repairHash = this._hashReply(reply);
+            if (prevRepairHash !== null && repairHash === prevRepairHash) {
+                repairDupes++;
+                console.log(`[duplicate] DETECTED in repair: reply #${att} identical to #${att - 1} (hash ${repairHash})`);
+                if (repairDupes >= 2) {
+                    console.error(`[duplicate] ABORT repair of ${e.name}: 2 consecutive duplicate replies; repair FAILED LOUDLY`);
+                    this._noteProposal(e, { task: q.task, kind: q.kind, evidence: q.evidence.slice(0, 200), desc: 'ABORTED: duplicate replies', outcome: 'duplicate replies' });
+                    return false;
+                }
+                extra = `\n--- your previous reply was IDENTICAL to the one before ---\nYou MUST write DIFFERENT code. Change your approach.\n--- previous code ---\n${code || '(none)'}`;
+                continue;
+            }
+            prevRepairHash = repairHash;
+            repairDupes = 0;
             code = extractCode(reply);
             const fn = code && code.match(/async\s+function\s+([A-Za-z_]\w*)\s*\(/);
             let err = null;
@@ -1883,13 +2080,34 @@ Interrupts: the bot may be interrupted at any time (danger, getting stuck, a pla
 
         let feedback = rp?.cut ? `Replay of ${rp.name} failed: ${rp.cut}\nExecution output:\n${String(rp.output).slice(-800)}` : '';
         let lastCode = '', anyCut = rp?.cut || '', prevCrit = null;
+        // fix37: duplicate-reply detection state
+        let prevReplyHash = null, consecutiveDupes = 0;
         for (let i = 1; i <= MAX_ATTEMPTS; i++) {
             if (this.abort) { console.log('[voyager] aborted for player'); return; }
+            // fix37: escalating duplicate feedback (changes each time to nudge the model)
+            const dupeEscalation = consecutiveDupes > 0 ? `\n\n!!! CRITICAL: Your previous ${consecutiveDupes} reply(ies) were IDENTICAL to the one before. You MUST write DIFFERENT code this time. The previous code did not work. Change your approach, use different skills, or try a simpler strategy. Repeating the same code will cause this task to fail. !!!` : '';
             const user = `Task: ${task}\nHint: ${proposal.context || ''}\n${recipeFacts(task)}\n--- state ---\n${this._stateText(this.observe())}
 --- learned skills you can call ---\n${ctx || '(none)'}
-${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- feedback from last attempt ---\n${feedback}\n` : ''}Attempt ${i}/${MAX_ATTEMPTS}. Write the code block:`;
+${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- feedback from last attempt ---\n${feedback}\n` : ''}${dupeEscalation}Attempt ${i}/${MAX_ATTEMPTS}. Write the code block:`;
             if (i === 1) console.log(`[voyager] code prompt: ${shown.size} of ${this.skills.filter(s => !s.demoted).length} skills in the catalogue (relevant + deps), ${Math.min(3, related.length)} with source; prompt ${system.length + user.length} chars`);
             const reply = await this._ask(system, user);
+            // fix37: duplicate-reply detection - hash and compare to previous
+            const replyHash = this._hashReply(reply);
+            if (prevReplyHash !== null && replyHash === prevReplyHash) {
+                consecutiveDupes++;
+                console.log(`[duplicate] DETECTED: code model reply #${i} is identical to reply #${i - 1} (hash ${replyHash}, consecutive dupes: ${consecutiveDupes})`);
+                if (consecutiveDupes >= 2) {
+                    console.error(`[duplicate] ABORT: 2 consecutive duplicate replies; task "${task}" FAILED LOUDLY (code model is stuck)`);
+                    this.progress.failed.push(`${task} (ABORTED: code model returned identical replies ${consecutiveDupes + 1} times)`);
+                    this._saveProgress();
+                    return;
+                }
+                // don't lint/exec, just reprompt with stronger feedback
+                feedback = `ERROR: Your reply was IDENTICAL to your previous attempt. The code model returned the exact same response twice. This is not acceptable. You MUST change your approach.\n\nPrevious code that failed:\n${lastCode}\n\nDo NOT repeat this code. Try a completely different strategy.`;
+                continue;
+            }
+            prevReplyHash = replyHash;
+            consecutiveDupes = 0;
             const code = extractCode(reply);
             if (!code) { feedback = 'Error: no code block. Reply with a ```javascript``` code block.'; continue; }
             const fn = code.match(/async\s+function\s+([A-Za-z_]\w*)\s*\(/);
