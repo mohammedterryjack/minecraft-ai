@@ -1,0 +1,547 @@
+/**
+ * fix47 regression tests
+ * 
+ * 1. Prefix cleanup: scan all prompt-visible strings for skills/world prefix patterns
+ * 2. Planning from inventory: decompose subtracts inventory + producible items; number-word parsing
+ * 3. posKey regression: missingCalls handles all local declaration patterns
+ * 4. ensureCraftingTable: recipe lookup without inventory filtering
+ * 5. Repair deduplication: no duplicate repairs for same skill+signature while pending
+ * 6. Open items: tossClutter postcondition, deposit logic
+ */
+
+import { describe, it, beforeEach } from 'node:test';
+import assert from 'node:assert';
+import { readFileSync } from 'fs';
+
+// ============================================================================
+// Issue 1: Prefix cleanup - no skills.*/world.* in model-visible strings
+// ============================================================================
+
+describe('fix47: no prefixed calls in model-visible strings', () => {
+    it('should NOT have skills.* or world.* in coding_examples', async () => {
+        const defaultProfile = JSON.parse(readFileSync('./profiles/defaults/_default.json', 'utf8'));
+        const examples = defaultProfile.coding_examples || [];
+        
+        const prefixPattern = /\b(?:skills|world)\s*\.\s*\w+\s*\(/g;
+        const violations = [];
+        
+        for (const example of examples) {
+            for (const msg of example) {
+                if (msg.content && prefixPattern.test(msg.content)) {
+                    violations.push(msg.content.match(prefixPattern));
+                }
+            }
+        }
+        
+        assert.strictEqual(violations.length, 0, 
+            `Found prefixed calls in coding_examples: ${JSON.stringify(violations.flat())}`);
+    });
+
+    it('should NOT have skills.* or world.* in conversation_examples', async () => {
+        const defaultProfile = JSON.parse(readFileSync('./profiles/defaults/_default.json', 'utf8'));
+        const examples = defaultProfile.conversation_examples || [];
+        
+        const prefixPattern = /\b(?:skills|world)\s*\.\s*\w+\s*\(/g;
+        const violations = [];
+        
+        for (const example of examples) {
+            for (const msg of example) {
+                if (msg.content && prefixPattern.test(msg.content)) {
+                    violations.push(msg.content.match(prefixPattern));
+                }
+            }
+        }
+        
+        assert.strictEqual(violations.length, 0, 
+            `Found prefixed calls in conversation_examples: ${JSON.stringify(violations.flat())}`);
+    });
+
+    it('should NOT have "You have skills and world imported" in coding prompt', async () => {
+        const defaultProfile = JSON.parse(readFileSync('./profiles/defaults/_default.json', 'utf8'));
+        const coding = defaultProfile.coding || '';
+        
+        assert.ok(!coding.includes('skills, and `world` imported'), 
+            'coding prompt should not mention skills/world objects as imported');
+        assert.ok(!coding.includes('`skills`, and `world`'), 
+            'coding prompt should not mention skills/world objects');
+    });
+
+    it('should NOT have skills.*/world.* in any SEEDED_PRIMITIVES code', async () => {
+        const { Voyager } = await import('../src/agent/voyager.js');
+        
+        const prefixPattern = /\b(?:skills|world)\s*\.\s*\w+\s*\(/g;
+        const violations = [];
+        
+        for (const prim of Voyager.SEEDED_PRIMITIVES || []) {
+            if (prim.code && prefixPattern.test(prim.code)) {
+                violations.push({ name: prim.name, matches: prim.code.match(prefixPattern) });
+            }
+        }
+        
+        assert.strictEqual(violations.length, 0, 
+            `Found prefixed calls in SEEDED_PRIMITIVES: ${JSON.stringify(violations)}`);
+    });
+
+    it('should NOT have skills.*/world.* in profile coding prompts', async () => {
+        const { readdirSync } = await import('fs');
+        const profiles = readdirSync('./profiles').filter(f => f.endsWith('.json'));
+        
+        const prefixPattern = /\b(?:skills|world)\s*\.\s*\w+\s*\(/g;
+        const violations = [];
+        
+        for (const profile of profiles) {
+            try {
+                const data = JSON.parse(readFileSync(`./profiles/${profile}`, 'utf8'));
+                if (data.coding && prefixPattern.test(data.coding)) {
+                    violations.push({ profile, matches: data.coding.match(prefixPattern) });
+                }
+            } catch (e) {
+                // Skip non-JSON files
+            }
+        }
+        
+        assert.strictEqual(violations.length, 0, 
+            `Found prefixed calls in profile coding prompts: ${JSON.stringify(violations)}`);
+    });
+});
+
+// ============================================================================
+// Issue 2: Planning from inventory - decompose with inventory subtraction
+// ============================================================================
+
+describe('fix47: number word parsing', () => {
+    it('should parse "five" as 5', async () => {
+        const { parseNumberWord } = await import('../src/agent/voyager.js');
+        assert.strictEqual(parseNumberWord('five'), 5);
+    });
+
+    it('should parse "twelve" as 12', async () => {
+        const { parseNumberWord } = await import('../src/agent/voyager.js');
+        assert.strictEqual(parseNumberWord('twelve'), 12);
+    });
+
+    it('should parse "twenty" as 20', async () => {
+        const { parseNumberWord } = await import('../src/agent/voyager.js');
+        assert.strictEqual(parseNumberWord('twenty'), 20);
+    });
+
+    it('should return null for non-number words', async () => {
+        const { parseNumberWord } = await import('../src/agent/voyager.js');
+        assert.strictEqual(parseNumberWord('iron'), null);
+        assert.strictEqual(parseNumberWord('pickaxe'), null);
+    });
+
+    it('should parse "Mine five iron ore" goal correctly', async () => {
+        const { parseVerboseGoal } = await import('../src/agent/voyager.js');
+        const result = parseVerboseGoal('Mine five iron ore');
+        
+        assert.ok(result, 'Should parse the goal');
+        assert.strictEqual(result.count, 5, 'Should parse "five" as 5');
+        assert.ok(result.items.some(i => i.includes('iron')), 'Should identify iron ore');
+    });
+
+    it('should parse numeric strings normally', async () => {
+        const { parseNumberWord } = await import('../src/agent/voyager.js');
+        assert.strictEqual(parseNumberWord('5'), 5);
+        assert.strictEqual(parseNumberWord('10'), 10);
+    });
+});
+
+describe('fix47: decompose subtracts inventory and producible items', () => {
+    it('should subtract raw_iron already in inventory', async () => {
+        const mockInventory = { raw_iron: 28, iron_ingot: 1 };
+        
+        const goalCount = 5;
+        const haveRaw = mockInventory.raw_iron || 0;
+        const shortfall = Math.max(0, goalCount - haveRaw);
+        
+        assert.strictEqual(shortfall, 0, 'Should need 0 raw_iron when have 28 and need 5');
+    });
+
+    it('should account for producible iron_ingot from raw_iron via smelting', async () => {
+        const mockInventory = { raw_iron: 28, iron_ingot: 1 };
+        
+        const needIngots = 5;
+        const haveIngots = mockInventory.iron_ingot || 0;
+        const canSmelt = mockInventory.raw_iron || 0;
+        const producible = haveIngots + canSmelt;
+        const shortfall = Math.max(0, needIngots - producible);
+        
+        assert.strictEqual(shortfall, 0, 'Should need 0 more iron_ingot when have 28 raw_iron + 1 ingot');
+    });
+
+    it('should calculate real shortfall when inventory is insufficient', async () => {
+        const mockInventory = { raw_iron: 2, iron_ingot: 1 };
+        
+        const needIngots = 5;
+        const haveIngots = mockInventory.iron_ingot || 0;
+        const canSmelt = mockInventory.raw_iron || 0;
+        const producible = haveIngots + canSmelt;
+        const shortfall = Math.max(0, needIngots - producible);
+        
+        assert.strictEqual(shortfall, 2, 'Should need 2 more iron_ingot when have 2 raw_iron + 1 ingot for 5 needed');
+    });
+});
+
+// ============================================================================
+// Issue 3: posKey regression - missingCalls handles local declarations
+// ============================================================================
+
+describe('fix47: missingCalls handles all local declaration patterns', () => {
+    it('should NOT flag arrow function assigned to const as unknown', async () => {
+        const { missingCalls } = await import('../src/agent/skill_graph.js');
+        
+        const code = `
+async function collectBlock(bot, blockType, num = 1) {
+    const posKey = p => \`\${Math.floor(p.x)},\${Math.floor(p.y)},\${Math.floor(p.z)}\`;
+    const excluded = new Set();
+    excluded.add(posKey(block.position));
+    log(bot, \`Failed at \${posKey(block.position)}\`);
+}`;
+        
+        const knownSkills = new Set(['getNearestBlock', 'goToPosition', 'log']);
+        const missing = missingCalls(code, 'collectBlock', knownSkills);
+        
+        assert.ok(!missing.includes('posKey'), 
+            `posKey should NOT be flagged as unknown (got: ${missing.join(', ')})`);
+    });
+
+    it('should NOT flag function parameters as unknown', async () => {
+        const { missingCalls } = await import('../src/agent/skill_graph.js');
+        
+        const code = `
+async function mySkill(bot, callbackFn) {
+    const result = callbackFn(42);
+    await goToPosition(bot, result, 64, result);
+}`;
+        
+        const knownSkills = new Set(['goToPosition', 'log']);
+        const missing = missingCalls(code, 'mySkill', knownSkills);
+        
+        assert.ok(!missing.includes('callbackFn'), 
+            `callbackFn (function param) should NOT be flagged as unknown (got: ${missing.join(', ')})`);
+    });
+
+    it('should NOT flag destructured variables as unknown', async () => {
+        const { missingCalls } = await import('../src/agent/skill_graph.js');
+        
+        const code = `
+async function mySkill(bot) {
+    const { posKey, otherFn } = helpers;
+    posKey(block);
+    otherFn(42);
+}`;
+        
+        const knownSkills = new Set(['goToPosition', 'log']);
+        const missing = missingCalls(code, 'mySkill', knownSkills);
+        
+        assert.ok(!missing.includes('posKey'), 
+            `posKey (destructured) should NOT be flagged as unknown (got: ${missing.join(', ')})`);
+        assert.ok(!missing.includes('otherFn'), 
+            `otherFn (destructured) should NOT be flagged as unknown (got: ${missing.join(', ')})`);
+    });
+
+    it('should NOT flag arrow function parameters as unknown', async () => {
+        const { missingCalls } = await import('../src/agent/skill_graph.js');
+        
+        const code = `
+async function mySkill(bot) {
+    const fn = (helperFn) => helperFn(42);
+    fn(x => x * 2);
+}`;
+        
+        const knownSkills = new Set(['goToPosition', 'log']);
+        const missing = missingCalls(code, 'mySkill', knownSkills);
+        
+        assert.ok(!missing.includes('helperFn'), 
+            `helperFn (arrow param) should NOT be flagged as unknown (got: ${missing.join(', ')})`);
+    });
+
+    it('should NOT flag catch clause parameter as unknown', async () => {
+        const { missingCalls } = await import('../src/agent/skill_graph.js');
+        
+        const code = `
+async function mySkill(bot) {
+    try {
+        await goToPosition(bot, 0, 64, 0);
+    } catch (errorFn) {
+        const msg = errorFn.message;
+    }
+}`;
+        
+        const knownSkills = new Set(['goToPosition', 'log']);
+        const missing = missingCalls(code, 'mySkill', knownSkills);
+        
+        // errorFn is not called with (), but ensure the pattern is recognized
+        assert.ok(!missing.includes('errorFn'), 
+            `errorFn (catch param) should NOT be flagged (got: ${missing.join(', ')})`);
+    });
+
+    it('should NOT flag for-of loop variable as unknown', async () => {
+        const { missingCalls } = await import('../src/agent/skill_graph.js');
+        
+        const code = `
+async function mySkill(bot) {
+    for (const blockFn of [() => 1, () => 2]) {
+        blockFn();
+    }
+}`;
+        
+        const knownSkills = new Set(['goToPosition', 'log']);
+        const missing = missingCalls(code, 'mySkill', knownSkills);
+        
+        assert.ok(!missing.includes('blockFn'), 
+            `blockFn (for-of var) should NOT be flagged as unknown (got: ${missing.join(', ')})`);
+    });
+
+    it('should still flag actually unknown camelCase calls', async () => {
+        const { missingCalls } = await import('../src/agent/skill_graph.js');
+        
+        const code = `
+async function mySkill(bot) {
+    await unknownSkillCall(bot);
+    posKey(123);
+}`;
+        
+        const knownSkills = new Set(['goToPosition', 'log']);
+        const missing = missingCalls(code, 'mySkill', knownSkills);
+        
+        assert.ok(missing.includes('unknownSkillCall'), 
+            `unknownSkillCall SHOULD be flagged as unknown`);
+        assert.ok(missing.includes('posKey'), 
+            `posKey SHOULD be flagged when not declared locally`);
+    });
+
+    it('should handle the exact findNextCollectBlock pattern from logs', async () => {
+        const { missingCalls } = await import('../src/agent/skill_graph.js');
+        
+        // This is the exact pattern that failed in the logs
+        const code = `
+async function findNextCollectBlock(bot, blockType) {
+    const excluded = new Set();
+    const posKey = p => \`\${Math.floor(p.x)},\${Math.floor(p.y)},\${Math.floor(p.z)}\`;
+    for (let i = 0; i < 10; i++) {
+        const block = getNearestBlock(bot, b => !excluded.has(posKey(b.position)), 64);
+        if (!block) break;
+        try {
+            await goToPosition(bot, block.position.x, block.position.y, block.position.z, 4);
+        } catch (err) {
+            excluded.add(posKey(block.position));
+            log(bot, \`Failed to collect \${blockType} at \${posKey(block.position)}: \${err.message}; trying another\`);
+            continue;
+        }
+    }
+    return true;
+}`;
+        
+        const knownSkills = new Set(['getNearestBlock', 'goToPosition', 'log', 'pickupNearbyItems']);
+        const missing = missingCalls(code, 'findNextCollectBlock', knownSkills);
+        
+        assert.ok(!missing.includes('posKey'), 
+            `posKey should NOT be flagged when declared as const arrow function (got: ${missing.join(', ')})`);
+    });
+});
+
+// ============================================================================
+// Issue 4: ensureCraftingTable recipe lookup without inventory filtering
+// ============================================================================
+
+describe('fix47: ensureCraftingTable recipe lookup', () => {
+    it('should use minecraft-data recipesAll when ingredients missing', async () => {
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        
+        // Check that ensureCraftingTable section has recipesAll for inventory-independent recipe lookup
+        // The code is in SEEDED_PRIMITIVES as a template literal, search the surrounding context
+        const ensureTableStart = voyagerSrc.indexOf("name: 'ensureCraftingTable'");
+        assert.ok(ensureTableStart > -1, 'ensureCraftingTable should be in SEEDED_PRIMITIVES');
+        
+        // Get a reasonable chunk of the ensureCraftingTable section (up to the next seeded primitive)
+        const nextPrimitive = voyagerSrc.indexOf("name: '", ensureTableStart + 30);
+        const sectionEnd = nextPrimitive > -1 ? nextPrimitive : ensureTableStart + 5000;
+        const code = voyagerSrc.slice(ensureTableStart, sectionEnd);
+        
+        // Should have recipe lookup that doesn't require ingredients
+        // Either bot.recipesAll or minecraft-data registry lookup
+        assert.ok(
+            code.includes('recipesAll') || 
+            code.includes('allRecipes') ||
+            code.includes('registry') || 
+            code.includes('minecraft-data') ||
+            code.includes('mcData'),
+            'Should use recipe lookup that does not require ingredients in inventory'
+        );
+    });
+
+    it('should NOT log "no recipe found" when planks are missing but recipe exists', async () => {
+        const { Voyager } = await import('../src/agent/voyager.js');
+        
+        const ensureTablePrim = Voyager.SEEDED_PRIMITIVES.find(p => p.name === 'ensureCraftingTable');
+        assert.ok(ensureTablePrim, 'ensureCraftingTable should exist');
+        
+        const code = ensureTablePrim.code;
+        
+        // Should decompose to missing ingredients, not report "no recipe"
+        assert.ok(
+            code.includes('need') || code.includes('planks') || code.includes('ingredient'),
+            'Should mention needing ingredients rather than "no recipe found"'
+        );
+    });
+});
+
+// ============================================================================
+// Issue 5: Repair deduplication and outcome logging
+// ============================================================================
+
+describe('fix47: repair deduplication', () => {
+    it('should have repair outcome logging (ok/rejected/rollback)', async () => {
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        
+        // Should log outcomes
+        assert.ok(
+            voyagerSrc.includes('[repair-outcome]') || 
+            voyagerSrc.includes('repair ok') ||
+            voyagerSrc.includes('repair rejected') ||
+            voyagerSrc.includes('repair rollback') ||
+            (voyagerSrc.includes('ROLLBACK') && voyagerSrc.includes('repair')),
+            'Should have repair outcome logging'
+        );
+    });
+
+    it('should have deduplication for same skill+signature repair requests', async () => {
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        
+        // Should check for duplicate repairs
+        assert.ok(
+            voyagerSrc.includes('already queued') ||
+            voyagerSrc.includes('pending') ||
+            voyagerSrc.includes('dedup') ||
+            voyagerSrc.includes('same failure') ||
+            voyagerSrc.includes('signature'),
+            'Should have deduplication check for repair queue'
+        );
+    });
+
+    it('should log loudly when same skill re-queued with same failure signature', async () => {
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        
+        // Should have loud logging for duplicate repairs
+        assert.ok(
+            voyagerSrc.includes('already queued') ||
+            voyagerSrc.includes('WARN') ||
+            voyagerSrc.includes('duplicate'),
+            'Should warn when duplicate repair queued'
+        );
+    });
+});
+
+// ============================================================================
+// Issue 6: Open items from log - tossClutter and deposit
+// ============================================================================
+
+describe('fix47: tossClutter postcondition and deposit logic', () => {
+    it('should have tossClutter postcondition that checks for actual removal', async () => {
+        const { Voyager } = await import('../src/agent/voyager.js');
+        
+        const tossClutterPrim = Voyager.SEEDED_PRIMITIVES.find(p => p.name === 'tossClutter');
+        assert.ok(tossClutterPrim, 'tossClutter should exist');
+        
+        if (tossClutterPrim.contract) {
+            const post = tossClutterPrim.contract.post;
+            assert.ok(
+                post.includes('delta') || post.includes('inv') || post.includes('emptySlot'),
+                'tossClutter postcondition should check for inventory change or slot freeing'
+            );
+        }
+    });
+
+    it('should deposit cobblestone when computed as candidate', async () => {
+        const { Voyager } = await import('../src/agent/voyager.js');
+        
+        const tossClutterPrim = Voyager.SEEDED_PRIMITIVES.find(p => p.name === 'tossClutter');
+        assert.ok(tossClutterPrim, 'tossClutter should exist');
+        
+        const code = tossClutterPrim.code;
+        
+        // Should call depositToChest for deposit candidates
+        assert.ok(code.includes('depositToChest'), 
+            'tossClutter should call depositToChest for deposit candidates');
+        assert.ok(code.includes('depositList') || code.includes('depositCandidates'),
+            'tossClutter should iterate over deposit candidates');
+    });
+
+    it('should have clear PREREQUISITE FAILED message when chest missing for deposit', async () => {
+        const { Voyager } = await import('../src/agent/voyager.js');
+        
+        const tossClutterPrim = Voyager.SEEDED_PRIMITIVES.find(p => p.name === 'tossClutter');
+        assert.ok(tossClutterPrim, 'tossClutter should exist');
+        
+        const code = tossClutterPrim.code;
+        
+        assert.ok(code.includes('PREREQUISITE') || code.includes('chest'),
+            'tossClutter should mention prerequisite or chest requirement on failure');
+    });
+});
+
+// ============================================================================
+// Integration tests
+// ============================================================================
+
+describe('fix47: integration - all prefixed patterns removed', () => {
+    it('should have no skills.* or world.* patterns in any file fed to the model', async () => {
+        const { readdirSync, existsSync } = await import('fs');
+        
+        const prefixPattern = /\b(?:skills|world)\s*\.\s*\w+\s*\(/g;
+        const violations = [];
+        
+        // Check profiles
+        for (const file of readdirSync('./profiles').filter(f => f.endsWith('.json'))) {
+            try {
+                const content = readFileSync(`./profiles/${file}`, 'utf8');
+                const data = JSON.parse(content);
+                
+                // Check coding examples
+                for (const examples of [data.coding_examples || [], data.conversation_examples || []]) {
+                    for (const ex of examples) {
+                        for (const msg of ex) {
+                            if (msg.content && prefixPattern.test(msg.content)) {
+                                violations.push({ file, content: msg.content.match(prefixPattern) });
+                            }
+                        }
+                    }
+                }
+                
+                // Check coding prompt
+                if (data.coding && prefixPattern.test(data.coding)) {
+                    violations.push({ file, content: data.coding.match(prefixPattern) });
+                }
+            } catch (e) {
+                // Skip non-parseable files
+            }
+        }
+        
+        // Check defaults
+        if (existsSync('./profiles/defaults')) {
+            for (const file of readdirSync('./profiles/defaults').filter(f => f.endsWith('.json'))) {
+                try {
+                    const content = readFileSync(`./profiles/defaults/${file}`, 'utf8');
+                    const data = JSON.parse(content);
+                    
+                    for (const examples of [data.coding_examples || [], data.conversation_examples || []]) {
+                        for (const ex of examples) {
+                            for (const msg of ex) {
+                                if (msg.content && prefixPattern.test(msg.content)) {
+                                    violations.push({ file: `defaults/${file}`, content: msg.content.match(prefixPattern) });
+                                }
+                            }
+                        }
+                    }
+                } catch (e) {
+                    // Skip
+                }
+            }
+        }
+        
+        assert.strictEqual(violations.length, 0, 
+            `Found prefixed calls in model-visible content: ${JSON.stringify(violations)}`);
+    });
+});

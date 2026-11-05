@@ -14,9 +14,76 @@ export function depsOf(code, name, names) {
     return [...out];
 }
 // bare (non skills./world./bot.) calls to camelCase identifiers that are neither library skills nor defined locally
+// fix47: comprehensive local declaration detection - handles function/const/let/var, params, destructuring, arrow params, for-of, catch
 export function missingCalls(code, name, names) {
     const src = stripComments(code);
-    const local = new Set([...src.matchAll(/(?:function\s+|(?:const|let|var)\s+)([A-Za-z_]\w*)/g)].map(m => m[1]));
+    const local = new Set();
+    
+    // Pattern 1: function declarations and const/let/var declarations
+    // e.g., function foo(...), const foo = ..., let bar, var baz
+    for (const m of src.matchAll(/(?:function\s+|(?:const|let|var)\s+)([A-Za-z_]\w*)/g)) {
+        local.add(m[1]);
+    }
+    
+    // Pattern 2: function parameters (both regular and arrow functions)
+    // e.g., function foo(bar, baz) {...}, (x, y) => ..., async (a, b) => ...
+    for (const m of src.matchAll(/(?:function\s*\w*|(?:async\s+)?)\s*\(([^)]*)\)\s*(?:=>|\{)/g)) {
+        const params = m[1];
+        for (const p of params.split(',')) {
+            const trimmed = p.trim().replace(/\s*=.*$/, '');  // remove default values
+            const id = trimmed.match(/^([A-Za-z_]\w*)/);
+            if (id) local.add(id[1]);
+        }
+    }
+    
+    // Pattern 3: arrow function single parameter (no parens)
+    // e.g., const fn = x => x * 2, array.map(item => ...)
+    for (const m of src.matchAll(/(?:^|[=,(\s])([A-Za-z_]\w*)\s*=>/gm)) {
+        local.add(m[1]);
+    }
+    
+    // Pattern 4: destructuring in const/let/var
+    // e.g., const { foo, bar } = obj, const [a, b] = arr, const { foo: bar } = obj
+    for (const m of src.matchAll(/(?:const|let|var)\s*\{([^}]+)\}/g)) {
+        const inner = m[1];
+        // Handle both { foo } and { foo: bar } patterns
+        // { foo } - foo is the local variable
+        // { foo: bar } - bar is the local variable (renaming)
+        for (const prop of inner.split(',')) {
+            const trimmed = prop.trim();
+            const colonIdx = trimmed.indexOf(':');
+            let localName;
+            if (colonIdx !== -1) {
+                // { foo: bar } pattern - bar is the local variable name
+                const afterColon = trimmed.slice(colonIdx + 1).trim();
+                const match = afterColon.match(/^([A-Za-z_]\w*)/);
+                localName = match ? match[1] : null;
+            } else {
+                // { foo } pattern - foo is the local variable name
+                const match = trimmed.match(/^([A-Za-z_]\w*)/);
+                localName = match ? match[1] : null;
+            }
+            if (localName && /^[A-Za-z_]\w*$/.test(localName)) local.add(localName);
+        }
+    }
+    for (const m of src.matchAll(/(?:const|let|var)\s*\[([^\]]+)\]/g)) {
+        for (const id of m[1].matchAll(/([A-Za-z_]\w*)/g)) {
+            local.add(id[1]);
+        }
+    }
+    
+    // Pattern 5: for-of and for-in loop variables
+    // e.g., for (const item of items), for (let key in obj)
+    for (const m of src.matchAll(/for\s*\(\s*(?:const|let|var)\s+([A-Za-z_]\w*)\s+(?:of|in)\b/g)) {
+        local.add(m[1]);
+    }
+    
+    // Pattern 6: catch clause parameter
+    // e.g., catch (err) {...}, catch (e) {...}
+    for (const m of src.matchAll(/catch\s*\(\s*([A-Za-z_]\w*)\s*\)/g)) {
+        local.add(m[1]);
+    }
+    
     const builtins = new Set(['if','for','while','switch','return','catch','function','await','async','Math','Promise','setTimeout','Number','String','Array','Object','Set','Map','JSON','Vec3','log','parseInt','parseFloat','isNaN','Boolean','Error','Date','require','console']);
     const out = new Set();
     const re = /(?<![.\w])([a-z]\w*[A-Z]\w*)\s*\(/g;   // camelCase bare calls only

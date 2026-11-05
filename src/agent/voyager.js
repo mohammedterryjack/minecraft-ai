@@ -127,10 +127,32 @@ function recipeFacts(text) {
     }
     return out.length ? 'RECIPES (from minecraft-data, authoritative):\n' + out.join('\n') : '';
 }
+// fix47: parse number words (one, two, three...) generically - no hard-coded item tables
+// Supports numbers 0-20 plus tens (thirty, forty... ninety) - returns null for non-numbers
+const NUMBER_WORDS = {
+    zero: 0, one: 1, two: 2, three: 3, four: 4, five: 5, six: 6, seven: 7, eight: 8, nine: 9,
+    ten: 10, eleven: 11, twelve: 12, thirteen: 13, fourteen: 14, fifteen: 15, sixteen: 16,
+    seventeen: 17, eighteen: 18, nineteen: 19, twenty: 20, thirty: 30, forty: 40, fifty: 50,
+    sixty: 60, seventy: 70, eighty: 80, ninety: 90, hundred: 100
+};
+export function parseNumberWord(word) {
+    if (!word) return null;
+    const lower = word.toLowerCase().trim();
+    // Try direct numeric parse first
+    const num = parseInt(lower, 10);
+    if (!isNaN(num)) return num;
+    // Try word-to-number lookup
+    if (NUMBER_WORDS.hasOwnProperty(lower)) return NUMBER_WORDS[lower];
+    return null;
+}
+
 function countGoal(task) {
-    const m = task.match(/^(mine|collect|gather|craft|smelt|obtain|get|chop|cook)\s+(\d+)\s+([a-z_]+)\b/i);
+    // fix47: support both numeric ("5") and word ("five") counts
+    const m = task.match(/^(mine|collect|gather|craft|smelt|obtain|get|chop|cook)\s+(\d+|[a-z]+)\s+([a-z_]+)\b/i);
     if (!m) return null;
     const verb = m[1].toLowerCase();
+    const countParsed = parseNumberWord(m[2]);
+    if (countParsed === null) return null;  // not a valid number
     let item = m[3].toLowerCase();
     // plural item names from the curriculum ("torches", "sticks") -> registry id
     { const irr = { torches: 'torch' }; if (irr[item]) item = irr[item];
@@ -140,7 +162,7 @@ function countGoal(task) {
     if (['mine', 'collect', 'gather', 'chop', 'get', 'obtain'].includes(verb)) {
         try { const md = minecraftData(VERSION || '1.20.4'); for (const d of (md.blockLoot?.[item]?.drops || [])) if (!items.includes(d.item)) items.push(d.item); } catch (e) {}
     }
-    return { count: parseInt(m[2]), item, items, verb };
+    return { count: countParsed, item, items, verb };
 }
 let VERSION = null;
 // fix46: test-only setter for VERSION (parseVerboseGoal requires VERSION to be set)
@@ -196,14 +218,26 @@ export function parseVerboseGoal(task) {
     };
     
     // Extract all potential "count item" pairs from the text
+    // fix47: support both numeric ("5") and word ("five") counts
     const candidates = [];
-    const pattern = /\b(\d+)\s+([a-z][a-z0-9_]*)\b/gi;
+    const patternNumeric = /\b(\d+)\s+([a-z][a-z0-9_]*)\b/gi;
     let m;
-    while ((m = pattern.exec(t))) {
+    while ((m = patternNumeric.exec(t))) {
         const count = parseInt(m[1]);
         const resolved = resolveItem(m[2]);
         if (resolved) {
             candidates.push({ count, item: resolved, pos: m.index });
+        }
+    }
+    // Also try number words (one, two, three, etc.)
+    const numberWordPattern = new RegExp(`\\b(${Object.keys(NUMBER_WORDS).join('|')})\\s+([a-z][a-z0-9_]*)\\b`, 'gi');
+    while ((m = numberWordPattern.exec(t))) {
+        const count = parseNumberWord(m[1]);
+        if (count !== null) {
+            const resolved = resolveItem(m[2]);
+            if (resolved) {
+                candidates.push({ count, item: resolved, pos: m.index });
+            }
         }
     }
     
@@ -524,7 +558,23 @@ export class Voyager {
     _updateAllowed(e, why) { const { V, p, n } = this._maturity(e), r = Math.random(), ok = r < p; gateLog(`maturity ${e.name}: V=${V.toFixed(2)} (u=${this._maturity(e).u.toFixed(2)}, ${n} runs) P(update)=${p.toFixed(2)} draw=${r.toFixed(2)} -> ${ok ? 'UPDATE ALLOWED' : 'FROZEN (mature skill kept)'} [${why}]`); return ok; }
     // fix20 (PSN repair memory): rolling buffer of the last 5 repair proposals per skill
     _noteProposal(e, p) { e.repairHistory = [...(e.repairHistory || []), { at: new Date().toISOString(), ...p }].slice(-5); this._saveSkills(); }
-    _proposalOutcome(e, outcome) { const h = e.repairHistory; if (h?.length && !h[h.length - 1].outcome) { h[h.length - 1].outcome = outcome; } }
+    // fix47: log repair outcomes (ok/rejected/rollback) for observability
+    _proposalOutcome(e, outcome, sig = null) { 
+        const h = e.repairHistory; 
+        if (h?.length && !h[h.length - 1].outcome) { h[h.length - 1].outcome = outcome; }
+        console.log(`[repair-outcome] ${e.name}: ${outcome}`);
+        // fix47: track failed signatures for deduplication
+        if (outcome && /reject|fail|lint|duplicate|abort/i.test(outcome) && sig) {
+            this.progress.failedRepairSigs ||= {};
+            this.progress.failedRepairSigs[sig] = Date.now();
+            // Clean up old signatures (> 30 min) to prevent unbounded growth
+            const now = Date.now();
+            for (const k of Object.keys(this.progress.failedRepairSigs)) {
+                if (now - this.progress.failedRepairSigs[k] > 30 * 60e3) delete this.progress.failedRepairSigs[k];
+            }
+            this._saveProgress();
+        }
+    }
     // ---------- fix22: learned skill contracts (PSN pre/postconditions) ----------
     // Each library skill carries { pre, post, text }: JS predicates over c = { args, ret, pre, post, delta } learned by the code model
     // from the skill's description, code and observed effects; evaluated after every traced call against real bot state.
@@ -2348,9 +2398,25 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
             if (kid) { const par = bs.find(q => q !== kid && kid.path.includes(q.target)); bs = [{ ...kid, kind: 'joint', parent: par.target, parentKind: par.kind }, ...bs.filter(x => x !== kid && x !== par)]; console.log(`[psn] JOINT repair queued: child ${kid.target} [${kid.kind}] with its caller ${par.target} [${par.kind}] (same failure path)`); }
         }
         const rq = [...(this._repairQueue || [])];
+        // fix47: deduplication - create signature from skill name + failure evidence (first 100 chars)
+        const failSig = (b) => `${b.target}:${(b.evidence || '').slice(0, 100).replace(/\s+/g, ' ')}`;
+        const pendingSigs = new Set(rq.map(failSig));
+        // fix47: track failed signatures (repairs that already failed on this signature) - persisted in progress
+        const failedSigs = this.progress.failedRepairSigs || {};
         for (const b of bs) {
+            const sig = failSig(b);
             if (rq.some(x => x.target === b.target)) { console.log(`[psn] repair of ${b.target} already queued`); continue; }
-            rq.push({ ...b, task, trace: traceText(trace, 60), peers: bs.map(x => x.target) }); console.log(`[psn] queued REPAIR of ${b.target} (${rq.length} in queue)`);
+            // fix47: loud deduplication if same skill + signature is re-queued while pending or already failed
+            if (pendingSigs.has(sig)) { 
+                console.log(`[psn] WARN: repair of ${b.target} with same failure signature already pending (dedup): ${sig.slice(0, 80)}`); 
+                continue; 
+            }
+            if (failedSigs[sig] && Date.now() - failedSigs[sig] < 30 * 60e3) {
+                console.log(`[psn] WARN: repair of ${b.target} with same failure signature already failed ${Math.round((Date.now() - failedSigs[sig]) / 60e3)} min ago (dedup): ${sig.slice(0, 80)}`);
+                continue;
+            }
+            rq.push({ ...b, task, trace: traceText(trace, 60), peers: bs.map(x => x.target), sig }); console.log(`[psn] queued REPAIR of ${b.target} (${rq.length} in queue)`);
+            pendingSigs.add(sig);
         }
         rq.sort((a, b) => (b.depth ?? 0) - (a.depth ?? 0)); this._repairQueue = rq;
         // fix35: prefetch embeddings for blamed skills (overlapped with next work; embeds are used by retrieveSkills when repair runs)
@@ -2476,7 +2542,7 @@ IMPORTANT: All functions use bare names. Do NOT write skills.goToPosition - writ
         this._noteProposal(e, { task: q.task, kind: q.kind, evidence: q.evidence.slice(0, 200), desc: desc.slice(0, 200) });
         const saved = await this.saveSkill(e.name, desc, body, `repair: ${q.task}`, { repair: true });
         if (!saved) {
-            this._proposalOutcome(e, 'rejected at submit'); this._saveSkills();
+            this._proposalOutcome(e, 'rejected at submit', q.sig); this._saveSkills();
             // AWM-style: record gate rejection
             await this.repairMemory.recordRepair({ errorSignature: q.evidence, fixSnippet: desc?.slice(0, 200), outcome: false, taskHint: q.task, skillName: e.name });
             console.log(`[psn] repair of ${e.name} rejected by the gate`);
@@ -3492,46 +3558,65 @@ Voyager.SEEDED_PRIMITIVES = [
     if (table) { log(bot, \`Crafting table already nearby at \${table.position}.\`); return true; }
     let hasTable = (getInventoryCounts(bot)['crafting_table'] || 0) > 0;
     
-    // fix43: if no table in inventory, craft one INLINE (2x2, no table needed) - avoids craftRecipe dep cycle
-    // Derive plank types from recipes API rather than hard-coded list
+    // fix43/47: if no table in inventory, craft one INLINE (2x2, no table needed) - avoids craftRecipe dep cycle
+    // fix47: use recipesAll (no inventory filter) to check if recipe EXISTS, then check ingredients
     if (!hasTable) {
         console.log('[ensureCraftingTable] no crafting_table in inventory, attempting inline 2x2 craft...');
         const tableId = bot.registry.itemsByName['crafting_table']?.id;
-        const recipes = tableId ? bot.recipesFor(tableId, null, 1, null) : [];  // null = no crafting table needed (2x2)
-        if (recipes && recipes.length) {
-            // Find which plank ingredient we have in inventory
-            const inv = getInventoryCounts(bot);
-            let canCraft = false;
-            for (const recipe of recipes) {
-                // Check if we have the ingredients for this recipe
-                const ingredients = recipe.delta?.filter(d => d.count < 0) || [];
-                const haveAll = ingredients.every(ing => {
-                    const ingItem = bot.registry.items[ing.id];
-                    return ingItem && (inv[ingItem.name] || 0) >= Math.abs(ing.count);
-                });
-                if (haveAll) {
-                    try {
-                        const beforeCount = (getInventoryCounts(bot)['crafting_table'] || 0);
-                        await bot.craft(recipe, 1, null);
-                        const afterCount = (getInventoryCounts(bot)['crafting_table'] || 0);
-                        if (afterCount > beforeCount) {
-                            log(bot, 'Crafted crafting_table (2x2, inline).');
-                            hasTable = true;
-                            canCraft = true;
-                            break;
-                        }
-                    } catch (e) {
-                        console.log(\`[ensureCraftingTable] inline craft failed: \${e.message}\`);
+        // fix47: recipesAll returns all recipes regardless of inventory; recipesFor filters by inventory
+        // Try recipesFor first (can craft now), then recipesAll (recipe exists but missing ingredients)
+        let recipes = tableId ? bot.recipesFor(tableId, null, 1, null) : [];
+        const allRecipes = tableId && typeof bot.recipesAll === 'function' ? bot.recipesAll(tableId, null, null) : recipes;
+        const inv = getInventoryCounts(bot);
+        let canCraft = false;
+        let missingIngredients = [];
+        
+        // Try to craft with current inventory
+        for (const recipe of recipes) {
+            const ingredients = recipe.delta?.filter(d => d.count < 0) || [];
+            const haveAll = ingredients.every(ing => {
+                const ingItem = bot.registry.items[ing.id];
+                return ingItem && (inv[ingItem.name] || 0) >= Math.abs(ing.count);
+            });
+            if (haveAll) {
+                try {
+                    const beforeCount = (getInventoryCounts(bot)['crafting_table'] || 0);
+                    await bot.craft(recipe, 1, null);
+                    const afterCount = (getInventoryCounts(bot)['crafting_table'] || 0);
+                    if (afterCount > beforeCount) {
+                        log(bot, 'Crafted crafting_table (2x2, inline).');
+                        hasTable = true;
+                        canCraft = true;
+                        break;
                     }
+                } catch (e) {
+                    console.log(\`[ensureCraftingTable] inline craft failed: \${e.message}\`);
                 }
             }
-            if (!canCraft && !hasTable) {
-                log(bot, 'FAILED: no crafting_table in inventory and cannot craft one (need 4 planks of same type)');
+        }
+        
+        // fix47: if can't craft, check what ingredients are missing (decompose to shortfall)
+        if (!canCraft && !hasTable) {
+            if (allRecipes && allRecipes.length) {
+                // Recipe exists - report missing ingredients rather than "no recipe"
+                const recipe = allRecipes[0];
+                const ingredients = recipe.delta?.filter(d => d.count < 0) || [];
+                for (const ing of ingredients) {
+                    const ingItem = bot.registry.items[ing.id];
+                    if (ingItem) {
+                        const have = inv[ingItem.name] || 0;
+                        const need = Math.abs(ing.count);
+                        if (have < need) {
+                            missingIngredients.push(\`\${ingItem.name} (need \${need}, have \${have})\`);
+                        }
+                    }
+                }
+                log(bot, \`FAILED: crafting_table requires planks - missing: \${missingIngredients.join(', ') || '4 planks of same type'}\`);
+                return false;
+            } else {
+                log(bot, 'FAILED: no crafting_table in inventory and no recipe found in registry');
                 return false;
             }
-        } else {
-            log(bot, 'FAILED: no crafting_table in inventory and no recipe found');
-            return false;
         }
     }
     
