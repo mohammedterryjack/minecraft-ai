@@ -325,6 +325,7 @@ Use only c; no other globals.`;
     // fix27: an action with no position/inventory change for 60s is stopped and traced as a failure (no waiting out the 5-min timeout)
     async _run(label, fn, timeout) {
         // fix28: progress = position, inventory, health, food, open-window contents (crafting/furnace UI) or a lit furnace/smoker nearby (smelting wait)
+        const bot = this.agent.bot;
         const lit = () => !!bot.findBlock({ matching: b => /furnace|smoker/.test(b.name) && b.getProperties?.().lit === true, maxDistance: 6 });
         const sig = () => { const p = bot.entity?.position; if (!p) return ''; const w = bot.currentWindow;
             return `${Math.round(p.x * 2)},${Math.round(p.y * 2)},${Math.round(p.z * 2)}|${JSON.stringify(world.getInventoryCounts(bot))}|${bot.health}|${bot.food}|${w ? w.type + ':' + w.slots.map(i => i ? i.name + i.count : '').join(',') : ''}|${lit() ? Date.now() : ''}`; };
