@@ -682,7 +682,7 @@ describe('fix47: prefix migration and shadow removal', () => {
     it('should detect and report leftover prefixed patterns after migration', async () => {
         const { Voyager } = await import('../src/agent/voyager.js');
         const { mkdirSync } = await import('fs');
-        const tmpDir = `/tmp/test-leftover-${Date.now()}`;
+        const tmpDir = `/tmp/test-fix47-leftover-${Date.now()}`;
         mkdirSync(tmpDir, { recursive: true });
         const mockVoyager = Object.create(Voyager.prototype);
         mockVoyager.dir = tmpDir;
@@ -692,25 +692,19 @@ describe('fix47: prefix migration and shadow removal', () => {
         mockVoyager.skills = [{
             name: 'testLeftover',
             // This shouldn't happen normally, but test the detection
+            // fix50: migration now THROWS on leftover patterns (fail loud, no soft paths)
             code: `async function testLeftover(bot) {
     // This is a comment mentioning skills.log
     const x = bot.skills.something; // Different pattern
 }`
         }];
         
-        // Capture console.error
-        const errors = [];
-        const origError = console.error;
-        console.error = (...args) => errors.push(args.join(' '));
-        
-        mockVoyager._migrateToBarenames();
-        
-        console.error = origError;
-        
-        // The comment contains "skills.log" which would match the pattern
-        // This tests that the leftover detection works
-        assert.ok(mockVoyager.skills[0].code.includes('skills.log'), 
-            'Comment with skills.log should be preserved for detection test');
+        // fix50: migration now THROWS on leftover patterns
+        assert.throws(
+            () => mockVoyager._migrateToBarenames(),
+            /LEFTOVER PREFIXED PATTERNS/,
+            'Migration should THROW when leftover patterns remain'
+        );
     });
 });
 

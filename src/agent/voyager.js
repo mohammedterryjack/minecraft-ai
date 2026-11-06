@@ -318,15 +318,41 @@ export class Voyager {
         this._relink();
         this._polyMerge();
         this._extractShared();
+        // fix50: assert no prefixed calls in prompt sources (fail loud at load time)
+        if (this.agent?.prompter?.profile) {
+            Voyager.assertNoPromptPrefixes(this.agent.prompter.profile, this.repairMemory);
+        }
     }
     // fix40/41: migration from skills.*/world.* to bare names
     // Rewrites all saved skill code to use bare function names instead of skills.X/world.Y
     // fix41: uses Object.keys for names (not extractSig), adds catch-all, re-runs on leftovers, also rewrites s.candidate.code
     // fix42: MUST NOT create self-recursion by rewriting skills.NAME/world.NAME to NAME inside function NAME
     _migrateToBarenames() {
-        // fix47: also detect shadow patterns like "const log = skills.log"
+        // fix50: shared regex and field extractor for ALL code fields that can feed composer/repair prompts
         const LEFTOVER_RE = /\b(?:skills|world)\.\w+/;
-        const hasLeftovers = () => this.skills.some(s => (s.code && LEFTOVER_RE.test(s.code)) || (s.candidate?.code && LEFTOVER_RE.test(s.candidate.code)));
+        // fix50: extract ALL code strings from a skill entry (code, candidate.code, prev.code, handwritten_original.code, variants[*].code, repairHistory[*] code)
+        const extractCodeFields = (s) => {
+            const fields = [];
+            if (s.code) fields.push({ path: 'code', value: s.code });
+            if (s.candidate?.code) fields.push({ path: 'candidate.code', value: s.candidate.code });
+            if (s.prev?.code) fields.push({ path: 'prev.code', value: s.prev.code });
+            if (s.handwritten_original?.code) fields.push({ path: 'handwritten_original.code', value: s.handwritten_original.code });
+            if (Array.isArray(s.variants)) {
+                for (let i = 0; i < s.variants.length; i++) {
+                    const v = s.variants[i];
+                    if (typeof v === 'object' && v?.code) fields.push({ path: `variants[${i}].code`, value: v.code });
+                }
+            }
+            if (Array.isArray(s.repairHistory)) {
+                for (let i = 0; i < s.repairHistory.length; i++) {
+                    const rh = s.repairHistory[i];
+                    if (rh?.code) fields.push({ path: `repairHistory[${i}].code`, value: rh.code });
+                    if (rh?.fixSnippet) fields.push({ path: `repairHistory[${i}].fixSnippet`, value: rh.fixSnippet });
+                }
+            }
+            return fields;
+        };
+        const hasLeftovers = () => this.skills.some(s => extractCodeFields(s).some(f => LEFTOVER_RE.test(f.value)));
         if (this.progress.migratedToBarenames && !hasLeftovers()) return;  // fully migrated
         if (this.progress.migratedToBarenames) {
             console.log('[fix41] migratedToBarenames was true but leftovers remain - rerunning migration');
@@ -411,19 +437,84 @@ export class Voyager {
                     skillChanged = true;
                 }
             }
+            // fix50: also rewrite s.prev.code (rollback source for promoted skills)
+            if (s.prev?.code) {
+                const prevFnMatch = s.prev.code.match(/(?:async\s+)?function\s+([A-Za-z_]\w*)\s*\(/);
+                const prevFnName = prevFnMatch ? prevFnMatch[1] : null;
+                const r = rewriteCode(s.prev.code, prevFnName);
+                if (r.changes > 0) {
+                    s.prev.code = r.code;
+                    console.log(`[fix50] migrate ${s.name}.prev: ${r.changes} changes`);
+                    skillChanged = true;
+                }
+            }
+            // fix50: also rewrite s.handwritten_original.code (restoreHandwritten source)
+            if (s.handwritten_original?.code) {
+                const hoFnMatch = s.handwritten_original.code.match(/(?:async\s+)?function\s+([A-Za-z_]\w*)\s*\(/);
+                const hoFnName = hoFnMatch ? hoFnMatch[1] : null;
+                const r = rewriteCode(s.handwritten_original.code, hoFnName);
+                if (r.changes > 0) {
+                    s.handwritten_original.code = r.code;
+                    console.log(`[fix50] migrate ${s.name}.handwritten_original: ${r.changes} changes`);
+                    skillChanged = true;
+                }
+            }
+            // fix50: also rewrite variants[*].code (if any variant objects have code)
+            if (Array.isArray(s.variants)) {
+                for (let i = 0; i < s.variants.length; i++) {
+                    const v = s.variants[i];
+                    if (typeof v === 'object' && v?.code) {
+                        const vFnMatch = v.code.match(/(?:async\s+)?function\s+([A-Za-z_]\w*)\s*\(/);
+                        const vFnName = vFnMatch ? vFnMatch[1] : null;
+                        const r = rewriteCode(v.code, vFnName);
+                        if (r.changes > 0) {
+                            v.code = r.code;
+                            console.log(`[fix50] migrate ${s.name}.variants[${i}]: ${r.changes} changes`);
+                            skillChanged = true;
+                        }
+                    }
+                }
+            }
+            // fix50: also rewrite repairHistory[*] code strings (code and fixSnippet fields)
+            if (Array.isArray(s.repairHistory)) {
+                for (let i = 0; i < s.repairHistory.length; i++) {
+                    const rh = s.repairHistory[i];
+                    if (rh?.code) {
+                        const rhFnMatch = rh.code.match(/(?:async\s+)?function\s+([A-Za-z_]\w*)\s*\(/);
+                        const rhFnName = rhFnMatch ? rhFnMatch[1] : null;
+                        const r = rewriteCode(rh.code, rhFnName);
+                        if (r.changes > 0) {
+                            rh.code = r.code;
+                            console.log(`[fix50] migrate ${s.name}.repairHistory[${i}].code: ${r.changes} changes`);
+                            skillChanged = true;
+                        }
+                    }
+                    if (rh?.fixSnippet && LEFTOVER_RE.test(rh.fixSnippet)) {
+                        const r = rewriteCode(rh.fixSnippet, null);
+                        if (r.changes > 0) {
+                            rh.fixSnippet = r.code;
+                            console.log(`[fix50] migrate ${s.name}.repairHistory[${i}].fixSnippet: ${r.changes} changes`);
+                            skillChanged = true;
+                        }
+                    }
+                }
+            }
             if (skillChanged) {
                 console.log(`[fix41] migrate ${s.name}: code changes=${totalChanges > 0 ? 'yes' : 'no'}, candidate changes=${s.candidate ? 'yes' : 'n/a'}`);
                 writeAtomic(`${this.dir}/${s.name}.js`, `// ${s.description}\n${s.code}\n`);
                 migrated++;
             }
         }
-        // fix42/47: post-migration scan for any remaining skills.*/world.* patterns (fail loud)
+        // fix50: post-migration scan - THROW if any prefixed patterns remain (fail loud, no soft paths)
+        const leftovers = [];
         for (const s of this.skills) {
-            if (!s.code) continue;
-            const leftover = s.code.match(/\b(?:skills|world)\.[A-Za-z_]\w*/g);
-            if (leftover) {
-                console.error(`[fix47] LEFTOVER OLD-STYLE PATTERNS in ${s.name}: ${leftover.join(', ')} - these will fail at runtime (SES has no skills/world objects)`);
+            for (const f of extractCodeFields(s)) {
+                const matches = f.value.match(/\b(?:skills|world)\.[A-Za-z_]\w*/g);
+                if (matches) leftovers.push(`${s.name}.${f.path}: ${matches.join(', ')}`);
             }
+        }
+        if (leftovers.length > 0) {
+            throw new Error(`[fix50] LEFTOVER PREFIXED PATTERNS after migration (will fail at runtime):\n${leftovers.join('\n')}`);
         }
         // fix47: also migrate standalone .js files in the skills directory
         let fileMigrated = 0;
@@ -460,6 +551,52 @@ export class Voyager {
             console.log('[fix41] migratedToBarenames set to true - no leftovers remain');
         } else {
             console.warn('[fix41] WARNING: some skills.*/world.* patterns remain after migration');
+        }
+    }
+    // fix50: static method to assert no prefixed calls in profile prompt sources (coding, coding_examples, conversation_examples)
+    // THROWS if any prefixed pattern found - fail loud, no soft paths
+    static assertNoPromptPrefixes(profile, repairMemory = null) {
+        const PREFIX_RE = /\b(?:skills|world)\.\w+\s*\(/g;
+        const violations = [];
+        const check = (text, source) => {
+            if (!text) return;
+            const matches = text.match(PREFIX_RE);
+            if (matches) violations.push({ source, matches: [...new Set(matches)] });
+        };
+        // Check coding prompt
+        if (profile?.coding) check(profile.coding, 'profile.coding');
+        // Check coding_examples
+        if (Array.isArray(profile?.coding_examples)) {
+            for (let i = 0; i < profile.coding_examples.length; i++) {
+                const ex = profile.coding_examples[i];
+                if (Array.isArray(ex)) {
+                    for (let j = 0; j < ex.length; j++) {
+                        if (ex[j]?.content) check(ex[j].content, `profile.coding_examples[${i}][${j}].content`);
+                    }
+                }
+            }
+        }
+        // Check conversation_examples
+        if (Array.isArray(profile?.conversation_examples)) {
+            for (let i = 0; i < profile.conversation_examples.length; i++) {
+                const ex = profile.conversation_examples[i];
+                if (Array.isArray(ex)) {
+                    for (let j = 0; j < ex.length; j++) {
+                        if (ex[j]?.content) check(ex[j].content, `profile.conversation_examples[${i}][${j}].content`);
+                    }
+                }
+            }
+        }
+        // Check repair memory (AWM lessons)
+        if (repairMemory?.repairs) {
+            for (let i = 0; i < repairMemory.repairs.length; i++) {
+                const r = repairMemory.repairs[i];
+                if (r?.fixSnippet) check(r.fixSnippet, `repairMemory.repairs[${i}].fixSnippet`);
+            }
+        }
+        if (violations.length > 0) {
+            const details = violations.map(v => `  ${v.source}: ${v.matches.join(', ')}`).join('\n');
+            throw new Error(`[fix50] PREFIXED CALLS in prompt sources (will fail at runtime):\n${details}`);
         }
     }
     // fix33: seed primitives into the skill library so they are blamable/repairable (learned path, not hard-coded)
@@ -3097,7 +3234,7 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
     _rollbackRefactor(id, by) {
         const rf = this.progress.refactors?.[id]; let n = 0;
         for (const e of this.skills) if (e.candidate?.refactor === id) { delete e.candidate; n++; }
-        for (const e of this.skills) if (e.refactorOf === id && e.prev) { /* already promoted: restore the pre-refactor version */ Object.assign(e, { code: e.prev.code, description: e.prev.description, deps: e.prev.deps, stats: e.prev.stats }); writeAtomic(`${this.dir}/${e.name}.js`, `// ${e.description}\n${e.code}\n`); delete e.refactorOf; n++; }
+        for (const e of this.skills) if (e.refactorOf === id && e.prev) { Object.assign(e, { code: e.prev.code, description: e.prev.description, deps: e.prev.deps, stats: e.prev.stats }); writeAtomic(`${this.dir}/${e.name}.js`, `// ${e.description}\n${e.code}\n`); delete e.refactorOf; n++; }
         if (rf) { const h = this.skills.find(s => s.name === rf.helper); if (h && !this.skills.some(s => !s.mergedInto && (s.deps || []).includes(rf.helper))) h.demoted = true; rf.rolledBack = by; this._saveProgress(); }
         this._saveSkills(); gateLog(`ROLLBACK refactor ${id} (rejected: ${by}): ${n} rewritten skill(s) restored; helper ${rf?.helper || '?'} retired if unused`);
     }
