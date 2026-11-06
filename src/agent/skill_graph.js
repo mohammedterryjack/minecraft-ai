@@ -4,9 +4,16 @@ export function signatureOf(code, name) {
     return m ? `${name}(${m[1].replace(/\s+/g, ' ').trim()})` : `${name}(bot)`;
 }
 function stripComments(code) { return String(code).replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, ''); }
+// fix51: strip string literals so names inside strings aren't counted as dependencies
+function stripStrings(code) {
+    return String(code)
+        .replace(/`(?:[^`\\]|\\.)*`/g, '""')  // template literals
+        .replace(/"(?:[^"\\]|\\.)*"/g, '""')  // double-quoted strings
+        .replace(/'(?:[^'\\]|\\.)*'/g, '""'); // single-quoted strings
+}
 // names of library skills this code calls (excluding itself)
 export function depsOf(code, name, names) {
-    const src = stripComments(code);
+    const src = stripStrings(stripComments(code));
     const out = new Set();
     const re = /(?<![.\w])([A-Za-z_]\w*)\s*\(/g;
     let m;

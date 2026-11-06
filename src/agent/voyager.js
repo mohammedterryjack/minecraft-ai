@@ -245,21 +245,20 @@ export function parseVerboseGoal(task) {
     }
     
     // fix51: try camelCase skill names like "craftIronHelmet" -> iron_helmet (count defaults to 1)
-    // Split on uppercase letters, join with underscore, check against registry
+    // Try every contiguous span of camel-parts against minecraft-data names, longest first
     if (candidates.length === 0) {
         const camelParts = task.match(/[A-Z]?[a-z0-9]+/g);
-        if (camelParts && camelParts.length >= 2) {
-            // Skip verb prefix (craft, mine, get, make, smelt, etc.)
-            const verbPrefixes = ['craft', 'mine', 'get', 'make', 'smelt', 'cook', 'obtain', 'collect', 'gather'];
-            const startIdx = verbPrefixes.includes(camelParts[0].toLowerCase()) ? 1 : 0;
-            // Try progressively longer suffixes: "IronHelmet" -> "iron_helmet", then "iron", etc.
-            for (let len = camelParts.length - startIdx; len > 0; len--) {
-                const itemParts = camelParts.slice(startIdx, startIdx + len);
-                const itemName = itemParts.map(p => p.toLowerCase()).join('_');
-                const resolved = resolveItem(itemName);
-                if (resolved) {
-                    console.log(`[fix51] parsed camelCase skill "${task}" -> ${resolved} (count 1)`);
-                    return { count: 1, item: resolved, items: [resolved] };
+        if (camelParts && camelParts.length >= 1) {
+            // Try all contiguous spans, longest first (greedy)
+            for (let len = camelParts.length; len > 0; len--) {
+                for (let start = 0; start <= camelParts.length - len; start++) {
+                    const span = camelParts.slice(start, start + len);
+                    const itemName = span.map(p => p.toLowerCase()).join('_');
+                    const resolved = resolveItem(itemName);
+                    if (resolved) {
+                        console.log(`[fix51] parsed camelCase "${task}" -> ${resolved} (count 1)`);
+                        return { count: 1, item: resolved, items: [resolved] };
+                    }
                 }
             }
         }
@@ -583,35 +582,56 @@ export class Voyager {
             console.error(msg);
             throw new Error(msg);
         }
-        // fix51: for incumbent skills with mutual-recursion cycles, break the back-edge and queue for repair
-        // (never reject an incumbent that was already in the library)
+        // Check for mutual recursion cycles in the dependency graph
         const graph = this._graph();
         const allCycles = findAllCycles(graph);
-        const repairQueue = [];
-        for (const cycle of allCycles) {
-            // cycle is [A, B, C] meaning A->B->C->A; the back-edge is C->A (last -> first)
-            const backFrom = cycle[cycle.length - 1];
-            const backTo = cycle[0];
-            const skill = this.skills.find(s => s.name === backFrom);
-            if (skill && skill.deps && skill.deps.includes(backTo)) {
-                // Remove the back-edge from deps
-                skill.deps = skill.deps.filter(d => d !== backTo);
-                console.log(`[psn] fix51: broke back-edge ${backFrom} -> ${backTo} to resolve cycle ${cycle.join(' -> ')}`);
-                // Queue the skill for repair so it can be rewritten without the cycle
-                if (!repairQueue.some(q => q.name === backFrom)) {
-                    repairQueue.push({ name: backFrom, reason: `cycle ${cycle.join(' -> ')} (back-edge removed)` });
+        if (allCycles.length > 0) {
+            // fix51: one-time data migration - demote promoted skills that create cycles back to prev/handwritten_original
+            let demoted = 0;
+            for (const cycle of allCycles) {
+                for (const skillName of cycle) {
+                    const s = this.skills.find(x => x.name === skillName);
+                    if (!s || s.seeded || s.primitive) continue;
+                    // If this skill has a prev or handwritten_original, demote to it
+                    if (s.prev || s.handwritten_original) {
+                        const restore = s.handwritten_original || s.prev;
+                        console.log(`[fix51] DEMOTING ${skillName} back to prev version (cycle: ${cycle.join(' -> ')})`);
+                        s.code = restore.code;
+                        s.description = restore.description;
+                        s.deps = restore.deps;
+                        delete s.candidate;
+                        s.demoted = false;
+                        demoted++;
+                    }
                 }
-                n++;
+            }
+            if (demoted > 0) {
+                this._saveSkills();
+                // Recalculate deps and re-check cycles after demoting
+                for (const s of this.skills) {
+                    if (s.seeded) continue;
+                    const d = depsOf(s.code, s.name, names);
+                    s.deps = d;
+                }
+                const graphAfter = this._graph();
+                const cyclesAfter = findAllCycles(graphAfter);
+                if (cyclesAfter.length === 0) {
+                    console.log(`[fix51] demoted ${demoted} skill(s), cycles resolved`);
+                } else {
+                    const cycleStrs = cyclesAfter.map(c => c.join(' -> ')).join('; ');
+                    const msg = `[psn] DEPENDENCY CYCLES PERSIST after demoting ${demoted} skill(s): ${cycleStrs}`;
+                    console.error(msg);
+                    throw new Error(msg);
+                }
+            } else {
+                const cycleStrs = allCycles.map(c => c.join(' -> ')).join('; ');
+                const msg = `[psn] DEPENDENCY CYCLES DETECTED: ${cycleStrs}`;
+                console.error(msg);
+                throw new Error(msg);
             }
         }
-        // Queue repairs for cycle-affected skills
-        for (const r of repairQueue) {
-            const s = this.skills.find(sk => sk.name === r.name);
-            if (s && !s.seeded && !s.primitive && !s.handwritten) {
-                this._queueRepair?.({ skill: s, reason: r.reason });
-                console.log(`[psn] fix51: queued ${r.name} for repair: ${r.reason}`);
-            }
-        }
+        // Original per-skill cycle check (kept for completeness)
+        for (const s of this.skills) { const c = findCycle(s.name, s.deps, this._graph(s.name)); if (c) throw new Error(`[psn] relink: dependency cycle ${c.join(' -> ')}`); }
         console.log(`[psn] relink: ${this.skills.length} skills, ${n} edge set(s) changed`);
         if (n) this._saveSkills();
     }
@@ -2116,7 +2136,7 @@ Use only c; no other globals.`;
         this.agent.bot.__safeToToss = lists.toss;
         this.agent.bot.__depositCandidates = lists.deposit;
         this.agent.bot.__uncertainItems = lists.uncertain || [];
-        this.agent.bot.__knownChests = this.chestMemory || {};
+        this.agent.bot.__knownChests = this.chestMemory;
     }
     // fix37: run a practice skill safely - returns { message } on success, false on context-fail, null on abort
     // Fail-loud: all skips and failures are logged clearly

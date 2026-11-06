@@ -561,8 +561,11 @@ async function _freeInventory(bot, keepName) {
     // Phase 2: if still low on space, try to deposit to chest
     // fix51: use ONLY learned chest memory (no world search, no distance cap)
     if (bot.inventory.emptySlotCount() < 2 && depositList.length) {
-        const knownChests = bot.__knownChests || {};
-        const chestKeys = Object.keys(knownChests);
+        if (!bot.__knownChests) {
+            log(bot, `[_freeInventory] FAIL LOUD: bot.__knownChests not initialized (voyager._prepareTossSignals not called)`);
+            return;
+        }
+        const chestKeys = Object.keys(bot.__knownChests);
         if (chestKeys.length === 0) {
             log(bot, `[_freeInventory] FAIL LOUD: no known chest in memory to deposit items (have ${depositList.length} deposit candidates). Discover or place a chest first.`);
             return;
