@@ -3,6 +3,7 @@ import * as world from "./world.js";
 import pf from 'mineflayer-pathfinder';
 import Vec3 from 'vec3';
 import settings from "../../../settings.js";
+import { watchPathing } from "../../utils/movement_model.js";
 
 const blockPlaceDelay = settings.block_place_delay == null ? 0 : settings.block_place_delay;
 const useDelay = blockPlaceDelay > 0;
@@ -1477,6 +1478,11 @@ export async function giveToPlayer(bot, itemType, username, num=1) {
     return false;
 }
 
+/** fix66: the learned no-progress verdict in words (kind, active time, and what it was compared with) */
+function describeStall(v) {
+    return `no ${v.kind} progress for ${Math.round(v.activeMs)}ms active, longer than all ${v.bound.n} completed ${v.kind} steps learned (longest ${Math.round(v.bound.max)}ms${v.kind === 'dig' ? ` over the game dig time, ${Math.round(v.bound.ms - v.bound.max)}ms here` : ''})`;
+}
+
 export async function goToGoal(bot, goal) {
     /**
      * Navigate to the given goal. Use doors and attempt minimally destructive movements.
@@ -1534,55 +1540,32 @@ export async function goToGoal(bot, goal) {
     const doorCheckInterval = startDoorInterval(bot);
     
     // fix44: progress monitoring - detect stalls where bot makes no progress
-    let lastPos = bot.entity.position.clone();
-    let noProgressTime = 0;
-    const PROGRESS_CHECK_INTERVAL = 1000;
-    const NO_PROGRESS_TIMEOUT = 15000; // 15s without movement = stall
-    let progressInterval = null;
-    let progressTimedOut = false;
+    // fix66: learned (utils/movement_model.js), checked on the physics tick; fix44's 1 s poll, 0.5-block "moved" and 15 s
+    // "no progress" were constants that knew nothing of digging, pillaring or swimming
+    let progressTimedOut = null;   // the verdict, when the learned no-progress check fired
 
     bot.pathfinder.setMovements(final_movements);
     try {
-        // fix44: wrap pathfinder.goto with progress monitoring
         const gotoWithProgress = async (targetGoal) => {
             return new Promise((resolve, reject) => {
-                progressInterval = setInterval(() => {
-                    // Check for interrupt
-                    if (bot.interrupt_code) {
-                        clearInterval(progressInterval);
-                        progressInterval = null;
-                        try { bot.pathfinder.stop(); } catch (e) {}
-                        reject(new Error('interrupted'));
-                        return;
-                    }
-                    
-                    // Check for progress
-                    const currentPos = bot.entity.position;
-                    const moved = currentPos.distanceTo(lastPos);
-                    if (moved < 0.5) {
-                        noProgressTime += PROGRESS_CHECK_INTERVAL;
-                        if (noProgressTime >= NO_PROGRESS_TIMEOUT) {
-                            clearInterval(progressInterval);
-                            progressInterval = null;
-                            progressTimedOut = true;
-                            try { bot.pathfinder.stop(); } catch (e) {}
-                            reject(new Error(`no progress for ${NO_PROGRESS_TIMEOUT / 1000}s (stalled)`));
-                        }
-                    } else {
-                        noProgressTime = 0;
-                        lastPos = currentPos.clone();
-                    }
-                }, PROGRESS_CHECK_INTERVAL);
-
+                let stopWatch = null;
+                const done = () => { stopWatch(); bot.removeListener('physicsTick', onInterrupt); };
+                const onInterrupt = () => {
+                    if (!bot.interrupt_code) return;
+                    done();
+                    bot.pathfinder.stop();
+                    reject(new Error('interrupted'));
+                };
+                bot.on('physicsTick', onInterrupt);
+                stopWatch = watchPathing(bot, (v) => {
+                    progressTimedOut = v;
+                    done();
+                    bot.pathfinder.stop();
+                    reject(new Error(`no progress (stalled): ${describeStall(v)}`));
+                }, (line) => console.log(line));
                 bot.pathfinder.goto(targetGoal)
-                    .then(() => {
-                        if (progressInterval) { clearInterval(progressInterval); progressInterval = null; }
-                        resolve(true);
-                    })
-                    .catch((err) => {
-                        if (progressInterval) { clearInterval(progressInterval); progressInterval = null; }
-                        reject(err);
-                    });
+                    .then(() => { done(); resolve(true); })
+                    .catch((err) => { done(); reject(err); });
             });
         };
 
@@ -1592,16 +1575,15 @@ export async function goToGoal(bot, goal) {
             // fix44: check for interrupt first
             if (bot.interrupt_code || /interrupted/i.test(String(err?.message))) {
                 clearInterval(doorCheckInterval);
-                if (progressInterval) clearInterval(progressInterval);
-                try { bot.pathfinder.stop(); } catch (e) {}
+                bot.pathfinder.stop();
                 log(bot, `FAILED: navigation cancelled (interrupted).`);
                 return false;
             }
             
             // fix44: check for progress timeout (stall)
-            if (progressTimedOut || /no progress|stalled/i.test(String(err?.message))) {
+            if (progressTimedOut) {
                 clearInterval(doorCheckInterval);
-                log(bot, `FAILED: navigation stalled - no progress for ${NO_PROGRESS_TIMEOUT / 1000}s.`);
+                log(bot, `FAILED: navigation stalled - ${describeStall(progressTimedOut)}.`);
                 return false;
             }
             
@@ -1614,7 +1596,7 @@ export async function goToGoal(bot, goal) {
             for (let hop = 0; hop < 3; hop++) {
                 if (bot.interrupt_code) {
                     clearInterval(doorCheckInterval);
-                    try { bot.pathfinder.stop(); } catch (e) {}
+                    bot.pathfinder.stop();
                     log(bot, `FAILED: navigation cancelled (interrupted).`);
                     return false;
                 }
@@ -1626,14 +1608,18 @@ export async function goToGoal(bot, goal) {
                 const wy = goal.y != null ? Math.floor(p.y + Math.sign(goal.y - p.y) * Math.min(6, Math.abs(goal.y - p.y))) : Math.floor(p.y);
                 log(bot, `Trying waypoint ${wx}, ${wy}, ${wz}.`);
                 bot.pathfinder.setMovements(destructiveMovements);
-                try { await bot.pathfinder.goto(new pf.goals.GoalNear(wx, wy, wz, 2)); } catch (e) {}
+                // fix66: hops are watched by the same learned no-progress check (they were unwatched); a stall or
+                // interrupt ends the navigation, any other hop failure is logged and the next hop is planned from here
+                try { await gotoWithProgress(new pf.goals.GoalNear(wx, wy, wz, 2)); }
+                catch (e) {
+                    if (progressTimedOut || bot.interrupt_code) throw e;
+                    log(bot, `Waypoint ${wx}, ${wy}, ${wz} not reached: ${e.message}`);
+                }
             }
             bot.pathfinder.setMovements(destructiveMovements);
             
             // Reset progress tracking for final attempt
-            lastPos = bot.entity.position.clone();
-            noProgressTime = 0;
-            progressTimedOut = false;
+            progressTimedOut = null;
             
             await gotoWithProgress(goal);
         }
@@ -1641,8 +1627,7 @@ export async function goToGoal(bot, goal) {
         return true;
     } catch (err) {
         clearInterval(doorCheckInterval);
-        if (progressInterval) clearInterval(progressInterval);
-        try { bot.pathfinder.stop(); } catch (e) {}
+        bot.pathfinder.stop();
         
         // fix44: loud FAILED for all path failures
         if (bot.interrupt_code || /interrupted/i.test(String(err?.message))) {
@@ -1651,8 +1636,8 @@ export async function goToGoal(bot, goal) {
             log(bot, `FAILED: pathfinder took too long to decide path.`);
         } else if (/No path/i.test(String(err?.message))) {
             log(bot, `FAILED: no reachable path found.`);
-        } else if (/stalled|no progress/i.test(String(err?.message))) {
-            log(bot, `FAILED: navigation stalled - no progress.`);
+        } else if (progressTimedOut) {
+            log(bot, `FAILED: navigation stalled - ${describeStall(progressTimedOut)}.`);
         } else {
             log(bot, `FAILED: navigation error: ${err.message}`);
         }

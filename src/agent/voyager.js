@@ -24,6 +24,7 @@ import { cosineSimilarity } from '../utils/math.js';
 import minecraftData from 'minecraft-data';
 import { Ollama } from '../models/ollama.js';
 import { setCallDurationStore } from '../models/call_durations.js';
+import { setMovementStore, learnedKinds, recordStep, recordCut, stepBound, noteUnbounded } from '../utils/movement_model.js';
 import { signatureOf, depsOf, missingCalls, findCycle, findAllCycles, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf } from './skill_graph.js';
 import { getBareAPI, collectBareApiUsedInSource } from './coder.js';   // fix40: unified bare-name API helper
 import { withStallPhase } from '../utils/event_loop_guard.js';
@@ -376,6 +377,9 @@ export class Voyager {
         // fix60: learned local-model call durations (bound a hung Ollama call), persisted with progress
         if (!this.progress.callDurations) this.progress.callDurations = {};
         setCallDurationStore(this.progress.callDurations);
+        // fix66: learned time per block / per progress gap (movement no-progress checks), persisted with progress
+        if (!this.progress.movement) this.progress.movement = {};
+        setMovementStore(this.progress.movement);
         this.running = false;
         this.abort = false;
         this.lastPlayerMsg = 0;
@@ -1339,7 +1343,7 @@ Use only c; no other globals.`;
     }
     // fix14: why an action was cut off, for failure feedback (critic, code writer, blame)
     // fix19 (6): did the bot die during the current run? (agent.lastDeath set by the death message handler)
-    // fix27: an action with no position/inventory change for 60s is stopped and traced as a failure (no waiting out the 5-min timeout)
+    // fix27: an action with no position/inventory change for longer than learned (fix66; was 60s) is stopped and traced as a failure (no waiting out the 5-min timeout)
     async _run(label, fn, timeout) {
         // fix42: populate bot.__safeToToss before any skill run (for tossClutter/freeInventory)
         this._prepareTossSignals();
@@ -1353,11 +1357,29 @@ Use only c; no other globals.`;
         const seen = new Set(), cell = p => `${Math.floor(p.x / 2)},${Math.floor(p.y / 2)},${Math.floor(p.z / 2)}`; let fresh = 0;
         const sig = () => { const p = bot.entity?.position; if (!p) return ''; const w = bot.currentWindow, c = cell(p); if (!seen.has(c)) { seen.add(c); fresh++; }
             return `${fresh}|${JSON.stringify(world.getInventoryCounts(bot))}|${w ? w.type + ':' + w.slots.map(i => i ? i.name + i.count : '').join(',') : ''}|${lit() ? Date.now() : ''}`; };  // fix41: host code uses world. prefix
-        let last = sig(), since = Date.now(); this._stall = null;
-        const iv = setInterval(() => { try { const s = sig(); if (s !== last) { last = s; since = Date.now(); return; }
-            if (Date.now() - since >= 60e3 && this.agent.actions.executing && !this._stall) { const p = bot.entity.position; this._stall = { t: Date.now(), pos: `${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}` }; console.log(`[stall] ${label}: no progress (no new ground reached, inventory, window, lit furnace) for 60s at ${this._stall.pos}; stopping the action`); this.agent.actions.stop(); } } catch (e) { console.log('[stall] watchdog error: ' + e.message); } }, 5000);
+        // fix66: the 60 s limit and 5 s poll were constants (fix27). Now: checked on the game's physics tick; the bound is the
+        // longest completed gap between progress signatures in earlier runs (movement store kind 'run'), only counting time
+        // while the action executes; UNBOUNDED (logged once) until a gap was learned before this run started
+        const learnedAtStart = learnedKinds();
+        let last = sig(), gap = 0, tickAt = performance.now(); this._stall = null;
+        const onTick = () => {
+            const now = performance.now(), dt = now - tickAt; tickAt = now;
+            const s = sig();
+            if (s !== last) { if (gap > 0) recordStep('run', gap, 0); last = s; gap = 0; return; }
+            if (!this.agent.actions.executing || this._stall) return;
+            gap += dt;
+            const b = stepBound('run', 0, learnedAtStart);
+            if (b.ms === null) { if (noteUnbounded('run')) console.log(`[stall] UNBOUNDED run: ${b.why}; the no-progress stop is off until learned`); return; }
+            if (gap <= b.ms) return;
+            recordCut('run');
+            const p = bot.entity.position;
+            this._stall = { t: Date.now(), pos: `${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}`, why: `${Math.round(gap)}ms, longer than all ${b.n} completed gaps learned (longest ${Math.round(b.max)}ms)` };
+            console.log(`[stall] ${label}: no progress (no new ground reached, inventory, window, lit furnace) for ${this._stall.why} at ${this._stall.pos}; stopping the action`);
+            this.agent.actions.stop();
+        };
+        bot.on('physicsTick', onTick);
         this._lastRunMsg = '';
-        try { const r = await this.agent.actions.runAction(label, fn, { timeout }); this._lastRunMsg = String(r?.message || ''); return r; } finally { clearInterval(iv); }
+        try { const r = await this.agent.actions.runAction(label, fn, { timeout }); this._lastRunMsg = String(r?.message || ''); return r; } finally { bot.removeListener('physicsTick', onTick); }
     }
     _stalledInRun() { const s = this._stall; return s && s.t >= (this._runStart || Infinity) ? s : null; }
     /** fix65: candidate code staged in place for a replay of `root`; `rootTrial` = the goal-overlap gate's verdict on root's own candidate */
@@ -1415,7 +1437,7 @@ Use only c; no other globals.`;
         const st = this._stalledInRun();
         if (st) {
             this._lastCutKind = 'stall';
-            return `stalled: no progress (no new ground reached, inventory, window, lit furnace) for 60s at ${st.pos}`;
+            return `stalled: no progress (no new ground reached, inventory, window, lit furnace) for ${st.why} at ${st.pos}`;
         }
         const bot = this.agent.bot, p = bot.entity.position, by = this.agent.actions.lastInterruptBy;
         if (!by) throw new Error('_interruptReason called but no interrupt source (lastInterruptBy missing)');
@@ -3652,7 +3674,7 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         // fix51: pass beforeInv for items-dropped reporting
         if (died) { let i = -1; for (let k = 0; k < trace.length; k++) if ((trace[k].t0 || 0) <= died.t && (trace[k].t1 ?? Infinity) >= died.t - 1500 && (i < 0 || trace[k].depth >= trace[i].depth)) i = k; if (i < 0) i = trace.length - 1; console.log(`[psn] death attributed to the call running at death time: ${trace[i].name} (depth ${trace[i].depth})`); trace[i].ownFail = [`DIED: ${died.message} at ${died.pos}${this._deathDetail(died, this._beforeRunInv)}`]; for (; i >= 0; i = trace[i].parent) { trace[i].intr = false; trace[i].ok = false; trace[i].fail = true; } ok = false; }
         const stalled = !died && this._stalledInRun();   // fix27: a stall is a failure of the deepest call open at stall time
-        if (stalled) { let i = -1; for (let k = 0; k < trace.length; k++) if ((trace[k].t0 || 0) <= stalled.t && (trace[k].t1 ?? Infinity) >= stalled.t - 1500 && (i < 0 || trace[k].depth >= trace[i].depth)) i = k; if (i < 0) i = trace.length - 1; console.log(`[psn] stall attributed to the call running at stall time: ${trace[i].name} (depth ${trace[i].depth})`); trace[i].ownFail = [`FAILED: STALLED: no progress (no new ground reached, inventory, window, lit furnace) for 60s at ${stalled.pos}`]; for (; i >= 0; i = trace[i].parent) { trace[i].intr = false; trace[i].ok = false; trace[i].fail = true; } ok = false; }
+        if (stalled) { let i = -1; for (let k = 0; k < trace.length; k++) if ((trace[k].t0 || 0) <= stalled.t && (trace[k].t1 ?? Infinity) >= stalled.t - 1500 && (i < 0 || trace[k].depth >= trace[i].depth)) i = k; if (i < 0) i = trace.length - 1; console.log(`[psn] stall attributed to the call running at stall time: ${trace[i].name} (depth ${trace[i].depth})`); trace[i].ownFail = [`FAILED: STALLED: no progress (no new ground reached, inventory, window, lit furnace) for ${stalled.why} at ${stalled.pos}`]; for (; i >= 0; i = trace[i].parent) { trace[i].intr = false; trace[i].ok = false; trace[i].fail = true; } ok = false; }
         const timedOut = !died && !stalled && /timed out/i.test(this._lastRunMsg);   // fix33: a timeout is a failure of the deepest call running at the cut
         if (timedOut) {
             this._lastCutKind = 'timeout';  // fix51: set structured kind field
