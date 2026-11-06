@@ -3019,8 +3019,11 @@ Use only c; no other globals.`;
             }
         }
         // fix76: learned food-raiser at observed food cap — practice would be an unmet eat precondition
-        const sat = this._foodRaiseSaturated(skill.name, this.agent.bot.food);
-        if (sat) return `${sat}: ${skill.name} is a learned food-raiser at the observed food cap`;
+        // (needs a live bot; unit tests that call _shouldSkipPractice without agent.bot only exercise consumes/effects gates)
+        if (this.agent && this.agent.bot) {
+            const sat = this._foodRaiseSaturated(skill.name, this.agent.bot.food);
+            if (sat) return `${sat}: ${skill.name} is a learned food-raiser at the observed food cap`;
+        }
         return null;
     }
     // fix43: compute safe-to-toss and deposit-candidate items based on POSITIVE learned signals only
