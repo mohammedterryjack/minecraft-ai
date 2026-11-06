@@ -1784,7 +1784,7 @@ Use only c; no other globals.`;
         const shortfall = need - have;
         if (!(shortfall > 0)) throw new Error(`__prereqFail for ${item} has non-positive shortfall (need ${need}, have ${have})`);
         const inv = this.observe().inventory;
-        const sub = this._subgoalToObtainItem(item, shortfall, inv);
+        const sub = this._subgoalToObtainItem(item, shortfall, inv, new Set());
         if (!sub) {
             console.log(`[psn] PREREQUISITE FAILED for ${item} but no learned producer subgoal (needs/produces + skill library)`);
             return false;
@@ -1798,16 +1798,23 @@ Use only c; no other globals.`;
         return true;
     }
     // fix51: pick a subgoal task string from learned producers / consumes chain (depth-first on missing inputs)
-    _subgoalToObtainItem(item, shortfall, inv) {
+    // fix54: `path` = items already being sought on this branch; a learned consumes cycle (A needs B needs A)
+    // ends that branch (logged) instead of recursing until the stack overflows
+    _subgoalToObtainItem(item, shortfall, inv, path) {
         const producers = this._producers(item);
         if (!producers.length) return null;
         const picked = this._boltzmann(producers);
         const skill = picked.s;
         const consumes = Object.hasOwn(skill, 'consumes') ? skill.consumes : {};
+        const onPath = new Set(path).add(item);
         for (const [consumed, amt] of Object.entries(consumes)) {
             const have = inv[consumed] || 0;
             if (have < amt) {
-                const sub = this._subgoalToObtainItem(consumed, amt - have, inv);
+                if (onPath.has(consumed)) {
+                    console.log(`[psn] subgoal cycle: ${[...onPath, consumed].join(' -> ')} (via ${skill.name}); not descending`);
+                    continue;
+                }
+                const sub = this._subgoalToObtainItem(consumed, amt - have, inv, onPath);
                 if (sub) return sub;
             }
         }
