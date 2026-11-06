@@ -17,8 +17,10 @@
         "url": "http://192.168.1.215:11434"
     },
     "code_model": {
-        "api": "cursor",
-        "model": "composer-2.5"
+        "api": "ollama",
+        "model": "qwen2.5-coder:7b",
+        "url": "http://192.168.1.215:11434",
+        "params": { "keep_alive": -1, "options": { "num_ctx": 8192 } }
     },
     "code_model_free": {
         "api": "ollama",
