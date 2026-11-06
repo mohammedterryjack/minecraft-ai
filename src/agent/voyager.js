@@ -24,7 +24,7 @@ import minecraftData from 'minecraft-data';
 import { Ollama } from '../models/ollama.js';
 import { setCallDurationStore } from '../models/call_durations.js';
 import { setMovementStore, learnedKinds, recordStep, recordCut, stepBound, noteUnbounded } from '../utils/movement_model.js';
-import { signatureOf, depsOf, missingCalls, findCycle, findAllCycles, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf, thrownIn } from './skill_graph.js';
+import { signatureOf, depsOf, missingCalls, findCycle, findAllCycles, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf, thrownIn, declaredNames } from './skill_graph.js';
 import { getBareAPI, collectBareApiUsedInSource } from './coder.js';   // fix40: unified bare-name API helper
 import { withStallPhase } from '../utils/event_loop_guard.js';
 import { watchdogEvidencePath } from '../utils/main_thread_watchdog.js';
@@ -4579,7 +4579,10 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             const directLearnedCalls = new Set(depsOf(code, own, libraryNames));
             const stageNameSet = new Set([own, ...directLearnedCalls]);
             for (const d of directLearnedCalls) for (const n of this._closure(d)) stageNameSet.add(n);
-            const libSkills = this.skills.filter(s => stageNameSet.has(s.name) && s.name !== own);
+            // fix70: every name the generated code declares is defined by the code itself in this bundle (as `own` always was): a
+            // library skill of the same name, reached through a dep's closure, is not staged next to it (one scope, one definition)
+            const codeDeclares = declaredNames(code);
+            const libSkills = this.skills.filter(s => stageNameSet.has(s.name) && s.name !== own && !codeDeclares.has(s.name));
             const libSrc = libSkills.map(s => over[s.name] ?? s.code).join('\n\n');
             const traced = Voyager._tracedSkillNamesForInstrument(this, stageNameSet, over);
             const execBundle = libSrc + (libSrc ? '\n\n' : '') + instrumentSrc(traced) + '\n\n' + code;

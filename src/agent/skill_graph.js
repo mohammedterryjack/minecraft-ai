@@ -50,13 +50,24 @@ function stripStrings(code) {
         .replace(/"(?:[^"\\]|\\.)*"/g, '""')  // double-quoted strings
         .replace(/'(?:[^'\\]|\\.)*'/g, '""'); // single-quoted strings
 }
-// names of library skills this code calls (excluding itself)
+// fix70: names this code declares itself (function declarations, const/let/var). A name the code declares is its own
+// definition, even when a library skill has the same name: it is not a call into the library.
+export function declaredNames(code) {
+    const out = new Set();
+    for (const m of stripStrings(stripComments(code)).matchAll(/(?:\bfunction\s*\*?\s*|\b(?:const|let|var)\s+)([A-Za-z_$][\w$]*)/g)) out.add(m[1]);
+    return out;
+}
+// fix70: a declaration `async function equipBestArmor(bot) {` matched the call pattern below, so generated code that defined
+// its own equipBestArmor "depended on" the library equipBestArmor; writeCode then put the library copy into the same bundle
+// and the bundle could not parse ("Identifier 'equipBestArmor' has already been declared", 13:35:42Z). Only `name` was exempt.
+// names of library skills this code calls (excluding itself and the names it declares)
 export function depsOf(code, name, names) {
     const src = stripStrings(stripComments(code));
+    const own = declaredNames(code);
     const out = new Set();
     const re = /(?<![.\w])([A-Za-z_]\w*)\s*\(/g;
     let m;
-    while ((m = re.exec(src))) if (m[1] !== name && names.has(m[1])) out.add(m[1]);
+    while ((m = re.exec(src))) if (m[1] !== name && !own.has(m[1]) && names.has(m[1])) out.add(m[1]);
     return [...out];
 }
 // bare (non skills./world./bot.) calls to camelCase identifiers that are neither library skills nor defined locally
