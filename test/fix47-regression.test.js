@@ -711,80 +711,8 @@ describe('fix47: prefix migration and shadow removal', () => {
     });
 });
 
-describe('fix47: harvestTools-based decompose', () => {
-    it('should compute cheapest harvest tool for stone via recipe chain', async () => {
-        const { Voyager, _setVersionForTest } = await import('../src/agent/voyager.js');
-        _setVersionForTest('1.20.4');
-        const mockVoyager = Object.create(Voyager.prototype);
-        mockVoyager.skills = [];
-        mockVoyager.progress = {};
-        
-        // No pickaxes in inventory
-        const inv = { oak_log: 10, cobblestone: 0 };
-        
-        const toolInfo = mockVoyager._cheapestHarvestTool('stone', inv);
-        
-        // Should find wooden_pickaxe as cheapest (can craft from oak_log)
-        assert.ok(toolInfo, 'Should find a tool');
-        assert.ok(toolInfo.tool, 'Should have a tool name');
-        assert.ok(toolInfo.chain, 'Should have a recipe chain');
-        // The chain should include gathering/crafting steps
-        assert.ok(toolInfo.chain.length > 0, 'Chain should have steps');
-    });
-    
-    it('should return already have if pickaxe is in inventory', async () => {
-        const { Voyager, _setVersionForTest } = await import('../src/agent/voyager.js');
-        _setVersionForTest('1.20.4');
-        const mockVoyager = Object.create(Voyager.prototype);
-        mockVoyager.skills = [];
-        mockVoyager.progress = {};
-        
-        const inv = { wooden_pickaxe: 1 };
-        
-        const toolInfo = mockVoyager._cheapestHarvestTool('stone', inv);
-        
-        assert.ok(toolInfo, 'Should find tool info');
-        assert.strictEqual(toolInfo.tool, 'wooden_pickaxe', 'Should identify wooden_pickaxe');
-        assert.deepStrictEqual(toolInfo.chain, [], 'Chain should be empty (already have)');
-        assert.strictEqual(toolInfo.reason, 'already have', 'Should say already have');
-    });
-    
-    it('should queue harvest tool recipe chain as subgoals on Cannot break failure', async () => {
-        const { Voyager, _setVersionForTest } = await import('../src/agent/voyager.js');
-        _setVersionForTest('1.20.4');
-        const mockVoyager = Object.create(Voyager.prototype);
-        mockVoyager.skills = [];
-        mockVoyager.progress = { decomposed: {}, subgoals: [] };
-        mockVoyager._curSub = null;
-        mockVoyager._saveProgress = () => {};
-        mockVoyager.observe = () => ({ inventory: { oak_log: 10 } });
-        
-        // Mock _cheapestHarvestTool to return a known chain
-        mockVoyager._cheapestHarvestTool = (blockName, inv) => {
-            if (blockName === 'stone') {
-                return {
-                    tool: 'wooden_pickaxe',
-                    chain: [
-                        { item: 'oak_planks', count: 4, action: 'craft' },
-                        { item: 'stick', count: 2, action: 'craft' },
-                        { item: 'wooden_pickaxe', count: 1, action: 'craft' }
-                    ]
-                };
-            }
-            return null;
-        };
-        
-        const result = await mockVoyager._decompose('Mine 10 stone', 'Cannot break stone with current tools');
-        
-        assert.ok(result, 'Decompose should return true (handled)');
-        assert.ok(mockVoyager.progress.decomposed['Mine 10 stone'], 'Should record decomposition');
-        const subs = mockVoyager.progress.decomposed['Mine 10 stone'].subs;
-        assert.ok(subs.length >= 1, 'Should have subgoals');
-        // Should include craft steps for the tool
-        assert.ok(subs.some(s => s.toLowerCase().includes('wooden_pickaxe')), 
-            'Subgoals should include crafting wooden_pickaxe');
-    });
-});
+// fix81: the harvestTools decompose (reason text "Cannot break X with current tools" -> _cheapestHarvestTool) is replaced by
+// the structural game-data precondition (recipe_plan.js, Voyager._queuePrerequisites); see test/fix81-backchain-tools.test.js
 
 describe('fix47: call-graph cycle detection', () => {
     it('should detect self-recursive skill code', async () => {
@@ -852,39 +780,8 @@ describe('fix47: call-graph cycle detection', () => {
 });
 
 describe('fix47: blocker tracking in curriculum', () => {
-    it('should track blockers when harvestTools decompose happens', async () => {
-        const { Voyager, _setVersionForTest } = await import('../src/agent/voyager.js');
-        _setVersionForTest('1.20.4');
-        
-        const mockVoyager = Object.create(Voyager.prototype);
-        mockVoyager.skills = [];
-        mockVoyager.progress = { decomposed: {}, subgoals: [], blockers: [] };
-        mockVoyager._curSub = null;
-        mockVoyager._saveProgress = () => {};
-        mockVoyager.observe = () => ({ inventory: {} });
-        
-        // Mock _cheapestHarvestTool
-        mockVoyager._cheapestHarvestTool = (blockName, inv) => {
-            if (blockName === 'stone') {
-                return {
-                    tool: 'wooden_pickaxe',
-                    chain: [
-                        { item: 'oak_planks', count: 4, action: 'craft' },
-                        { item: 'wooden_pickaxe', count: 1, action: 'craft' }
-                    ]
-                };
-            }
-            return null;
-        };
-        
-        await mockVoyager._decompose('Mine 10 stone', 'Cannot break stone with current tools');
-        
-        assert.ok(mockVoyager.progress.blockers.length > 0, 'Should have blockers');
-        const blocker = mockVoyager.progress.blockers[0];
-        assert.strictEqual(blocker.tool, 'wooden_pickaxe', 'Blocker should track the needed tool');
-        assert.strictEqual(blocker.block, 'stone', 'Blocker should track the blocked block');
-    });
-    
+    // fix81: blockers are now recorded from the structural tool precondition (test/fix81-backchain-tools.test.js)
+
     it('should include blockers in curriculum prompt facts', async () => {
         const { readFileSync } = await import('fs');
         const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');

@@ -195,7 +195,7 @@ describe('fix74: no magic timers or fallbacks in practice', () => {
     const body = (start, end) => SRC.slice(SRC.indexOf(start), SRC.indexOf(end, SRC.indexOf(start))).split('\n').map(l => l.replace(/\s\/\/ .*$/, '')).join('\n');   // code only
     it('the practice loop and run have no sleeps; the only timer is the learned bound', () => {
         const loop = body('    async _startIdlePractice(callNum) {', '    _armPracticeAbort() {');
-        const run = body('    async _runPracticeSkill(skill) {', '    // fix47: compute cheapest tool');
+        const run = body('    async _runPracticeSkill(skill) {', '    // ---------- automatic curriculum ----------');
         assert.doesNotMatch(loop, /setTimeout|setInterval|\b\d{3,}\b/);
         assert.deepStrictEqual(run.match(/setTimeout\([^;]*;/g), ["setTimeout(() => resolve({ kind: 'cut' }), bound);"]);
         assert.doesNotMatch(run, /maxPracticeMs|10000/);

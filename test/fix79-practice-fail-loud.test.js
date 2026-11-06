@@ -65,7 +65,7 @@ describe('fix79: the practice session does not swallow errors', () => {
         const start = SRC.indexOf('    async _startIdlePractice(callNum) {');
         const session = code(SRC.slice(start, SRC.indexOf('    _armPracticeAbort() {', start)));
         const rs = SRC.indexOf('    async _runPracticeSkill(skill) {');
-        const run = code(SRC.slice(rs, SRC.indexOf('    // fix47: compute cheapest tool', rs)));
+        const run = code(SRC.slice(rs, SRC.indexOf('    // ---------- automatic curriculum ----------', rs)));
         assert.doesNotMatch(session, /\.catch\(|catch \(/);
         // the only catch in the run is inside the generated harness string, which re-throws
         assert.deepStrictEqual(run.match(/catch \(e\) \{[^}]*\}/g), ["catch (e) { log(bot, 'PRACTICE FAILED: ' + e.message); throw e; }"]);
