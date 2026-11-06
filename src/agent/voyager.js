@@ -1171,6 +1171,8 @@ Use only c; no other globals.`;
             const ct = out?.[e.name], bad = this._validContract(ct);
             e.contractTried = Date.now();
             if (bad) { console.log(`[contract] FAILED for ${e.name}: ${bad}`); continue; }
+            // fix56: a repair that returns the same post means the contract was not the problem (e.g. the trace state it was judged on was wrong)
+            if (why === 'contract repair' && e.contract && e.contract.pre === ct.pre && e.contract.post === ct.post) console.log(`!!! [contract] LOUD: contract repair of ${e.name} returned the SAME pre/post; the violation (${fixNote}) is not explained by the contract`);
             if (e.contract) e.contractPrev = e.contract;
             e.contract = { pre: ct.pre, post: ct.post, text: String(ct.text || '').slice(0, 200), learned: new Date().toISOString(), why };
             n++; console.log(`[contract] ${e.name}: pre ${ct.pre.slice(0, 80)} | post ${ct.post.slice(0, 120)}`);
@@ -1520,7 +1522,9 @@ Use only c; no other globals.`;
     }
     _cursorLimited() { const cm = this.agent.prompter.code_model; return !cm.fallback && Date.now() < (cm.quotaUntil || 0); }   // fix33: fallback configured = not limited
     // find a saved skill that can be replayed without any model call
-    _findReplay(task) {
+    // fix56: structured routes (exact name/task identity, parsed kill/harvest/mine/craft/travel/smelt) first, then lexical word overlap
+    _findReplay(task) { return this._structuredReplay(task) || this._lexicalReplay(task); }
+    _structuredReplay(task) {
         // fix41: exact skill name or exact task match FIRST, including primitives (tossClutter/tossItem/depositToChest)
         const taskLower = task.toLowerCase().trim();
         for (const s of this.skills) {
@@ -1556,6 +1560,12 @@ Use only c; no other globals.`;
             return { name: 'smeltWithFuel', call: `await smeltWithFuel(bot, ${JSON.stringify(sm.input)}, ${sm.count});` };
         if (sm && this.skills.some(s => s.name === 'smeltItems'))
             return { name: 'smeltItems', call: `await smeltItems(bot, ${JSON.stringify(sm.input)}, ${sm.count});` };
+        return null;
+    }
+    // fix56: lexical word-overlap routing. Any two task heads without digits/ids are "comparable" and 0.3*rate is always > 0,
+    // so this returns the best-rated unrelated skill when nothing matches (live: "Explore for iron ore deposit" -> ensureFurnaceInRange).
+    // Item goals still use it (they are verified by inventory gain); open goals never do (see _step).
+    _lexicalReplay(task) {
         const nums = t => (t.match(/\d+/g) || []).join(',');
         const ids = t => (t.toLowerCase().match(/\b[a-z]+(?:_[a-z]+)+\b/g) || []).sort().join(',');
         const head = t => t.split(/\s+(?:within|at|in|on|using|from|near|and)\b/i)[0].trim().toLowerCase();
@@ -1590,7 +1600,7 @@ Use only c; no other globals.`;
         return best && bs >= th ? { name: best.name, call: `await ${best.name}(bot);`, embed: bs } : null;
     }
     _learnReplayThreshold(rp) {
-        if (!rp || rp.interrupted) return;
+        if (!rp || rp.interrupted || rp.unverified) return;   // fix56: an unverifiable post says nothing about routing
         const P = this.progress, old = P.replayThreshold; P.replayThreshold = Math.min(0.99, Math.max(0.6, old + (rp.ok ? -0.01 : 0.02))); this._saveProgress();
         console.log(`[replay] embedding replay ${rp.ok ? 'passed' : 'failed'}; threshold ${old.toFixed(3)} -> ${P.replayThreshold.toFixed(3)}`);
     }
@@ -1673,7 +1683,7 @@ Use only c; no other globals.`;
         const res = await this._run(`voyager:replay:${task}`, async () => { this.agent.bot.__psnALS = globalThis.__psnALS; await staged.func.main(this.agent.bot); }, 5);
         if (this.abort) return { ok: false, interrupted: true };
         const after = this.observe();
-        let ok;
+        let ok, unverified = false;
         const cut = res.interrupted || this._diedInRun() || this._stalledInRun() ? this._interruptReason(res.message) : '';   // fix14: a cut-off replay is a failure
         if (this._diedInRun()) this._noteDeath(this._diedInRun(), task);
         if (cut) { ok = false; console.log(`[voyager] replay ${r.name} ${cut}; counting as a failure`); } else
@@ -1693,8 +1703,16 @@ Use only c; no other globals.`;
                 if (entry) delete entry.contractTried;
                 ok = false;
             } else {
-                ok = this._postHolds(entry);
-                console.log(`[psn] fix55 open goal "${task}": ${r.name} learned post ${entry.contract.post} -> ${ok}`);
+                const held = this._postHolds(entry);
+                const v = held ? this._postVerifiesRun(entry) : { ok: true };
+                if (held && !v.ok) {
+                    // fix56: the post held but would also hold for a run that did nothing -> it cannot verify an open goal
+                    console.log(`!!! [psn] LOUD: open goal "${task}" NOT verified: ${r.name} post ${entry.contract.post} cannot verify it (${v.why}); queued contract repair`);
+                    this._queueContractFix(entry, `post cannot verify a goal: ${v.why}`);
+                    unverified = true;
+                }
+                ok = held && v.ok;
+                console.log(`[psn] fix55 open goal "${task}": ${r.name} learned post ${entry.contract.post} -> held=${held}, verifies run=${v.ok} -> ${ok}`);
             }
         }
         if (!ok) this._tryDecomposePrerequisiteFailure(task);
@@ -1702,10 +1720,11 @@ Use only c; no other globals.`;
         // fix44: pass goal items to filter learned effects and produces (denoise)
         const goalItems = goal?.items || (goal?.item ? [goal.item] : null);
         if (entry && ok && !trial) this._learnEffects(entry, before, after, goalItems);
-        if (entry) this._recordRun(entry, task, ok, trial);
+        // fix56: an unverified open goal is neither a pass nor a failure of the skill: no run stats, no blame of the root for the goal
+        if (entry && !unverified) this._recordRun(entry, task, ok, trial);
         // ADAM-style: record inventory delta for needs/produces learning
         if (ok) this.npGraph.recordDelta(r.name, before.inventory, after.inventory, goalItems);
-        this._attribute(r.name, task, ok, over);   // fix10: per-call trace -> contract results -> blame -> targeted repair
+        this._attribute(r.name, task, unverified ? true : ok, over);   // fix10: per-call trace -> contract results -> blame -> targeted repair
 
         // fix37 (D): detect and log inventory-full as a fact for learning
         const invFullFact = !ok ? this._detectInventoryFullFailure(task, before, after, String(res.message || '')) : null;
@@ -1718,7 +1737,7 @@ Use only c; no other globals.`;
             if (invFullFact) console.log(`[voyager] replay ${r.name} INVENTORY FULL DETECTED: ${invFullFact}`);
         }
         if (!ok) console.log(`[voyager] replay ${r.name} output: ${String(res.message || '(none)').slice(-600).replace(/\n+/g, ' | ')}`);
-        return { ok, name: r.name, output: String(res.message || ''), cut, invFullFact };
+        return { ok, name: r.name, output: String(res.message || ''), cut, invFullFact, unverified };
     }
     // library source with optional per-name code overrides (candidates under test)
     _libSrc(over = {}) { return this.skills.map(s => over[s.name] ?? s.code).join('\n\n'); }
@@ -1866,6 +1885,26 @@ Use only c; no other globals.`;
         if (why) { console.log(`[psn] post of ${e.name}: ${why} -> does not hold`); return false; }
         try { return this._compileContract(e.contract.post)({ args: r.argv, ret: r.rv, pre: r.s0, post: r.s1, delta: r.delta, dist: (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z) }) === true; }
         catch (err) { console.log(`!!! [contract] ${e.name}.post THREW: ${err.message}; does not hold, queued contract repair`); this._queueContractFix(e, `post threw: ${err.message}`); return false; }
+    }
+
+    // fix56: can this post-contract verify a goal at all, judged on the run that just happened?
+    //  1) AST: the post must read something the run produces: c.ret, c.delta or c.post.* (c.dist(c.pre.pos, c.post.pos) counts via c.post.pos)
+    //  2) null-run counterfactual: the same post on a run that did nothing (ret undefined, post state = pre state, empty delta) must be false;
+    //     a post that also holds when nothing happened (e.g. "!c.ret || (c.post.alive && c.pre.dim === c.post.dim)") verifies nothing
+    //  3) falsy ret: when the real ret is falsy, the pass must come from the state change, not from a "!c.ret ||" guard:
+    //     the post with the real ret but no state change must be false
+    _postVerifiesRun(e) {
+        const src = e.contract.post;
+        const { root, param } = this._parseContract(src);
+        if (param === null) return { ok: false, why: 'post takes no parameter, so it reads nothing from the run' };
+        const reads = new Set();
+        this._walkAst(root.body, node => { if (node.type !== 'MemberExpression') return; const p = this._contractPath(node, param); if (p && p.length) reads.add(p[0] === 'post' ? 'post' : p[0]); });
+        if (!['ret', 'delta', 'post'].some(k => reads.has(k))) return { ok: false, why: `post reads only [${[...reads].join(', ')}], nothing the run produced (ret, delta, post state)` };
+        const r = this.agent.bot.__psnTrace.find(t => t.name === e.name && (t.parent ?? -1) < 0);
+        const f = this._compileContract(src), dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+        if (f({ args: r.argv, ret: undefined, pre: r.s0, post: r.s0, delta: {}, dist }) === true) return { ok: false, why: 'post also holds for a run that did nothing (ret undefined, no state change)' };
+        if (!r.rv && f({ args: r.argv, ret: r.rv, pre: r.s0, post: r.s0, delta: {}, dist }) === true) return { ok: false, why: `ret was ${JSON.stringify(r.rv)} and the post holds from ret alone (vacuous guard), not from what the run changed` };
+        return { ok: true };
     }
 
     // fix47: compute what can be produced from current inventory via learned producers ONLY
@@ -3984,7 +4023,11 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
 
         // fix55: a skill goal runs exactly that skill (never a different skill whose task text matches)
         const goalKind = this._resolveGoal(task);
-        const route = goalKind.kind === 'skill' ? { name: goalKind.skill.name, call: `await ${goalKind.skill.name}(bot);` } : this._findReplay(task) || await this._embedReplay(task);   // fix28 (D): replay a matching learned skill before any code-model call
+        // fix56: an open goal is routed only by identity/parsed routes or by the embedding match (nearest skill among all candidates AND above
+        // the learned replay threshold); never by lexical word overlap, which picks unrelated well-rated skills
+        const route = goalKind.kind === 'skill' ? { name: goalKind.skill.name, call: `await ${goalKind.skill.name}(bot);` }
+            : goalKind.kind === 'open' ? this._structuredReplay(task) || await this._embedReplay(task)
+            : this._findReplay(task) || await this._embedReplay(task);   // fix28 (D): replay a matching learned skill before any code-model call
         let rp = route ? await this._replay(task, before, route) : null;
         if (route?.embed) this._learnReplayThreshold(rp);
         if (!rp?.ok && !rp?.interrupted) { const bc = await this._backchain(task, rp ? this.observe() : before); if (bc) rp = bc; }   // fix32 PSN backward chaining

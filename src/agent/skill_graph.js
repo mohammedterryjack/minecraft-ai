@@ -171,10 +171,10 @@ export function instrumentSrc(names) {
     // fix43: __st() now includes equipment state (eq) so equip skill contracts can be idempotent (already-equipped = success)
     // fix49/fix51: __have() = getInventoryCounts (slots 5+ already include armor, held hotbar slot and off-hand: counting eq again double-counts)
     //        waitForTicks(1) before post snapshot (one server tick, not magic timers)
-    const wrap = `const __T = bot.__psnTrace = []; const __als = bot.__psnALS; if (!__als) throw new Error('PSN trace: bot.__psnALS (AsyncLocalStorage) missing'); const __inv = () => { try { return world.getInventoryCounts(bot); } catch { return {}; } };
+    const wrap = `const __T = bot.__psnTrace = []; const __als = bot.__psnALS; if (!__als) throw new Error('PSN trace: bot.__psnALS (AsyncLocalStorage) missing'); const __inv = () => getInventoryCounts(bot);
 const __eq = () => { const s = bot.inventory.slots; return { heldItem: s[bot.quickBarSlot + 36]?.name || null, offHand: s[45]?.name || null, helmet: s[5]?.name || null, chestplate: s[6]?.name || null, leggings: s[7]?.name || null, boots: s[8]?.name || null }; };
 const __have = () => __inv();
-const __st = () => { try { const p = bot.entity.position, b = bot.blockAt(p.floored().offset(0, 1, 0)); return { pos: { x: p.x, y: p.y, z: p.z }, hp: bot.health, food: bot.food, oxygen: bot.oxygenLevel, sky: b ? b.skyLight : null, alive: bot.health > 0, dim: String(bot.game?.dimension || ''), inv: __inv(), eq: __eq() }; } catch (e) { return { err: String(e?.message || e) }; } };
+const __st = () => { const p = bot.entity.position, b = bot.blockAt(p.floored().offset(0, 1, 0)); return { pos: { x: p.x, y: p.y, z: p.z }, hp: bot.health, food: bot.food, oxygen: bot.oxygenLevel, sky: b ? b.skyLight : null, alive: bot.health > 0, dim: String(bot.game?.dimension || ''), inv: __inv(), eq: __eq() }; };
 const __wrap = (n, f) => async function (...a) {
     if (__T.length >= 1500) return await f.apply(this, a);
     const par = __als.getStore() ?? -1;
