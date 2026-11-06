@@ -752,6 +752,22 @@ Use only c; no other globals.`;
         try { for (const k of ['pre', 'post']) { const r = this._compileContract(ct[k])(c); if (typeof r !== 'boolean') return `${k} returned ${typeof r}, not boolean`; } } catch (e) { return `throws: ${e.message}`; }
         return null;
     }
+    // fix51: detect travel skill with inventory-based postcondition (contract bug)
+    // A travel skill's postcondition should check position change, not inventory delta
+    _isTravelContractBug(skillName, contract) {
+        if (!contract?.post) return false;
+        const isTravel = /travel|goto|goTo|moveTo|walk|navigate|approach|flee|escape|avoid/i.test(skillName);
+        if (!isTravel) return false;
+        const postStr = String(contract.post);
+        const checksDelta = /c\.delta|delta\[|delta\./.test(postStr);
+        const checksPos = /c\.post\.pos|c\.pre\.pos|c\.dist/.test(postStr);
+        // Bug: travel skill checks delta but not position
+        if (checksDelta && !checksPos) {
+            console.log(`[fix51] CONTRACT BUG: travel skill "${skillName}" postcondition checks delta but not position: ${postStr.slice(0, 100)}`);
+            return true;
+        }
+        return false;
+    }
     // evaluate contracts on every traced library call; violations become contract failures in the trace
     _checkContracts(trace, taskOk) {
         const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
@@ -759,6 +775,11 @@ Use only c; no other globals.`;
             if (r.intr || !r.s0 || !r.s1) continue;
             const e = this.skills.find(s => s.name === r.name);
             if (!e?.contract) continue;
+            // fix51: detect travel skill with inventory-based postcondition (contract bug) and queue repair
+            if (this._isTravelContractBug(e.name, e.contract)) {
+                this._queueContractFix(e, `travel skill postcondition checks delta but not position`);
+                continue;
+            }
             const c = { args: r.argv || [], ret: r.rv, pre: r.s0, post: r.s1, delta: r.delta || {}, dist };
             for (const k of ['pre', 'post']) {
                 let ok;
@@ -872,8 +893,8 @@ Use only c; no other globals.`;
     async _run(label, fn, timeout) {
         // fix42: populate bot.__safeToToss before any skill run (for tossClutter/freeInventory)
         this._prepareTossSignals();
-        // fix51: track inventory before run for death item-drop reporting
-        this._beforeRunInv = world.getInventoryCounts(this.agent.bot);
+        // fix51: track inventory+equipment before run for death item-drop reporting (same view as satisfaction check)
+        this._beforeRunInv = this._getInventoryWithEquipment();
         // fix28: progress = position, inventory, health, food, open-window contents (crafting/furnace UI) or a lit furnace/smoker nearby (smelting wait)
         const bot = this.agent.bot;
         const lit = () => !!bot.findBlock({ matching: b => /furnace|smoker/.test(b.name) && b.getProperties?.().lit === true, maxDistance: 6 });
@@ -936,21 +957,17 @@ Use only c; no other globals.`;
                 oxygenTrend = `; oxygen ${first} -> ${last} (min ${minO}) over ${elapsed}s`;
             }
         }
-        // fix51: compute items dropped on death (inventory delta)
+        // fix51: compute items dropped on death (inventory+equipment delta, same view as satisfaction check)
         let itemsLost = '';
         if (beforeInv) {
-            const afterInv = this.observe().inventory;
+            const afterInv = this._getInventoryWithEquipment();
             const lost = [];
             for (const [item, beforeCount] of Object.entries(beforeInv)) {
                 const afterCount = afterInv[item] || 0;
                 const delta = beforeCount - afterCount;
-                if (delta > 0) {
-                    lost.push(`${item}:${delta}`);
-                }
+                if (delta > 0) lost.push(`${item}:${delta}`);
             }
-            if (lost.length > 0) {
-                itemsLost = `; items dropped: ${lost.slice(0, 10).join(', ')}${lost.length > 10 ? ` (+${lost.length - 10} more)` : ''}`;
-            }
+            if (lost.length > 0) itemsLost = `; items dropped: ${lost.join(', ')}`;
         }
         return `; fall height ${fall} blocks in the last 10s; damage taken: ${hits.length ? hits.join(', ') : 'none sampled'}${oxygenTrend}${itemsLost}`;
     }
@@ -1026,6 +1043,20 @@ Use only c; no other globals.`;
             recent_deaths: (this.agent.recentDeaths || []).join('; ') || 'none',
             death_hotspots: this._deathHotspots(),
         };
+    }
+    // fix51: get inventory+equipment combined view (same as satisfaction check uses for __have)
+    _getInventoryWithEquipment() {
+        const bot = this.agent.bot;
+        const inv = world.getInventoryCounts(bot);
+        // Add equipment items (same slots as observe().equipment)
+        const eqSlots = [45, 5, 6, 7, 8]; // off_hand, head, torso, legs, feet
+        const heldItem = bot.heldItem;
+        if (heldItem) inv[heldItem.name] = (inv[heldItem.name] || 0) + heldItem.count;
+        for (const slot of eqSlots) {
+            const item = bot.inventory.slots[slot];
+            if (item) inv[item.name] = (inv[item.name] || 0) + item.count;
+        }
+        return inv;
     }
     // fix19 (6): places where the bot died 2+ times (16-block cells): a problem for the curriculum to learn to handle, no reflex
     _deathHotspots() {
@@ -3628,20 +3659,18 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
         const invFullReason = finalInvFull ? ` Inventory state: ${finalInvFull}` : '';
 
         // fix51: track per-goal::reason failures using learned (s+1)/(n+2) Laplace-smoothed rate
-        // When stalls repeat on the same goal, the rate drops and backoff increases
-        const reasonKey = `${task}::${(anyCut || 'unknown').replace(/at \d+,\d+,\d+/g, 'at X,Y,Z').slice(0, 80)}`;
+        // Key by normalized structured source: skill name (from trace) + failure kind (stall/death/timeout)
+        const failKind = anyCut?.match(/stall|death|timeout|travel/i)?.[0]?.toLowerCase() || 'unknown';
+        const failSkill = (this.agent.bot.__psnTrace || []).filter(t => t.fail && !t.intr).map(t => t.name)[0] || 'root';
+        const reasonKey = `${task}::${failSkill}::${failKind}`;
         const goalStats = (this.progress.goalFailures ||= {});
         const gs = (goalStats[reasonKey] ||= { success: 0, fail: 0 });
         gs.fail++;
         gs.lastFail = Date.now();
         const rate = (gs.success + 1) / (gs.success + gs.fail + 2);  // Laplace-smoothed
-        console.log(`[fix51] goal::reason "${reasonKey.slice(0, 60)}" fail rate: ${(1 - rate).toFixed(2)} (${gs.fail} fails, ${gs.success} successes)`);
-        // If repeated stalls (rate < 0.3), increase backoff proportionally
-        if (rate < 0.3 && anyCut && /stall/i.test(anyCut)) {
-            const extraBackoff = Math.round(10000 * (1 - rate));  // up to 10s extra based on failure rate
-            this._backoffUntil = Math.max(this._backoffUntil || 0, Date.now() + extraBackoff);
-            console.log(`[fix51] repeated stall on same goal - extra backoff ${Math.round(extraBackoff / 1000)}s (rate ${rate.toFixed(2)})`);
-        }
+        console.log(`[fix51] goal::reason "${reasonKey}" rate=${rate.toFixed(2)} (${gs.success}s/${gs.fail}f)`);
+        // Store the rate for skip-probability based ordering (no wall-clock backoff, no threshold)
+        gs.rate = rate;
         this._saveProgress();
 
         // fix19 (1): failed twice (recently) or cut off -> decompose

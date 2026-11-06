@@ -369,21 +369,34 @@ describe('fix51 issue 9: tossClutter fail-loud checks', async () => {
 
 // Issue 10 (live run-2): Items dropped on death tracking
 describe('fix51 issue 10: items dropped on death tracking', async () => {
-    it('_run stores inventory before execution', () => {
+    it('_run stores inventory+equipment before execution', () => {
         const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
         assert.ok(voyagerSrc.includes('_beforeRunInv') || voyagerSrc.includes('beforeRunInv'),
             'should track inventory before run');
+        assert.ok(voyagerSrc.includes('_getInventoryWithEquipment'),
+            'should use combined inventory+equipment view');
     });
 
-    it('_deathDetail computes inventory delta', () => {
+    it('_deathDetail computes inventory+equipment delta (full, no cap)', () => {
         const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
         assert.ok(voyagerSrc.includes('items dropped') || voyagerSrc.includes('itemsLost'),
             '_deathDetail should report items dropped');
+        // No cap on items
+        assert.ok(!voyagerSrc.includes('lost.slice(0, 10)'),
+            'should NOT cap items dropped at 10');
+    });
+
+    it('_getInventoryWithEquipment includes held item and armor slots', () => {
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        assert.ok(voyagerSrc.includes('bot.heldItem'),
+            'should include held item in inventory view');
+        assert.ok(voyagerSrc.includes('eqSlots') || voyagerSrc.includes('slots[45]'),
+            'should include equipment slots');
     });
 
     it('items dropped computed as beforeInv - afterInv delta', () => {
-        const beforeInv = { iron_ingot: 68, diamond: 5, stone_pickaxe: 3 };
-        const afterInv = { iron_ingot: 0, stone_pickaxe: 1 }; // died and lost stuff
+        const beforeInv = { iron_ingot: 68, diamond: 5, stone_pickaxe: 3, iron_pickaxe: 1 };
+        const afterInv = { iron_ingot: 0, stone_pickaxe: 1 }; // died and lost stuff including held pickaxe
 
         const lost = [];
         for (const [item, beforeCount] of Object.entries(beforeInv)) {
@@ -395,6 +408,7 @@ describe('fix51 issue 10: items dropped on death tracking', async () => {
         assert.ok(lost.includes('iron_ingot:68'), 'should detect iron_ingot loss');
         assert.ok(lost.includes('diamond:5'), 'should detect diamond loss');
         assert.ok(lost.includes('stone_pickaxe:2'), 'should detect stone_pickaxe partial loss');
+        assert.ok(lost.includes('iron_pickaxe:1'), 'should detect held iron_pickaxe loss');
     });
 });
 
@@ -428,13 +442,50 @@ describe('fix51 issue 11: nav stall loop per-goal::reason tracking', async () =>
         assert.ok(rate3 > 0.6, '3 successes 1 fail should have high rate');
     });
 
-    it('repeated stalls trigger backoff (no new thresholds)', () => {
+    it('stores rate for skip-probability ordering (no wall-clock backoff)', () => {
         const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
-        assert.ok(voyagerSrc.includes('_backoffUntil') && voyagerSrc.includes('stall'),
-            'should apply backoff on repeated stalls');
-        // The 0.3 threshold is the existing learned maturity threshold
-        assert.ok(voyagerSrc.includes('rate < 0.3'),
-            'should use existing maturity threshold for stall backoff');
+        assert.ok(voyagerSrc.includes('gs.rate = rate'),
+            'should store rate for skip-probability ordering');
+        // No wall-clock backoff timer
+        assert.ok(!voyagerSrc.includes('10000 * (1 - rate)'),
+            'should NOT have wall-clock backoff based on rate');
+    });
+
+    it('keys by normalized structured source (skill + kind), not truncated text', () => {
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        assert.ok(voyagerSrc.includes('failSkill') && voyagerSrc.includes('failKind'),
+            'should key by skill name and failure kind');
+        // Check that reasonKey is not truncated (no .slice after reasonKey assignment)
+        const reasonKeySection = voyagerSrc.match(/reasonKey\s*=\s*`[^`]+`/);
+        assert.ok(reasonKeySection && !reasonKeySection[0].includes('.slice'),
+            'reasonKey should not be truncated');
+    });
+});
+
+// Issue 13 (live run-2): Travel skill contract bug detection
+describe('fix51 issue 13: travel skill contract bug detection', async () => {
+    it('_isTravelContractBug exists and checks for delta-only postconditions', () => {
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        assert.ok(voyagerSrc.includes('_isTravelContractBug'),
+            'should have _isTravelContractBug method');
+    });
+
+    it('detects travel skill with delta-based postcondition as bug', () => {
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        assert.ok(voyagerSrc.includes('checksDelta') && voyagerSrc.includes('checksPos'),
+            'should check if postcondition uses delta vs position');
+    });
+
+    it('queues contract repair for travel skill with inventory-based postcondition', () => {
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        assert.ok(voyagerSrc.includes('_queueContractFix') && voyagerSrc.includes('travel skill postcondition'),
+            'should queue contract fix for travel skill contract bug');
+    });
+
+    it('travel skill name detection is case-insensitive', () => {
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        assert.ok(voyagerSrc.includes('/travel|goto|goTo') && voyagerSrc.includes('/i.test'),
+            'should use case-insensitive regex for travel skill detection');
     });
 });
 
