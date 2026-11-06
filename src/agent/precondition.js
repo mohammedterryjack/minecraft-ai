@@ -20,6 +20,15 @@ export function markPreconditionUnmet(bot, detail) {
     if (!detail) throw new Error('[fix81] markPreconditionUnmet: detail { need: { item | anyOf, count, reason } } required');
     if (typeof detail !== 'object') throw new Error('[fix81] markPreconditionUnmet: detail must be an object');
     checkNeed(detail.need, 'markPreconditionUnmet');
+    // fix85: the need belongs to the call that is running, not to a single bot slot (last write wins, so a nested
+    // iron_pickaxe need became the need of "Collect 4 oak_planks"). The trace prelude publishes that frame on the bot.
+    const frame = bot.__psnFrame;
+    if (typeof frame === 'number' && frame >= 0) {
+        if (!Array.isArray(bot.__psnTrace)) throw new Error('[fix85] markPreconditionUnmet: bot.__psnFrame is set but bot.__psnTrace is not the trace');
+        const rec = bot.__psnTrace[frame];
+        if (!rec) throw new Error(`[fix85] markPreconditionUnmet: frame ${frame} is not in the trace (${bot.__psnTrace.length} records)`);
+        rec.reportedNeed = detail.need;
+    }
     bot.__unmetPrecondition = Object.assign({ kind: 'precondition' }, detail);
     return bot.__unmetPrecondition;
 }

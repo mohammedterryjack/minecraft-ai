@@ -124,17 +124,51 @@ export function splitGeneratedCode(code, own) {
     if (typeof own !== 'string' || !own) throw new Error('splitGeneratedCode: own function name required');
     const src = String(code), body = topLevelStatements(src);
     const last = body[body.length - 1];
-    const skillSource = last && last.kind === 'ExpressionStatement' && last.calls === own
+    const entry = !!(last && last.kind === 'ExpressionStatement' && last.calls === own);
+    const skillSource = entry
         ? (src.slice(0, last.node.start) + src.slice(last.node.end)).trim()
         : src.trim();
-    return { skillSource, violations: skillSourceViolations(skillSource, own) };
+    return { skillSource, violations: skillSourceViolations(skillSource, own), entry };
 }
 // fix82: lint feedback for the model when its code breaks the one-function rule
+// fix85: the reply that is executed must end with the call. The call is still cut before the skill is saved.
 export function oneFunctionFeedback(own, violations, pasted) {
     if (!Array.isArray(violations) || !violations.length) throw new Error('oneFunctionFeedback: violations required');
     if (!Array.isArray(pasted)) throw new Error('oneFunctionFeedback: pasted (library skill names the code declares) required');
     const lib = pasted.length ? ` ${pasted.join(', ')} ${pasted.length === 1 ? 'is a learned skill' : 'are learned skills'} already defined for your code: call ${pasted.length === 1 ? 'it' : 'them'} by name, do not paste ${pasted.length === 1 ? 'its' : 'their'} source.` : '';
-    return `A learned skill is ONE top-level function: \`async function ${own}(bot, ...)\` (optionally followed by one call of it). Helper functions and constants go INSIDE ${own}, so they are not globals of other skills' code. Your code has: ${violations.join('; ')}.${lib}`;
+    return `A learned skill is ONE top-level function: \`async function ${own}(bot, ...)\` (the reply that runs must end with \`await ${own}(bot);\`, and that call is cut before the skill is saved). Helper functions and constants go INSIDE ${own}, so they are not globals of other skills' code. Your code has: ${violations.join('; ')}.${lib}`;
+}
+// fix85: a reply that only defines the function records no execution trace (live: collectLogs defined, never called)
+export function entryCallFeedback(own) {
+    if (typeof own !== 'string' || !own) throw new Error('entryCallFeedback: own function name required');
+    return `The reply must end with exactly one call of ${own} (\`await ${own}(bot);\`) so the function runs and the execution trace records the call. A definition alone runs nothing: the task fails with no execution trace. That call is cut before the skill is saved, so the saved function does not run itself whenever it is staged.`;
+}
+// fix85: source text of each call of a reserved binding (whitespace-normalized). A repair must still contain each one.
+export function markerCallTexts(code, name) {
+    if (typeof name !== 'string' || !name) throw new Error('markerCallTexts: binding name required');
+    let ast;
+    try { ast = acorn.parse(String(code), { ecmaVersion: 'latest', sourceType: 'module', allowAwaitOutsideFunction: true }); }
+    catch (e) { throw new Error(`markerCallTexts: parse failed: ${e.message}`); }
+    const src = String(code), out = [];
+    const walk = n => {
+        if (!n || typeof n.type !== 'string') return;
+        if (n.type === 'CallExpression' && n.callee.type === 'Identifier' && n.callee.name === name) out.push(src.slice(n.start, n.end).replace(/\s+/g, ' '));
+        for (const v of Object.values(n)) {
+            if (Array.isArray(v)) v.forEach(walk);
+            else if (v && typeof v === 'object' && typeof v.type === 'string') walk(v);
+        }
+    };
+    walk(ast);
+    return out;
+}
+// null when `after` still contains every call of `name` that `before` contains. A skill that did not call it must not gain one.
+export function markerCallsMissing(before, after, name) {
+    const kept = markerCallTexts(before, name);
+    const now = markerCallTexts(after, name);
+    if (!kept.length && now.length) return `uses ${name}, reserved for seeded primitives (a new skill must not call it; a repair of a skill that already calls it must keep those calls)`;
+    const missing = kept.filter(c => !now.includes(c));
+    if (!missing.length) return null;
+    return `repair dropped the ${name} call(s) the current code uses to report a structured need: ${missing.join(' | ')}. A repair must keep those calls. A seeded primitive that returned false after reporting a need is not a missing log line.`;
 }
 // fix83: library skills a reply declares at top level besides its own function, or its own name declared more than once: the
 //        reply pasted their source (the prompt shows the top related skills in full)
@@ -356,6 +390,7 @@ const __have = () => __inv();
 const __st = () => { const p = bot.entity.position, b = bot.blockAt(p.floored().offset(0, 1, 0)); return { pos: { x: p.x, y: p.y, z: p.z }, hp: bot.health, food: bot.food, oxygen: bot.oxygenLevel, sky: b ? b.skyLight : null, alive: bot.health > 0, dim: String(bot.game?.dimension || ''), inv: __inv(), free: bot.inventory.emptySlotCount(), eq: __eq() }; };
 let __inHarness = false;
 let __syncParent = -1;
+bot.__psnFrame = -1;   // fix85: the frame markPreconditionUnmet stamps its need on (the bot slot is last-write-wins)
 // fix83: argument text of a traced call; JSON renders NaN/Infinity as null and drops undefined, so the live trace showed
 //        craftSticks(null) for the craftSticks(NaN) call its contract refused (19:03:57 GMT)
 const __argText = xs => '[' + xs.map(x => typeof x === 'number' || x === undefined ? String(x) : JSON.stringify(x)).join(',') + ']';
@@ -375,19 +410,21 @@ const __wrap = (n, f) => function (...a) {
     const finish = () => { Promise.resolve().then(finishBody); };
     const prev = __syncParent;
     __syncParent = id;
+    bot.__psnFrame = id;
     let r;
     try { r = f.apply(this, a); }
     catch (e) { threw(e); finish(); throw e; }
-    finally { __syncParent = prev; }
+    finally { __syncParent = prev; bot.__psnFrame = prev; }
     if (r === null || typeof r !== 'object' || typeof r.then !== 'function') { settle(r); finish(); return r; }
     return (async () => {
         const prev2 = __syncParent;
         __syncParent = id;
+        bot.__psnFrame = id;
         try {
             try { return settle(await r); }
             catch (e) { threw(e); throw e; }
             finally { await bot.waitForTicks(1); finish(); }
-        } finally { __syncParent = prev2; }
+        } finally { __syncParent = prev2; bot.__psnFrame = prev2; }
     })();
 };`;
     return wrap + '\n' + names.map(n => `${n} = __wrap(${JSON.stringify(n)}, ${n});`).join('\n');
@@ -454,6 +491,14 @@ export function blameAll(trace, isLeaf, isLearned) {
     // merely propagated it (no FAILED line of their own) met the callee's contract and are not blamed for it
     const owned = new Set();
     for (const [r] of pool) if (r.preHeld && !isLeaf(r.name) && isLearned(r.name)) for (let p = r.parent; p >= 0; p = trace[p].parent) owned.add(p);
+    // fix85: a frame that reported a structured need failed because that need is unmet, not because its source is wrong.
+    // It is not repaired. Ancestors that only propagated it (no failure line of their own) are not blamed for the log line
+    // the marker's comment was copied into (live collectBlock: the reach call became log("FAILED: no source within reach...")).
+    const structured = new Set();
+    for (const [r, i] of pool) if (r.reportedNeed) {
+        structured.add(i);
+        for (let p = r.parent; p >= 0; p = trace[p].parent) if (!(trace[p].ownFail || []).length) structured.add(p);
+    }
     // top-down: walk each failing call's ancestry from the root so a parent is credited before its children
     for (const [r, i] of [...pool].sort((x, y) => y[0].depth - x[0].depth)) {   // deepest failure first: it defines each skill's role
         const chain = []; for (let k = i; k >= 0; k = trace[k].parent) chain.unshift(k);
@@ -462,6 +507,7 @@ export function blameAll(trace, isLeaf, isLearned) {
         for (const k of chain) {
             const n = trace[k].name; if (isLeaf(n) || !isLearned(n) || (k === i && trace[k].preFail)) continue;   // fix22: violated precondition -> caller's fault
             if (owned.has(k) && !trace[k].ownFail.length) continue;   // fix60: only propagated a callee-owned failure
+            if (structured.has(k)) continue;   // fix85: a reported structured need, or an ancestor that only propagated it
             const kind = k === i ? 'callee_fix' : 'caller_fix';   // the failing call itself vs an ancestor that did not handle it
             const prev = out.get(n);
             if (!prev) out.set(n, { target: n, leaf: r.name, path, kind, swallowed, evidence, depth: trace[k].depth });
