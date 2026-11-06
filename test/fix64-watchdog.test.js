@@ -19,7 +19,7 @@ import { Vec3 } from 'vec3';
 import { Coder } from '../src/agent/coder.js';
 
 const NAME = '__fix64_test__';
-after(() => rmSync(`./bots/${NAME}`, { recursive: true, force: true }));
+after(() => { rmSync(`./bots/${NAME}`, { recursive: true, force: true }); rmSync(`./bots/${NAME}-watchdog_kill.json`, { force: true }); });
 
 // Verbatim from bots/icefox2000/skills/index.json on the iMac: collectBlock.candidate.code (under trial since 09:37Z,
 // staged into "Mine 5 iron_ore" attempt 4 by fix24's "candidates get trial runs in every task"; its line
@@ -158,7 +158,7 @@ describe('fix64: async loops yield every iteration', () => {
 const CHILD = fileURLToPath(new URL('./fixtures/fix64-watchdog-child.mjs', import.meta.url));
 function runChild(mode, gapMs) {
     return new Promise((resolve) => {
-        const p = spawn(process.execPath, [CHILD, mode, String(gapMs)], { stdio: ['ignore', 'pipe', 'pipe'] });
+        const p = spawn(process.execPath, [CHILD, mode, String(gapMs), `./bots/${NAME}-watchdog_kill.json`, 'mineIron > collectBlock'], { stdio: ['ignore', 'pipe', 'pipe'] });
         let out = '', err = '';
         p.stdout.on('data', d => { out += d; });
         p.stderr.on('data', d => { err += d; });

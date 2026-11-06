@@ -31,23 +31,24 @@ const modes_list = [
         fall_blocks: ['sand', 'gravel', 'concrete_powder'], // includes matching substrings like 'sandstone' and 'red_sand'
         update: async function (agent) {
             const bot = agent.bot;
-            let block = bot.blockAt(bot.entity.position);
-            let blockAbove = bot.blockAt(bot.entity.position.offset(0, 1, 0));
-            if (!block) block = {name: 'air'}; // hacky fix when blocks are not loaded
-            if (!blockAbove) blockAbove = {name: 'air'};
-            if (blockAbove.name === 'water') {
+            const block = bot.blockAt(bot.entity.position);
+            const blockAbove = bot.blockAt(bot.entity.position.offset(0, 1, 0));
+            // fix65: an unloaded cell is unknown, not air (dc520a9 faked air to stop a null crash): water, falling blocks and
+            // fire are judged only on loaded cells; the damage branch below needs no block and always runs
+            const cellsKnown = !!block && !!blockAbove;
+            if (cellsKnown && blockAbove.name === 'water') {
                 // does not call execute so does not interrupt other actions
                 if (!bot.pathfinder.goal) {
                     bot.setControlState('jump', true);
                 }
             }
-            else if (this.fall_blocks.some(name => blockAbove.name.includes(name))) {
+            else if (cellsKnown && this.fall_blocks.some(name => blockAbove.name.includes(name))) {
                 execute(this, agent, async () => {
                     await skills.moveAway(bot, 2);
                 });
             }
-            else if (block.name === 'lava' || block.name === 'fire' ||
-                blockAbove.name === 'lava' || blockAbove.name === 'fire') {
+            else if (cellsKnown && (block.name === 'lava' || block.name === 'fire' ||
+                blockAbove.name === 'lava' || blockAbove.name === 'fire')) {
                 say(agent, 'I\'m on fire!');
                 // if you have a water bucket, use it
                 let waterBucket = bot.inventory.findInventoryItem('water_bucket');

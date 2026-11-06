@@ -114,7 +114,14 @@ function _stallPollTick(bot) {
  * (Re)schedule poll: interval is always derived from current threshold via Nyquist.
  * @param {import('mineflayer').Bot} bot
  */
-function _scheduleStallPoll(bot) {
+/**
+ * fix65: `material` = this keep_alive gap fell outside every gap observed before it (a new min or max of the learned
+ * spread). Only then is ARMED logged; inside the spread the threshold still tracks the latest gap, silently. Before, both
+ * ARMED lines were logged on every keep_alive (37 lines in 5 minutes on the iMac).
+ * @param {import('mineflayer').Bot} bot
+ * @param {boolean} material
+ */
+function _scheduleStallPoll(bot, material) {
     const thresholdMs = bot.__eventLoopStallThresholdMs;
     if (typeof thresholdMs !== 'number' || !Number.isFinite(thresholdMs) || thresholdMs <= 0) {
         throw new Error('[event_loop_guard] cannot schedule stall poll: invalid threshold on bot');
@@ -124,7 +131,8 @@ function _scheduleStallPoll(bot) {
         clearInterval(bot.__stallPollInterval);
         bot.__stallPollInterval = null;
     }
-    console.log(`[event-loop] stall guard ARMED: threshold tracks observed server keep_alive gap (currently ${thresholdMs}ms); poll every ${pollMs}ms (Nyquist: interval/2)`);
+    const spread = bot.__keepAliveGapSpread;
+    if (material) console.log(`[event-loop] stall guard ARMED: threshold tracks observed server keep_alive gap (currently ${thresholdMs}ms, outside the ${spread.n - 1} gap(s) seen before; spread now ${spread.min}-${spread.max}ms); poll every ${pollMs}ms (Nyquist: interval/2)`);
 
     if (!bot.__stallEventLoopHist) {
         bot.__stallEventLoopHist = monitorEventLoopDelay({ resolution: 20 });
@@ -137,7 +145,7 @@ function _scheduleStallPoll(bot) {
     if (mainThreadWatchdogStarted()) {
         armMainThreadWatchdog(thresholdMs + pollMs);
         beatMainThreadWatchdog();
-        console.log(`[watchdog] ARMED: SIGKILL after ${thresholdMs + pollMs}ms without a main-loop heartbeat (keep_alive gap ${thresholdMs}ms + beat period ${pollMs}ms)`);
+        if (material) console.log(`[watchdog] ARMED: SIGKILL after ${thresholdMs + pollMs}ms without a main-loop heartbeat (keep_alive gap ${thresholdMs}ms + beat period ${pollMs}ms)`);
     }
 }
 
@@ -180,7 +188,12 @@ export function startEventLoopStallGuard(bot) {
         }
         bot.__serverKeepAliveIntervalMs = intervalMs;
         bot.__eventLoopStallThresholdMs = intervalMs;
-        _scheduleStallPoll(bot);
+        const sp = bot.__keepAliveGapSpread;
+        const material = !sp || intervalMs < sp.min || intervalMs > sp.max;
+        bot.__keepAliveGapSpread = sp
+            ? { min: Math.min(sp.min, intervalMs), max: Math.max(sp.max, intervalMs), n: sp.n + 1 }
+            : { min: intervalMs, max: intervalMs, n: 1 };
+        _scheduleStallPoll(bot, material);
     };
     bot.__stallGuardKeepAliveHandler = onKeepAlive;
     bot._client.on('keep_alive', onKeepAlive);

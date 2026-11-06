@@ -4,7 +4,7 @@ import {
     getNearbyPlayerNames,
     getInventoryCounts,
     getNearbyEntityTypes,
-    getBlockAtPosition,
+    reportBlockAtOffset,
     getFirstBlockAboveHead
 } from "./world.js";
 import convoManager from '../conversation.js';
@@ -27,9 +27,10 @@ export function getFullState(agent) {
     if (bot.time.timeOfDay < 6000) timeLabel = 'Morning';
     else if (bot.time.timeOfDay < 12000) timeLabel = 'Afternoon';
 
-    const below = getBlockAtPosition(bot, 0, -1, 0).name;
-    const legs = getBlockAtPosition(bot, 0, 0, 0).name;
-    const head = getBlockAtPosition(bot, 0, 1, 0).name;
+    // fix65: an unloaded cell is reported as UNLOADED, not as air
+    const below = reportBlockAtOffset(bot, 0, -1, 0);
+    const legs = reportBlockAtOffset(bot, 0, 0, 0);
+    const head = reportBlockAtOffset(bot, 0, 1, 0);
 
     let players = getNearbyPlayerNames(bot);
     let bots = convoManager.getInGameAgents().filter(b => b !== agent.name);
