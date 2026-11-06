@@ -348,6 +348,24 @@ export function roomForItem(bot, itemName) {
 }
 
 
+// fix86: the dependency walk of a craft (ingredients, and, when the caller says so, the tool a mined ingredient needs).
+// A cycle throws by name. The live craftItem('torch') trial recursed torch -> coal -> a pickaxe -> … until
+// RangeError: Maximum call stack size exceeded, because this walk had no path.
+export function walkCraftNeeds(item, ingredientsOf, path = []) {
+    if (typeof item !== 'string' || item === '') throw new Error('[fix86] walkCraftNeeds: item name required');
+    if (typeof ingredientsOf !== 'function') throw new Error('[fix86] walkCraftNeeds: ingredientsOf(item) required');
+    if (!Array.isArray(path)) throw new Error('[fix86] walkCraftNeeds: path must be the items already being expanded');
+    if (path.includes(item)) throw new Error(`[fix86] recipe cycle: ${[...path, item].join(' -> ')}`);
+    const ings = ingredientsOf(item);
+    if (!Array.isArray(ings)) throw new Error(`[fix86] walkCraftNeeds: ingredients of ${item} are not a list`);
+    const next = [...path, item];
+    for (const ing of ings) {
+        if (typeof ing !== 'string' || ing === '') throw new Error(`[fix86] walkCraftNeeds: ingredient of ${item} is not a name`);
+        walkCraftNeeds(ing, ingredientsOf, next);
+    }
+    return next;
+}
+
 export function getCraftableItems(bot) {
     /**
      * Get a list of all items that can be crafted with the bot's current inventory.
