@@ -28,7 +28,7 @@ import minecraftData from 'minecraft-data';
 import { Ollama } from '../models/ollama.js';
 import { setCallDurationStore } from '../models/call_durations.js';
 import { setMovementStore, learnedKinds, recordStep, recordCut, stepBound, noteUnbounded } from '../utils/movement_model.js';
-import { signatureOf, depsOf, missingCalls, reservedNamesUsed, findCycle, findAllCycles, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf, thrownIn, declaredNames, skillSourceViolations, splitGeneratedCode, oneFunctionFeedback, parsesAsScript, pastedLibrarySkills } from './skill_graph.js';
+import { signatureOf, depsOf, missingCalls, findCycle, findAllCycles, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf, thrownIn, declaredNames, skillSourceViolations, splitGeneratedCode, oneFunctionFeedback, entryCallFeedback, markerCallsMissing, parsesAsScript, pastedLibrarySkills } from './skill_graph.js';
 import { getBareAPI, collectBareApiUsedInSource, PRECONDITION_UNMET_BINDING } from './coder.js';   // fix40: unified bare-name API helper
 import { withStallPhase } from '../utils/event_loop_guard.js';
 import { watchdogEvidencePath } from '../utils/main_thread_watchdog.js';
@@ -1074,9 +1074,9 @@ export class Voyager {
   c.dist(a, b) = euclidean distance between two {x,y,z}
   c.game.item(name) / c.game.block(name) = true when name is an item / a block in the game data; c.game.drops(block) = names of the items that block drops; c.game.harvestTools(block) = the tools that block drops with, or null when the game data lists none
 NEVER enumerate item, block or kind names in a list (e.g. ['birch_log', 'spruce_log'].includes(c.args[1])): a hand-written list leaves out real values (oak_log) and every call with one of them is refused. Derive membership from c.game (game data) or from the observed state (c.pre / c.post).
-A postcondition must not require a held or returned item that a named block's harvestTools omit.
-pre: what must hold before the call for it to be able to succeed (use "c => true" if nothing).
-post: what the call promises afterwards when it reports success (state the observable effect: arrived near target, item gained, still alive, not stranded underground, etc.). If the call returns false/null it already reported failure, so post may return true in that case.
+A postcondition must not require a held or returned item that a named block's harvestTools omit. harvestTools(block) is null when the block drops by hand: requiring a tool for it is wrong.
+pre: what must hold before the call for it to be able to succeed (use "c => true" if nothing). A precondition reads c.pre and c.args only. It must not read c.post: that is the state after the call.
+post: what the call promises afterwards when it reports success (state the observable effect: arrived near target, item gained, still alive, not stranded underground, etc.). If the call returns false/null it already reported failure, so post may return true in that case. post must return a boolean; undefined is not a boolean.
 IMPORTANT for equip skills: postconditions should check c.post.eq (equipment state) rather than c.delta for idempotency - already-equipped items should satisfy the postcondition without requiring an inventory change.
 Use only c; no other globals.`;
     // fix26: endow contract compartment with bare API surface (same as live SES) so contracts that
@@ -1135,8 +1135,10 @@ Use only c; no other globals.`;
         if (!reg || !reg.blocksByName || !reg.items) throw new Error(`[fix84] _validContract: no game data for version ${JSON.stringify(VERSION)}`);
         const tools = Voyager.contractToolMismatches([ct.pre, ct.post], reg);
         if (tools !== null) return tools;
+        const postRead = Voyager.contractPreReadsPost(ct.pre);
+        if (postRead !== null) return `pre reads c.${postRead} (state after the call); a precondition may read c.pre and c.args only`;
         const c = this._contractCtx({ args: [0, 64, 0, 'x', 1], ret: true, pre: s, post: s, delta: {} });
-        try { for (const k of ['pre', 'post']) { const r = this._compileContract(ct[k])(c); if (typeof r !== 'boolean') return `${k} returned ${typeof r}, not boolean`; } } catch (e) { return `throws: ${e.message}`; }
+        try { for (const k of ['pre', 'post']) { const r = this._compileContract(ct[k])(c); if (typeof r !== 'boolean') return `${k} returned ${r === undefined ? 'undefined' : JSON.stringify(r)} (${typeof r}), not a boolean`; } } catch (e) { return `throws: ${e.message}`; }
         return null;
     }
     // fix83: what a violated contract was given, for the model's feedback: the call with its real arguments (NaN, not JSON's
@@ -1185,13 +1187,13 @@ Use only c; no other globals.`;
             const param = root.params && root.params[0] && root.params[0].type === 'Identifier' ? root.params[0].name : null;
             const walk = n => {
                 if (!n || typeof n.type !== 'string') return;
-                if (n.type === 'Literal' && typeof n.value === 'string' && Object.hasOwn(registry.blocksByName, n.value) && registry.blocksByName[n.value].harvestTools) blocks.add(n.value);
+                if (n.type === 'Literal' && typeof n.value === 'string' && Object.hasOwn(registry.blocksByName, n.value)) blocks.add(n.value);
                 if ((n.type === 'BinaryExpression' && (n.operator === '===' || n.operator === '=='))) {
                     const sides = [[n.left, n.right], [n.right, n.left]];
                     for (const [lit, other] of sides) {
                         if (lit.type !== 'Literal' || typeof lit.value !== 'string') continue;
                         const p = pathOf(other, param);
-                        if (p !== null && (eq(p, ['post', 'eq', 'heldItem']) || eq(p, ['ret']))) tools.add(lit.value);
+                        if (p !== null && (eq(p, ['post', 'eq', 'heldItem']) || eq(p, ['pre', 'eq', 'heldItem']) || eq(p, ['ret']))) tools.add(lit.value);
                     }
                 }
                 for (const v of Object.values(n)) { if (Array.isArray(v)) v.forEach(walk); else if (v && typeof v === 'object' && typeof v.type === 'string') walk(v); }
@@ -1201,7 +1203,9 @@ Use only c; no other globals.`;
         const msgs = [];
         for (const tool of [...tools].sort()) {
             for (const block of [...blocks].sort()) {
-                const names = Object.keys(registry.blocksByName[block].harvestTools).map(id => {
+                const ht = registry.blocksByName[block].harvestTools;
+                if (!ht) { msgs.push(`post expects '${tool}' for block '${block}', whose harvestTools list none (it drops by hand)`); continue; }
+                const names = Object.keys(ht).map(id => {
                     const it = registry.items[id];
                     if (!it) throw new Error(`[fix84] harvestTools id ${id} of ${block} is not an item`);
                     return it.name;
@@ -1210,6 +1214,36 @@ Use only c; no other globals.`;
             }
         }
         return msgs.length ? msgs.join('; ') : null;
+    }
+    // fix85: a precondition that reads c.post is judging the state after the call (equipBestToolForAxe). Returns the member path, or null.
+    static contractPreReadsPost(src) {
+        const ast = acorn.parse(`(${String(src)})`, { ecmaVersion: 'latest' });
+        const root = ast.body[0].expression;
+        const param = root.params && root.params[0] && root.params[0].type === 'Identifier' ? root.params[0].name : null;
+        if (param === null) return null;
+        const pathOf = node => {
+            const keys = [];
+            let n = node;
+            while (n && n.type === 'MemberExpression') {
+                if (!n.computed) keys.unshift(n.property.name);
+                else if (n.property.type === 'Literal') keys.unshift(String(n.property.value));
+                else keys.unshift('*');
+                n = n.object;
+            }
+            if (!n || n.type !== 'Identifier' || n.name !== param) return null;
+            return keys;
+        };
+        let found = null;
+        const walk = n => {
+            if (!n || typeof n.type !== 'string' || found) return;
+            if (n.type === 'MemberExpression') {
+                const p = pathOf(n);
+                if (p !== null && p[0] === 'post') found = p.join('.');
+            }
+            for (const v of Object.values(n)) { if (Array.isArray(v)) v.forEach(walk); else if (v && typeof v === 'object' && typeof v.type === 'string') walk(v); }
+        };
+        walk(root);
+        return found;
     }
     // fix51: parse a contract with acorn; returns { root, param, src } where root is the contract function node
     _parseContract(contractSrc) {
@@ -1698,14 +1732,15 @@ Use only c; no other globals.`;
         }
         if (!learnable.length) return 0;
         const system = `You write PSN skill contracts for a Minecraft mineflayer skill library.\n${Voyager.CONTRACT_SPEC}\nReply ONLY with JSON: {"<skillName>": {"pre": "c => ...", "post": "c => ...", "text": "<one-line contract summary>"}, ...} for exactly the skills given.`;
-        const user = learnable.map(e => `--- ${e.name} ---\ndescription: ${e.description}\nobserved effects: ${JSON.stringify(e.effects)}\n${e.contract ? `current contract (${fixNote || 'to fix'}): ${JSON.stringify(e.contract)}\n` : ''}code:\n${String(e.code).slice(0, 1800)}`).join('\n');
+        const user = learnable.map(e => `--- ${e.name} ---\ndescription: ${e.description}\nobserved effects: ${JSON.stringify(e.effects)}\n${e.contractFail ? `previous contract was refused: ${e.contractFail}\n` : ''}${e.contract ? `current contract (${fixNote || 'to fix'}): ${JSON.stringify(e.contract)}\n` : ''}code:\n${String(e.code).slice(0, 1800)}`).join('\n');
         console.log(`[contract] learning contracts for ${learnable.length} skill(s) (${why}): ${learnable.map(e => e.name).join(', ')}`);
         let out; try { out = parseJSON(await this._ask(system, user)); } catch (err) { console.log(`[contract] learning FAILED: ${err.message}`); return 0; }
         let n = 0;
         for (const e of learnable) {
             const ct = out?.[e.name], bad = this._validContract(ct);
             e.contractTried = Date.now();
-            if (bad) { console.log(`[contract] FAILED for ${e.name}: ${bad}`); continue; }
+            if (bad) { e.contractFail = bad; console.log(`[contract] FAILED for ${e.name}: ${bad}`); continue; }
+            delete e.contractFail;
             // fix56: a repair that returns the same post means the contract was not the problem (e.g. the trace state it was judged on was wrong)
             if (why === 'contract repair' && e.contract && e.contract.pre === ct.pre && e.contract.post === ct.post) console.log(`!!! [contract] LOUD: contract repair of ${e.name} returned the SAME pre/post; the violation (${fixNote}) is not explained by the contract`);
             if (e.contract) e.contractPrev = e.contract;
@@ -2684,7 +2719,16 @@ Use only c; no other globals.`;
     //      ingredients; an ensure goal whose block is not in the inventory to place
     //   null when none of them names anything (an open goal whose code reported nothing): the model decomposes it.
     _failureNeeds(task, reported, trace, state) {
-        if (reported !== null && Object.hasOwn(reported, 'need')) return [this._checkNeed(reported.need, 'reported')];
+        // fix85: a need stamped on the root frame of this run is this task's. A need stamped only on a nested frame
+        // (an iron_pickaxe craft inside "Collect 4 oak_planks") is that call's, and the global marker is the last write
+        // of either. With no trace (the test world, a failure before any call) the marker is the whole run's report.
+        if (Array.isArray(trace) && trace.some(r => Object.hasOwn(r, 'reportedNeed'))) {
+            const roots = trace.filter(r => r.parent < 0 && Object.hasOwn(r, 'reportedNeed'));
+            if (roots.length > 1) throw new Error(`[fix85] ${roots.length} root frames reported a need on "${task}"`);
+            if (roots.length === 1) return [this._checkNeed(roots[0].reportedNeed, `reported by ${roots[0].name}`)];
+            const nested = trace.filter(r => Object.hasOwn(r, 'reportedNeed'));
+            console.log(`[fix85] "${task}": ${nested.map(r => `${r.name} reported ${r.reportedNeed.item || r.reportedNeed.reason} at depth ${r.depth}`).join('; ')}; a nested call's need is that call's, not this task's`);
+        } else if (reported !== null && Object.hasOwn(reported, 'need')) return [this._checkNeed(reported.need, 'reported')];
         if (Array.isArray(trace)) {
             const rec = trace.filter(r => r.preFail && Object.hasOwn(r, 'need'));
             if (rec.length) return [this._checkNeed(rec[rec.length - 1].need, `contract of ${rec[rec.length - 1].name}`)];
@@ -4158,8 +4202,12 @@ current_health: ${Math.round(bot.health)}/${vmax.health}\ncurrent_food: ${bot.fo
         if (missing.length) { gateLog(`REJECT ${name}: calls unknown skills ${missing.join(', ')}`); return false; }
         // fix74: the unmet-precondition marker is for repo-owned seeded primitives only (it voids a run's stats, fix76); model
         //        code (new, repaired, refactored) that names it is rejected. missingCalls cannot see it (camelCase calls only).
-        const reserved = reservedNamesUsed(code, [PRECONDITION_UNMET_BINDING]);
-        if (reserved.length) { gateLog(`REJECT ${name}: uses ${reserved.join(', ')}, reserved for seeded primitives (marks a failure as an unmet precondition)`); return false; }
+        // fix85: new code must not introduce the marker. A repair of code that already calls it must keep each call
+        // (a collectBlock repair that replaced the reach call with a log of the comment was accepted, and that FAILED
+        // line then became the evidence for mineBlocks).
+        const incumbent = this.skills.find(s => s.name === name);
+        const markerGap = markerCallsMissing(incumbent ? incumbent.code : '', code, PRECONDITION_UNMET_BINDING);
+        if (markerGap) { gateLog(`REJECT ${name}: ${markerGap}`); return false; }
         // fix82: every path that puts model code into the library (writeCode, repair, joint repair, refactor, generalise,
         //        split) passes here. One top-level function per source (a second one is a hidden global of every bundle that
         //        stages this skill: live checkIronPickaxe, 18:23:44Z) and the static API gate writeCode already ran (only
@@ -4405,7 +4453,7 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
                 const libF = !rec.ok && this._libraryFault(trace, name);
                 let unmetC = null;
                 if (!rec.ok && !libF) {
-                    if (peekPreconditionUnmet(this.agent.bot)) unmetC = 'precondition';
+                    if (rec.reportedNeed || peekPreconditionUnmet(this.agent.bot)) unmetC = 'precondition';
                     else if (rec.s0 && typeof rec.s0.food === 'number') unmetC = this._foodRaiseSaturated(name, rec.s0.food);
                     // no s0 (hung/crash before snapshot): cannot claim food_saturated; count as a normal trial fail
                 }
@@ -4608,8 +4656,10 @@ IMPORTANT: All functions use bare names. Do NOT write skills.goToPosition - writ
                 const shape = scriptParse !== true ? `does not parse as a script: ${scriptParse}` : (split.violations.length ? oneFunctionFeedback(e.name, split.violations, pastedLibrarySkills(code, e.name, new Set(this.skills.map(s => s.name)))) : null);
                 const gate = shape === null ? this.agent.coder.userGeneratedCodeLintBlockers(code, this.skills.map(s => s.name)) : null;
                 body = split !== null ? split.skillSource : null;
+                const markerGap = body !== null ? markerCallsMissing(e.code, body, PRECONDITION_UNMET_BINDING) : null;
                 if (shape !== null) err = `lint: ${shape}`;
                 else if (gate !== null) err = `lint: ${gate}`;
+                else if (markerGap) err = `lint: ${markerGap}`;
                 else {
                     // fix49: check for dependency cycles BEFORE lint (feedback tells model which deps to avoid)
                     const cycleErr = this._cycleLint(e.name, body);
@@ -5234,6 +5284,9 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             const split = scriptParse === true ? splitGeneratedCode(code, own) : null;
             let lint = scriptParse !== true ? `does not parse as a script: ${scriptParse}` : (split.violations.length ? oneFunctionFeedback(own, split.violations, pastedLibrarySkills(code, own, libraryNames)) : null);
             if (lint === null) lint = this.agent.coder.userGeneratedCodeLintBlockers(code, this.skills.map(s => s.name));
+            // fix85: the executed reply must call the new function. The saved skill source still has the call cut off.
+            if (lint === null && !split.entry) lint = entryCallFeedback(own);
+            if (lint === null) { const introduced = markerCallsMissing('', code, PRECONDITION_UNMET_BINDING); if (introduced) lint = introduced; }
             let staged = null;
             if (!lint) {
                 const { lint: lint2, staged: st } = await this._stageLintExecTraced(libSrc + (libSrc ? '\n\n' : '') + code, execBundle, stageNameSet, `voyager:writeCode:${task}:att${i}`);
@@ -5466,19 +5519,30 @@ Voyager.SEEDED_PRIMITIVES = [
     const posKey = p => \`\${Math.floor(p.x)},\${Math.floor(p.y)},\${Math.floor(p.z)}\`;
     for (let i = 0; i < num; i++) {
         if (bot.interrupt_code) break;
-        const block = getNearestBlock(bot, b => types.includes(b.name) && !excluded.has(posKey(b.position)), 64);
+        const found = getNearestBlocksWhere(bot, b => types.includes(b.name) && !excluded.has(posKey(b.position)), 64, 1);
+        const block = found.length ? found[0] : null;
         if (!block) {
             if (excluded.size) log(bot, \`FAILED: no reachable \${blockType} nearby (\${excluded.size} unreachable block(s) excluded)\`);
             else log(bot, collected ? \`No more \${blockType} nearby.\` : \`No \${blockType} nearby.\`);
             // fix83: no source within reach is a structured need (as tossClutter's chest proximity): the learner chains "reach <block>"
             const sources = types.filter(t => Object.hasOwn(bot.registry.blocksByName, t));
             if (sources.length === 0) throw new Error(\`collectBlock: \${blockType} names no block in the game data (searched \${types.join(', ')})\`);
+            for (const t of sources) {
+                const blockDrops = bot.registry.blocksByName[t].drops;
+                if (!Array.isArray(blockDrops)) throw new Error(\`collectBlock: \${t} has no drops list in the game data\`);
+                if (!blockDrops.length) throw new Error(\`collectBlock: \${t} drops nothing in the game data; a reach need cannot obtain it\`);
+            }
             __mcPreconditionUnmet__(bot, { need: sources.length === 1 ? { item: sources[0], count: num - collected, reason: 'reach' } : { anyOf: sources, count: num - collected, reason: 'reach' } });
             break;
         }
         await equipToolForBlock(bot, block);   // fix62: cheapest tool that works on this block (was mineflayer-tool equipForBlock: fastest dig = top tier)
         const itemId = bot.heldItem ? bot.heldItem.type : null;
-        if (!block.canHarvest(itemId)) { __mcPreconditionUnmet__(bot, { need: { anyOf: Object.keys(block.harvestTools).map(id => bot.registry.items[id].name), count: 1, reason: 'tool' } }); log(bot, \`Don't have right tools to harvest \${blockType}.\`); return false; }
+        if (!block.canHarvest(itemId)) {
+            if (!block.harvestTools) throw new Error(\`collectBlock: \${block.name} failed canHarvest but the game data lists no harvestTools (it drops by hand)\`);
+            __mcPreconditionUnmet__(bot, { need: { anyOf: Object.keys(block.harvestTools).map(id => bot.registry.items[id].name), count: 1, reason: 'tool' } });
+            log(bot, \`Don't have right tools to harvest \${blockType}.\`);
+            return false;
+        }
         // fix84: no free slot is the same kind of structured need as the reach marker above (a chest then chains through planks to logs)
         const drops = bot.registry.blocksByName[block.name].drops;
         if (!Array.isArray(drops)) throw new Error(\`collectBlock: \${block.name} has no drops list in the game data\`);

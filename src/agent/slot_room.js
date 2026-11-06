@@ -114,7 +114,10 @@ export function bestSlotFreeingCraft(registry, recipesOf, counts) {
         const recipes = recipesOf(id);
         if (!Array.isArray(recipes)) throw new Error(`[fix84] recipesOf(${name}) did not return an array`);
         for (const r of recipes) {
-            if (!r || !Array.isArray(r.delta) || !r.result || !Number.isInteger(r.result.count) || r.result.count < 1) continue;
+            if (!r || !Array.isArray(r.delta) || !r.result || !Number.isInteger(r.result.count) || r.result.count < 1) {
+                const why = !r ? 'recipe is empty' : !Array.isArray(r.delta) ? 'recipe has no delta array' : !r.result ? 'recipe has no result' : `recipe result count is ${JSON.stringify(r.result.count)}`;
+                throw new Error(`[fix85] game-data recipe for ${name} is malformed (${why})`);
+            }
             const ings = r.delta.filter(d => d.count < 0);
             if (!ings.length) continue;
             let maxTimes = null;
