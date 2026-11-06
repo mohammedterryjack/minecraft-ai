@@ -148,7 +148,21 @@ export function obtainPlanner({ registry, recipesOf, known, choose }) {
                 steps: best.missing.map(m => ({ item: m.item, count: m.count, task: taskFor(m.how, m.item, m.count) })),
                 plan: best.steps.map(s => taskFor(s.verb, s.item, s.count)),
                 cycles: [...ctx.cycles],
+                cost: best.cost,
             };
+        },
+        // the one of `items` that is cheapest to gain `count` of from `inv` (a need that any of several items meets:
+        // a harvest tool tier, a storage block); exact ties go to `choose`. Throws when none of them can be obtained.
+        cheapest(items, count, inv) {
+            const opts = [];
+            for (const item of items) {
+                const ctx = { cycles: new Set(), unobtainable: new Set() };
+                const best = plan(item, count, { ...inv }, [], ctx, true);
+                if (best) opts.push({ cost: best.cost, item });
+            }
+            const best = pick(opts);
+            if (best === null) throw new Error(`[fix81] LOUD: none of ${items.join(', ')} can be obtained from the game data`);
+            return best.item;
         },
     };
 }

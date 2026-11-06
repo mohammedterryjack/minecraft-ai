@@ -71,7 +71,7 @@ describe('fix76: learned hunger at full HP', () => {
 describe('fix76: structural unmet-precondition classification', () => {
     it('typed kind:precondition marker is detected; clear removes it', () => {
         const bot = {};
-        markPreconditionUnmet(bot, { why: 'chest missing' });
+        markPreconditionUnmet(bot, { need: { item: 'chest', count: 1, reason: 'proximity' }, why: 'chest missing' });
         const m = peekPreconditionUnmet(bot);
         assert.strictEqual(m.kind, 'precondition');
         clearPreconditionUnmet(bot);
@@ -97,7 +97,7 @@ describe('fix76: structural unmet-precondition classification', () => {
         assert.match(src, /_foodRaiseSaturated/);
         assert.match(src, /_classifyUnmetPrecondition/);
         // fix74: seeded primitives write the marker only through markPreconditionUnmet (precondition.js owns the kind)
-        assert.match(src, /__mcPreconditionUnmet__\(bot\)/);
+        assert.match(src, /__mcPreconditionUnmet__\(bot, \{ need: /);   // fix81: structured need
         assert.equal(src.includes('bot.__unmetPrecondition ='), false, 'no bare marker write');
         assert.match(pre, /kind: 'precondition'/);
         const bot = { output: 'FAILED to consume cooked_mutton: Food is full. Food stayed at 20.' };

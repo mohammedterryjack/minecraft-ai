@@ -39,7 +39,9 @@ describe('fix74: the precondition marker has one writer, and generated code cann
     it('seeded primitives call the internal binding; no bare marker writes remain', () => {
         const v = src('src/agent/voyager.js');
         assert.strictEqual(v.includes('bot.__unmetPrecondition ='), false);
-        assert.strictEqual((v.match(new RegExp(`${PRECONDITION_UNMET_BINDING}\\(bot\\);`, 'g')) || []).length, 3);
+        // fix81: every call says what is missing: { need: { item | anyOf, count, reason } }
+        assert.strictEqual((v.match(new RegExp(`${PRECONDITION_UNMET_BINDING}\\(bot\\);`, 'g')) || []).length, 0);
+        assert.strictEqual((v.match(new RegExp(`${PRECONDITION_UNMET_BINDING}\\(bot, \\{ need: \\{`, 'g')) || []).length, 5);
     });
     it('it is not on the model-visible API: not a skills.js export, not in getBareAPI (prompts, lint sandbox)', () => {
         assert.strictEqual(Object.hasOwn(skillsLib, 'markPreconditionUnmet'), false);
@@ -71,10 +73,13 @@ describe('fix74: the precondition marker has one writer, and generated code cann
     it('staged seeded code reaches it through the sandbox binding and sets the typed marker', async () => {
         const coder = new Coder({ name: NAME, bot: stubBot() });
         while (!coder.code_lint_template || !coder.code_template) await new Promise(r => setImmediate(r));
-        const st = await coder._stageCode(`${PRECONDITION_UNMET_BINDING}(bot);`, {});
+        const st = await coder._stageCode(`${PRECONDITION_UNMET_BINDING}(bot, { need: { item: 'chest', count: 1, reason: 'proximity' } });`, {});
         const bot = { interrupt_code: false, output: '' };
         await st.func.main(bot);
-        assert.deepStrictEqual(peekPreconditionUnmet(bot), { kind: 'precondition' });
+        assert.deepStrictEqual(peekPreconditionUnmet(bot), { kind: 'precondition', need: { item: 'chest', count: 1, reason: 'proximity' } });
+        // fix81: a marker that does not say what is missing throws
+        const bare = await coder._stageCode(`${PRECONDITION_UNMET_BINDING}(bot);`, {});
+        await assert.rejects(bare.func.main({ interrupt_code: false, output: '' }), /need: \{ item \| anyOf, count, reason \}/);
     });
 });
 
