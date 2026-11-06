@@ -21,15 +21,17 @@ import { instrumentSrc } from '../src/agent/skill_graph.js';
 const NAME = '__fix68_test__';
 after(() => rmSync(`./bots/${NAME}`, { recursive: true, force: true }));
 const CHILD = fileURLToPath(new URL('./fixtures/fix68-harness-child.mjs', import.meta.url));
+const CHILD_OVERFLOW = fileURLToPath(new URL('./fixtures/fix68b-overflow-child.mjs', import.meta.url));
 const LIVE = fileURLToPath(new URL('./fixtures/fix68-live-harness-103.js', import.meta.url));
 
-function runChild(arg, ms) {
+function runChild(arg, ms, script = CHILD) {
     return new Promise(resolve => {
-        const c = spawn(process.execPath, [CHILD, arg], { stdio: ['ignore', 'pipe', 'ignore'] });
+        const argv = arg == null ? [script] : [script, arg];
+        const c = spawn(process.execPath, argv, { stdio: ['ignore', 'pipe', 'ignore'] });
         let out = '';
         c.stdout.on('data', d => { out += d; });
         const t = setTimeout(() => c.kill('SIGKILL'), ms);
-        c.on('exit', (code, signal) => { clearTimeout(t); resolve({ out, signal }); });
+        c.on('exit', (code, signal) => { clearTimeout(t); resolve({ out, signal, code }); });
     });
 }
 async function mkCoder() {
@@ -92,16 +94,19 @@ describe('fix68b: an error inside traced code is never turned into a value', () 
         return { bot, err };
     };
     const failedLines = (out) => out.split('\n').filter(l => l.startsWith('FAILED:'));
-    it('a stack overflow in async traced code propagates to the caller and is reported once, where it was thrown', async () => {
-        const { bot, err } = await run('async function deep(bot, n) {\n    return await deep(bot, n + 1);\n}\nasync function outer(bot) {\n    const r = await deep(bot, 0);\n    bot.reached = true;\n    return r;\n}', ['outer', 'deep'], 'await outer(bot);');
-        assert.ok(err instanceof RangeError, String(err));
-        assert.match(err.message, /Maximum call stack size exceeded/);
-        assert.strictEqual(bot.reached, undefined, 'the caller did not continue past the throw');
-        const lines = failedLines(bot.output);
-        assert.strictEqual(lines.length, 1, lines.join(' | '));
-        assert.match(lines[0], /^FAILED: deep threw Maximum call stack size exceeded/);
-        const outerRec = bot.__psnTrace.find(r => r.name === 'outer');
-        assert.strictEqual(outerRec.fail, true); assert.match(outerRec.err, /Maximum call stack/);
+    it('a stack overflow in async traced code propagates to the caller and is reported once, where it was thrown', { timeout: 20000 }, async () => {
+        // Child process: node --test's async_hooks make async stack overflow fatal on Node 20.19 even when the harness
+        // itself no longer calls user code under ALS.run (CVE-2025-59466). icefox does not enable those hooks.
+        const { out, signal, code } = await runChild(null, 15000, CHILD_OVERFLOW);
+        assert.strictEqual(signal, null, 'child must not be killed');
+        assert.strictEqual(code, 0, 'child must exit 0 (exit 7 was the node20 fatal uncaught RangeError)');
+        const got = JSON.parse(out.trim().split('\n').pop());
+        assert.strictEqual(got.name, 'RangeError', JSON.stringify(got));
+        assert.match(String(got.message), /Maximum call stack size exceeded/);
+        assert.strictEqual(got.reached, undefined, 'the caller did not continue past the throw');
+        assert.strictEqual(got.failed.length, 1, JSON.stringify(got.failed));
+        assert.match(got.failed[0], /^FAILED: deep threw Maximum call stack size exceeded/);
+        assert.strictEqual(got.outerFail, true);
     });
     it('a sync stack overflow and a sync throw propagate too (no false, no default)', async () => {
         const a = await run('function spin(bot) {\n    return spin(bot);\n}\nasync function outer(bot) {\n    const r = spin(bot);\n    bot.reached = r;\n    return r;\n}', ['outer', 'spin'], 'await outer(bot);');
