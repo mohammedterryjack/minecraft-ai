@@ -780,8 +780,8 @@ Use only c; no other globals.`;
         if (!postFailed || !e?.contract?.post || !r.s0 || !r.s1) return null;
         const fields = this._extractPostFields(e.contract.post);
         
-        // Compute what actually changed
-        const deltaEmpty = Object.keys(r.delta || {}).length === 0;
+        // Compute what actually changed (r.delta is always set by __wrap in skill_graph.js)
+        const deltaEmpty = Object.keys(r.delta).length === 0;
         const posMoved = r.s0.pos && r.s1.pos && 
             (Math.abs(r.s1.pos.x - r.s0.pos.x) > 1 || Math.abs(r.s1.pos.y - r.s0.pos.y) > 1 || Math.abs(r.s1.pos.z - r.s0.pos.z) > 1);
         const hpChanged = r.s0.hp !== r.s1.hp;
@@ -811,7 +811,7 @@ Use only c; no other globals.`;
         }
         // Case: post checks specific delta items that aren't in actual delta, but other things changed
         if (postChecksDelta && !fields.delta.includes('*')) {
-            const checkedButMissing = fields.delta.filter(item => !(r.delta || {})[item]);
+            const checkedButMissing = fields.delta.filter(item => !r.delta[item]);
             if (checkedButMissing.length === fields.delta.length && changed.length > 0) {
                 return `postcondition checks delta items [${fields.delta.join(',')}] but none were in actual delta; other state changed. Changed: ${changed.join(', ')}; Unchanged: ${unchanged.join(', ')}`;
             }
@@ -825,7 +825,7 @@ Use only c; no other globals.`;
             if (r.intr || !r.s0 || !r.s1) continue;
             const e = this.skills.find(s => s.name === r.name);
             if (!e?.contract) continue;
-            const c = { args: r.argv || [], ret: r.rv, pre: r.s0, post: r.s1, delta: r.delta || {}, dist };
+            const c = { args: r.argv, ret: r.rv, pre: r.s0, post: r.s1, delta: r.delta, dist };
             for (const k of ['pre', 'post']) {
                 let ok;
                 try { ok = this._compileContract(e.contract[k])(c); }
@@ -855,10 +855,10 @@ Use only c; no other globals.`;
                 }
                 r.ok = false; r.fail = true; if (k === 'pre') r.preFail = true;
                 r.ownFail = [...(r.ownFail || []), `${k === 'pre' ? 'PRECONDITION' : 'POSTCONDITION'} violated: ${e.contract.text || e.contract[k]} (post pos ${r.s1.pos ? [r.s1.pos.x, r.s1.pos.y, r.s1.pos.z].map(Math.round).join(',') : '?'}, sky ${r.s1.sky}, alive ${r.s1.alive})`];
-                // fix51: enhanced VIOLATED logging with exact context for debugging
-                const stateInfo = `pre.inv=${JSON.stringify(r.s0?.inv || {}).slice(0, 100)}, post.inv=${JSON.stringify(r.s1?.inv || {}).slice(0, 100)}, delta=${JSON.stringify(r.delta || {}).slice(0, 80)}`;
-                console.log(`[contract] VIOLATED ${e.name}(${(r.argv || []).join(',')}) ${k}condition: ${e.contract[k].slice(0, 200)}`);
-                console.log(`[contract] VIOLATED context: task=${this.currentTask?.slice(0, 80)}, ${stateInfo}`);
+                // fix51: enhanced VIOLATED logging with exact context for debugging (full values, truncated in jsonl)
+                const stateInfo = `pre.inv=${JSON.stringify(r.s0.inv)}, post.inv=${JSON.stringify(r.s1.inv)}, delta=${JSON.stringify(r.delta)}`;
+                console.log(`[contract] VIOLATED ${e.name}(${r.argv.join(',')}) ${k}condition: ${e.contract[k]}`);
+                console.log(`[contract] VIOLATED context: task=${this.currentTask}, ${stateInfo}`);
                 // Log to file for next run analysis
                 try { appendFileSync(`./bots/${this.agent.name}/violated_contracts.jsonl`, JSON.stringify({ at: new Date().toISOString(), skill: e.name, field: k, contract: e.contract[k], args: r.argv, task: this.currentTask, state: { pre: r.s0, post: r.s1, delta: r.delta } }) + '\n'); } catch (err) { void 0; }
                 // the task outcome disagrees with the contract: the contract itself may be wrong -> it is repairable
@@ -968,13 +968,22 @@ Use only c; no other globals.`;
     _diedInRun() { const d = this.agent.lastDeath; return d && d.t >= (this._runStart || Infinity) ? d : null; }
     _interruptReason(output = '') {
         const died = this._diedInRun();
-        // fix51: pass beforeInv for items-dropped reporting
-        if (died) return `died: ${died.message} at ${died.pos}${this._deathDetail(died, this._beforeRunInv)}`;
-        const st = this._stalledInRun(); if (st) return `stalled: no progress (no new ground reached, inventory, window, lit furnace) for 60s at ${st.pos}`;
-        const bot = this.agent.bot, p = bot.entity.position, by = this.agent.actions.lastInterruptBy || 'unknown';
+        // fix51: set structured kind field (no text parsing needed later)
+        if (died) {
+            this._lastCutKind = 'death';
+            return `died: ${died.message} at ${died.pos}${this._deathDetail(died, this._beforeRunInv)}`;
+        }
+        const st = this._stalledInRun();
+        if (st) {
+            this._lastCutKind = 'stall';
+            return `stalled: no progress (no new ground reached, inventory, window, lit furnace) for 60s at ${st.pos}`;
+        }
+        const bot = this.agent.bot, p = bot.entity.position, by = this.agent.actions.lastInterruptBy;
+        if (!by) throw new Error('_interruptReason called but no interrupt source (lastInterruptBy missing)');
         const s = this._surfaceY(p.x, p.z), under = s !== null && p.y < s - 4;
         const travelling = /travelTo|goToPosition|goToSurface|path|Moving|travell/i.test(String(output).slice(-800));
         const what = by === 'mode:unstuck' ? 'stuck' : `cut off by ${by}`;
+        this._lastCutKind = 'interrupt';
         return `interrupted: ${what}${travelling ? ' while travelling' : ''}${under ? ` (underground: y=${Math.floor(p.y)}, surface y=${s})` : ''}`;
     }
 
@@ -1186,10 +1195,10 @@ Use only c; no other globals.`;
     // fix47: compact state format for efficient prompts (one line, critical info only)
     // Includes full inventory as k:v pairs (no slice - hiding items causes bugs like raw_iron:28 invisible)
     _compactState(s) {
-        const inv = s.inventory || {};
+        const inv = s.inventory;
         const items = Object.entries(inv).sort((a, b) => b[1] - a[1]);
         const invSummary = items.length ? items.map(([k, v]) => `${k}:${v}`).join(',') : 'empty';
-        const eq = s.equipment || {};
+        const eq = s.equipment;
         const held = eq.hand !== 'empty' ? eq.hand : '';
         return `pos:(${s.position}) biome:${s.biome} time:${(s.time || '').split(' ')[0]} hp:${s.health_value}/${s.health_max} food:${s.food_value}/${s.food_max} inv:${s.inventory_slots},${s.empty_inventory_slots}empty${held ? ` held:${held}` : ''} threats:${s.threats || 'none'} items:[${invSummary}]`;
     }
@@ -1466,7 +1475,7 @@ Use only c; no other globals.`;
     _postHolds(e) {
         const tr = this.agent.bot.__psnTrace; if (!e?.contract || !Array.isArray(tr)) return false;
         const r = tr.find(t => t.name === e.name && (t.parent ?? -1) < 0); if (!r || r.intr || !r.s0 || !r.s1 || r.fail || r.rv === false || r.rv === null) return false;
-        try { return this._compileContract(e.contract.post)({ args: r.argv || [], ret: r.rv, pre: r.s0, post: r.s1, delta: r.delta || {}, dist: (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z) }) === true; }
+        try { return this._compileContract(e.contract.post)({ args: r.argv, ret: r.rv, pre: r.s0, post: r.s1, delta: r.delta, dist: (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z) }) === true; }
         catch (err) { this._queueContractFix(e, `post threw: ${err.message}`); return false; }
     }
 
@@ -1539,13 +1548,13 @@ Use only c; no other globals.`;
         const goal = smeltGoal(task) || countGoal(task) || parseVerboseGoal(task);  // fix45: verbose fallback
         if (!goal) return { satisfied: false, reason: 'goal not parseable as count/smelt/verbose', noLearnedCheck: true };
 
-        const inv = state.inventory || {};
+        const inv = state.inventory;
         
         // fix51: inventory count is the EXACT item count, not producible count
         // This fixes "have 68" bug when bot has 0 iron_pickaxe but 68 iron_ingot
-        const invCount = inv[goal.item] || 0;
+        const invCount = inv[goal.item] || 0;  // item may not exist in inventory
         // Also check equipment for the exact item (e.g., held iron_pickaxe counts)
-        const eq = state.equipment || {};
+        const eq = state.equipment;
         const eqCount = Object.values(eq).filter(v => v === goal.item).length;
         const haveExact = invCount + eqCount;
         
@@ -1565,7 +1574,7 @@ Use only c; no other globals.`;
                 // fix26: use 'inv' not 'inventory' to match CONTRACT_SPEC (c.post.inv, not c.post.inventory)
                 // fix26: include all state fields from CONTRACT_SPEC to avoid undefined errors
                 // fix43: include eq (equipment state) for idempotent equip contracts
-                const eqState = state.equipment || { heldItem: null, offHand: null, helmet: null, chestplate: null, leggings: null, boots: null };
+                const eqState = state.equipment;
                 const syntheticState = { inv, pos: state.pos || { x: 0, y: 64, z: 0 }, hp: 20, food: 20, sky: 15, alive: true, dim: 'overworld', eq: eqState };
                 const c = {
                     args: [goal.item, goal.count],
@@ -2893,12 +2902,15 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         if (died) { let i = -1; for (let k = 0; k < trace.length; k++) if ((trace[k].t0 || 0) <= died.t && (trace[k].t1 ?? Infinity) >= died.t - 1500 && (i < 0 || trace[k].depth >= trace[i].depth)) i = k; if (i < 0) i = trace.length - 1; console.log(`[psn] death attributed to the call running at death time: ${trace[i].name} (depth ${trace[i].depth})`); trace[i].ownFail = [`DIED: ${died.message} at ${died.pos}${this._deathDetail(died, this._beforeRunInv)}`]; for (; i >= 0; i = trace[i].parent) { trace[i].intr = false; trace[i].ok = false; trace[i].fail = true; } ok = false; }
         const stalled = !died && this._stalledInRun();   // fix27: a stall is a failure of the deepest call open at stall time
         if (stalled) { let i = -1; for (let k = 0; k < trace.length; k++) if ((trace[k].t0 || 0) <= stalled.t && (trace[k].t1 ?? Infinity) >= stalled.t - 1500 && (i < 0 || trace[k].depth >= trace[i].depth)) i = k; if (i < 0) i = trace.length - 1; console.log(`[psn] stall attributed to the call running at stall time: ${trace[i].name} (depth ${trace[i].depth})`); trace[i].ownFail = [`FAILED: STALLED: no progress (no new ground reached, inventory, window, lit furnace) for 60s at ${stalled.pos}`]; for (; i >= 0; i = trace[i].parent) { trace[i].intr = false; trace[i].ok = false; trace[i].fail = true; } ok = false; }
-        const timedOut = !died && !stalled && /timed out/i.test(this._lastRunMsg || '');   // fix33: a timeout is a failure of the deepest call running at the cut
-        if (timedOut) { const ix = trace.map((r, k) => k).filter(k => trace[k].intr && trace[k].t1); const cutT = Math.min(...ix.map(k => trace[k].t1)); let i = -1;
+        const timedOut = !died && !stalled && /timed out/i.test(this._lastRunMsg);   // fix33: a timeout is a failure of the deepest call running at the cut
+        if (timedOut) {
+            this._lastCutKind = 'timeout';  // fix51: set structured kind field
+            const ix = trace.map((r, k) => k).filter(k => trace[k].intr && trace[k].t1); const cutT = Math.min(...ix.map(k => trace[k].t1)); let i = -1;
             for (const k of ix) if (trace[k].t1 <= cutT + 1500 && (i < 0 || trace[k].depth >= trace[i].depth)) i = k;
-            if (i < 0) i = trace.length - 1; while (i >= 0 && trace[i].name.startsWith('skills.') && trace[i].parent >= 0) i = trace[i].parent;   // raw API -> the library skill that called it
+            if (i < 0) i = trace.length - 1; while (i >= 0 && trace[i].name.startsWith('skills.') && trace[i].parent >= 0) i = trace[i].parent;
             console.log(`[psn] timeout attributed to the call running at the cut: ${trace[i].name} (depth ${trace[i].depth})`);
-            trace[i].ownFail = [`FAILED: TIMED OUT while running (${String(trace[i].ownFail?.join(' | ') || '').slice(0, 200)})`]; for (; i >= 0; i = trace[i].parent) { trace[i].intr = false; trace[i].ok = false; trace[i].fail = true; } ok = false; }
+            trace[i].ownFail = [`FAILED: TIMED OUT while running (${String(trace[i].ownFail?.join(' | ')).slice(0, 200)})`]; for (; i >= 0; i = trace[i].parent) { trace[i].intr = false; trace[i].ok = false; trace[i].fail = true; } ok = false;
+        }
         // fix27: no hotspot filter; deaths stay traced failures (above) and blame/repair learns avoidance
         // fix19 (5): an explicit FAILED line from a skill is a contract failure even if the task check passed (e.g. ensureChest inside a storage task)
         const explicit = trace.some(r => !r.intr && (r.ownFail || []).some(l => /FAILED|CONDITION violated/.test(l)));   // fix22: contract violations count
@@ -3714,18 +3726,28 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
         const invFullReason = finalInvFull ? ` Inventory state: ${finalInvFull}` : '';
 
         // fix51: track per-goal::reason failures using learned (s+1)/(n+2) Laplace-smoothed rate
-        // Key by normalized structured source: skill name (from trace) + failure kind (stall/death/timeout)
-        const failKind = anyCut?.match(/stall|death|timeout|travel/i)?.[0]?.toLowerCase() || 'unknown';
-        const failSkill = (this.agent.bot.__psnTrace || []).filter(t => t.fail && !t.intr).map(t => t.name)[0] || 'root';
-        const reasonKey = `${task}::${failSkill}::${failKind}`;
-        const goalStats = (this.progress.goalFailures ||= {});
-        const gs = (goalStats[reasonKey] ||= { success: 0, fail: 0 });
-        gs.fail++;
-        gs.lastFail = Date.now();
-        const rate = (gs.success + 1) / (gs.success + gs.fail + 2);  // Laplace-smoothed
-        console.log(`[fix51] goal::reason "${reasonKey}" rate=${rate.toFixed(2)} (${gs.success}s/${gs.fail}f)`);
-        // Store the rate for skip-probability based ordering (no wall-clock backoff, no threshold)
-        gs.rate = rate;
+        // Key by normalized structured source: skill name (from trace) + failure kind (set by _interruptReason)
+        if (anyCut) {
+            // _lastCutKind is set by _interruptReason when a cut occurs
+            if (!this._lastCutKind) throw new Error('anyCut set but _lastCutKind missing (structured failure kind not recorded)');
+            const failKind = this._lastCutKind;
+            const trace = this.agent.bot.__psnTrace;
+            if (!trace) throw new Error('__psnTrace missing when recording failure');
+            const failingCalls = trace.filter(t => t.fail && !t.intr);
+            // Only record backoff if there's a failing skill to attribute
+            if (failingCalls.length > 0) {
+                const failSkill = failingCalls[0].name;
+                const reasonKey = `${task}::${failSkill}::${failKind}`;
+                const goalStats = (this.progress.goalFailures ||= {});
+                const gs = (goalStats[reasonKey] ||= { success: 0, fail: 0 });
+                gs.fail++;
+                gs.lastFail = Date.now();
+                const rate = (gs.success + 1) / (gs.success + gs.fail + 2);  // Laplace-smoothed
+                console.log(`[fix51] goal::reason "${reasonKey}" rate=${rate.toFixed(2)} (${gs.success}s/${gs.fail}f)`);
+                gs.rate = rate;
+            }
+            this._lastCutKind = null;  // reset for next run
+        }
         this._saveProgress();
 
         // fix19 (1): failed twice (recently) or cut off -> decompose
