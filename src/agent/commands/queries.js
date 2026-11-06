@@ -1,6 +1,7 @@
 import * as world from '../library/world.js';
 import * as mc from '../../utils/mcdata.js';
 import { getCommandDocs } from './index.js';
+import { getVitalsMax } from '../library/skills.js';   // fix59: hp/food max from one source
 import convoManager from '../conversation.js';
 import { checkLevelBlueprint, checkBlueprint } from '../tasks/construction_tasks.js';
 import { load } from 'cheerio';
@@ -22,8 +23,8 @@ export const queryList = [
             res += `\n- Position: x: ${pos.x.toFixed(2)}, y: ${pos.y.toFixed(2)}, z: ${pos.z.toFixed(2)}`;
             // Gameplay
             res += `\n- Gamemode: ${bot.game.gameMode}`;
-            res += `\n- Health: ${Math.round(bot.health)} / 20`;
-            res += `\n- Hunger: ${Math.round(bot.food)} / 20`;
+            res += `\n- Health: ${Math.round(bot.health)} / ${getVitalsMax(bot).health}`;
+            res += `\n- Hunger: ${Math.round(bot.food)} / ${getVitalsMax(bot).food}`;
             res += `\n- Biome: ${world.getBiomeName(bot)}`;
             let weather = "Clear";
             if (bot.rainState > 0)
