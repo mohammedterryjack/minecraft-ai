@@ -855,12 +855,12 @@ Use only c; no other globals.`;
         for (const m of eqMatches) {
             const slot = m[1], op = m[2], expected = m[3];
             const actual = c.post.eq?.[slot];
-            parts.push(`c.post.eq.${slot}=${actual || 'null'} (expected ${op}'${expected}')`);
+            parts.push(`c.post.eq.${slot}=${actual} (expected ${op}'${expected}')`);
         }
         
         if (parts.length === 0) {
-            // Fallback: show key state for manual analysis
-            const deltaKeys = Object.keys(c.delta || {});
+            // No specific sub-expression matched; show key state for manual analysis
+            const deltaKeys = Object.keys(c.delta);
             const deltaStr = deltaKeys.length ? deltaKeys.map(k => `${k}:${c.delta[k]}`).join(',') : 'empty';
             return `delta={${deltaStr}}, ret=${c.ret}, alive=${c.post.alive}`;
         }
@@ -875,6 +875,10 @@ Use only c; no other globals.`;
             if (!e?.contract) continue;
             const c = { args: r.argv, ret: r.rv, pre: r.s0, post: r.s1, delta: r.delta, dist };
             for (const k of ['pre', 'post']) {
+                // fix51: when skill explicitly returns false, skip postcondition checking
+                // The skill already signaled failure; evaluating post would just mark VIOLATED for expected failure
+                // This fixes craftSticks/tossClutter VIOLATED when they legitimately can't succeed
+                if (k === 'post' && r.rv === false) continue;
                 let ok;
                 try { ok = this._compileContract(e.contract[k])(c); }
                 catch (err) { console.log(`!!! [contract] ${e.name}.${k} THREW: ${err.message}; queued contract repair`); this._queueContractFix(e, `${k} threw: ${err.message}`); continue; }
@@ -3914,14 +3918,17 @@ Voyager.SEEDED_PRIMITIVES = [
         if (craftingTable) recipes = bot.recipesFor(bot.registry.itemsByName[itemName]?.id, null, 1, craftingTable);
     }
     if (!recipes || !recipes.length) { log(bot, \`Cannot craft \${itemName}: missing ingredients.\`); if (placedTable) await collectBlock(bot, 'crafting_table', 1); return false; }
-    // fix51: navigate to within reach of the crafting table, then wait for movement to settle
+    // fix51: navigate to within reach of the crafting table, verify reachability before crafting
     if (craftingTable) {
-        await goToPosition(bot, craftingTable.position.x, craftingTable.position.y, craftingTable.position.z, 3);
-        await sleep(100);  // let movement settle before opening crafting window
+        const reached = await goToPosition(bot, craftingTable.position.x, craftingTable.position.y, craftingTable.position.z, 3);
+        if (!reached) { log(bot, \`FAILED: craftRecipe(\${itemName}) could not reach crafting table\`); if (placedTable) await collectBlock(bot, 'crafting_table', 1); return false; }
+        const dist = bot.entity.position.distanceTo(craftingTable.position);
+        if (dist > 4) { log(bot, \`FAILED: craftRecipe(\${itemName}) crafting table out of reach at distance \${dist.toFixed(1)}\`); if (placedTable) await collectBlock(bot, 'crafting_table', 1); return false; }
+        if (!bot.canSeeBlock(craftingTable)) { log(bot, \`FAILED: craftRecipe(\${itemName}) no line of sight to crafting table at \${craftingTable.position}\`); if (placedTable) await collectBlock(bot, 'crafting_table', 1); return false; }
     }
     const before = getInventoryCounts(bot)[itemName] || 0;
     try { await bot.craft(recipes[0], Math.min(num, 64), craftingTable); }
-    catch (err) { log(bot, \`FAILED: Crafting \${itemName} threw: \${err.message}\`); if (placedTable) await collectBlock(bot, 'crafting_table', 1); return false; }
+    catch (err) { log(bot, \`FAILED: craftRecipe(\${itemName}) threw: \${err.message}\`); if (placedTable) await collectBlock(bot, 'crafting_table', 1); return false; }
     const after = getInventoryCounts(bot)[itemName] || 0;
     if (placedTable) await collectBlock(bot, 'crafting_table', 1);
     if (after > before) { log(bot, \`Crafted \${itemName}, now have \${after}.\`); return true; }
@@ -4102,15 +4109,15 @@ Voyager.SEEDED_PRIMITIVES = [
     // fix51: fail loud if signals not initialized (no fallback)
     if (!Array.isArray(bot.__safeToToss)) {
         log(bot, 'FAIL LOUD: bot.__safeToToss not initialized (voyager._prepareTossSignals not called before tossClutter)');
-        return bot.inventory.emptySlotCount();
+        return false;
     }
     if (!Array.isArray(bot.__depositCandidates)) {
         log(bot, 'FAIL LOUD: bot.__depositCandidates not initialized');
-        return bot.inventory.emptySlotCount();
+        return false;
     }
     if (!Array.isArray(bot.__uncertainItems)) {
         log(bot, 'FAIL LOUD: bot.__uncertainItems not initialized');
-        return bot.inventory.emptySlotCount();
+        return false;
     }
     const safeList = bot.__safeToToss;
     const depositList = bot.__depositCandidates;
@@ -4125,7 +4132,14 @@ Voyager.SEEDED_PRIMITIVES = [
             if (!pick) break;
             const it = bot.inventory.items().find(x => x.name === pick);
             if (!it) { inv[pick] = 0; continue; }
-            if (bot.currentWindow) { bot.closeWindow(bot.currentWindow); await sleep(500); }
+            if (bot.currentWindow) {
+                const win = bot.currentWindow;
+                bot.closeWindow(win);
+                await new Promise(resolve => {
+                    const onClose = (w) => { if (!w || w === win) { bot.off('windowClose', onClose); resolve(); } };
+                    bot.on('windowClose', onClose);
+                });
+            }
             await bot.tossStack(it);
             inv[pick] = Math.max(0, (inv[pick] || 0) - it.count);
             tossed++;
@@ -4144,7 +4158,7 @@ Voyager.SEEDED_PRIMITIVES = [
         if (!chest) {
             if (depositList.length || (bot.inventory.emptySlotCount() < 2 && uncertainList.length)) {
                 log(bot, \`PREREQUISITE FAILED: tossClutter needs chest within 32 blocks to deposit items (have \${depositList.length} deposit candidates, \${uncertainList.length} uncertain items). Place or find a chest first.\`);
-                return bot.inventory.emptySlotCount();
+                return false;
             }
         } else if (depositList.length) {
             console.log(\`[toss] still only \${bot.inventory.emptySlotCount()} empty after tossing \${tossed} stacks; depositing \${depositList.length} candidate(s) to chest at \${chest.position}\`);
@@ -4169,14 +4183,16 @@ Voyager.SEEDED_PRIMITIVES = [
     }
     
     // fix43: if we couldn't free space and have uncertain items, surface this for model/planning
+    // fix51: return false when failing to meet minFree, so postcondition skip (r.rv === false) works
     if (bot.inventory.emptySlotCount() < minFree && !bot.interrupt_code) {
         if (uncertainList.length && !safeList.length) {
             log(bot, \`FAILED tossClutter: \${uncertainList.length} item(s) have NO learned producer signal (\${uncertainList.slice(0,3).join(', ')}\${uncertainList.length > 3 ? '...' : ''}) - cannot auto-toss unknown items. Return decision to model/planning.\`);
         } else if (!safeList.length && !depositList.length) {
             log(bot, 'FAILED tossClutter: no learned signal indicates what is safe to toss/deposit');
         }
+        return false;  // fix51: explicit failure so postcondition isn't evaluated
     }
-    return bot.inventory.emptySlotCount();
+    return true;  // fix51: success when emptySlotCount >= minFree
 }`,
         deps: ['moveAway', 'depositToChest'],
     },

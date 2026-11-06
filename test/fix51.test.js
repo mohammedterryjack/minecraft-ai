@@ -626,7 +626,7 @@ describe('fix51 issue 15: craftRecipe calls ensureCraftingTable', async () => {
             `craftRecipe deps should include ensureCraftingTable, got: ${deps}`);
     });
 
-    it('craftRecipe code calls ensureCraftingTable and goToPosition', async () => {
+    it('craftRecipe code calls ensureCraftingTable and verifies reachability', async () => {
         const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
         const craftRecipeStart = voyagerSrc.indexOf("name: 'craftRecipe'");
         assert.ok(craftRecipeStart > 0, 'craftRecipe seeded skill should exist');
@@ -637,6 +637,12 @@ describe('fix51 issue 15: craftRecipe calls ensureCraftingTable', async () => {
             'craftRecipe code should call ensureCraftingTable');
         assert.ok(section.includes('goToPosition'),
             'craftRecipe code should navigate to crafting table');
+        assert.ok(section.includes('dist > 4'),
+            'craftRecipe should check distance to crafting table');
+        assert.ok(section.includes('canSeeBlock'),
+            'craftRecipe should check line of sight to crafting table');
+        assert.ok(!section.includes('sleep(100)'),
+            'craftRecipe should NOT use magic sleep timer');
     });
 });
 
@@ -757,6 +763,47 @@ describe('fix51 issue 17: VIOLATED contract analysis', async () => {
         assert.ok(jsonlMatch, 'VIOLATED should log to jsonl');
         assert.ok(jsonlMatch[0].includes('analysis'),
             'VIOLATED jsonl should include analysis field');
+    });
+});
+
+describe('fix51 issue 17b: tossClutter return value fix', async () => {
+    it('tossClutter returns false on failure, not emptySlotCount', async () => {
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        const tossClutterStart = voyagerSrc.indexOf("name: 'tossClutter'");
+        assert.ok(tossClutterStart > 0, 'tossClutter seeded skill should exist');
+        const depsStart = voyagerSrc.indexOf('deps:', tossClutterStart);
+        const section = voyagerSrc.slice(tossClutterStart, depsStart);
+        
+        assert.ok(!section.includes('return bot.inventory.emptySlotCount();'),
+            'tossClutter should NOT return emptySlotCount on failure');
+        assert.ok(section.includes('return false;'),
+            'tossClutter should return false on failure');
+        assert.ok(section.includes('return true;'),
+            'tossClutter should return true on success');
+    });
+
+    it('tossClutter does not use magic sleep timer', async () => {
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        const tossClutterStart = voyagerSrc.indexOf("name: 'tossClutter'");
+        const depsStart = voyagerSrc.indexOf('deps:', tossClutterStart);
+        const section = voyagerSrc.slice(tossClutterStart, depsStart);
+        
+        assert.ok(!section.includes('await sleep(500)'),
+            'tossClutter should NOT use magic sleep timer');
+        assert.ok(section.includes('windowClose'),
+            'tossClutter should wait on windowClose event');
+    });
+});
+
+describe('fix51 issue 17c: postcondition skip on explicit failure', async () => {
+    it('_checkContracts skips postcondition when r.rv === false', async () => {
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        const checkContractsMatch = voyagerSrc.match(/_checkContracts\(trace, taskOk\)\s*\{[\s\S]*?^\s{4}\}/m);
+        assert.ok(checkContractsMatch, '_checkContracts function should exist');
+        const fnBody = checkContractsMatch[0];
+        
+        assert.ok(fnBody.includes("k === 'post' && r.rv === false"),
+            '_checkContracts should skip postcondition when r.rv === false');
     });
 });
 
