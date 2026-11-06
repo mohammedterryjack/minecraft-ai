@@ -1,7 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { missingCalls } from '../src/agent/skill_graph.js';
-import { Voyager } from '../src/agent/voyager.js';
+import { Voyager, _setVersionForTest } from '../src/agent/voyager.js';
 
 describe('fix51 watcher 09:22', () => {
     it('JS globals like isFinite are not unknown skills', () => {
@@ -20,6 +20,7 @@ describe('fix51 watcher 09:22', () => {
         assert.strictEqual(post({ ret, delta: {} }), true);
     });
     it('regression rerun skips past tasks whose goal is not among the skill learned effects (callee inherits caller task)', async () => {
+        _setVersionForTest('1.20.4');
         const v = Object.create(Voyager.prototype);
         let staged = false;
         v.agent = { coder: { _stageCode: async () => { staged = true; return null; } } };

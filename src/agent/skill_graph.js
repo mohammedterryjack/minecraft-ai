@@ -169,13 +169,16 @@ export function gateLog(msg) { console.log('[gate] ' + msg); }
 export function instrumentSrc(names) {
     // fix11 (B6): parent call tracked with AsyncLocalStorage (bot.__psnALS, set by voyager.js before each run; fix12: SES compartments have their own globalThis), so parallel calls get the right parent
     // fix43: __st() now includes equipment state (eq) so equip skill contracts can be idempotent (already-equipped = success)
+    // fix49/fix51: __have() = getInventoryCounts (slots 5+ already include armor, held hotbar slot and off-hand: counting eq again double-counts)
+    //        waitForTicks(1) before post snapshot (one server tick, not magic timers)
     const wrap = `const __T = bot.__psnTrace = []; const __als = bot.__psnALS; if (!__als) throw new Error('PSN trace: bot.__psnALS (AsyncLocalStorage) missing'); const __inv = () => { try { return world.getInventoryCounts(bot); } catch { return {}; } };
-const __eq = () => { try { const s = bot.inventory?.slots || []; return { heldItem: s[bot.quickBarSlot + 36]?.name || null, offHand: s[45]?.name || null, helmet: s[5]?.name || null, chestplate: s[6]?.name || null, leggings: s[7]?.name || null, boots: s[8]?.name || null }; } catch { return {}; } };
+const __eq = () => { const s = bot.inventory.slots; return { heldItem: s[bot.quickBarSlot + 36]?.name || null, offHand: s[45]?.name || null, helmet: s[5]?.name || null, chestplate: s[6]?.name || null, leggings: s[7]?.name || null, boots: s[8]?.name || null }; };
+const __have = () => __inv();
 const __st = () => { try { const p = bot.entity.position, b = bot.blockAt(p.floored().offset(0, 1, 0)); return { pos: { x: p.x, y: p.y, z: p.z }, hp: bot.health, food: bot.food, oxygen: bot.oxygenLevel, sky: b ? b.skyLight : null, alive: bot.health > 0, dim: String(bot.game?.dimension || ''), inv: __inv(), eq: __eq() }; } catch (e) { return { err: String(e?.message || e) }; } };
 const __wrap = (n, f) => async function (...a) {
     if (__T.length >= 1500) return await f.apply(this, a);
     const par = __als.getStore() ?? -1;
-    const rec = { name: n, args: (() => { try { return JSON.stringify(a.slice(1)).slice(0, 120); } catch { return '?'; } })(), parent: par, depth: par < 0 ? 0 : __T[par].depth + 1, o0: (bot.output || '').length, t0: Date.now(), pre: __inv(), argv: a.slice(1).map(x => x === null || typeof x !== 'object' ? x : null) };
+    const rec = { name: n, args: (() => { try { return JSON.stringify(a.slice(1)).slice(0, 120); } catch { return '?'; } })(), parent: par, depth: par < 0 ? 0 : __T[par].depth + 1, o0: (bot.output || '').length, t0: Date.now(), pre: __have(), argv: a.slice(1).map(x => x === null || typeof x !== 'object' ? x : null) };
     if (!n.startsWith('skills.')) rec.s0 = __st();
     const id = __T.push(rec) - 1;
     try { const r = await __als.run(id, () => f.apply(this, a)); rec.ret = r === undefined ? 'undefined' : String(JSON.stringify(r)).slice(0, 60); rec.rv = r === null || typeof r !== 'object' ? r : null; rec.fail = r === false || r === null || r === 0; return r; }
@@ -187,7 +190,7 @@ const __wrap = (n, f) => async function (...a) {
         rec.rv = false;
         return false;
     }
-    finally { rec.t1 = Date.now(); if (!n.startsWith('skills.')) rec.s1 = __st(); rec.o1 = (bot.output || '').length; bot.__psnOut = bot.output; const post = __inv(); rec.delta = {}; for (const k of new Set([...Object.keys(rec.pre), ...Object.keys(post)])) { const d = (post[k] || 0) - (rec.pre[k] || 0); if (d) rec.delta[k] = d; } delete rec.pre; rec.intr = !!bot.interrupt_code; }
+    finally { await bot.waitForTicks(1); rec.t1 = Date.now(); if (!n.startsWith('skills.')) rec.s1 = __st(); rec.o1 = (bot.output || '').length; bot.__psnOut = bot.output; const post = __have(); rec.delta = {}; for (const k of new Set([...Object.keys(rec.pre), ...Object.keys(post)])) { const d = (post[k] || 0) - (rec.pre[k] || 0); if (d) rec.delta[k] = d; } delete rec.pre; rec.intr = !!bot.interrupt_code; }
 };`;
     // fix40: bare-name API - builtins and learned skills both use bare names
     // Wrap all provided names (both built-in and learned) for tracing
