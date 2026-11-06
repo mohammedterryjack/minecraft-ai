@@ -1258,27 +1258,42 @@ Use only c; no other globals.`;
     // version); one that fails is queued for a normal repair with the lint text as evidence, so the code model rewrites it and
     // the trial gate decides (no hand edit, no rewrite rule). Clean results are remembered so restarts do not re-lint.
     _apiSignature() { return this._skillHash({ code: getBareAPI().sigs.join('\n') }); }
+    // fix71: lint one learned skill alone against the current built-in API; the lint text, or null when it is clean
+    async _apiLintOf(e) {
+        const names = new Set(this.skills.map(s => s.name));
+        const st = await this.agent.coder._stageCode(e.code, { ...this._coderStageOpts(e.code, names), lintOnly: true });
+        return await this.agent.coder._lintCode(st.src_lint_copy, st.preludeLines);
+    }
     async _queueApiLintRepairs() {
         const api = this._apiSignature();
         const prior = this.progress.apiLint;
         const clean = prior && prior.api === api ? prior.clean : {};
         const seeded = new Set(Voyager.SEEDED_PRIMITIVES.map(p => p.name));   // repo-owned, linted by the tests
-        const names = new Set(this.skills.map(s => s.name));
         let linted = 0; const broken = [];
         for (const e of this.skills) {
             if (seeded.has(e.name) || e.mergedInto) continue;
             const h = this._skillHash(e);
             if (clean[e.name] === h) continue;
-            const st = await this.agent.coder._stageCode(e.code, { ...this._coderStageOpts(e.code, names), lintOnly: true });
-            const lint = await this.agent.coder._lintCode(st.src_lint_copy, st.preludeLines);
+            const lint = await this._apiLintOf(e);
             linted++;
             if (!lint) { clean[e.name] = h; continue; }
             delete clean[e.name];
             broken.push(e.name);
+            const evidence = `${e.name} does not lint against the current built-in API, so it cannot run: ${String(lint).replace(/\s+/g, ' ').slice(0, 600)}`;
+            // fix71: the lint result rides on the queue entry (API hash + skill hash), so _repair can tell the maturity gate
+            // that this version's track record was earned under an API it no longer runs on
+            const apiLint = { api, hash: h };
             const rq = [...(this._repairQueue || [])];
-            if (rq.some(x => x.target === e.name)) { console.log(`[api-lint] ${e.name} does not lint against the current API; a repair is already queued`); continue; }
+            const queued = rq.find(x => x.target === e.name && x.kind !== 'contract_fix');
+            if (queued) {
+                if (queued.apiLint?.api === api && queued.apiLint?.hash === h) { console.log(`[api-lint] ${e.name} does not lint against the current API; its repair is already queued with that evidence`); continue; }
+                queued.apiLint = apiLint; queued.evidence = `${evidence}; ${queued.evidence}`;
+                this._repairQueue = rq;
+                console.log(`[api-lint] ${e.name} does not lint against the current API; the queued ${queued.kind} repair now carries that evidence`);
+                continue;
+            }
             rq.push({ target: e.name, leaf: e.name, path: [e.name], kind: 'callee_fix', swallowed: false, task: 'lint against the current built-in API',
-                evidence: `${e.name} does not lint against the current built-in API, so it cannot run: ${String(lint).replace(/\s+/g, ' ').slice(0, 600)}`, trace: '', depth: 0 });
+                evidence, trace: '', depth: 0, apiLint });
             this._repairQueue = rq;
             console.log(`[api-lint] QUEUED REPAIR of ${e.name}: it does not lint against the current built-in API`);
         }
@@ -3845,7 +3860,21 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         if (Date.now() - (this._repairs[e.name] || 0) < 30 * 60e3) { console.log(`[psn] repair of ${e.name} skipped: already repaired in the last 30 min (cap)`); this._deferRepair(q, Math.max(60e3, 30 * 60e3 - (Date.now() - (this._repairs[e.name] || 0))), 'already repaired in the last 30 min (cap)'); return false; }
         if (e.candidate) { console.log(`[psn] repair of ${e.name} skipped: a candidate is already under trial`); this._deferRepair(q, 10 * 60e3, 'a candidate is already under trial'); return false; }
         if (this._cursorLimited()) { console.log(`[psn] repair of ${e.name} skipped: code model at its limit`); this._deferRepair(q, 10 * 60e3, 'code model at its limit'); return false; }
-        if (!this._updateAllowed(e, `repair after ${q.kind}`)) { console.log(`[psn] repair of ${e.name} skipped: maturity gate froze it`); return false; }
+        // fix71: the maturity gate protects a version whose record says it works. An API-lint failure is evidence that record
+        // does not hold under the current API: the version cannot even be staged. Re-lint now (the API, the library or the
+        // skill may have changed since it was queued); still broken -> the gate is not consulted; clean again -> no repair.
+        if (q.apiLint) {
+            const api = this._apiSignature(), lint = await this._apiLintOf(e);
+            if (!lint) {
+                console.log(`[api-lint] repair of ${e.name} dropped: it lints against the current API ${api} (queued under API ${q.apiLint.api})`);
+                this.progress.apiLint = { api, clean: { ...(this.progress.apiLint?.api === api ? this.progress.apiLint.clean : {}), [e.name]: this._skillHash(e) } };
+                this._saveProgress();
+                return false;
+            }
+            q.evidence = `${e.name} does not lint against the current built-in API, so it cannot run: ${String(lint).replace(/\s+/g, ' ').slice(0, 600)}`;
+            const { V, n } = this._maturity(e);
+            gateLog(`maturity ${e.name}: V=${V.toFixed(2)} (${n} runs) NOT CONSULTED: that record was earned by code that does not lint against the current API ${api} [repair after ${q.kind}]`);
+        } else if (!this._updateAllowed(e, `repair after ${q.kind}`)) { console.log(`[psn] repair of ${e.name} skipped: maturity gate froze it`); return false; }
         this._repairs[e.name] = Date.now(); delete (this.progress.deferCounts || {})[`${e.name}:${q.kind}`]; this._saveProgress();   // fix27: counter resets when the repair actually runs
         const kids = [...this._closure(e.name)].map(n => this.skills.find(s => s.name === n)).filter(Boolean);
         // AWM-style: retrieve similar past repair lessons
