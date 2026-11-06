@@ -339,17 +339,14 @@ describe('fix46: integration - verbose goal satisfaction', () => {
         assert.ok(result.items.includes('iron_pickaxe'), 'items should include iron_pickaxe');
     });
 
-    it('should verify _goalAlreadySatisfied uses parseVerboseGoal as fallback', async () => {
+    it('fix55: goal resolution does not scrape free text with parseVerboseGoal (no fallback chain)', async () => {
         const voyagerSrc = await import('fs').then(fs => 
             fs.readFileSync('./src/agent/voyager.js', 'utf8')
         );
-        
-        // _goalAlreadySatisfied should call parseVerboseGoal
-        assert.ok(
-            voyagerSrc.includes('parseVerboseGoal(task)') && 
-            voyagerSrc.includes('_goalAlreadySatisfied'),
-            '_goalAlreadySatisfied should use parseVerboseGoal as fallback'
-        );
+        const fn = voyagerSrc.match(/    _resolveGoal\(task\) \{[\s\S]*?\n    \}/);
+        assert.ok(fn, '_resolveGoal should exist');
+        assert.ok(!fn[0].includes('parseVerboseGoal'), '_resolveGoal must not fall back to parseVerboseGoal');
+        assert.ok(!fn[0].includes('itemsArray'), '_resolveGoal must not scan the registry for item substrings');
     });
 
     it('should export parseVerboseGoal for testing', async () => {
