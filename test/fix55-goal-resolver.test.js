@@ -113,7 +113,17 @@ function replayHarness(skills, rootRecord) {
     const v = mk(skills);
     const bot = { output: '', inventory: { emptySlotCount: () => 10 }, entity: { position: { x: 0, y: 64, z: 0 } } };
     const state = { inventory: { cobblestone: 20 }, equipment: eq, nearby_blocks: [] };
-    v.agent = { bot, coder: { _stageCode: async () => ({ func: { main: async b => { b.__psnTrace = rootRecord ? [rootRecord] : []; } } }) } };
+    v.agent = {
+        bot,
+        coder: {
+            _lintCode: async () => null,
+            _stageCode: async (_bundle, opts) => {
+                const preludeLines = 0;
+                if (opts?.lintOnly) return { src_lint_copy: '', preludeLines };
+                return { func: { main: async b => { b.__psnTrace = rootRecord ? [rootRecord] : []; } }, src_lint_copy: '', preludeLines };
+            }
+        }
+    };
     v.observe = () => state;
     v._run = async (label, fn) => { await fn(); return { success: true, message: '' }; };
     v._diedInRun = () => null; v._stalledInRun = () => null;
