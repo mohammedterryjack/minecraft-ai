@@ -1,7 +1,15 @@
 import { io } from 'socket.io-client';
+import { inspect } from 'node:util';
+import { writeProcessLoud } from '../process/exit_log.js';
 import convoManager from './conversation.js';
 import { setSettings } from './settings.js';
 import { getFullState } from './library/full_state.js';
+
+function verbatim(reason) {
+    if (typeof reason === 'string') return reason;
+    if (reason === undefined || reason === null) return String(reason);
+    return inspect(reason, { depth: 4, breakLength: 120 });
+}
 
 // agent's individual connection to the mindserver
 // always connect to localhost
@@ -35,13 +43,24 @@ class MindServerProxy {
         this.connected = true;
         console.log(name, 'connected to MindServer');
 
-        this.socket.on('disconnect', () => {
-            console.log('Disconnected from MindServer');
+        this.socket.on('disconnect', (reason) => {
+            this._disconnectReason = reason;
+            const why = `MindServer socket disconnected; reason: ${verbatim(reason)}`;
+            writeProcessLoud(why);
             this.connected = false;
             if (this.agent) {
-                this.agent.cleanKill('Disconnected from MindServer. Killing agent process.');
+                this.agent.cleanKill(why);
+            } else {
+                writeProcessLoud('MindServer socket disconnected before the agent existed');
             }
         });
+        const onSocketEvent = (event) => (...args) => {
+            writeProcessLoud(`MindServer socket ${event}; last disconnect reason: ${verbatim(this._disconnectReason)}; detail: ${args.map(verbatim).join(' ')}`);
+        };
+        this.socket.io.on('reconnect_attempt', onSocketEvent('reconnect_attempt'));
+        this.socket.io.on('reconnect', onSocketEvent('reconnect'));
+        this.socket.io.on('reconnect_error', onSocketEvent('reconnect_error'));
+        this.socket.io.on('reconnect_failed', onSocketEvent('reconnect_failed'));
 
         this.socket.on('chat-message', (agentName, json) => {
             convoManager.receiveFromBot(agentName, json);

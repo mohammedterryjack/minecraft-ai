@@ -1,4 +1,6 @@
+import { inspect } from 'node:util';
 import { sendOutputToServer } from './mindserver_proxy.js';
+import { writeProcessLoud } from '../process/exit_log.js';
 
 // Definitions of error types, keywords, and full human-readable messages.
 const ERROR_DEFINITIONS = {
@@ -43,7 +45,8 @@ const ERROR_DEFINITIONS = {
 export const log = (agentName, msg) => {
     // Use console.error for visibility in terminal
     console.error(msg);
-    try { sendOutputToServer(agentName || 'system', msg); } catch (_) {}
+    try { sendOutputToServer(agentName || 'system', msg); }
+    catch (e) { writeProcessLoud(`could not mirror a log line to MindServer: ${e instanceof Error ? e.stack : inspect(e)}`); }
 };
 
 // Analyzes the kick reason and returns a full, human-readable sentence.
@@ -65,13 +68,15 @@ export function parseKickReason(reason) {
     try {
         const obj = typeof reason === 'string' ? JSON.parse(reason) : reason;
         fallback = obj.translate || obj.text || (obj.value?.translate) || raw;
-    } catch (_) {}
+    } catch (e) { writeProcessLoud(`kick reason did not parse as JSON: ${e instanceof Error ? e.message : inspect(e)}`); }
     
     return { type: 'other', msg: `Disconnected: ${fallback}`, isFatal: true };
 }
 
 // Centralized handler for disconnections.
 export function handleDisconnection(agentName, reason) {
+    const raw = typeof reason === 'string' ? reason : (reason === undefined || reason === null ? String(reason) : inspect(reason, { depth: 6, breakLength: 120 }));
+    writeProcessLoud(`${agentName} disconnected; reason verbatim: ${raw}`);
     const { type, msg } = parseKickReason(reason);
     
     // Format: [LoginGuard] Error Message

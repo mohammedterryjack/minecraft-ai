@@ -3,10 +3,12 @@
 // exit on a non-zero child exit, so launchd restarts com.mo.icefox. No catch-and-continue.
 import { inspect } from 'node:util';
 import { log } from './connection_handler.js';
+import { logExitCause } from '../process/exit_log.js';
 
 export function fatalExit(agentName, where, err) {
     const raw = err instanceof Error ? err.stack : inspect(err, { depth: 6, maxArrayLength: 50, breakLength: 120 });
     const msg = `[fatal] ${where}; agent cannot act, exiting 1: ${raw}`;
+    logExitCause(msg);
     console.error(msg);
     log(agentName, msg);
     process.exit(1);

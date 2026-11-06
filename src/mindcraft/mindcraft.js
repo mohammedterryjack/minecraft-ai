@@ -1,6 +1,7 @@
 import { createMindServer, registerAgent, numStateListeners } from './mindserver.js';
 import { AgentProcess } from '../process/agent_process.js';
 import { getServer } from './mcserver.js';
+import { logExitCause } from '../process/exit_log.js';
 import open from 'open';
 
 let mindserver;
@@ -106,6 +107,7 @@ export function shutdown() {
         agent_processes[agentName].stop();
     }
     setTimeout(() => {
+        logExitCause('Mindcraft.shutdown');
         process.exit(0);
     }, 2000);
 }

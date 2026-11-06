@@ -178,14 +178,22 @@ describe('fix86: a generic description is not a subgoal, and a self-decompositio
 });
 
 describe('fix86: a trial cannot drop the reported need', () => {
-    it('a collectBlock candidate that returns 0 without the marker is refused', () => {
+    it('a collectBlock candidate that returns 0 without the marker is rejected and not kept', () => {
         const v = Object.create(Voyager.prototype);
         const incumbent = Voyager.SEEDED_PRIMITIVES.find(p => p.name === 'collectBlock').code;
-        v.skills = [{ name: 'collectBlock', code: incumbent, deps: [], candidate: { code: 'async function collectBlock(bot, blockType, num) { log(bot, "No oak_log nearby"); return 0; }', deps: [] } }];
+        const candidateCode = 'async function collectBlock(bot, blockType, num) { log(bot, "No oak_log nearby"); return 0; }';
+        v.skills = [{ name: 'collectBlock', code: incumbent, deps: [], candidate: { code: candidateCode, deps: [], task: 'Collect 1 oak_log' } }];
         v._graph = () => ({});
-        assert.throws(() => v._trialClosure('collectBlock', true), /trial of collectBlock would drop the reported need/);
-        const dropped = markerCallsMissing(incumbent, v.skills[0].candidate.code, PRECONDITION_UNMET_BINDING);
+        v._saveSkills = () => {};
+        const dropped = markerCallsMissing(incumbent, candidateCode, PRECONDITION_UNMET_BINDING);
         assert.match(dropped, /repair dropped/);
+        const first = v._trialClosure('collectBlock', true);
+        assert.strictEqual(first.over.collectBlock, undefined);
+        assert.match(first.rejected.get('collectBlock'), /repair dropped/);
+        assert.strictEqual(v.skills[0].candidate, undefined);
+        assert.match(v.skills[0].repairHistory[0].outcome, /rejected dropped need/);
+        assert.match(v.skills[0].repairHistory[0].evidence, /repair dropped/);
+        assert.doesNotThrow(() => v._trialClosure('collectBlock', true));
     });
 });
 

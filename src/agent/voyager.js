@@ -13,7 +13,7 @@ import { RepairMemory } from './repair_memory.js';
 import { IdlePractice } from './idle_practice.js';
 import { VitalsModel } from './vitals_model.js';   // fix58
 import { checkNeedSource, needInterruptSource, isUnblamedInterruptKind, sampleBeta, pickUrgentCandidate } from './urgent_need.js';   // fix80
-import { peekPreconditionUnmet, clearPreconditionUnmet, checkNeed } from './precondition.js';   // fix76; fix81: structured needs (markPreconditionUnmet is called by seeded code)
+import { peekPreconditionUnmet, clearPreconditionUnmet, checkNeed, reachNeedForBlocks } from './precondition.js';   // fix76; fix81: structured needs (markPreconditionUnmet is called by seeded code)
 import { SlotEffects } from './slot_effects.js';   // fix59
 import { obtainPlanner } from './recipe_plan.js';   // fix81
 import { stackableCounts, emptySlotsToFit, bestSlotFreeingCraft, surplusFromConsumption, slotsFreedBy } from './slot_room.js';   // fix84
@@ -1049,6 +1049,22 @@ export class Voyager {
         }
         return (hash >>> 0).toString(36);
     }
+    // fix47: repair dedup key (target, skill hash, evidence). The hash is in the key, so a changed skill is a new repair.
+    _repairSig(target, evidence) {
+        const skill = this.skills.find(s => s.name === target);
+        const hash = this._skillHash(skill);
+        return `${target}:${hash}:${(evidence || '').slice(0, 100).replace(/\s+/g, ' ')}`;
+    }
+    // fix87: a contract repair that already came back with the same pre/post for this evidence, and the skill hash has not changed
+    _sameContractRepairRejected(e, evidence) {
+        const sigs = this.progress.failedRepairSigs;
+        if (sigs === undefined) return false;
+        const sig = this._repairSig(e.name, evidence);
+        if (!Object.hasOwn(sigs, sig)) return false;
+        const rec = sigs[sig];
+        if (!rec || typeof rec.hash !== 'string') throw new Error(`[fix87] rejected repair of ${e.name} (${sig}) has no hash`);
+        return rec.hash === this._skillHash(e);
+    }
     // fix47: log repair outcomes (ok/rejected/rollback) for observability
     _proposalOutcome(e, outcome, sig = null) { 
         const h = e.repairHistory; 
@@ -1822,6 +1838,13 @@ Use only c; no other globals.`;
         return broken;
     }
     _queueContractFix(e, why) {
+        // fix87: an identical pre/post repair is terminal for this evidence. The queue item is consumed when it runs;
+        //        the next step's check would unshift another one. failedRepairSigs (hash + evidence, no timer) is the
+        //        rejection, so that unshift does not happen.
+        if (this._sameContractRepairRejected(e, why)) {
+            console.log(`!!! [contract] LOUD: contract repair of ${e.name} not re-queued; this evidence was already rejected (${why})`);
+            return;
+        }
         const rq = [...(this._repairQueue || [])];
         if (rq.some(x => x.target === e.name && x.kind === 'contract_fix')) return;
         rq.unshift({ target: e.name, leaf: e.name, path: [e.name], kind: 'contract_fix', swallowed: false, evidence: why, task: 'contract check', trace: '', depth: 99 });
@@ -1847,8 +1870,16 @@ Use only c; no other globals.`;
             e.contractTried = Date.now();
             if (bad) { e.contractFail = bad; console.log(`[contract] FAILED for ${e.name}: ${bad}`); continue; }
             delete e.contractFail;
-            // fix56: a repair that returns the same post means the contract was not the problem (e.g. the trace state it was judged on was wrong)
-            if (why === 'contract repair' && e.contract && e.contract.pre === ct.pre && e.contract.post === ct.post) console.log(`!!! [contract] LOUD: contract repair of ${e.name} returned the SAME pre/post; the violation (${fixNote}) is not explained by the contract`);
+            // fix56/fix87: the same pre/post does not explain the violation. Installing it anyway left the contract
+            //        unchanged, the queue entry was already consumed, and the next step queued the same repair (live:
+            //        equipBestToolForAxe, 511 code-model calls). Record it on failedRepairSigs and do not install it,
+            //        so the same evidence is not re-queued while this skill hash stands. A different evidence string,
+            //        or a changed skill, is still a repair.
+            if (why === 'contract repair' && e.contract && e.contract.pre === ct.pre && e.contract.post === ct.post) {
+                console.log(`!!! [contract] LOUD: contract repair of ${e.name} returned the SAME pre/post; the violation (${fixNote}) is not explained by the contract`);
+                this._proposalOutcome(e, 'rejected same contract', this._repairSig(e.name, fixNote));
+                continue;
+            }
             if (e.contract) e.contractPrev = e.contract;
             e.contract = { pre: ct.pre, post: ct.post, text: String(ct.text || '').slice(0, 200), learned: new Date().toISOString(), why };
             n++; console.log(`[contract] ${e.name}: pre ${ct.pre.slice(0, 80)} | post ${ct.post.slice(0, 120)}`);
@@ -1943,7 +1974,7 @@ Use only c; no other globals.`;
     _replayOverrides(root, rootTrial) { return this._trialClosure(root, rootTrial).over; }
     _trialClosure(root, rootTrial) {
         const g = this._graph(), byName = new Map(this.skills.map(s => [s.name, s]));
-        const closure = new Set(), over = {}, st = [root];
+        const closure = new Set(), over = {}, rejected = new Map(), st = [root];
         while (st.length) {
             const n = st.pop();
             if (closure.has(n)) continue;
@@ -1953,13 +1984,28 @@ Use only c; no other globals.`;
             if (trial) {
                 if (!Array.isArray(e.candidate.deps)) throw new Error(`[fix81] candidate of ${n} has no deps array`);
                 // fix86: a trial that drops the unmet-need marker returns 0 with no reach need (live collectBlock repair)
+                // fix87: that candidate is rejected and not kept. The incumbent runs. It is not a step error of the caller's task
+                //        (the same throw twice was a [fatal] exit 1, pickupNearbyItems 21:38:26).
                 const dropped = markerCallsMissing(e.code, e.candidate.code, PRECONDITION_UNMET_BINDING);
-                if (typeof dropped === 'string' && dropped.includes('repair dropped')) throw new Error(`[fix86] LOUD: trial of ${n} would drop the reported need: ${dropped}`);
-                over[n] = e.candidate.code;
-                st.push(...e.candidate.deps);
+                if (typeof dropped === 'string' && dropped.includes('repair dropped')) {
+                    this._rejectDroppedNeed(e, dropped);
+                    rejected.set(n, dropped);
+                    if (Object.hasOwn(g, n)) st.push(...g[n]);
+                } else {
+                    over[n] = e.candidate.code;
+                    st.push(...e.candidate.deps);
+                }
             } else if (Object.hasOwn(g, n)) st.push(...g[n]);
         }
-        return { closure, over };
+        return { closure, over, rejected };
+    }
+    // fix87: the candidate is not kept. The reason is stored on the skill, and the next repair prompt shows repairHistory.
+    _rejectDroppedNeed(e, dropped) {
+        if (!e.candidate || typeof e.candidate.task !== 'string') throw new Error(`[fix87] LOUD: candidate of ${e.name} has no task; the rejection cannot be fed back`);
+        const task = e.candidate.task;
+        console.error(`!!! [fix87] LOUD: candidate of ${e.name} rejected (not kept, not a step failure): ${dropped}`);
+        delete e.candidate;
+        this._noteProposal(e, { task, kind: 'trial', evidence: dropped.slice(0, 200), desc: 'candidate dropped the reported need', outcome: 'rejected dropped need' });
     }
     _crashedInRun() { const c = this._crash; return c && c.t >= (this._runStart || Infinity) ? c : null; }
     // fix65: a run that kills the process (watchdog SIGKILL on a blocked main loop) never reaches _attribute, so its trial
@@ -2481,12 +2527,21 @@ Use only c; no other globals.`;
                 if (c.item.startsWith('any')) return { ok: true };
                 const md = minecraftData(VERSION); const b = md.blocksByName[c.item];
                 if (!b) return { ok: false, why: `unknown block ${c.item}` };
-                const ids = [b.id, md.blocksByName['deepslate_' + c.item]?.id].filter(x => x !== undefined);
-                return bot.findBlock({ matching: ids, maxDistance: 64 }) ? { ok: true } : { ok: false, why: `no ${c.item} within 64 blocks` };
+                const names = [c.item];
+                const deep = 'deepslate_' + c.item;
+                if (Object.hasOwn(md.blocksByName, deep)) names.push(deep);
+                const ids = names.map(n => md.blocksByName[n].id);
+                if (bot.findBlock({ matching: ids, maxDistance: 64 })) return { ok: true };
+                const need = reachNeedForBlocks(md.blocksByName, names, c.count);
+                if (need === null) throw new Error(`[fix87] LOUD: ${c.item} is not a block in the game data`);
+                return { ok: false, why: `no ${c.item} within 64 blocks`, need };
             }
             if (c.pre === 'mob') return Object.values(bot.entities).some(e => e.name === c.mob && e.position.distanceTo(bot.entity.position) <= 48) ? { ok: true } : { ok: false, why: `no ${c.mob} within 48 blocks` };
             if (c.pre === 'input') return (inv[c.input] || 0) > 0 ? { ok: true } : { ok: false, why: `no ${c.input} in inventory` };
-        } catch (e) { return { ok: false, why: `precheck error ${e.message}` }; }
+        } catch (e) {
+            if (e instanceof Error && e.message.startsWith('[fix87]')) throw e;
+            return { ok: false, why: `precheck error ${e.message}` };
+        }
         return { ok: true };
     }
     // fix79: what a skill is learned to produce: its measured effects (recordEffectEvidence, fix74), its candidate's, and the
@@ -2533,6 +2588,11 @@ Use only c; no other globals.`;
             if (pc.reroute && r.name !== pc.reroute && this.skills.some(s => s.name === pc.reroute && !s.demoted)) {
                 console.log(`[skillv] precheck ${r.name}: not applicable (${pc.why}); rerouting to ${pc.reroute} to fetch prerequisites`);
                 r = { name: pc.reroute, call: `await ${pc.reroute}(bot, ${JSON.stringify(pc.item)}, ${pc.count});` };
+            } else if (pc.need) {
+                // fix87: "no <block> within search range" is a reach need. Returning null here used to skip the chain
+                // and write new code, so a log that is not nearby never became "reach <log block>".
+                console.error(`!!! [fix87] LOUD: ${r.name}: ${pc.why}; reporting a reach need instead of writing new code`);
+                return { ok: false, name: r.name, output: '', reason: pc.why, needs: [this._checkNeed(pc.need, pc.why)] };
             } else { console.log(`[skillv] precheck ${r.name}: not applicable (${pc.why}); skipping replay, writing code instead`); return null; }
         } else if (ct) console.log(`[skillv] precheck ${r.name}: applicable`);
         // fix55: one goal resolver; item/smelt goals are verified by gain, ensure by placement, skill/open goals by a learned post-contract
@@ -2585,7 +2645,14 @@ Use only c; no other globals.`;
                 return { ok: false, name: r.name, output: '', unmetPrecondition: sat, unverified: true };
             }
         }
-        const { closure: replayClosure, over } = this._trialClosure(r.name, trial);
+        const { closure: replayClosure, over, rejected } = this._trialClosure(r.name, trial);
+        if (rejected.has(r.name)) {
+            // fix87: the root candidate dropped the need marker and was rejected. A dedicated trial must not run the
+            // incumbent in its place (that would charge the incumbent). A caller's replay runs the incumbent.
+            const why = rejected.get(r.name);
+            if (forced?.dedicatedTrial) return { ok: false, name: r.name, output: '', unverified: true, reason: `candidate rejected: ${why}` };
+            trial = false;
+        }
         const tracedNames = Voyager._tracedSkillNamesForInstrument(this, replayClosure, over);
         const libPart = this._libSrcSubset(replayClosure, over);
         const call = '\n\nasync function __replay(bot) {\n    try { ' + r.call + ' } finally { bot.__psnOut = bot.output; }\n}\nawait __replay(bot);';
@@ -2632,13 +2699,17 @@ Use only c; no other globals.`;
             } else {
                 const held = this._postHolds(entry);
                 const v = held ? this._postVerifiesRun(entry) : { ok: true };
-                if (held && !v.ok) {
+                if (held && v.ok === false) {
                     // fix56: the post held but would also hold for a run that did nothing -> it cannot verify an open goal
                     console.log(`!!! [psn] LOUD: open goal "${task}" NOT verified: ${r.name} post ${entry.contract.post} cannot verify it (${v.why}); queued contract repair`);
                     this._queueContractFix(entry, `post cannot verify a goal: ${v.why}`);
                     unverified = true;
-                }
-                ok = held && v.ok;
+                } else if (held && v.ok === null) {
+                    // fix87: pre did not hold. The goal is not verified by this run, and the contract is not at fault.
+                    console.log(`[psn] open goal "${task}": ${r.name} ${v.why}; not a contract violation`);
+                    unverified = true;
+                } else if (held && v.ok !== true) throw new Error(`[fix87] _postVerifiesRun(${r.name}) returned ok=${JSON.stringify(v.ok)}`);
+                ok = held && v.ok === true;
                 console.log(`[psn] fix55 open goal "${task}": ${r.name} learned post ${entry.contract.post} -> held=${held}, verifies run=${v.ok} -> ${ok}`);
             }
         }
@@ -2919,7 +2990,25 @@ Use only c; no other globals.`;
         const pre = this._obtainPlanner(state).prerequisites(goal.item, goal.count, state.inventory);
         for (const t of pre.ties) console.log(`[backchain] cost tie broken (proven edges, then name) planning ${goal.item}: ${t}`);
         if (pre.cycles.length) console.log(`[backchain] LOUD: ${pre.cycles.length} recipe cycle(s) in the game data excluded while planning ${goal.item}, through: ${[...new Set(pre.cycles.flatMap(c => c.split(' -> ')))].join(', ')}`);
-        if (!pre.steps.length) return null;
+        if (!pre.steps.length) {
+            // fix87: a raw resource's game-data plan is "collect it from its source block", with nothing else missing
+            // (a log drops by hand). That used to return null, so "no log in range" never became a reach need.
+            // A source block that is already observed nearby is a different failure: do not invent a reach need for it.
+            if (pre.how === 'collect') {
+                if (!Array.isArray(state.nearby_blocks)) throw new Error('[fix87] _failureNeeds: state.nearby_blocks required');
+                const src = this._obtainPlanner(state).sources(goal.item);
+                const near = new Set(state.nearby_blocks);
+                const missing = src.filter(b => !near.has(b));
+                if (src.length > 0 && missing.length === src.length) {
+                    const blocksByName = this.agent.bot.registry.blocksByName;
+                    const need = reachNeedForBlocks(blocksByName, missing, goal.count);
+                    if (need === null) throw new Error(`[fix87] LOUD: source blocks of ${goal.item} (${missing.join(', ')}) are not blocks in the game data`);
+                    console.error(`!!! [fix87] LOUD: "${task}": no source block within range (${missing.join(', ')}); reach need`);
+                    return [this._checkNeed(need, 'no source block in range')];
+                }
+            }
+            return null;
+        }
         return pre.steps.map(st => this._checkNeed({ item: st.item, count: st.count, reason: pre.tool === null ? 'ingredients' : 'tool' }, 'game data'));
     }
     _checkNeed(need, source) { return { ...checkNeed(need, source), source }; }
@@ -3181,7 +3270,10 @@ Use only c; no other globals.`;
             const held = this._postHolds(skill);
             if (!held) return { ok: false, detail: `learned post ${skill.contract.post} does not hold` };
             const v = this._postVerifiesRun(skill);
-            if (!v.ok) { this._queueContractFix(skill, `post cannot verify a run: ${v.why}`); return { ok: null, detail: `post ${skill.contract.post} held but cannot verify a run (${v.why}); queued contract repair` }; }
+            // fix87: ok null is "this run is not evidence", not a violation. ok false is a bad post and is queued once.
+            if (v.ok === false) { this._queueContractFix(skill, `post cannot verify a run: ${v.why}`); return { ok: null, detail: `post ${skill.contract.post} held but cannot verify a run (${v.why}); queued contract repair` }; }
+            if (v.ok === null) return { ok: null, detail: v.why };
+            if (v.ok !== true) throw new Error(`[fix87] _postVerifiesRun(${skill.name}) returned ok=${JSON.stringify(v.ok)}`);
             return { ok: true, detail: `learned post ${skill.contract.post} holds` };
         }
         const effects = verifiedEffects(skill);
@@ -3209,9 +3301,11 @@ Use only c; no other globals.`;
     // fix56: can this post-contract verify a goal at all, judged on the run that just happened?
     //  1) AST: the post must read something the run produces: c.ret, c.delta or c.post.* (c.dist(c.pre.pos, c.post.pos) counts via c.post.pos)
     //  2) null-run counterfactual: the same post on a run that did nothing (ret undefined, post state = pre state, empty delta) must be false;
-    //     a post that also holds when nothing happened (e.g. "!c.ret || (c.post.alive && c.pre.dim === c.post.dim)") verifies nothing
+    //     a post that also holds when nothing happened (e.g. "!c.ret || (c.post.alive && c.pre.dim === c.post.dim)") verifies nothing.
+    //     fix87: only a run whose pre held is that experiment. A pre-false no-op (the axe is already in hand, so the skill
+    //     correctly changes nothing and the post is already true) is not evidence for or against the post.
     //  3) falsy ret: when the real ret is falsy, the pass must come from the state change, not from a "!c.ret ||" guard:
-    //     the post with the real ret but no state change must be false
+    //     the post with the real ret but no state change must be false. Same pre-held rule as (2).
     _postVerifiesRun(e) {
         const src = e.contract.post;
         const { root, param } = this._parseContract(src);
@@ -3220,6 +3314,12 @@ Use only c; no other globals.`;
         this._walkAst(root.body, node => { if (node.type !== 'MemberExpression') return; const p = this._contractPath(node, param); if (p && p.length) reads.add(p[0] === 'post' ? 'post' : p[0]); });
         if (!['ret', 'delta', 'post'].some(k => reads.has(k))) return { ok: false, why: `post reads only [${[...reads].join(', ')}], nothing the run produced (ret, delta, post state)` };
         const r = this.agent.bot.__psnTrace.find(t => t.name === e.name && (t.parent ?? -1) < 0);
+        // fix87: pre false -> this run neither confirms nor refutes the post's discriminative power. No violation.
+        if (typeof e.contract.pre === 'string') {
+            const preHeld = this._compileContract(e.contract.pre)(this._contractCtx({ args: r.argv, ret: r.rv, pre: r.s0, post: r.s1, delta: r.delta }));
+            if (preHeld !== true && preHeld !== false) throw new Error(`[fix87] ${e.name}.pre returned ${preHeld === undefined ? 'undefined' : JSON.stringify(preHeld)}, not a boolean`);
+            if (preHeld === false) return { ok: null, why: 'pre did not hold, so this run is not evidence for or against the post' };
+        }
         const f = this._compileContract(src), dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
         if (f(this._contractCtx({ args: r.argv, ret: undefined, pre: r.s0, post: r.s0, delta: {} })) === true) return { ok: false, why: 'post also holds for a run that did nothing (ret undefined, no state change)' };
         if (!r.rv && f(this._contractCtx({ args: r.argv, ret: r.rv, pre: r.s0, post: r.s0, delta: {} })) === true) return { ok: false, why: `ret was ${JSON.stringify(r.rv)} and the post holds from ret alone (vacuous guard), not from what the run changed` };
@@ -4706,11 +4806,7 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         }
         const rq = [...(this._repairQueue || [])];
         // fix47: hash-based deduplication - signature includes skill hash so it resets when skill changes
-        const failSig = (b) => {
-            const skill = this.skills.find(s => s.name === b.target);
-            const hash = this._skillHash(skill);
-            return `${b.target}:${hash}:${(b.evidence || '').slice(0, 100).replace(/\s+/g, ' ')}`;
-        };
+        const failSig = (b) => this._repairSig(b.target, b.evidence);
         const pendingSigs = new Set(rq.map(failSig));
         // fix47: track failed signatures - dedup until skill code/contract changes (hash-based, no time window)
         const failedSigs = this.progress.failedRepairSigs || {};
@@ -4782,11 +4878,19 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
                 this._noteProposal(e, { task: q.task, kind: q.kind, evidence: q.evidence.slice(0, 200), desc: `seeded contract restored: ${e.contract.text}`, outcome: 'seeded contract restored' });
                 return true;
             }
+            // fix87: practice can unshift the same evidence during the model call, before the rejection is recorded.
+            //        That item is already off the "don't queue" check. Drop it here. Do not defer it (a deferral would
+            //        run it again on a timer) and do not call the model again.
+            if (this._sameContractRepairRejected(e, q.evidence)) {
+                console.log(`!!! [contract] LOUD: contract repair of ${e.name} not run; this evidence was already rejected (${q.evidence})`);
+                return false;
+            }
             if (this._cursorLimited()) { console.log(`[psn] contract repair of ${e.name} deferred: code model at its limit`); this._deferRepair(q, 10 * 60e3, 'code model at its limit'); return false; }
             delete (this.progress.deferCounts || {})[`${e.name}:contract_fix`];
             console.log(`[psn] REPAIR contract of ${e.name} (${q.evidence})`);
             const n = await this._learnContracts([e], 'contract repair', q.evidence);
-            this._noteProposal(e, { task: q.task, kind: q.kind, evidence: q.evidence.slice(0, 200), desc: n ? `contract -> ${e.contract.text}` : 'contract repair failed', outcome: n ? 'contract replaced' : 'failed' });
+            const rejected = n === 0 && this._sameContractRepairRejected(e, q.evidence);
+            this._noteProposal(e, { task: q.task, kind: q.kind, evidence: q.evidence.slice(0, 200), desc: n ? `contract -> ${e.contract.text}` : (rejected ? 'same pre/post rejected' : 'contract repair failed'), outcome: n ? 'contract replaced' : (rejected ? 'rejected same contract' : 'failed') });
             return n > 0;
         }
         if (Date.now() - (this._repairs[e.name] || 0) < 30 * 60e3) { console.log(`[psn] repair of ${e.name} skipped: already repaired in the last 30 min (cap)`); this._deferRepair(q, Math.max(60e3, 30 * 60e3 - (Date.now() - (this._repairs[e.name] || 0))), 'already repaired in the last 30 min (cap)'); return false; }

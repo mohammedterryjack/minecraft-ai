@@ -5,7 +5,7 @@ import Vec3 from 'vec3';
 import settings from "../../../settings.js";
 import { watchPathing } from "../../utils/movement_model.js";
 import { findCarried } from "../../utils/carried.js";
-import { markPreconditionUnmet } from "../precondition.js";
+import { markPreconditionUnmet, markBlockOutOfRange } from "../precondition.js";
 
 const blockPlaceDelay = settings.block_place_delay == null ? 0 : settings.block_place_delay;
 const useDelay = blockPlaceDelay > 0;
@@ -1864,6 +1864,8 @@ export async function goToNearestBlock(bot, blockType,  min_distance=2, range=64
         log(bot, `FAILED: no ${blockType} within ${range} blocks.` +
             (range < MAX_RANGE ? ` You may retry ONCE with a larger range (max ${MAX_RANGE}),` : ' Already at max range,') +
             ` otherwise do not retry: explore with !moveAway(64), pick a substitute block, or ask a player.`);
+        // fix87: one block is what this call was searching for. A name that is not a block in the game data is not a reach need.
+        markBlockOutOfRange(bot, [blockType], 1);
         return false;
     }
     log(bot, `Found ${blockType} at ${block.position}. Navigating...`);
@@ -2743,10 +2745,16 @@ export async function gatherUntil(bot, itemName, target, maxRadius=256) {
     while (have() < target && fails < 3) {
         if (bot.interrupt_code) return false;
         const before = have();
-        const block = world.getNearestBlock(bot, itemName === 'cobblestone' ? 'stone' : itemName, maxRadius)
-            || (itemName === 'dirt' ? world.getNearestBlock(bot, 'grass_block', maxRadius) : null);
+        const searched = [itemName === 'cobblestone' ? 'stone' : itemName];
+        if (itemName === 'dirt') searched.push('grass_block');
+        let block = null;
+        for (const name of searched) {
+            block = world.getNearestBlock(bot, name, maxRadius);
+            if (block) break;
+        }
         if (!block) {
             log(bot, `FAILED: have ${have()}/${target} ${itemName}; no more ${itemName} found within ${maxRadius} blocks. Move to a new area (!moveAway(100)) or use a substitute material.`);
+            markBlockOutOfRange(bot, searched, target - have());
             return false;
         }
         await collectBlock(bot, itemName, Math.min(target - before, 16));

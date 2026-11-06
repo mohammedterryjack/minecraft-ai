@@ -44,6 +44,33 @@ export function peekPreconditionUnmet(bot) {
     return m;
 }
 
+// fix87: a search that found no block of these names. Names that are not blocks in the game data are not a reach
+// need (the caller still reports its own failure). Returns the need, or null when none of the names is a block.
+export function reachNeedForBlocks(blocksByName, blockNames, count) {
+    if (!blocksByName || typeof blocksByName !== 'object') throw new Error('[fix87] reachNeedForBlocks: blocksByName required');
+    if (!Array.isArray(blockNames) || blockNames.length === 0) throw new Error('[fix87] reachNeedForBlocks: block names required');
+    for (const n of blockNames) if (typeof n !== 'string' || n === '') throw new Error(`[fix87] reachNeedForBlocks: block name must be a non-empty string, got ${JSON.stringify(n)}`);
+    if (!Number.isInteger(count) || count < 1) throw new Error(`[fix87] reachNeedForBlocks: positive integer count required, got ${JSON.stringify(count)}`);
+    const blocks = [];
+    for (const n of blockNames) if (Object.hasOwn(blocksByName, n) && !blocks.includes(n)) blocks.push(n);
+    if (!blocks.length) return null;
+    return blocks.length === 1 ? { item: blocks[0], count, reason: 'reach' } : { anyOf: blocks, count, reason: 'reach' };
+}
+
+// fix87: the search gave up. Stamp a reach need on the running call when the name is a block in the game data.
+export function markBlockOutOfRange(bot, blockNames, count) {
+    if (!bot || typeof bot !== 'object') throw new Error('[fix87] markBlockOutOfRange: bot required');
+    if (!bot.registry || !bot.registry.blocksByName) throw new Error('[fix87] markBlockOutOfRange: bot.registry.blocksByName required');
+    const need = reachNeedForBlocks(bot.registry.blocksByName, blockNames, count);
+    if (need === null) {
+        console.error(`[fix87] LOUD: search miss for ${blockNames.join(' / ')} is not a block in the game data; no reach need`);
+        return null;
+    }
+    const named = need.item || need.anyOf.join(' / ');
+    console.error(`[fix87] LOUD: no ${named} within search range; reporting a reach need of ${count}`);
+    return markPreconditionUnmet(bot, { need });
+}
+
 export function clearPreconditionUnmet(bot) {
     if (!bot) throw new Error('[fix76] clearPreconditionUnmet: bot object required');
     if (typeof bot !== 'object') throw new Error('[fix76] clearPreconditionUnmet: bot object required');

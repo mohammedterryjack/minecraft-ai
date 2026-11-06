@@ -3,6 +3,9 @@ import settings from './settings.js';
 import yargs from 'yargs';
 import { hideBin } from 'yargs/helpers';
 import { readFileSync } from 'fs';
+import { installExitLogging } from './src/process/exit_log.js';
+
+installExitLogging();
 
 function parseArguments() {
     return yargs(hideBin(process.argv))
