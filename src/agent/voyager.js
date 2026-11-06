@@ -1208,12 +1208,14 @@ Use only c; no other globals.`;
     _foodRaiseSaturated(skillName, foodAtStart) {
         if (typeof skillName !== 'string') throw new Error('[fix76] _foodRaiseSaturated: skillName required');
         if (!skillName) throw new Error('[fix76] _foodRaiseSaturated: skillName required');
-        if (typeof foodAtStart !== 'number') throw new Error(`[fix76] _foodRaiseSaturated: foodAtStart number required, got ${foodAtStart}`);
-        if (Number.isNaN(foodAtStart)) throw new Error(`[fix76] _foodRaiseSaturated: foodAtStart number required, got ${foodAtStart}`);
+        if (!this.vitals) return null;   // no vitals store yet → no learned food-raiser
         const e = this.vitals.s.runs[skillName];
         if (!e) return null;
         if (e.n < 1) return null;
         if (!(e.food / e.n > 0)) return null;
+        // foodAtStart is required only once this skill is a learned food-raiser
+        if (typeof foodAtStart !== 'number') throw new Error(`[fix76] foodAtStart required to test saturation of food-raiser ${skillName}, got ${foodAtStart}`);
+        if (Number.isNaN(foodAtStart)) throw new Error(`[fix76] foodAtStart required to test saturation of food-raiser ${skillName}, got ${foodAtStart}`);
         const cap = skills.getVitalsMax(this.agent.bot).food;
         if (foodAtStart >= cap) return 'food_saturated';
         return null;
@@ -2015,10 +2017,7 @@ Use only c; no other globals.`;
         // task, so it is trialled in place whenever it is in the closure (fix10's rule).
         // fix76: learned food-raiser already at observed food cap — do not run (would raise a saturated vital); not evidence
         {
-            const foodNow = this.agent.bot.food;
-            if (typeof foodNow !== 'number') throw new Error(`[fix76] bot.food must be a number before replay, got ${foodNow}`);
-            if (Number.isNaN(foodNow)) throw new Error(`[fix76] bot.food must be a number before replay, got ${foodNow}`);
-            const sat = this._foodRaiseSaturated(r.name, foodNow);
+            const sat = this._foodRaiseSaturated(r.name, this.agent.bot.food);
             if (sat) {
                 console.log(`!!! [blame] UNMET PRECONDITION (${sat}): skip replay of ${r.name} — not counted against stats or gate`);
                 return { ok: false, name: r.name, output: '', unmetPrecondition: sat, unverified: true };
@@ -2089,10 +2088,7 @@ Use only c; no other globals.`;
         // fix70: a run whose error was raised in library code is that code's fault, not a run of the learned skill
         // fix76: structural unmet preconditions (typed marker or learned food-raiser at food cap) are not skill/candidate evidence
         const libFault = !ok && this._libraryFault(this.agent.bot.__psnTrace, r.name);
-        const foodAtStart = runBefore.food_value;
-        if (typeof foodAtStart !== 'number') throw new Error(`[fix76] runBefore.food_value required, got ${foodAtStart}`);
-        if (Number.isNaN(foodAtStart)) throw new Error(`[fix76] runBefore.food_value required, got ${foodAtStart}`);
-        const unmet = !ok && !libFault && this._classifyUnmetPrecondition(r.name, foodAtStart);
+        const unmet = !ok && !libFault && this._classifyUnmetPrecondition(r.name, runBefore.food_value);
         if (unmet) console.log(`!!! [blame] UNMET PRECONDITION (${unmet}): ${r.name} — not counted against stats or gate`);
         if (entry && !unverified && !libFault && !unmet) this._recordRun(entry, task, ok, trial);
         // ADAM-style: record inventory delta for needs/produces learning
@@ -3023,10 +3019,7 @@ Use only c; no other globals.`;
             }
         }
         // fix76: learned food-raiser at observed food cap — practice would be an unmet eat precondition
-        const bot = this.agent.bot;
-        if (typeof bot.food !== 'number') throw new Error(`[fix76] bot.food must be a number for practice skip, got ${bot.food}`);
-        if (Number.isNaN(bot.food)) throw new Error(`[fix76] bot.food must be a number for practice skip, got ${bot.food}`);
-        const sat = this._foodRaiseSaturated(skill.name, bot.food);
+        const sat = this._foodRaiseSaturated(skill.name, this.agent.bot.food);
         if (sat) return `${sat}: ${skill.name} is a learned food-raiser at the observed food cap`;
         return null;
     }
