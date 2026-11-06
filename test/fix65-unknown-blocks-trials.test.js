@@ -119,7 +119,7 @@ describe('fix65: trial candidates are retired by the learner', () => {
         v._stall = cut ? { t, pos: '-122,33,58' } : null;
         v._lastRunMsg = '';
         v._isLeaf = () => { throw STOP; };
-        assert.throws(() => v._attribute('mineOneIronOre', 'Mine 1 iron_ore', false, v._replayOverrides('mineOneIronOre', false)), e => e === STOP);
+        assert.throws(() => v._attribute('mineOneIronOre', 'Mine 1 iron_ore', false, v._replayOverrides('mineOneIronOre', false), null), e => e === STOP);
     }
 
     it('two failed in-place trials REJECT the live candidate and roll back its joint refactor (mineBlocks too)', () => {
@@ -153,7 +153,7 @@ describe('fix65: trial candidates are retired by the learner', () => {
         ];
         v._stall = null; v._lastRunMsg = ''; v.agent.lastDeath = null;
         v._isLeaf = () => { throw STOP; };
-        assert.throws(() => v._attribute('mineOneIronOre', 'Mine 1 iron_ore', false, v._replayOverrides('mineOneIronOre', false)), e => e === STOP);
+        assert.throws(() => v._attribute('mineOneIronOre', 'Mine 1 iron_ore', false, v._replayOverrides('mineOneIronOre', false), null), e => e === STOP);
         assert.strictEqual(v.skills.find(s => s.name === 'collectBlock').candidate.stats.fail, 1);
     });
 

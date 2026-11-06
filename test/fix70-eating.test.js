@@ -180,7 +180,7 @@ describe('fix70: blame-aware accounting (where the throwing frame lives)', () =>
             { name: 'checkInventoryForCookedMutton', args: '[]', parent: 0, depth: 1, o0: 0, o1: 0, t0: 1, t1: 2, intr: false, ret: 'true', rv: true, fail: false, delta: {} },
         ];
         const lines = []; const log = console.log; console.log = (...a) => lines.push(a.join(' '));
-        try { v._attribute('eatCookedMutton', 'eatCookedMutton', false, { eatCookedMutton: skill('eatCookedMutton').candidate.code }); } finally { console.log = log; }
+        try { v._attribute('eatCookedMutton', 'eatCookedMutton', false, { eatCookedMutton: skill('eatCookedMutton').candidate.code }, null); } finally { console.log = log; }
         assert.ok(!(v._repairQueue || []).length, 'no repair of the incumbent queued from the candidate\'s TypeError');
         assert.ok(lines.some(l => /blame of eatCookedMutton is its candidate's trial failure/.test(l)), lines.join('\n'));
     });
