@@ -1,3 +1,6 @@
+import { withStallPhase } from '../utils/event_loop_guard.js';
+import { wrapBotForApiTiming } from '../utils/bot_api_timing.js';
+
 export class ActionManager {
     constructor(agent) {
         this.agent = agent;
@@ -103,7 +106,11 @@ export class ActionManager {
             }
 
             // start the action
-            await actionFn();
+            await withStallPhase(`action:${actionLabel}`, async () => {
+                const timedBot = wrapBotForApiTiming(this.agent.bot);
+                if (timedBot !== this.agent.bot) this.agent.bot = timedBot;
+                await actionFn();
+            });
 
             // mark action as finished + cleanup
             this.executing = false;

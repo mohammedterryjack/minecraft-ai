@@ -1,5 +1,6 @@
 import minecraftData from 'minecraft-data';
 import settings from '../agent/settings.js';
+import rootSettings from '../../settings.js';
 import { createBot } from 'mineflayer';
 import prismarine_items from 'prismarine-item';
 import { pathfinder } from 'mineflayer-pathfinder';
@@ -60,7 +61,6 @@ export function initBot(username) {
         port: settings.port,
         auth: settings.auth,
         version: mc_version,
-        checkTimeoutInterval: 60000,  // 60s keep-alive check (default 30s) — reduces disconnects on slow servers
     }
     if (!mc_version || mc_version === "auto") {
         delete options.version;

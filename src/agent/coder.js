@@ -1,14 +1,17 @@
 import { writeFile, readFile, mkdirSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { Worker } from 'worker_threads';
 import { makeCompartment, lockdown } from './library/lockdown.js';
 import * as skills from './library/skills.js';
 import * as world from './library/world.js';
 import { Vec3 } from 'vec3';
-import {ESLint} from "eslint";
 import * as acorn from "acorn";
+const { tokenizer: acornTokenizer, tokTypes } = acorn;
 import pf from 'mineflayer-pathfinder';
 import { logPromptBreakdown } from './prompt_utils.js';
+import { withStallPhase, pushStallPhase, popStallPhase } from '../utils/event_loop_guard.js';
+import { wrapBotForApiTiming } from '../utils/bot_api_timing.js';
 
 // fix38: expose pathfinder goals to generated code (fail loud if missing)
 const pathfinderGoals = pf.goals;
@@ -17,6 +20,13 @@ if (!pathfinderGoals || !pathfinderGoals.GoalNear) {
 }
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+function _trimLineAt(code, line1) {
+    const lines = code.split('\n');
+    const raw = lines[line1 - 1];
+    if (raw === undefined) throw new Error(`[coder] line ${line1} out of range (${lines.length} lines in source)`);
+    return raw.trim();
+}
 
 // fix40/41: unified bare-name API - all functions (built-in + learned) use bare names only
 // Exported for voyager.js to build the unified signature list for prompts
@@ -53,6 +63,36 @@ export function getRealAPI() {
         return fn ? `${fn.source}.${s}` : s;
     });
     return { set: new Set(list), list };
+}
+
+/** Which built-in skill/world bare names appear as call sites in source (for smaller lint/exec bindings). */
+export function collectBareApiUsedInSource(combinedSrc) {
+    const skillNames = new Set();
+    const worldNames = new Set();
+    const skillKeySet = new Set(Object.keys(skills).filter((k) => typeof skills[k] === 'function' && k !== 'log'));
+    const worldKeySet = new Set(Object.keys(world).filter((k) => typeof world[k] === 'function'));
+    let ast;
+    try {
+        ast = acorn.parse(String(combinedSrc), { ecmaVersion: 'latest', sourceType: 'module', allowAwaitOutsideFunction: true });
+    } catch (e) {
+        const loc = e && typeof e.pos === 'number' ? ` (at offset ${e.pos})` : '';
+        throw new Error(`[coder] collectBareApiUsedInSource: parse failed${loc}: ${e && e.message ? e.message : String(e)}`);
+    }
+    const walk = (node) => {
+        if (!node || typeof node.type !== 'string') return;
+        if (node.type === 'CallExpression' && node.callee?.type === 'Identifier') {
+            const id = node.callee.name;
+            if (skillKeySet.has(id)) skillNames.add(id);
+            if (worldKeySet.has(id)) worldNames.add(id);
+        }
+        for (const k in node) {
+            const v = node[k];
+            if (Array.isArray(v)) v.forEach(walk);
+            else if (v && typeof v.type === 'string') walk(v);
+        }
+    };
+    walk(ast);
+    return { skillNames, worldNames };
 }
 
 export class Coder {
@@ -157,15 +197,20 @@ export class Coder {
             // fix34: formatting-only auto-fix before lint (whitespace, semicolons, quotes - nothing semantic)
             code = this._autoFixFormatting(code);
             lastCode = code;  // fix46: track for retry
-            const result = await this._stageCode(code);
-            const executionModule = result.func;
+            const bareApiFilter = collectBareApiUsedInSource(code);
+            const stagedLint = await withStallPhase('coder:stage', () => this._stageCode(code, { bareApiFilter, lintOnly: true }));
             // fix45: pass preludeLines to exclude prelude bindings from shadow warnings
-            const lintResult = await this._lintCode(result.src_lint_copy, result.preludeLines || 0);
+            if (typeof stagedLint.preludeLines !== 'number') {
+                throw new Error('[coder] generateCode: staged lint bundle must return numeric preludeLines');
+            }
+            const lintResult = await withStallPhase('coder:lint', () => this._lintCode(stagedLint.src_lint_copy, stagedLint.preludeLines));
             if (lintResult) {
                 lastError = 'Error: Code lint error:\n' + lintResult + '\nPlease try again.';
                 console.warn("Linting error:\n" + lintResult + '\n');
                 continue;
             }
+            const result = await withStallPhase('coder:stage-exec', () => this._stageCode(code, { bareApiFilter, lintOnly: false }));
+            const executionModule = result.func;
             if (!executionModule) {
                 console.warn("Failed to stage code, something is wrong.");
                 return 'Failed to stage code, something is wrong.';
@@ -173,7 +218,11 @@ export class Coder {
 
             try {
                 console.log('Executing code...');
-                await executionModule.main(this.agent.bot);
+                await withStallPhase('coder:execute', async () => {
+                    const timedBot = wrapBotForApiTiming(this.agent.bot);
+                    if (timedBot !== this.agent.bot) this.agent.bot = timedBot;
+                    await executionModule.main(timedBot);
+                });
 
                 const code_output = this.agent.actions.getBotOutputSummary();
                 const summary = "Agent wrote this code: \n```" + this._sanitizeCode(code) + "```\nCode Output:\n" + code_output;
@@ -193,6 +242,20 @@ export class Coder {
         return `Code generation failed after ${MAX_ATTEMPTS} attempts.`;
     }
     
+    /**
+     * Pre-lint checks on user/voyager-generated snippet only (no prelude); blocks execution if timers invalid or API gate fails.
+     * @param {string} code
+     * @param {string[]} knownNames
+     * @returns {string|null}
+     */
+    userGeneratedCodeLintBlockers(code, knownNames = []) {
+        const timerLint = this._forbiddenTimerLint(code, 0);
+        if (timerLint.length > 0) {
+            return 'setTimeout/setInterval are not available in the sandbox; use `await sleep(ms)`';
+        }
+        return this._apiGate(code, knownNames);
+    }
+
     // fix32: static API gate on freshly generated code: every bot.<member> must exist on the live bot (or be assigned
     // in the code), every bare function call must be declared in the code, a known skill, or a sandbox global, and every
     // snake_case string passed to a call must be a real item/block/entity name in the live registry. Returns null or an error text.
@@ -371,6 +434,160 @@ export class Coder {
     }
     // fix40: extract skills.*/world.* calls from code using acorn - these are NOW FORBIDDEN
     // All functions must be called by bare name, not with skills.*/world.* prefix
+    /** AST walk: true if node subtree contains an AwaitExpression */
+    _astHasAwait(node) {
+        if (!node || typeof node.type !== 'string') return false;
+        if (node.type === 'AwaitExpression') return true;
+        for (const k in node) {
+            const v = node[k];
+            if (Array.isArray(v)) {
+                for (const c of v) if (this._astHasAwait(c)) return true;
+            } else if (v && typeof v.type === 'string' && this._astHasAwait(v)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Warn when a for/while/do-while loop body has no await (likely synchronous hot loop).
+     * @param {string} code
+     * @param {number} preludeLines
+     */
+    _syncLoopLint(code, preludeLines) {
+        let ast;
+        try {
+            ast = acorn.parse(code, { ecmaVersion: 'latest', sourceType: 'module', allowAwaitOutsideFunction: true, locations: true });
+        } catch (e) {
+            throw new Error(`[coder] _syncLoopLint: parse failed: ${e && e.message ? e.message : String(e)}`);
+        }
+        const out = [];
+        const loopKinds = new Set(['ForStatement', 'WhileStatement', 'DoWhileStatement', 'ForInStatement', 'ForOfStatement']);
+        const walk = (node) => {
+            if (!node || typeof node.type !== 'string') return;
+            if (loopKinds.has(node.type)) {
+                const body = node.body;
+                const line = body.loc.start.line;
+                if (line > preludeLines && !this._astHasAwait(body)) {
+                    out.push({ line, text: _trimLineAt(code, line) });
+                }
+            }
+            for (const k in node) {
+                const v = node[k];
+                if (Array.isArray(v)) v.forEach(walk);
+                else if (v && typeof v.type === 'string') walk(v);
+            }
+        };
+        walk(ast);
+        return out;
+    }
+
+    _getNumericLiteral(node) {
+        if (!node) return null;
+        if (node.type === 'Literal' && typeof node.value === 'number') return node.value;
+        if (node.type === 'UnaryExpression' && node.operator === '-' && node.argument?.type === 'Literal' && typeof node.argument.value === 'number') {
+            return -node.argument.value;
+        }
+        return null;
+    }
+
+    /**
+     * Warn on large-radius block/entity scans (numeric maxDistance or similar).
+     */
+    /**
+     * @param {string} code
+     * @param {number} preludeLines
+     * @param {number} warnDistMs numeric literal threshold (derived from observed keep_alive gap ms on the live bot)
+     */
+    _largeWorldScanLint(code, preludeLines, warnDistMs) {
+        if (typeof warnDistMs !== 'number' || !Number.isFinite(warnDistMs) || warnDistMs <= 0) {
+            throw new Error('[coder] _largeWorldScanLint: warnDistMs must be a positive finite number');
+        }
+        let ast;
+        try {
+            ast = acorn.parse(code, { ecmaVersion: 'latest', sourceType: 'module', allowAwaitOutsideFunction: true, locations: true });
+        } catch (e) {
+            throw new Error(`[coder] _largeWorldScanLint: parse failed: ${e && e.message ? e.message : String(e)}`);
+        }
+        const warnDist = warnDistMs;
+        const out = [];
+        const scanCalleeNames = new Set(['findBlock', 'findBlocks', 'nearestEntity']);
+        const walk = (node) => {
+            if (!node || typeof node.type !== 'string') return;
+            if (node.type === 'CallExpression') {
+                let reportLine = null;
+                let detail = '';
+                const callee = node.callee;
+                if (callee?.type === 'MemberExpression' && !callee.computed && callee.object?.type === 'Identifier' && callee.object.name === 'bot' && callee.property?.type === 'Identifier' && scanCalleeNames.has(callee.property.name)) {
+                    const first = node.arguments[0];
+                    if (first?.type === 'ObjectExpression') {
+                        for (const p of first.properties) {
+                            if (p.type !== 'Property' || p.key?.type !== 'Identifier') continue;
+                            const kn = p.key.name;
+                            if (kn !== 'maxDistance' && kn !== 'maxBlocks') continue;
+                            const n = this._getNumericLiteral(p.value);
+                            if (n !== null && n >= warnDist) {
+                                reportLine = p.value.loc.start.line;
+                                detail = `bot.${callee.property.name} option ${kn}=${n} (>= observed keep_alive gap ${warnDist}ms as stall-risk distance)`;
+                            }
+                        }
+                    }
+                    if (callee.property.name === 'nearestEntity' && node.arguments.length >= 2) {
+                        const n = this._getNumericLiteral(node.arguments[1]);
+                        if (n !== null && n >= warnDist) {
+                            reportLine = node.arguments[1].loc.start.line;
+                            detail = `bot.nearestEntity second arg maxDistance=${n} (>= observed keep_alive gap ${warnDist}ms as stall-risk distance)`;
+                        }
+                    }
+                }
+                if (callee?.type === 'Identifier' && callee.name === 'getNearestBlock' && node.arguments.length >= 3) {
+                    const n = this._getNumericLiteral(node.arguments[2]);
+                    if (n !== null && n >= warnDist) {
+                        reportLine = node.arguments[2].loc.start.line;
+                        detail = `getNearestBlock distance=${n} (>= observed keep_alive gap ${warnDist}ms as stall-risk distance)`;
+                    }
+                }
+                if (reportLine !== null && reportLine > preludeLines) {
+                    out.push({ line: reportLine, text: _trimLineAt(code, reportLine), detail });
+                }
+            }
+            for (const k in node) {
+                const v = node[k];
+                if (Array.isArray(v)) v.forEach(walk);
+                else if (v && typeof v.type === 'string') walk(v);
+            }
+        };
+        walk(ast);
+        return out;
+    }
+
+    /**
+     * Disallow setTimeout/setInterval in sandbox-bound code (AST; not string regex).
+     */
+    _forbiddenTimerLint(code, preludeLines) {
+        let ast;
+        try {
+            ast = acorn.parse(code, { ecmaVersion: 'latest', sourceType: 'module', allowAwaitOutsideFunction: true, locations: true });
+        } catch (e) {
+            throw new Error(`[coder] _forbiddenTimerLint: parse failed: ${e && e.message ? e.message : String(e)}`);
+        }
+        const bad = [];
+        const walk = (node) => {
+            if (!node || typeof node.type !== 'string') return;
+            if (node.type === 'CallExpression' && node.callee?.type === 'Identifier' && (node.callee.name === 'setTimeout' || node.callee.name === 'setInterval')) {
+                const line = node.loc.start.line;
+                if (line > preludeLines) {
+                    bad.push({ line, text: _trimLineAt(code, line) });
+                }
+            }
+            for (const k in node) {
+                const v = node[k];
+                if (Array.isArray(v)) v.forEach(walk);
+                else if (v && typeof v.type === 'string') walk(v);
+            }
+        };
+        walk(ast);
+        return bad;
+    }
+
     _extractOldStyleCalls(code) {
         let ast;
         try { ast = acorn.parse(code, { ecmaVersion: 'latest', sourceType: 'module', allowAwaitOutsideFunction: true }); }
@@ -394,6 +611,28 @@ export class Coder {
         walk(ast);
         return { calls, positions, error: null };
     }
+    /**
+     * After each statement semicolon that is immediately followed by a line break, insert interrupt check
+     * (template/string safe — uses tokenizer, not naive `;\\n` replace).
+     */
+    _injectSemicolonInterruptGuards(code) {
+        const src = String(code);
+        const GUARD = ' if(bot.interrupt_code) {__mcLog__(bot, "Code interrupted.");return;}';
+        /** @type {number[]} */
+        const insertAt = [];
+        const t = acornTokenizer(src, { ecmaVersion: 2024, sourceType: 'module', allowAwaitOutsideFunction: true });
+        for (const tok of t) {
+            if (tok.type === tokTypes.semi && tok.end < src.length) {
+                const ch = src[tok.end];
+                if (ch === '\n' || ch === '\r') insertAt.push(tok.end);
+            }
+        }
+        insertAt.sort((a, b) => b - a);
+        let out = src;
+        for (const p of insertAt) out = out.slice(0, p) + GUARD + out.slice(p);
+        return out;
+    }
+
     // fix34: formatting-only auto-fix (whitespace, semicolons, quotes, code fences - nothing semantic)
     _autoFixFormatting(code) {
         let fixed = code.trim();
@@ -404,22 +643,45 @@ export class Coder {
         fixed = fixed.replace(/[ \t]+$/gm, '');
         return fixed;
     }
+    async _lintWithEslintWorker(code) {
+        const workerPath = path.join(__dirname, '../utils/eslint_lint_worker.mjs');
+        return new Promise((resolve, reject) => {
+            let settled = false;
+            const w = new Worker(workerPath);
+            w.on('message', (msg) => {
+                settled = true;
+                w.terminate();
+                if (msg && msg.error) reject(new Error(msg.error));
+                else resolve(msg.results);
+            });
+            w.on('error', (e) => { if (!settled) reject(e); });
+            w.on('exit', (c) => {
+                if (!settled && c !== 0) reject(new Error(`eslint worker exited ${c}`));
+            });
+            w.postMessage(code);
+        });
+    }
+
     // fix45: accept preludeLines to exclude prelude bindings from shadow warnings
     async  _lintCode(code, preludeLines = 0) {
-        let result = '#### CODE ERROR INFO ###\n';
+        const header = '#### CODE ERROR INFO ###\n';
+        /** @type {string[]} */
+        const errors = [];
+        /** @type {string[]} */
+        const warnings = [];
         // fix40: use acorn to extract old-style skills.*/world.* calls - these are NOW FORBIDDEN
         const { calls: oldStyleCalls, error: parseError } = this._extractOldStyleCalls(code);
         if (parseError) {
-            result += `Syntax error (cannot parse): ${parseError}\n`;
-            return result;
+            errors.push(`Syntax error (cannot parse): ${parseError}\n`);
+            return header + errors.join('');
         }
         const { builtInNames, learnedNames, builtInSigs } = this._getUnifiedAPI();
         const learned = this._getLearnedSkillNames();
         // fix40: ANY skills.*/world.* call is an error - must use bare names
         if (oldStyleCalls.length > 0) {
-            result += 'ERROR: Old-style skills.*/world.* calls are forbidden. Use bare function names instead.\n';
-            result += 'The following calls must be changed to bare names:\n';
-            result += oldStyleCalls.map(call => {
+            let block = 'ERROR: Old-style skills.*/world.* calls are forbidden. Use bare function names instead.\n';
+            block += 'The following calls must be changed to bare names:\n';
+            block += oldStyleCalls.map(call => {
                 const fnName = call.split('.').pop();
                 // Find nearest match in unified pool (built-in + learned)
                 const nearest = this._nearestBareName(fnName);
@@ -446,13 +708,13 @@ export class Coder {
                 const suggestionText = suggestions.length ? suggestions.join(', ') : '(no close match)';
                 return `  ${call} -> use bare name: ${suggestionText}`;
             }).join('\n');
-            result += '\n\nAVAILABLE FUNCTIONS (call by bare name, e.g. goToPosition(bot, x, y, z)):\n';
-            result += builtInSigs.slice(0, 20).join('\n') + (builtInSigs.length > 20 ? `\n... (${builtInSigs.length - 20} more built-in)` : '');
+            block += '\n\nAVAILABLE FUNCTIONS (call by bare name, e.g. goToPosition(bot, x, y, z)):\n';
+            block += builtInSigs.join('\n');
             if (learned.length) {
-                result += '\n\nLEARNED SKILLS (also bare names):\n' + learned.slice(0, 15).join(', ') + (learned.length > 15 ? ` ... (${learned.length - 15} more)` : '');
+                block += '\n\nLEARNED SKILLS (also bare names):\n' + learned.join(', ');
             }
-            console.log(result);
-            return result;
+            console.log(header + block);
+            return header + block;
         }
 
         // fix44: lint check for shadowing `log` - explicit feedback only, NO auto-renaming of user locals
@@ -461,33 +723,80 @@ export class Coder {
         // fix45: use preludeLines from _stageCode (calculated after inserting bare bindings)
         const shadowLogWarnings = this._checkLogShadowing(code, preludeLines);
         if (shadowLogWarnings.length > 0) {
-            result += 'WARNING: Variable(s) shadowing the built-in `log` helper detected.\n';
-            result += 'This will prevent log(bot, ...) calls from working in that scope.\n';
-            result += 'Consider renaming your variable to avoid collision (e.g., `logBlock`, `targetBlock`, `nearestLog`):\n';
-            for (const w of shadowLogWarnings) {
-                result += `  Line ${w.line}: ${w.text}\n`;
+            let w = 'WARNING: Variable(s) shadowing the built-in `log` helper detected.\n';
+            w += 'This will prevent log(bot, ...) calls from working in that scope.\n';
+            w += 'Consider renaming your variable to avoid collision (e.g., `logBlock`, `targetBlock`, `nearestLog`):\n';
+            for (const x of shadowLogWarnings) {
+                w += `  Line ${x.line}: ${x.text}\n`;
             }
-            result += '\n';
+            w += '\n';
+            warnings.push(w);
         }
 
         // fix51: lint check for potential null dereference on findBlock/blockAt results (feedback only)
         // These functions can return null (chunk unloaded, no block found), and accessing .name/.position/.count will TypeError
         const nullDerefWarnings = this._checkNullDeref(code, preludeLines);
         if (nullDerefWarnings.length > 0) {
-            result += 'WARNING: Potential null dereference on findBlock/blockAt result detected.\n';
-            result += 'These functions return null when no block is found or the chunk is unloaded.\n';
-            result += 'Accessing properties like .name, .position, or .count on null will throw TypeError.\n';
-            result += 'Check for null before accessing properties:\n';
-            result += '  WRONG:  const block = getNearestBlock(bot, "iron_ore", 16); const pos = block.position;\n';
-            result += '  RIGHT:  const block = getNearestBlock(bot, "iron_ore", 16); if (!block) { log(bot, "no iron_ore found"); return false; } const pos = block.position;\n';
-            for (const w of nullDerefWarnings) {
-                result += `  Line ${w.line}: ${w.text}\n`;
+            let w = 'WARNING: Potential null dereference on findBlock/blockAt result detected.\n';
+            w += 'These functions return null when no block is found or the chunk is unloaded.\n';
+            w += 'Accessing properties like .name, .position, or .count on null will throw TypeError.\n';
+            w += 'Check for null before accessing properties:\n';
+            w += '  WRONG:  const block = getNearestBlock(bot, "iron_ore", 16); const pos = block.position;\n';
+            w += '  RIGHT:  const block = getNearestBlock(bot, "iron_ore", 16); if (!block) { log(bot, "no iron_ore found"); return false; } const pos = block.position;\n';
+            for (const x of nullDerefWarnings) {
+                w += `  Line ${x.line}: ${x.text}\n`;
             }
-            result += '\n';
+            w += '\n';
+            warnings.push(w);
         }
 
-        const eslint = new ESLint();
-        const results = await eslint.lintText(code);
+        const timerLint = this._forbiddenTimerLint(code, preludeLines);
+        if (timerLint.length > 0) {
+            let e = 'ERROR: setTimeout/setInterval are not available in the sandbox; use `await sleep(ms)`.\n';
+            for (const x of timerLint) {
+                e += `  Line ${x.line}: ${x.text}\n`;
+            }
+            e += '\nThe code contains forbidden timer calls and cannot continue execution.';
+            errors.push(e);
+            return header + errors.join('');
+        }
+
+        const bot = this.agent.bot;
+        const learnedMs =
+            bot &&
+            typeof bot.__eventLoopStallThresholdMs === 'number' &&
+            Number.isFinite(bot.__eventLoopStallThresholdMs) &&
+            bot.__eventLoopStallThresholdMs > 0
+                ? bot.__eventLoopStallThresholdMs
+                : null;
+        if (learnedMs === null) {
+            warnings.push(
+                'WARNING: large-radius scan stall-risk check is OFF until the event-loop guard learns the server keep_alive interval (two inbound keep_alive packets on bot._client).\n'
+            );
+        }
+        const largeScanWarnings = learnedMs === null ? [] : this._largeWorldScanLint(code, preludeLines, learnedMs);
+        if (largeScanWarnings.length > 0) {
+            const wd = learnedMs;
+            let w = `WARNING: Large-radius block/world scan (numeric distance >= ${wd} — same ms as the observed server keep_alive gap used for stall detection) may block the event loop.\n`;
+            w += 'Prefer smaller maxDistance, chunk-aware iteration, or yield with await between batches.\n';
+            for (const x of largeScanWarnings) {
+                w += `  Line ${x.line}: ${x.detail}\n`;
+            }
+            w += '\n';
+            warnings.push(w);
+        }
+
+        const syncLoopWarnings = this._syncLoopLint(code, preludeLines);
+        if (syncLoopWarnings.length > 0) {
+            let w = 'WARNING: Loop body has no await (possible synchronous hot loop).\n';
+            for (const x of syncLoopWarnings) {
+                w += `  Line ${x.line}: ${x.text}\n`;
+            }
+            w += '\n';
+            warnings.push(w);
+        }
+
+        const results = await this._lintWithEslintWorker(code);
         const codeLines = code.split('\n');
         let exceptions = results.map(r => r.messages).flat();
         
@@ -509,24 +818,25 @@ export class Coder {
         exceptions = exceptions.filter(exc => !isInterruptReturnError(exc));
 
         if (exceptions.length > 0) {
+            let eslintBlock = '';
             exceptions.forEach((exc, index) => {
                 if (exc.line && exc.column ) {
                     const errorLine = codeLines[exc.line - 1]?.trim() || 'Unable to retrieve error line content';
-                    result += `#ERROR ${index + 1}\n`;
+                    eslintBlock += `#ERROR ${index + 1}\n`;
                     // Actionable feedback for empty catch blocks (Mo fail-loud principle)
                     if (exc.ruleId === 'no-empty' && /catch\s*\([^)]*\)\s*\{\s*\}/.test(errorLine)) {
-                        result += `Message: EMPTY CATCH BLOCK - swallowing errors hides failures and breaks the repair loop.\n`;
-                        result += `Why rejected: Mo fail-loud principle - every error must propagate so the skill library can learn what went wrong. An empty catch silently discards the failure, leaving no trace for diagnosis or repair.\n`;
-                        result += `How to fix: Either rethrow the error, or log then rethrow:\n`;
-                        result += `  WRONG:  } catch (e) {}\n`;
-                        result += `  RIGHT:  } catch (e) { throw e; }\n`;
-                        result += `  RIGHT:  } catch (e) { log(bot, \`Step failed: \${e.message}\`); throw e; }\n`;
-                        result += `If the error is truly recoverable, log it and return a falsy value - never silently continue.\n`;
+                        eslintBlock += `Message: EMPTY CATCH BLOCK - swallowing errors hides failures and breaks the repair loop.\n`;
+                        eslintBlock += `Why rejected: Mo fail-loud principle - every error must propagate so the skill library can learn what went wrong. An empty catch silently discards the failure, leaving no trace for diagnosis or repair.\n`;
+                        eslintBlock += `How to fix: Either rethrow the error, or log then rethrow:\n`;
+                        eslintBlock += `  WRONG:  } catch (e) {}\n`;
+                        eslintBlock += `  RIGHT:  } catch (e) { throw e; }\n`;
+                        eslintBlock += `  RIGHT:  } catch (e) { log(bot, \`Step failed: \${e.message}\`); throw e; }\n`;
+                        eslintBlock += `If the error is truly recoverable, log it and return a falsy value - never silently continue.\n`;
                     } else {
-                        result += `Message: ${exc.message}\n`;
+                        eslintBlock += `Message: ${exc.message}\n`;
                     }
-                    result += `Location: Line ${exc.line}, Column ${exc.column}\n`;
-                    result += `Related Code Line: ${errorLine}\n`;
+                    eslintBlock += `Location: Line ${exc.line}, Column ${exc.column}\n`;
+                    eslintBlock += `Related Code Line: ${errorLine}\n`;
                     // fix36: add surrounding context to help identify which skill contains the error (especially for joined skill code)
                     const start = Math.max(0, exc.line - 4);
                     const end = Math.min(codeLines.length, exc.line + 2);
@@ -535,29 +845,38 @@ export class Coder {
                         const marker = ln === exc.line ? '>>>' : '   ';
                         return `${marker} ${ln}: ${l}`;
                     }).join('\n');
-                    result += `Context:\n${context}\n`;
+                    eslintBlock += `Context:\n${context}\n`;
                 }
             });
-            result += 'The code contains exceptions and cannot continue execution.';
-        } else {
-            return null;//no error
+            eslintBlock += 'The code contains exceptions and cannot continue execution.';
+            errors.push(eslintBlock);
+            return header + errors.join('');
         }
 
-        return result ;
+        if (warnings.length) {
+            console.warn('[lint] warnings (non-blocking):\n' + warnings.join(''));
+        }
+        return null;
     }
     // write custom code to file and import it
-    // write custom code to file and prepare for evaluation
-    async _stageCode(code) {
+    /**
+     * @param {string} code - combined skill library + generated user code (or user-only when no library)
+     * @param {{ bareApiFilter?: { skillNames: Set<string>, worldNames: Set<string> }, lintOnly?: boolean, learnedNamesForLint?: Set<string> }} [opts]
+     */
+    async _stageCode(code, opts) {
+        const lintOnly = !!(opts && opts.lintOnly);
+        const bareApiFilter = opts && opts.bareApiFilter ? opts.bareApiFilter : null;
+        const learnedNamesForLint = opts && opts.learnedNamesForLint ? opts.learnedNamesForLint : null;
         code = this._sanitizeCode(code);
         let src = '';
         code = code.replaceAll('console.log(', 'log(bot,');
         code = code.replaceAll('log("', 'log(bot,"');
 
-        console.log(`Staged code (library + generated; the raw model reply size is in the [timing] composer line) (${code.length} chars, ${code.split('\n').length} lines): """${code.length > 400 ? code.slice(-400) + '\n...[truncated]' : code}"""`);   // fix27: tail only (the new code is at the end)
+        console.log(`[staging] coder:_stageCode staged_source=${code.length} chars lines=${code.split('\n').length}`);
 
         // fix44: interrupt guard uses __mcLog__ (collision-safe binding injected into endowments)
-        // instead of bare `log` which user code can shadow (e.g. `const log = getNearestBlock(...)`)
-        code = code.replaceAll(';\n', '; if(bot.interrupt_code) {__mcLog__(bot, "Code interrupted.");return;}\n');
+        // String/template aware: naive `;\n` replacement breaks instrumentSrc template bodies that contain `;`+newline
+        code = this._injectSemicolonInterruptGuards(code);
         for (let line of code.split('\n')) {
             // every loop iteration checks for an interrupt
             line = line.replace(/^(\s*(?:\}\s*)?(?:for|while)\s*\(.*\)\s*\{)\s*$/, '$1 if (bot.interrupt_code) {__mcLog__(bot, "Code interrupted.");return;}');
@@ -566,15 +885,32 @@ export class Coder {
         }
         // fix41: generate const bindings for bare API names so ESLint no-undef can see them
         // fix45: include log in bare bindings (no longer in prelude to avoid shadow warning on prelude)
-        const bareBindings = [
-            ...Object.keys(skills).filter(k => typeof skills[k] === 'function').map(k => `const ${k} = skills.${k};`),
-            ...Object.keys(world).filter(k => typeof world[k] === 'function').map(k => `const ${k} = world.${k};`)
+        const allSkillKeys = Object.keys(skills).filter(k => typeof skills[k] === 'function');
+        const allWorldKeys = Object.keys(world).filter(k => typeof world[k] === 'function');
+        const alwaysSkills = new Set(['log']);
+        const skillKeysForLint = bareApiFilter
+            ? [...new Set([...alwaysSkills, ...allSkillKeys.filter(k => bareApiFilter.skillNames.has(k))])].filter(k => typeof skills[k] === 'function')
+            : allSkillKeys;
+        const worldKeysForLint = bareApiFilter
+            ? allWorldKeys.filter(k => bareApiFilter.worldNames.has(k))
+            : allWorldKeys;
+        const bareBindingsLint = [
+            ...skillKeysForLint.map(k => `const ${k} = skills.${k};`),
+            ...worldKeysForLint.map(k => `const ${k} = world.${k};`)
         ].join('\n');
+        let learnedConstBlock = '';
+        if (learnedNamesForLint && learnedNamesForLint.size > 0) {
+            learnedConstBlock = [...learnedNamesForLint].sort().map(n => `const ${n} = undefined; // learned skill (no-undef)`).join('\n');
+        }
         // fix45: calculate prelude line count AFTER inserting bare bindings but BEFORE inserting user code
         // This is used by _lintCode to exclude prelude lines from shadow warnings
-        const templateWithBindings = this.code_lint_template.replace('/* BARE API HERE */', bareBindings);
+        const templateWithBindings = this.code_lint_template
+            .replace('/* BARE API HERE */', bareBindingsLint + (learnedConstBlock ? '\n' + learnedConstBlock : ''));
         const preludeLines = (templateWithBindings.split('/* CODE HERE */')[0] || '').split('\n').length;
         let src_lint_copy = templateWithBindings.replace('/* CODE HERE */', src);
+        if (lintOnly) {
+            return { src_lint_copy, preludeLines };
+        }
         src = this.code_template.replace('/* CODE HERE */', src);
 
         let filename = this.file_counter + '.js';
@@ -595,17 +931,18 @@ export class Coder {
         const endowments = {};
         // fix44: __mcLog__ is a collision-safe binding for interrupt guards (user code cannot shadow it)
         endowments.__mcLog__ = skills.log;
-        // Inject all skills.* functions as bare names (e.g., goToPosition instead of skills.goToPosition)
-        for (const [k, f] of Object.entries(skills)) {
+        const skillKeysExec = bareApiFilter ? skillKeysForLint : allSkillKeys;
+        const worldKeysExec = bareApiFilter ? worldKeysForLint : allWorldKeys;
+        // Inject skills.* / world.* used by this bundle only when narrowing (full library otherwise)
+        for (const k of skillKeysExec) {
+            const f = skills[k];
             if (typeof f === 'function') {
                 endowments[k] = k === 'log' ? f : (...a) => (a[0]?.interrupt_code ? Promise.resolve(false) : f(...a));
             }
         }
-        // Inject all world.* functions as bare names (e.g., getNearestBlock instead of world.getNearestBlock)
-        for (const [k, f] of Object.entries(world)) {
-            if (typeof f === 'function') {
-                endowments[k] = f;
-            }
+        for (const k of worldKeysExec) {
+            const f = world[k];
+            if (typeof f === 'function') endowments[k] = f;
         }
         // fix38: expose pathfinder goals so generated code can use GoalNear, GoalFollow, etc.
         const goals = {
@@ -639,7 +976,13 @@ export class Coder {
             sleep: ms => new Promise(r => setTimeout(r, ms)),   // fix27: the only way to wait; setTimeout itself is not in scope
         });
         const compartment = makeCompartment(endowments);
-        const mainFn = compartment.evaluate(src);
+        pushStallPhase('coder:ses-eval');
+        let mainFn;
+        try {
+            mainFn = compartment.evaluate(src);
+        } finally {
+            popStallPhase();
+        }
         
         if (write_result) {
             console.error('Error writing code execution file: ' + write_result);

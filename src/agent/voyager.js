@@ -22,7 +22,9 @@ import { cosineSimilarity } from '../utils/math.js';
 import minecraftData from 'minecraft-data';
 import { Ollama } from '../models/ollama.js';
 import { signatureOf, depsOf, missingCalls, findCycle, findAllCycles, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf } from './skill_graph.js';
-import { getBareAPI } from './coder.js';   // fix40: unified bare-name API helper
+import { getBareAPI, collectBareApiUsedInSource } from './coder.js';   // fix40: unified bare-name API helper
+import { withStallPhase } from '../utils/event_loop_guard.js';
+import { wrapBotForApiTiming } from '../utils/bot_api_timing.js';
 import { logPromptBreakdown, extractBareCalls } from './prompt_utils.js';   // fix47: shared prompt utilities
 const LOCAL = { model: 'qwen3:4b-instruct-2507-q4_K_M', url: 'http://192.168.1.215:11434', params: { format: 'json', options: { num_ctx: 8192, num_predict: 512 } } };   // fix38: raised from 150 to 512 - short JSON replies still need room for reasoning; truncation fails loudly (fix31)
 export const CALLS = { local: 0, code: 0, replay: 0 };
@@ -678,6 +680,77 @@ export class Voyager {
             throw new Error(`[fix50] PREFIXED CALLS in prompt sources (will fail at runtime):\n${details}`);
         }
     }
+
+    /**
+     * Build the list of skill names to pass to instrumentSrc: all members of closureSet, ordered callee-before-caller
+     * using acorn-extracted call edges (bare name or skills./world. prefix). Cycles fall back to lexicographic order.
+     */
+    static _tracedSkillNamesForInstrument(voyager, closureSet, over = {}) {
+        if (!(closureSet instanceof Set)) throw new Error('[voyager] _tracedSkillNamesForInstrument: closureSet must be a Set');
+        const nodes = [...closureSet].filter(n => typeof n === 'string');
+        /** @type {Map<string, Set<string>>} */
+        const edges = new Map();
+        const inDeg = new Map();
+        for (const name of nodes) {
+            inDeg.set(name, 0);
+            edges.set(name, new Set());
+        }
+        for (const name of nodes) {
+            const entry = voyager.skills.find(s => s.name === name);
+            const code = Object.prototype.hasOwnProperty.call(over, name) ? over[name] : entry?.code;
+            if (typeof code !== 'string') continue;
+            let ast;
+            try {
+                ast = acorn.parse(code, { ecmaVersion: 'latest', sourceType: 'module', allowAwaitOutsideFunction: true });
+            } catch (e) {
+                throw new Error(`[voyager] _tracedSkillNamesForInstrument: parse failed for skill "${name}": ${e && e.message ? e.message : String(e)}`);
+            }
+            const walk = (node) => {
+                if (!node || typeof node.type !== 'string') return;
+                if (node.type === 'CallExpression') {
+                    const c = node.callee;
+                    let calleeName = null;
+                    if (c?.type === 'Identifier') calleeName = c.name;
+                    else if (c?.type === 'MemberExpression' && !c.computed && c.object?.type === 'Identifier' && (c.object.name === 'skills' || c.object.name === 'world') && c.property?.type === 'Identifier') {
+                        calleeName = c.property.name;
+                    }
+                    if (calleeName && closureSet.has(calleeName) && calleeName !== name) {
+                        const set = edges.get(name);
+                        if (!set.has(calleeName)) {
+                            set.add(calleeName);
+                            inDeg.set(calleeName, (inDeg.get(calleeName) || 0) + 1);
+                        }
+                    }
+                }
+                for (const k in node) {
+                    const v = node[k];
+                    if (Array.isArray(v)) v.forEach(walk);
+                    else if (v && typeof v.type === 'string') walk(v);
+                }
+            };
+            walk(ast);
+        }
+        const ready = new Set(nodes.filter(n => (inDeg.get(n) || 0) === 0));
+        const out = [];
+        while (ready.size) {
+            const n = [...ready].sort()[0];
+            ready.delete(n);
+            out.push(n);
+            for (const d of edges.get(n) || []) {
+                const prev = inDeg.get(d);
+                if (prev === undefined) continue;
+                const next = prev - 1;
+                inDeg.set(d, next);
+                if (next === 0) ready.add(d);
+            }
+        }
+        if (out.length !== nodes.length) {
+            console.warn('[voyager] _tracedSkillNamesForInstrument: cycle in call graph; using sorted closure order');
+            return nodes.slice().sort();
+        }
+        return out;
+    }
+
     // fix33: seed primitives into the skill library so they are blamable/repairable (learned path, not hard-coded)
     // These are skills from skills.js that need to be in the skill graph to enable learning (e.g. water escape)
     // fix42: SEEDED_PRIMITIVES moved to static property so _migrateToBarenames can derive seeded names from it
@@ -1676,11 +1749,19 @@ Use only c; no other globals.`;
             }
         }
         const over = {}; for (const s of this.skills) if (s.candidate && trial && (s.name === r.name || this._closure(r.name).has(s.name))) over[s.name] = s.candidate.code;   // fix10: candidates of children are trialled in place too (only if trial enabled)
-        const full = this._libSrc(over) + '\n\n' + instrumentSrc(this.skills.filter(s => new RegExp(`async\\s+function\\s+${s.name}\\s*\\(`).test(over[s.name] ?? s.code)).map(s => s.name)) + '\n\nasync function __replay(bot) {\n    try { ' + r.call + ' } finally { bot.__psnOut = bot.output; }\n}\nawait __replay(bot);';
-        const staged = await this.agent.coder._stageCode(full);
+        const replayClosure = new Set([r.name, ...this._closure(r.name)]);
+        const tracedNames = Voyager._tracedSkillNamesForInstrument(this, replayClosure, over);
+        const libPart = this._libSrcSubset(replayClosure, over);
+        const full = libPart + '\n\n' + instrumentSrc(tracedNames) + '\n\nasync function __replay(bot) {\n    try { ' + r.call + ' } finally { bot.__psnOut = bot.output; }\n}\nawait __replay(bot);';
+        const { lint, staged } = await this._stageLintExec(full, replayClosure, `voyager:replay:${r.name}`);
+        if (lint) { console.error(`[voyager] replay ${r.name}: lint failed before run`); return { ok: false }; }
         if (!staged) return { ok: false };
         this._runStart = Date.now();
-        const res = await this._run(`voyager:replay:${task}`, async () => { this.agent.bot.__psnALS = globalThis.__psnALS; await staged.func.main(this.agent.bot); }, 5);
+        const res = await this._run(`voyager:replay:${task}`, async () => {
+            const bot = this._timedBotForSkillRun();
+            bot.__psnALS = globalThis.__psnALS;
+            await staged.func.main(bot);
+        }, 5);
         if (this.abort) return { ok: false, interrupted: true };
         const after = this.observe();
         let ok, unverified = false;
@@ -1741,6 +1822,38 @@ Use only c; no other globals.`;
     }
     // library source with optional per-name code overrides (candidates under test)
     _libSrc(over = {}) { return this.skills.map(s => over[s.name] ?? s.code).join('\n\n'); }
+    /** Only skills in `names` (dependency-closure subset); same override rules as _libSrc */
+    _libSrcSubset(names, over = {}) {
+        const set = names instanceof Set ? names : new Set(names);
+        return this.skills.filter(s => set.has(s.name)).map(s => over[s.name] ?? s.code).join('\n\n');
+    }
+    /** Install bot API timing proxy once for skill/staged execution. */
+    _timedBotForSkillRun() {
+        const b = wrapBotForApiTiming(this.agent.bot);
+        if (b !== this.agent.bot) this.agent.bot = b;
+        return this.agent.bot;
+    }
+    /** Staging options for coder: narrow bare API + declare learned names for eslint */
+    _coderStageOpts(bundleSrc, skillNameSet) {
+        const bareApiFilter = collectBareApiUsedInSource(bundleSrc);
+        const learnedNamesForLint = skillNameSet instanceof Set ? skillNameSet : new Set(skillNameSet);
+        // PSN trace instrumentSrc assigns `name = __wrap(..., name)` — `name` may not match `name(` call detection
+        for (const n of learnedNamesForLint) {
+            if (typeof skills[n] === 'function') bareApiFilter.skillNames.add(n);
+            else if (typeof world[n] === 'function') bareApiFilter.worldNames.add(n);
+        }
+        return { bareApiFilter, learnedNamesForLint };
+    }
+    async _stageLintExec(bundleSrc, skillNameSet, label = 'voyager') {
+        const opts = this._coderStageOpts(bundleSrc, skillNameSet);
+        console.log(`[staging] ${label}: bundle ${bundleSrc.length} chars, ${bundleSrc.split('\n').length} lines, ${skillNameSet instanceof Set ? skillNameSet.size : '?'} skill names in closure`);
+        const lintSt = await withStallPhase('voyager:stage-lint', () => this.agent.coder._stageCode(bundleSrc, { ...opts, lintOnly: true }));
+        if (typeof lintSt.preludeLines !== 'number') throw new Error('[voyager] _stageLintExec: lint stage must return numeric preludeLines');
+        const lint = await withStallPhase('voyager:lint', () => this.agent.coder._lintCode(lintSt.src_lint_copy, lintSt.preludeLines));
+        if (lint) return { lint, staged: null };
+        const staged = await withStallPhase('voyager:stage-exec', () => this.agent.coder._stageCode(bundleSrc, { ...opts, lintOnly: false }));
+        return { lint: null, staged };
+    }
     _graph(exclude) { const g = {}; for (const s of this.skills) if (s.name !== exclude) g[s.name] = s.deps || []; return g; }
     
     // fix49: check if code would create a dependency cycle - returns error message or null
@@ -2336,10 +2449,17 @@ Use only c; no other globals.`;
         const goal = goalOf(past);
         const before = this.observe();
         gateLog(`regression rerun of candidate ${entry.name} on past task "${past}"`);
-        const staged = await this.agent.coder._stageCode(this._libSrc({ [entry.name]: code }) + `\n\nawait ${entry.name}(bot);`);
+        const regClosure = new Set([entry.name, ...this._closure(entry.name)]);
+        const regBundle = this._libSrcSubset(regClosure, { [entry.name]: code }) + `\n\nawait ${entry.name}(bot);`;
+        const { lint, staged } = await this._stageLintExec(regBundle, regClosure, `voyager:regression:${entry.name}`);
+        if (lint) { gateLog(`regression ${entry.name}: lint failed`); return false; }
         if (!staged) return false;
         this._runStart = Date.now();
-        const res = await this._run(`voyager:gate:${entry.name}`, async () => { this.agent.bot.__psnALS = globalThis.__psnALS; await staged.func.main(this.agent.bot); }, 4);   // fix28: stall watchdog on gate runs
+        const res = await this._run(`voyager:gate:${entry.name}`, async () => {
+            const bot = this._timedBotForSkillRun();
+            bot.__psnALS = globalThis.__psnALS;
+            await staged.func.main(bot);
+        }, 4);   // fix28: stall watchdog on gate runs
         if (this._stalledInRun()) { gateLog(`regression rerun of ${entry.name} stalled; counted as a failed rerun`); return false; }
         if (res.interrupted || this.abort) return null;
         return gainedFor(goal, before, this.observe()) >= goal.count;
@@ -2699,9 +2819,14 @@ Use only c; no other globals.`;
         
         // stage and run the skill (fail-loud: log errors, rethrow critical ones)
         const call = `await ${skill.name}(bot);`;
-        const full = this._libSrc() + `\n\nasync function __practice(bot) {\n    try { ${call} } catch (e) { log(bot, 'PRACTICE FAILED: ' + e.message); throw e; }\n}\nawait __practice(bot);`;
+        const prClosure = new Set([skill.name, ...this._closure(skill.name)]);
+        const full = this._libSrcSubset(prClosure) + `\n\nasync function __practice(bot) {\n    try { ${call} } catch (e) { log(bot, 'PRACTICE FAILED: ' + e.message); throw e; }\n}\nawait __practice(bot);`;
         let staged;
-        try { staged = await this.agent.coder._stageCode(full); }
+        try {
+            const { lint, staged: st } = await this._stageLintExec(full, prClosure, `voyager:idle-practice:${skill.name}`);
+            if (lint) { console.error(`[idle-practice] LINT FAILED ${skill.name}`); return false; }
+            staged = st;
+        }
         catch (e) { console.error(`[idle-practice] STAGING FAILED ${skill.name}: ${e.message}`); return false; }
         if (!staged) { console.error(`[idle-practice] STAGING FAILED ${skill.name}: no staged code returned`); return false; }
         // mark as running, cap at 10 seconds for practice runs
@@ -2712,7 +2837,7 @@ Use only c; no other globals.`;
         const runPromise = (async () => {
             try {
                 await Promise.race([
-                    staged.func.main(bot),
+                    staged.func.main(this._timedBotForSkillRun()),
                     new Promise((_, rej) => setTimeout(() => rej(new Error('practice timeout')), maxPracticeMs))
                 ]);
                 completed = true;
@@ -3525,6 +3650,7 @@ IMPORTANT: All functions use bare names. Do NOT write skills.goToPosition - writ
         console.log(`[psn] repair memory for ${e.name}: ${(e.repairHistory || []).length} past proposal(s) in the prompt${pastLessons.length ? `, ${pastLessons.length} AWM lesson(s)` : ''}`);
         console.log(`[psn] REPAIR ${e.name} [${q.kind}] with the code model (evidence: ${q.evidence.slice(0, 160)})`);
         let code, body, desc, extra = '';
+        let _repairStaged = null;
         // fix37: duplicate-reply detection state for repair loop
         let prevRepairHash = null, repairDupes = 0;
         for (let att = 1; att <= 2; att++) {   // fix19 (3): one retry with the lint/format error fed back
@@ -3558,15 +3684,17 @@ IMPORTANT: All functions use bare names. Do NOT write skills.goToPosition - writ
                 const cycleErr = this._cycleLint(e.name, body);
                 if (cycleErr) err = cycleErr;
                 else {
-                    const staged = await this.agent.coder._stageCode(this._libSrc({ [e.name]: body }) + '\n\nawait Promise.resolve();');   // fix19: lint needs an await in main (library-only source always failed lint)
-                    const lint = staged ? await this.agent.coder._lintCode(staged.src_lint_copy) : 'staging failed';
-                    if (lint) err = `lint: ${String(lint).slice(0, 600)}`;
+                    const repClosure = new Set([e.name, ...this._closure(e.name)]);
+                    const repBundle = this._libSrcSubset(repClosure, { [e.name]: body }) + '\n\nawait Promise.resolve();';
+                    const { lint, staged } = await this._stageLintExec(repBundle, repClosure, `voyager:repair:${e.name}`);
+                    _repairStaged = staged;
+                    if (lint) err = `lint: ${String(lint)}`;
                 }
             }
             if (!err) break;
-            console.log(`[psn] repair attempt ${att} FAILED for ${e.name}: ${err.slice(0, 300)}${att < 2 ? '; retrying with the error fed back' : ''}`);
+            console.log(`[psn] repair attempt ${att} FAILED for ${e.name}: ${String(err).slice(0, 300)}${att < 2 ? '; retrying with the error fed back' : ''}`);
             if (att === 2) {
-                this._noteProposal(e, { task: q.task, kind: q.kind, evidence: q.evidence.slice(0, 200), desc: `invalid code: ${err.slice(0, 150)}`, outcome: 'lint failed' });
+                this._noteProposal(e, { task: q.task, kind: q.kind, evidence: q.evidence.slice(0, 200), desc: `invalid code: ${String(err).slice(0, 150)}`, outcome: 'lint failed' });
                 // AWM-style: record lint failure
                 await this.repairMemory.recordRepair({ errorSignature: q.evidence, fixSnippet: code?.slice(0, 300), outcome: false, taskHint: q.task, skillName: e.name });
                 return false;
@@ -3723,8 +3851,9 @@ IMPORTANT: All functions use bare names. Do NOT write skills.goToPosition - writ
             return false;
         }
         const strip = c => c.replace(/^\s*\/\/[^\n]*\n/gm, '').trim(), desc = (c, d) => ((c.match(/\/\/\s*DESCRIPTION:\s*(.+)/) || [])[1] || d).trim();
-        const staged = await this.agent.coder._stageCode(this._libSrc({ [e.name]: strip(fns[e.name]), [pe.name]: strip(fns[pe.name]) }) + '\n\nawait Promise.resolve();');
-        const lint = staged ? await this.agent.coder._lintCode(staged.src_lint_copy) : 'staging failed';
+        const jointSet = new Set(relevantSkills);
+        const jointBundle = this._libSrcSubset(jointSet, { [e.name]: strip(fns[e.name]), [pe.name]: strip(fns[pe.name]) }) + '\n\nawait Promise.resolve();';
+        const { lint } = await this._stageLintExec(jointBundle, jointSet, `voyager:joint-repair:${e.name}+${pe.name}`);
         if (lint) { console.log(`[psn] joint repair FAILED lint: ${String(lint).slice(0, 300)}`); return false; }
         const id = `jr${Date.now()}`;
         this.progress.refactors = { ...(this.progress.refactors || {}), [id]: { helper: null, skills: [e.name, pe.name], at: Date.now(), joint: true } }; this._saveProgress();
@@ -3791,8 +3920,10 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
         if (!helper || rewrites.length < 2) { console.log(`[psn] refactor ${id} FAILED: reply had ${helper ? 'a' : 'no'} new helper and ${rewrites.length} rewritten skill(s)`); return false; }
         const hdesc = ((code.match(/\/\/\s*DESCRIPTION:\s*(.+)/) || [])[1] || `shared helper extracted from ${rewrites.map(r => r[0]).join(', ')}`).trim();
         const over = { [helper[0]]: helper[1] }; for (const [n, c] of rewrites) over[n] = c;
-        const staged = await this.agent.coder._stageCode(this._libSrc(over) + `\n\n${helper[1]}\n\nawait Promise.resolve();`);
-        const lint = staged ? await this.agent.coder._lintCode(staged.src_lint_copy) : 'staging failed';
+        const rfNames = new Set(Object.keys(over));
+        for (const n of Object.keys(over)) for (const d of this._closure(n)) rfNames.add(d);
+        const rfBundle = this._libSrcSubset(rfNames, over) + `\n\n${helper[1]}\n\nawait Promise.resolve();`;
+        const { lint } = await this._stageLintExec(rfBundle, rfNames, `voyager:refactor:${id}`);
         if (lint) { console.log(`[psn] refactor ${id} FAILED lint: ${String(lint).slice(0, 300)}`); return false; }
         this._lastEffects = [];
         if (!(await this.saveSkill(helper[0], hdesc, helper[1], `refactor ${id}`))) { console.log(`[psn] refactor ${id} FAILED: helper rejected`); return false; }
@@ -3853,8 +3984,10 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
         if (!helper || wrappers.length < 2) { console.log(`[psn] generalise ${id} FAILED: reply had ${helper ? 'a' : 'no'} new helper and ${wrappers.length} wrapper(s)`); return false; }
         const hdesc = ((code.match(/\/\/\s*DESCRIPTION:\s*(.+)/) || [])[1] || `parameterized helper generalising ${wrappers.map(r => r[0]).join(', ')}`).trim();
         const over = { [helper[0]]: helper[1] }; for (const [n, c] of wrappers) over[n] = c;
-        const staged = await this.agent.coder._stageCode(this._libSrc(over) + `\n\n${helper[1]}\n\nawait Promise.resolve();`);
-        const lint = staged ? await this.agent.coder._lintCode(staged.src_lint_copy) : 'staging failed';
+        const gnNames = new Set(Object.keys(over));
+        for (const n of Object.keys(over)) for (const d of this._closure(n)) gnNames.add(d);
+        const gnBundle = this._libSrcSubset(gnNames, over) + `\n\n${helper[1]}\n\nawait Promise.resolve();`;
+        const { lint } = await this._stageLintExec(gnBundle, gnNames, `voyager:generalise:${id}`);
         if (lint) { console.log(`[psn] generalise ${id} FAILED lint: ${String(lint).slice(0, 300)}`); return false; }
         this._lastEffects = [];
         if (!(await this.saveSkill(helper[0], hdesc, helper[1], `generalise ${id}`))) { console.log(`[psn] generalise ${id} FAILED: helper rejected`); return false; }
@@ -3889,8 +4022,10 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
         const main = fns.find(([n]) => n === e.name);
         if (subs.length < 2 || !main) { console.log(`[psn] split ${id} FAILED: reply had ${subs.length} sub-skill(s) and ${main ? 'the' : 'no'} rewritten main`); return false; }
         const over = { [main[0]]: main[1] }; for (const [n, c] of subs) over[n] = c;
-        const staged = await this.agent.coder._stageCode(this._libSrc(over) + `\n\n${subs.map(s => s[1]).join('\n\n')}\n\nawait Promise.resolve();`);
-        const lint = staged ? await this.agent.coder._lintCode(staged.src_lint_copy) : 'staging failed';
+        const spNames = new Set(Object.keys(over));
+        for (const n of Object.keys(over)) for (const d of this._closure(n)) spNames.add(d);
+        const spBundle = this._libSrcSubset(spNames, over) + `\n\n${subs.map(s => s[1]).join('\n\n')}\n\nawait Promise.resolve();`;
+        const { lint } = await this._stageLintExec(spBundle, spNames, `voyager:split:${id}`);
         if (lint) { console.log(`[psn] split ${id} FAILED lint: ${String(lint).slice(0, 300)}`); return false; }
         this._lastEffects = [];
         for (const [n, c] of subs) {
@@ -4150,20 +4285,32 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             if (!fn) { feedback = 'Error: code must define `async function name(bot)` and call it.'; lastCode = code; continue; }
             const desc = (code.match(/\/\/\s*DESCRIPTION:\s*(.+)/) || [])[1] || task;
             const own = fn[1];
-            const libOthers = this.skills.filter(s => s.name !== own);
-            const over = {}; for (const s of libOthers) if (s.candidate) over[s.name] = s.candidate.code;   // fix24: candidates get trial runs in every task
-            const full = libOthers.map(s => over[s.name] ?? s.code).join('\n\n') + '\n\n' + code;
-            const plain = await this.agent.coder._stageCode(full);
-            const lint = /\b(setTimeout|setInterval)\s*\(/.test(code) ? 'setTimeout/setInterval are not available in the sandbox; use `await sleep(ms)`' : this.agent.coder._apiGate(code, this.skills.map(s => s.name)) || (plain ? await this.agent.coder._lintCode(plain.src_lint_copy) : 'staging failed');   // fix32: static API gate first   // fix27
-            // fix11 (B7): run the generated code with the PSN trace wrapper (rebinding happens before the code's own top-level call)
-            const traced = [...libOthers.map(s => s.name), own];
-            const staged = lint ? null : await this.agent.coder._stageCode(libOthers.map(s => over[s.name] ?? s.code).join('\n\n') + '\n\n' + instrumentSrc(traced) + '\n\n' + code);
+            const over = {}; for (const s of this.skills) if (s.candidate) over[s.name] = s.candidate.code;   // fix24: candidates get trial runs in every task
+            // Staging uses dependency closure from what the NEW code actually calls — not the embedding "shown" catalogue (which unions many irrelevant skills and inflates SES/eval 86k+ chars).
+            const libraryNames = new Set(this.skills.map(s => s.name));
+            const directLearnedCalls = new Set(depsOf(code, own, libraryNames));
+            const stageNameSet = new Set([own, ...directLearnedCalls]);
+            for (const d of directLearnedCalls) for (const n of this._closure(d)) stageNameSet.add(n);
+            const libSkills = this.skills.filter(s => stageNameSet.has(s.name) && s.name !== own);
+            const libSrc = libSkills.map(s => over[s.name] ?? s.code).join('\n\n');
+            const traced = Voyager._tracedSkillNamesForInstrument(this, stageNameSet, over);
+            const execBundle = libSrc + (libSrc ? '\n\n' : '') + instrumentSrc(traced) + '\n\n' + code;
+            console.log(`[staging] voyager:writeCode task="${task}" attempt=${i} bundle=${execBundle.length} chars closure_skills=${stageNameSet.size}`);
+            let lint = this.agent.coder.userGeneratedCodeLintBlockers(code, this.skills.map(s => s.name));
+            let staged = null;
+            if (!lint) {
+                const { lint: lint2, staged: st } = await this._stageLintExec(execBundle, stageNameSet, `voyager:writeCode:${task}:att${i}`);
+                lint = lint2;
+                staged = st;
+            }
             if (!lint && !staged) throw new Error('[psn] staging of traced generated code failed');
-            if (lint) { console.log('[voyager] lint failed: ' + String(lint).slice(0, 300)); feedback = 'Lint error:\n' + lint; lastCode = code; continue; }
+            if (lint) { console.log('[voyager] lint failed: ' + String(lint)); feedback = 'Lint error:\n' + lint; lastCode = code; continue; }
 
             this._runStart = Date.now();
             const res = await this._run(`voyager:${task}`, async () => {
-                this.agent.bot.__psnALS = globalThis.__psnALS; await staged.func.main(this.agent.bot);
+                const bot = this._timedBotForSkillRun();
+                bot.__psnALS = globalThis.__psnALS;
+                await staged.func.main(bot);
             }, 5);
             console.log(`[timing] game action attempt ${i} took ${Date.now() - this._runStart}ms`);   // fix23: measurement
             if (this.abort) { console.log('[voyager] task interrupted'); return; }

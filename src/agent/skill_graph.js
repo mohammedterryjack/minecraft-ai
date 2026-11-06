@@ -1,7 +1,46 @@
 // Stage 1 (PSN-style skill network + Skill-V-style regression gate) helpers.
+import * as acorn from 'acorn';
+
+/** Function declaration / async function expression assigned to `name` — AST only (no name regex on user code). */
 export function signatureOf(code, name) {
-    const m = String(code).match(new RegExp('(?:async\\s+)?function\\s+' + name + '\\s*\\(([^)]*)\\)'));
-    return m ? `${name}(${m[1].replace(/\s+/g, ' ').trim()})` : `${name}(bot)`;
+    let ast;
+    try {
+        ast = acorn.parse(String(code), { ecmaVersion: 'latest', sourceType: 'module', allowAwaitOutsideFunction: true });
+    } catch (e) {
+        throw new Error(`[skill_graph] signatureOf: parse failed for skill "${name}": ${e && e.message ? e.message : String(e)}`);
+    }
+    const paramsFrom = (fnNode) => {
+        if (!fnNode.body) return '';
+        const header = String(code).slice(fnNode.start, fnNode.body.start);
+        const open = header.indexOf('(');
+        const close = header.lastIndexOf(')');
+        if (open < 0 || close <= open) return '';
+        return header.slice(open + 1, close).replace(/\s+/g, ' ').trim();
+    };
+    let found = null;
+    const walk = (node) => {
+        if (!node || typeof node.type !== 'string') return;
+        if (node.type === 'ExportDefaultDeclaration' && node.declaration?.type === 'FunctionDeclaration' && node.declaration.id?.name === name) {
+            found = node.declaration;
+            return;
+        }
+        if (node.type === 'FunctionDeclaration' && node.id?.name === name) {
+            found = node;
+            return;
+        }
+        if (node.type === 'VariableDeclarator' && node.id?.type === 'Identifier' && node.id.name === name) {
+            const init = node.init;
+            if (init && (init.type === 'FunctionExpression' || init.type === 'ArrowFunctionExpression')) found = init;
+        }
+        for (const k in node) {
+            const v = node[k];
+            if (Array.isArray(v)) v.forEach(walk);
+            else if (v && typeof v.type === 'string') walk(v);
+        }
+    };
+    walk(ast);
+    if (found) return `${name}(${paramsFrom(found)})`;
+    throw new Error(`[skill_graph] signatureOf: no function declaration or assignment for "${name}" in skill source`);
 }
 function stripComments(code) { return String(code).replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, ''); }
 // fix51: strip string literals so names inside strings aren't counted as dependencies
@@ -178,7 +217,9 @@ const __st = () => { const p = bot.entity.position, b = bot.blockAt(p.floored().
 const __wrap = (n, f) => async function (...a) {
     if (__T.length >= 1500) return await f.apply(this, a);
     const par = __als.getStore() ?? -1;
-    const rec = { name: n, args: (() => { try { return JSON.stringify(a.slice(1)).slice(0, 120); } catch { return '?'; } })(), parent: par, depth: par < 0 ? 0 : __T[par].depth + 1, o0: (bot.output || '').length, t0: Date.now(), pre: __have(), argv: a.slice(1).map(x => x === null || typeof x !== 'object' ? x : null) };
+    const __stackParts = []; for (let __i = par; __i >= 0 && __i < __T.length; __i = __T[__i].parent) __stackParts.push(__T[__i].name); const __stackStr = [...__stackParts.reverse(), n].join(' <- ');
+    bot.__psnRunningSkill = n; bot.__psnStackStr = __stackStr;
+    const rec = { name: n, args: (() => { const s = a.slice(1); return JSON.stringify(s).slice(0, 120); })(), parent: par, depth: par < 0 ? 0 : __T[par].depth + 1, o0: (bot.output || '').length, t0: Date.now(), pre: __have(), argv: a.slice(1).map(x => x === null || typeof x !== 'object' ? x : null) };
     if (!n.startsWith('skills.')) rec.s0 = __st();
     const id = __T.push(rec) - 1;
     try { const r = await __als.run(id, () => f.apply(this, a)); rec.ret = r === undefined ? 'undefined' : String(JSON.stringify(r)).slice(0, 60); rec.rv = r === null || typeof r !== 'object' ? r : null; rec.fail = r === false || r === null || r === 0; return r; }
@@ -190,7 +231,7 @@ const __wrap = (n, f) => async function (...a) {
         rec.rv = false;
         return false;
     }
-    finally { await bot.waitForTicks(1); rec.t1 = Date.now(); if (!n.startsWith('skills.')) rec.s1 = __st(); rec.o1 = (bot.output || '').length; bot.__psnOut = bot.output; const post = __have(); rec.delta = {}; for (const k of new Set([...Object.keys(rec.pre), ...Object.keys(post)])) { const d = (post[k] || 0) - (rec.pre[k] || 0); if (d) rec.delta[k] = d; } delete rec.pre; rec.intr = !!bot.interrupt_code; }
+    finally { await bot.waitForTicks(1); rec.t1 = Date.now(); if (!n.startsWith('skills.')) rec.s1 = __st(); rec.o1 = (bot.output || '').length; bot.__psnOut = bot.output; const post = __have(); rec.delta = {}; for (const k of new Set([...Object.keys(rec.pre), ...Object.keys(post)])) { const d = (post[k] || 0) - (rec.pre[k] || 0); if (d) rec.delta[k] = d; } delete rec.pre; rec.intr = !!bot.interrupt_code; bot.__psnRunningSkill = null; bot.__psnStackStr = ''; }
 };`;
     // fix40: bare-name API - builtins and learned skills both use bare names
     // Wrap all provided names (both built-in and learned) for tracing
