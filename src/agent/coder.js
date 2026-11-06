@@ -341,7 +341,14 @@ export class Coder {
         const allNames = [...new Set([...Object.keys(reg.itemsByName), ...Object.keys(reg.blocksByName), ...Object.keys(reg.entitiesByName || {})])];
         const lev = (a, b) => { if (Math.abs(a.length - b.length) > 2) return 3; let prev = Array.from({ length: b.length + 1 }, (_, j) => j); for (let i = 1; i <= a.length; i++) { const cur = [i]; for (let j = 1; j <= b.length; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)); prev = cur; } return prev[b.length]; };
         const nearMiss = s => allNames.find(x => lev(s, x) <= 2);   // only typo-like strings are flagged; free-form labels pass
+        // fix79: runtime-owned keys (fix51 __prereqFail, fix76 __unmetPrecondition). Seeded ensure* writes them;
+        // generated/repaired code must not. Only these two names — other bot.__* assignments still pass via `assigned`.
+        const runtimeOwnedBotWrites = new Set(['__unmetPrecondition', '__prereqFail']);
         for (const n of nodes) {
+            if (n.type === 'AssignmentExpression' && n.left.type === 'MemberExpression' && !n.left.computed
+                && n.left.object.type === 'Identifier' && n.left.object.name === 'bot'
+                && n.left.property.type === 'Identifier' && runtimeOwnedBotWrites.has(n.left.property.name))
+                errs.add(`writing bot.${n.left.property.name} is forbidden in generated code (runtime-owned; seeded ensure* sets it)`);
             if (n.type === 'MemberExpression' && !n.computed && n.object.type === 'Identifier' && n.object.name === 'bot' && n.property.type === 'Identifier' && !(n.property.name in bot) && !assigned.has(n.property.name))
                 errs.add(`bot.${n.property.name} does not exist on the live bot (closest real members: ${nearestBotMember(bot, n.property.name, nodes.some(c => c.type === 'CallExpression' && c.callee === n)).map(k => 'bot.' + k).join(', ')})`);
             if (n.type === 'CallExpression') {

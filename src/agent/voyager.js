@@ -2843,7 +2843,11 @@ Use only c; no other globals.`;
         const wasQueued = prev !== (this._askQPrev || Promise.resolve());
         this._askQPrev = prev;
         if (wasQueued) console.log(`[overlap] code-model call #${callNum} waiting for previous call to finish (serialized)`);
-        try { await prev; } catch (e) { /* previous call's error doesn't block us */ }
+        // fix79: _askQ is resolve-only (release() in finally), same as _localQ in _askLocal (f850a88/fix31).
+        // fix35 (714ce15) wrapped this in try/catch "previous call's error doesn't block us", but prev never rejects —
+        // the previous _ask's error already surfaces to its own caller. Awaiting only serialises; a bare await matches
+        // _askLocal and does not swallow or double-report.
+        await prev;
         if (wasQueued) console.log(`[overlap] code-model call #${callNum} now running (previous finished)`);
         // fix33: CodeModel.sendRequest handles paid→free fallback internally; no pre/post quota check here
         const cm = this.agent.prompter.code_model;

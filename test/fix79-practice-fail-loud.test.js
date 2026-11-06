@@ -71,3 +71,28 @@ describe('fix79: the practice session does not swallow errors', () => {
         assert.deepStrictEqual(run.match(/catch \(e\) \{[^}]*\}/g), ["catch (e) { log(bot, 'PRACTICE FAILED: ' + e.message); throw e; }"]);
     });
 });
+
+describe('fix79: _ask queue serialises only (no empty catch)', () => {
+    it('awaits prev with no catch; matches _askLocal (f850a88) resolve-only mutex', () => {
+        const start = SRC.indexOf('    async _ask(system, user) {');
+        const ask = code(SRC.slice(start, SRC.indexOf('    _hashReply(text) {', start)));
+        assert.match(ask, /\n\s*await prev;\n/);
+        assert.doesNotMatch(ask, /await prev; \} catch/);
+        assert.doesNotMatch(ask, /previous call's error doesn't block us/);
+        // previous rejection already reaches its caller; the next _ask still runs (release in finally)
+        const local = code(SRC.slice(SRC.indexOf('    async _askLocal(system, user) {'), SRC.indexOf('    _cursorLimited()')));
+        assert.match(local, /await prev;/);
+        assert.doesNotMatch(local, /await prev;.*catch/);
+    });
+    it('a rejected previous _ask does not poison the next (queue is resolve-only)', async () => {
+        let n = 0;
+        const v = mkV(async () => ({ lint: null, staged: null }), {
+            _overlapCpuMaintenance: () => {},
+            _startIdlePractice: () => Promise.resolve(),
+            _stopIdlePractice: () => {},
+        });
+        v.agent.prompter = { code_model: { sendRequest: async () => { if (n++ === 0) throw new Error('first call failed'); return 'ok'; } } };
+        await assert.rejects(v._ask('s', 'u'), /first call failed/);
+        assert.strictEqual(await v._ask('s', 'u'), 'ok');
+    });
+});
