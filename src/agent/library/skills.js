@@ -559,15 +559,29 @@ async function _freeInventory(bot, keepName) {
     if (freed) log(bot, `[_freeInventory] dropped ${freed} stacks using learned safe-to-toss signals (items with known producers).`);
     
     // Phase 2: if still low on space, try to deposit to chest
+    // fix51: use ONLY learned chest memory (no world search, no distance cap)
     if (bot.inventory.emptySlotCount() < 2 && depositList.length) {
-        // fix43: check for chest FIRST and fail loud if missing
-        const chest = world.getNearestBlock(bot, 'chest', 32);
-        if (!chest) {
-            log(bot, `[_freeInventory] PREREQUISITE FAILED: need chest within 32 blocks to deposit items (have ${depositList.length} deposit candidates). Place or find a chest first.`);
+        const knownChests = bot.__knownChests || {};
+        const chestKeys = Object.keys(knownChests);
+        if (chestKeys.length === 0) {
+            log(bot, `[_freeInventory] FAIL LOUD: no known chest in memory to deposit items (have ${depositList.length} deposit candidates). Discover or place a chest first.`);
             return;
         }
         
-        console.log(`[_freeInventory] still only ${bot.inventory.emptySlotCount()} empty after tossing ${freed} stacks; depositing to chest at ${chest.position}`);
+        // Find nearest known chest by Euclidean distance (no cap)
+        const botPos = bot.entity.position;
+        let nearestChest = null;
+        let nearestDist = Infinity;
+        for (const key of chestKeys) {
+            const [cx, cy, cz] = key.split(',').map(Number);
+            const dist = Math.hypot(cx - botPos.x, cy - botPos.y, cz - botPos.z);
+            if (dist < nearestDist) {
+                nearestDist = dist;
+                nearestChest = { x: cx, y: cy, z: cz, key };
+            }
+        }
+        
+        console.log(`[_freeInventory] still only ${bot.inventory.emptySlotCount()} empty after tossing ${freed} stacks; depositing to known chest at ${nearestChest.x},${nearestChest.y},${nearestChest.z} (dist ${Math.round(nearestDist)})`);
         let deposited = 0;
         for (const itemName of depositList) {
             if (itemName === keepName) continue;
@@ -884,12 +898,15 @@ export async function placeBlock(bot, blockType, x, y, z, placeOn='bottom', dont
         if (useDelay) { await new Promise(resolve => setTimeout(resolve, blockPlaceDelay)); }
         let msg = '/setblock ' + Math.floor(x) + ' ' + Math.floor(y) + ' ' + Math.floor(z) + ' ' + blockType;
         bot.chat(msg);
-        if (blockType.includes('door'))
+        // fix51: door/bed multi-block placement must be inside braces (was missing, caused command spam)
+        if (blockType.includes('door')) {
             if (useDelay) { await new Promise(resolve => setTimeout(resolve, blockPlaceDelay)); }
             bot.chat('/setblock ' + Math.floor(x) + ' ' + Math.floor(y+1) + ' ' + Math.floor(z) + ' ' + blockType + '[half=upper]');
-        if (blockType.includes('bed'))
+        }
+        if (blockType.includes('bed')) {
             if (useDelay) { await new Promise(resolve => setTimeout(resolve, blockPlaceDelay)); }
             bot.chat('/setblock ' + Math.floor(x) + ' ' + Math.floor(y) + ' ' + Math.floor(z-1) + ' ' + blockType + '[part=head]');
+        }
         log(bot, `Used /setblock to place ${blockType} at ${target_dest}.`);
         return true;
     }

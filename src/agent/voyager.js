@@ -562,17 +562,35 @@ export class Voyager {
             console.error(msg);
             throw new Error(msg);
         }
-        // Check for mutual recursion cycles in the dependency graph
+        // fix51: for incumbent skills with mutual-recursion cycles, break the back-edge and queue for repair
+        // (never reject an incumbent that was already in the library)
         const graph = this._graph();
         const allCycles = findAllCycles(graph);
-        if (allCycles.length > 0) {
-            const cycleStrs = allCycles.map(c => c.join(' -> ')).join('; ');
-            const msg = `[psn] DEPENDENCY CYCLES DETECTED: ${cycleStrs}`;
-            console.error(msg);
-            throw new Error(msg);
+        const repairQueue = [];
+        for (const cycle of allCycles) {
+            // cycle is [A, B, C] meaning A->B->C->A; the back-edge is C->A (last -> first)
+            const backFrom = cycle[cycle.length - 1];
+            const backTo = cycle[0];
+            const skill = this.skills.find(s => s.name === backFrom);
+            if (skill && skill.deps && skill.deps.includes(backTo)) {
+                // Remove the back-edge from deps
+                skill.deps = skill.deps.filter(d => d !== backTo);
+                console.log(`[psn] fix51: broke back-edge ${backFrom} -> ${backTo} to resolve cycle ${cycle.join(' -> ')}`);
+                // Queue the skill for repair so it can be rewritten without the cycle
+                if (!repairQueue.some(q => q.name === backFrom)) {
+                    repairQueue.push({ name: backFrom, reason: `cycle ${cycle.join(' -> ')} (back-edge removed)` });
+                }
+                n++;
+            }
         }
-        // Original per-skill cycle check (kept for completeness)
-        for (const s of this.skills) { const c = findCycle(s.name, s.deps, this._graph(s.name)); if (c) throw new Error(`[psn] relink: dependency cycle ${c.join(' -> ')}`); }
+        // Queue repairs for cycle-affected skills
+        for (const r of repairQueue) {
+            const s = this.skills.find(sk => sk.name === r.name);
+            if (s && !s.seeded && !s.primitive && !s.handwritten) {
+                this._queueRepair?.({ skill: s, reason: r.reason });
+                console.log(`[psn] fix51: queued ${r.name} for repair: ${r.reason}`);
+            }
+        }
         console.log(`[psn] relink: ${this.skills.length} skills, ${n} edge set(s) changed`);
         if (n) this._saveSkills();
     }
@@ -844,17 +862,29 @@ Use only c; no other globals.`;
     }
 
     // fix28: 1 Hz motion/health samples so a death carries fall height and the damage that preceded it
+    // fix51: also samples oxygen_level (bot.oxygenLevel) for drowning analysis
     _sample() {
         const bot = this.agent.bot, now = Date.now(); if (!bot?.entity || now - (this._lastSample || 0) < 1000) return; this._lastSample = now;
-        const p = bot.entity.position, h = bot.health, prev = (this._samples ||= []).slice(-1)[0];
+        const p = bot.entity.position, h = bot.health, o = bot.oxygenLevel, prev = (this._samples ||= []).slice(-1)[0];
         const hit = prev && h < prev.h ? { t: now, dmg: +(prev.h - h).toFixed(1), near: (() => { const e = bot.nearestEntity(x => x !== bot.entity && x.type !== 'object' && x.position.distanceTo(p) < 8); return e ? `${e.name || e.username} ${e.position.distanceTo(p).toFixed(0)}m` : 'no entity within 8m'; })(), onGround: bot.entity.onGround, inLava: !!bot.entity.isInLava, inWater: !!bot.entity.isInWater } : null;
-        this._samples.push({ t: now, y: p.y, h, hit }); if (this._samples.length > 30) this._samples.shift();
+        this._samples.push({ t: now, y: p.y, h, o, hit }); if (this._samples.length > 30) this._samples.shift();
     }
     _deathDetail(d) {
         const ss = (this._samples || []).filter(x => x.t >= d.t - 10e3 && x.t <= d.t + 1500); if (!ss.length) return '';
         const dy = +d.pos.split(',')[1], fall = Math.max(0, Math.round(Math.max(...ss.map(x => x.y)) - dy));
         const hits = ss.filter(x => x.hit).map(x => `-${x.hit.dmg}hp (${x.hit.near}${x.hit.inLava ? ', in lava' : ''}${x.hit.inWater ? ', in water' : ''}${x.hit.onGround ? '' : ', airborne'})`);
-        return `; fall height ${fall} blocks in the last 10s; damage taken: ${hits.length ? hits.join(', ') : 'none sampled'}`;
+        // fix51: report observed oxygen trend (no threshold classification)
+        const oxygenSamples = ss.filter(x => typeof x.o === 'number');
+        let oxygenTrend = '';
+        if (oxygenSamples.length >= 2) {
+            const first = oxygenSamples[0].o, last = oxygenSamples[oxygenSamples.length - 1].o;
+            const minO = Math.min(...oxygenSamples.map(x => x.o));
+            if (first !== last || minO < first) {
+                const elapsed = Math.round((oxygenSamples[oxygenSamples.length - 1].t - oxygenSamples[0].t) / 1000);
+                oxygenTrend = `; oxygen ${first} -> ${last} (min ${minO}) over ${elapsed}s`;
+            }
+        }
+        return `; fall height ${fall} blocks in the last 10s; damage taken: ${hits.length ? hits.join(', ') : 'none sampled'}${oxygenTrend}`;
     }
     update() {
         try { this._sample(); } catch (e) { console.log('[death] sampler error: ' + e.message); }
@@ -907,6 +937,8 @@ Use only c; no other globals.`;
             food_max: skills.VITALS_MAX.food,
             health_value: Math.round(bot.health),
             health_max: skills.VITALS_MAX.health,
+            // fix51: oxygen level as protocol value (300 = full breath, decreases when submerged, 0 = drowning damage)
+            oxygen_level: bot.oxygenLevel,
             inventory: world.getInventoryCounts(bot),  // fix41: host code uses world. prefix
             inventory_slots: `${usedSlots}/${totalSlots}`,
             empty_inventory_slots: emptySlots,
@@ -2057,11 +2089,13 @@ Use only c; no other globals.`;
         };
     }
     // fix43: populate bot.__safeToToss, __depositCandidates, and __uncertainItems before running tossClutter/freeInventory
+    // fix51: also populate __knownChests from chestMemory (deposit uses ONLY learned chests)
     _prepareTossSignals() {
         const lists = this._computeTossAndDepositLists();
         this.agent.bot.__safeToToss = lists.toss;
         this.agent.bot.__depositCandidates = lists.deposit;
         this.agent.bot.__uncertainItems = lists.uncertain || [];
+        this.agent.bot.__knownChests = this.chestMemory || {};
     }
     // fix37: run a practice skill safely - returns { message } on success, false on context-fail, null on abort
     // Fail-loud: all skips and failures are logged clearly
