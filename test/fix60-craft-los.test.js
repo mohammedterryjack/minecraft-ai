@@ -12,6 +12,7 @@ import http from 'node:http';
 import { readFileSync } from 'fs';
 import pf from 'mineflayer-pathfinder';
 import Registry from 'prismarine-registry';
+import { EventEmitter } from 'node:events';
 import PWorld from 'prismarine-world';
 import PChunk from 'prismarine-chunk';
 import Vec3 from 'vec3';
@@ -37,7 +38,9 @@ function liveWorld({ shaft = false, approach = false } = {}) {
     return w;
 }
 function mockBot(world, feet, pathfinder) {
-    return {
+    // fix66: a mineflayer bot is an EventEmitter and its pathfinder reports what it is doing (goToGoal watches physicsTick)
+    Object.assign(pathfinder, { isMoving: () => false, isMining: () => false, isBuilding: () => false });
+    return Object.assign(new EventEmitter(), {
         registry, world, output: '', interrupt_code: false,
         entity: { position: feet.clone(), eyeHeight: 1.62 },
         inventory: { items: () => [] },
@@ -50,7 +53,7 @@ function mockBot(world, feet, pathfinder) {
             return !!hit && hit.position.equals(block.position);
         },
         pathfinder,
-    };
+    });
 }
 const noPath = { setMovements() {}, stop() {}, getPathTo: async () => ({ status: 'noPath' }), goto: async () => { throw new Error('No path to the goal!'); } };
 
