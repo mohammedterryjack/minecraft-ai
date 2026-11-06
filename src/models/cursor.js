@@ -15,7 +15,8 @@ export class CursorCLI {
     constructor(model_name, url, params) {
         this.model_name = model_name || 'composer-2.5';
         this.params = params || {};
-        this.timeoutMs = (this.params.timeout_s || 170) * 1000;
+        // fix51: no built-in timeout (was a magic 170s default). Only an explicit profile value (params.timeout_s) arms our timer.
+        this.timeoutMs = Object.hasOwn(this.params, 'timeout_s') ? this.params.timeout_s * 1000 : null;
         mkdirSync(WORKDIR, { recursive: true });
     }
     // fix31: the CLI takes ~3s to start; keep one process started ahead of time, waiting for its prompt on stdin
@@ -34,8 +35,9 @@ export class CursorCLI {
         const prompt = `${systemMessage}\n\n${convo}\n\nRespond directly with the answer text only. Do not use any tools.`;
         const t0 = Date.now(), { w, warm } = this._take();
         w.p.stdin.end(prompt);
-        let timer; const to = new Promise(res => { timer = setTimeout(() => { try { w.p.kill('SIGKILL'); } catch {} res('timeout'); }, this.timeoutMs); });
-        const how = await Promise.race([w.done.then(() => 'done'), to]); clearTimeout(timer);
+        let timer; const waits = [w.done.then(() => 'done')];
+        if (this.timeoutMs !== null) waits.push(new Promise(res => { timer = setTimeout(() => { w.p.kill('SIGKILL'); res('timeout'); }, this.timeoutMs); }));
+        const how = await Promise.race(waits); clearTimeout(timer);
         this._warm = this._spawn();
         const ms = Date.now() - t0;
         let obj = null; try { obj = JSON.parse(String(w.out).trim().split('\n').pop()); } catch {}
@@ -43,7 +45,9 @@ export class CursorCLI {
             console.log(`[cursor] ${this.model_name} ok in ${ms}ms (api ${obj.duration_api_ms}ms, ${warm ? 'pre-started' : 'cold'} process)`);
             return obj.result;
         }
-        const msg = how === 'timeout' ? `timeout after ${this.timeoutMs / 1000}s` : (String(w.err).trim().slice(0, 400) || `exit ${w.code}, no output`);
+        // fix51: our timeout is named as ours; otherwise the provider/CLI's own error, exit code and result are logged verbatim
+        const msg = how === 'timeout' ? `model timeout (ours: profile params.timeout_s=${this.params.timeout_s})`
+            : `provider: exit ${w.code}; stderr: ${String(w.err).trim()}; stdout: ${String(w.out).trim()}`;
         const e = new Error(`cursor-agent failed after ${ms}ms: ${msg}`);
         if (LIMIT_RE.test(msg)) { e.status = 429; e.message = 'cursor usage limit / quota: ' + msg; }
         throw e;

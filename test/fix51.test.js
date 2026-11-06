@@ -1145,3 +1145,27 @@ describe('fix51 exact equip / goal item resolution', async () => {
         assert.strictEqual(mk()._resolveGoalItemUnified('mine 3 iron ore').item, 'iron_ore');
     });
 });
+
+describe('fix51 code model timeout: no magic timer; provider error verbatim', async () => {
+    it('CursorCLI has no built-in timeout; CodeModel/prompter have no wrapper timeout', () => {
+        const cur = readFileSync('./src/models/cursor.js', 'utf8');
+        const cm = readFileSync('./src/models/code_model.js', 'utf8');
+        const pr = readFileSync('./src/models/prompter.js', 'utf8');
+        assert.ok(!cur.includes('|| 170'), 'no 170s default');
+        assert.ok(cur.includes('model timeout (ours: profile params.timeout_s='), 'our timeout names its source');
+        assert.ok(!cm.includes('timeoutMs') && !pr.includes('timeoutMs'), 'no 120s/180s wrapper race');
+    });
+    it('provider failure is reported verbatim (exit code + stderr)', async () => {
+        const { mkdtempSync, writeFileSync, chmodSync } = await import('fs');
+        const os = await import('os'); const path = await import('path');
+        const dir = mkdtempSync(path.join(os.tmpdir(), 'fakecli-'));
+        const bin = path.join(dir, 'cursor-agent');
+        writeFileSync(bin, '#!/bin/sh\ncat >/dev/null\necho "HTTP 504 upstream gateway timeout" >&2\nexit 7\n'); chmodSync(bin, 0o755);
+        process.env.CURSOR_AGENT_BIN = bin;
+        const { CursorCLI } = await import('../src/models/cursor.js?fake=' + Date.now());
+        const m = new CursorCLI('composer-2.5', null, {});
+        assert.strictEqual(m.timeoutMs, null);
+        await assert.rejects(m.sendRequest([{ role: 'user', content: 'x' }], 'sys'), e => e.message.includes('provider: exit 7') && e.message.includes('HTTP 504 upstream gateway timeout'));
+        m._warm.p.kill('SIGKILL');
+    });
+});

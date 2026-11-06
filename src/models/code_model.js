@@ -8,7 +8,7 @@ export function isQuotaError(err) {
 export class CodeModel {
     constructor(primary, cooldownMs = 60 * 60 * 1000, label = 'code-model', fallback = null) {
         this.label = label; this.primary = primary; this.cooldownMs = cooldownMs; this.fallback = fallback;
-        this.quotaUntil = 0; this.timeoutMs = 120 * 1000; this.pName = primary.model_name || 'primary';
+        this.quotaUntil = 0; this.pName = primary.model_name || 'primary';
         this.fName = fallback?.model_name || 'local-free'; this.onFallback = false; this.switchedAt = null;
     }
     async sendRequest(turns, systemMessage) {
@@ -20,12 +20,9 @@ export class CodeModel {
             console.log(`[${this.label}] *** PAID PATH RECOVERED *** switching back to ${this.pName} (was on free fallback ${this.fName} since ${this.switchedAt})`);
             this.onFallback = false; this.switchedAt = null;
         }
-        let timer;
+        // fix51: no wrapper timeout (was a magic 120s/180s race); the provider owns its timeout and reports its own error
         try {
-            const r = await Promise.race([
-                this.primary.sendRequest(turns, systemMessage),
-                new Promise((_, rej) => { timer = setTimeout(() => rej(new Error(`timeout after ${this.timeoutMs / 1000}s`)), this.timeoutMs); }),
-            ]);
+            const r = await this.primary.sendRequest(turns, systemMessage);
             console.log(`[${this.label}] used ${this.pName}`);
             return r;
         } catch (err) {
@@ -39,7 +36,7 @@ export class CodeModel {
                 console.error(`[${this.label}] ${this.pName} quota/usage limit hit - PAUSED for ${Math.round(this.cooldownMs / 60000)} min (no free fallback configured)`);
             } else console.error(`[${this.label}] ${this.pName} FAILED: ${err?.message ?? err}`);
             throw err;
-        } finally { clearTimeout(timer); }
+        }
     }
     async _useFreeFallback(turns, systemMessage) {
         if (!this.onFallback) { this.onFallback = true; this.switchedAt = new Date().toISOString(); }
