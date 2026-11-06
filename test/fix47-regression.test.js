@@ -681,7 +681,11 @@ describe('fix47: prefix migration and shadow removal', () => {
     
     it('should detect and report leftover prefixed patterns after migration', async () => {
         const { Voyager } = await import('../src/agent/voyager.js');
+        const { mkdirSync } = await import('fs');
+        const tmpDir = `/tmp/test-leftover-${Date.now()}`;
+        mkdirSync(tmpDir, { recursive: true });
         const mockVoyager = Object.create(Voyager.prototype);
+        mockVoyager.dir = tmpDir;
         mockVoyager.progress = { migratedToBarenames: false };
         mockVoyager._saveProgress = () => {};
         mockVoyager._saveSkills = () => {};
