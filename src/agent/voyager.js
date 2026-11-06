@@ -3023,7 +3023,11 @@ Use only c; no other globals.`;
         const wasQueued = prev !== (this._askQPrev || Promise.resolve());
         this._askQPrev = prev;
         if (wasQueued) console.log(`[overlap] code-model call #${callNum} waiting for previous call to finish (serialized)`);
-        try { await prev; } catch (e) { /* previous call's error doesn't block us */ }
+        // fix79: _askQ is resolve-only (release() in finally), same as _localQ in _askLocal (f850a88/fix31).
+        // fix35 (714ce15) wrapped this in try/catch "previous call's error doesn't block us", but prev never rejects —
+        // the previous _ask's error already surfaces to its own caller. Awaiting only serialises; a bare await matches
+        // _askLocal and does not swallow or double-report.
+        await prev;
         if (wasQueued) console.log(`[overlap] code-model call #${callNum} now running (previous finished)`);
         // fix33: CodeModel.sendRequest handles paid→free fallback internally; no pre/post quota check here
         const cm = this.agent.prompter.code_model;
@@ -3034,9 +3038,12 @@ Use only c; no other globals.`;
         const practicePromise = this._startIdlePractice(callNum);
         let r; try { r = await cm.sendRequest([{ role: 'user', content: user }], system); } finally {
             this._stopIdlePractice();
-            await practicePromise;   // fix70: no practice run outlives this call into the next action's window (see _runPracticeSkill)
-            release();
-            console.log(`[timing] ${new Date().toISOString().slice(11,19)}Z composer call #${callNum} took ${Date.now() - t0}ms (reply ${String(r ?? '').length} chars)`);
+            // fix79: a practice error now rejects here (it fails the step); the next code-model call is released either way
+            try { await practicePromise; }   // fix70: no practice run outlives this call into the next action's window (see _runPracticeSkill)
+            finally {
+                release();
+                console.log(`[timing] ${new Date().toISOString().slice(11,19)}Z composer call #${callNum} took ${Date.now() - t0}ms (reply ${String(r ?? '').length} chars)`);
+            }
         }
         return r;
     }
@@ -3100,11 +3107,14 @@ Use only c; no other globals.`;
             const idleMs = modelCallMs - pm;
             // fix49: log format for before/after measurement
             console.log(`[idle] model_call_ms=${modelCallMs} practice_ms=${pm} idle_ms=${idleMs} runs=${practiceCount}`);
-        }).catch(e => {
-            console.error(`[idle-practice] ERROR: ${e.message}; stopping practice`);
         }).finally(() => {
             this._idlePracticeActive = false;
         });
+        // fix79: no .catch. fa01ee3 logged "[idle-practice] ERROR: <message>; stopping practice" and resolved, so a bug in
+        //        practice ended only that session, without a stack, and came back next call (live 14:43:52Z-15:02:47Z on 36ffd89:
+        //        27x "Cannot convert undefined or null to object", Object.keys(skill.consumes) of a skill saved without consumes,
+        //        the creator fix73 fixed). The rejection reaches _ask, which awaits this promise, and fails the step loudly
+        //        (_onStepError: logged with its stack; the same error on two consecutive steps is fatal).
         return this._idlePracticePromise;
     }
     // fix74: the end of the code-model call is a signal (a promise the practice run races), not a flag polled every 200 ms
@@ -3374,14 +3384,12 @@ Use only c; no other globals.`;
         const libPart = this._libSrcSubset(prClosure);
         const body = `\n\nasync function __practice(bot) {\n    try { ${call} } catch (e) { log(bot, 'PRACTICE FAILED: ' + e.message); throw e; } finally { bot.__psnOut = bot.output; }\n}\nawait __practice(bot);`;
         const full = libPart + '\n\n' + instrumentSrc(Voyager._tracedSkillNamesForInstrument(this, prClosure)) + body;
-        let staged;
-        try {
-            const { lint, staged: st } = await this._stageLintExecTraced(libPart + body, full, prClosure, `voyager:idle-practice:${skill.name}`);
-            if (lint) { console.error(`[idle-practice] LINT FAILED ${skill.name}: ${lint}`); return { notRun: `lint failed: ${lint}` }; }
-            staged = st;
-        }
-        catch (e) { console.error(`[idle-practice] STAGING FAILED ${skill.name}: ${e.message}`); return { notRun: `staging failed: ${e.message}` }; }
-        if (!staged) { console.error(`[idle-practice] STAGING FAILED ${skill.name}: no staged code returned`); return { notRun: 'no staged code returned' }; }
+        // fix79: staging that throws is our bug (the bundle the replay of the same skill stages, voyager:replay, which has no
+        //        catch): it propagates. fa01ee3 caught it, logged STAGING FAILED and went on to the next skill. A lint result is
+        //        data about the skill's code, not an exception: the skill is not run this session.
+        const { lint, staged } = await this._stageLintExecTraced(libPart + body, full, prClosure, `voyager:idle-practice:${skill.name}`);
+        if (lint) { console.error(`[idle-practice] LINT FAILED ${skill.name}: ${lint}`); return { notRun: `lint failed: ${lint}` }; }
+        if (!staged) throw new Error(`[idle-practice] ${skill.name}: staging returned no code (coder._stageCode could not write the execution file)`);
         const bound = this._practiceBound(skill);
         if (bound === null) console.log(`[idle-practice] ${skill.name}: no observed run duration yet; uncapped, ends when it returns or the code-model call completes`);
         const traceWas = bot.__psnTrace;
