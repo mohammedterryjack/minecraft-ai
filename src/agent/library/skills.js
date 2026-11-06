@@ -194,7 +194,17 @@ export async function craftRecipe(bot, itemName, num=1) {
     await Promise.race([bot.craft(recipe, Math.min(craftLimit.num, num), craftingTable),
         new Promise((_, rej) => setTimeout(() => rej(new Error('bot.craft timed out after 15s (no server slot update)')), 15000))]).catch(e => { craftErr = e; });
     if (craftErr) {
-        try { bot.closeWindow(bot.currentWindow || bot.inventory); } catch (e) {}
+        // fix69: close the window the failed craft left open (the timeout branch leaves bot.craft's table window open;
+        // its own error path closes it). With no window open there is nothing to close: the player inventory is not a
+        // window to close, and closing it (the old `|| bot.inventory`) emitted a spurious windowClose and, before
+        // stateId versions, a click at slot -999 that drops the cursor item. mineflayer's closeWindow throws only on a
+        // null window, which the check rules out, so it is not wrapped.
+        if (bot.currentWindow) {
+            console.log(`[craftRecipe] closing ${bot.currentWindow.type} (id ${bot.currentWindow.id}) left open by the failed craft: ${craftErr.message}`);
+            await bot.closeWindow(bot.currentWindow);
+        } else {
+            console.log(`[craftRecipe] no window open after the failed craft (${craftErr.message}); nothing to close`);
+        }
         await new Promise(r => setTimeout(r, 1000));   // let the server resend inventory, then trust only that
         const nowCount = world.getInventoryCounts(bot)[itemName] || 0;
         if (nowCount <= beforeCount) { log(bot, `Crafting ${itemName} FAILED: ${craftErr.message}`); return false; }
@@ -815,7 +825,15 @@ export async function pickupNearbyItems(bot) {
     let pickedUp = 0;
     for (let tries = 0; nearestItem && tries < 12; tries++) {
         bot.pathfinder.setMovements(_survivalMovements(bot, {dig: false}));
-        try { await goToGoal(bot, new pf.goals.GoalNear(nearestItem.position.x, nearestItem.position.y, nearestItem.position.z, 0.5)); } catch (e) {}
+        // fix69: goToGoal reports every pathfinder outcome (NoPath, Timeout, GoalChanged, PathStopped, stall, interrupt)
+        // as a logged FAILED line and `false`; it throws only on a bug, which now surfaces instead of being swallowed.
+        // An unreachable item is the next re-scan's business (the same valid item twice ends the loop); an interrupt
+        // ends the pickup.
+        const reached = await goToGoal(bot, new pf.goals.GoalNear(nearestItem.position.x, nearestItem.position.y, nearestItem.position.z, 0.5));
+        if (!reached && bot.interrupt_code) {
+            log(bot, `Picked up ${pickedUp} items before being interrupted.`);
+            return false;
+        }
         await new Promise(r => setTimeout(r, 500));
         let prev = nearestItem;
         nearestItem = getNearestItem(bot);
@@ -1164,8 +1182,11 @@ export async function equip(bot, itemName) {
             return true;
         } finally {
             // fix44: ensure window cleanup on all paths (success, throw, timeout, interrupt)
+            // fix69: the state check is the handling: a window is open and it is not the player inventory. mineflayer's
+            // closeWindow throws only on a null window (excluded here) and writes nothing once the socket is gone, so
+            // the swallowing catch hid nothing but a bug, and in a finally it would also have masked the real error.
             if (bot.currentWindow && bot.currentWindow.type !== 'minecraft:inventory') {
-                try { await bot.closeWindow(bot.currentWindow); } catch (e) {}
+                await bot.closeWindow(bot.currentWindow);
             }
         }
     });
@@ -1379,8 +1400,11 @@ export async function consume(bot, itemName="") {
             
         } finally {
             // fix44: ensure window cleanup on all paths (success, throw, timeout, interrupt)
+            // fix69: the state check is the handling: a window is open and it is not the player inventory. mineflayer's
+            // closeWindow throws only on a null window (excluded here) and writes nothing once the socket is gone, so
+            // the swallowing catch hid nothing but a bug, and in a finally it would also have masked the real error.
             if (bot.currentWindow && bot.currentWindow.type !== 'minecraft:inventory') {
-                try { await bot.closeWindow(bot.currentWindow); } catch (e) {}
+                await bot.closeWindow(bot.currentWindow);
             }
         }
         
@@ -2116,7 +2140,13 @@ export async function goToBed(bot) {
     log(bot, `You are in bed.`);
     bot.modes.pause('unstuck');
     while (bot.isSleeping) {
-        if (bot.interrupt_code) { await bot.wake().catch(() => {}); return false; }
+        // fix69: bot.wake() rejects only with 'already awake' (!bot.isSleeping), which the loop condition rules out,
+        // so the rejection it swallowed could not be a normal state
+        if (bot.interrupt_code) {
+            await bot.wake();
+            log(bot, `Interrupted; got out of bed.`);
+            return false;
+        }
         await new Promise(resolve => setTimeout(resolve, 500));
     }
     log(bot, `You have woken up.`);
