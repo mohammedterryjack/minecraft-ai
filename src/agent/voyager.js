@@ -1469,35 +1469,25 @@ Use only c; no other globals.`;
         const cut = res.interrupted || this._diedInRun() || this._stalledInRun() ? this._interruptReason(res.message) : '';   // fix14: a cut-off replay is a failure
         if (this._diedInRun()) this._noteDeath(this._diedInRun(), task);
         if (cut) { ok = false; console.log(`[voyager] replay ${r.name} ${cut}; counting as a failure`); } else
+        if (!res.success) { ok = false; console.log(`[voyager] replay ${r.name} EXEC_FAILED: ${String(res.message).slice(0, 300)}`); } else
         if (r.free) { const e = this.agent.bot.inventory.emptySlotCount(); ok = e >= r.free; console.log(`[voyager] inventory check: ${e} empty slots (need ${r.free})`); }
         else if (r.at) { const p = this.agent.bot.entity.position; ok = Math.hypot(p.x - r.at.x, p.z - r.at.z) <= 8; }
         else if (goal && ['mine','collect','gather','chop','craft','smelt','cook','get','obtain'].includes(goal.verb)) ok = gainedFor(goal, before, after) >= goal.count;
         else {
-            // fix51: resolve goal item from task text and check exact inventory+equipment count
-            // A sub-skill's post must NEVER satisfy the parent goal - only the resolved goal item count matters
-            const resolvedGoal = smeltGoal(task) || countGoal(task) || parseVerboseGoal(task) || this._resolveGoalItem(task);
-            if (resolvedGoal && resolvedGoal.item) {
-                const invCount = (after.inventory[resolvedGoal.item] || 0);
+            const resolvedGoal = this._resolveGoalItemUnified(task);
+            if (!resolvedGoal) {
+                console.log(`[psn] LOUD: cannot resolve goal product item from task "${task}" — replay NOT satisfied`);
+                ok = false;
+            } else {
+                const invCount = after.inventory[resolvedGoal.item] || 0;
                 const eqCount = Object.values(after.equipment).filter(v => v === resolvedGoal.item).length;
                 const haveNow = invCount + eqCount;
-                const hadBefore = (before.inventory[resolvedGoal.item] || 0) + Object.values(before.equipment).filter(v => v === resolvedGoal.item).length;
                 const targetCount = resolvedGoal.count || 1;
-                ok = haveNow >= targetCount || (haveNow > hadBefore && haveNow > 0);
-                console.log(`[psn] fix51 goal-item check: ${resolvedGoal.item} before=${hadBefore} after=${haveNow} target=${targetCount} -> ${ok}`);
-            } else if (entry?.effects?.length) {
-                // Fallback: PSN rule-based effect check only when no goal item resolvable
-                const gotten = entry.effects.filter(it => (after.inventory[it] || 0) > (before.inventory[it] || 0));
-                ok = gotten.length > 0;
-                console.log(`[psn] effect check ${r.name}: expected +[${entry.effects.join(', ')}], got +[${gotten.join(', ')}] -> ${ok}`);
-            } else if (this._postHolds(entry)) {
-                // Last resort: skill's own post holds - but warn that this may not reflect goal satisfaction
-                console.log(`[psn] WARN: postcondition of ${r.name} holds but no goal-item check; goal satisfaction uncertain`);
-                ok = true;
-            } else {
-                const v = await this.critique(task, before, after, extractFeedback(res.message, 1500));
-                ok = !!v.success;
+                ok = haveNow >= targetCount;
+                console.log(`[psn] fix51 goal check: ${resolvedGoal.item} have=${haveNow} target=${targetCount} -> ${ok}`);
             }
         }
+        if (!ok) this._tryDecomposePrerequisiteFailure(task, String(res.message || '') + '\n' + String(this.agent.bot.output || ''));
         // fix44: pass goal items to filter learned effects and produces (denoise)
         const goalItems = goal?.items || (goal?.item ? [goal.item] : null);
         if (entry && ok && !trial) this._learnEffects(entry, before, after, goalItems);
@@ -1545,14 +1535,24 @@ Use only c; no other globals.`;
         for (const k of down) con[k] = Math.max(con[k] || 0, (inv0[k] || 0) - (inv1[k] || 0));
         if (JSON.stringify(eff) !== JSON.stringify(e.effects || []) || JSON.stringify(con) !== JSON.stringify(e.consumes || {})) { e.effects = eff; e.consumes = con; this._saveSkills(); }
     }
-    // fix51: resolve goal item from task text using minecraft-data registry
-    // Tries to extract item name (e.g., "craft iron pickaxe" -> "iron_pickaxe")
-    // Returns { item, count } or null if not resolvable
-    _resolveGoalItem(task) {
+    // fix51: UNIFIED goal item resolver - ONE path, no fallbacks
+    // Combines smeltGoal, countGoal, parseVerboseGoal, and minecraft-data registry lookup
+    // Returns { item, count, items } or null if not resolvable
+    _resolveGoalItemUnified(task) {
         if (!task || typeof task !== 'string') return null;
-        const t = task.toLowerCase().replace(/_/g, ' ').trim();
         
-        // Try to find item name in task text using minecraft-data
+        // Try structured parsers first (they extract count too)
+        const smelt = smeltGoal(task);
+        if (smelt) return smelt;
+        
+        const count = countGoal(task);
+        if (count) return count;
+        
+        const verbose = parseVerboseGoal(task);
+        if (verbose) return verbose;
+        
+        // Final attempt: find item name in task text using minecraft-data registry
+        const t = task.toLowerCase().replace(/_/g, ' ').trim();
         const md = minecraftData(VERSION);
         if (!md || !md.itemsArray) return null;
         
@@ -1565,9 +1565,71 @@ Use only c; no other globals.`;
             }
         }
         if (best) {
-            return { item: best.name, count: 1 };
+            return { item: best.name, count: 1, items: [best.name] };
         }
         return null;
+    }
+    // fix51: parse PREREQUISITE FAILED output and queue producer subgoals via learned graph (not hard-coded chains)
+    _tryDecomposePrerequisiteFailure(parentTask, text) {
+        const blob = String(text);
+        if (!/PREREQUISITE FAILED/i.test(blob)) return false;
+        let item = null, shortfall = null;
+        const missing = blob.match(/(\w+)\s*\(need\s*(\d+),\s*have\s*(\d+)\)/);
+        if (missing) {
+            item = missing[1].toLowerCase();
+            shortfall = parseInt(missing[2], 10) - parseInt(missing[3], 10);
+        } else {
+            const more = blob.match(/needs\s*(\d+)\s*more\s*(\w+)/i);
+            if (more) { shortfall = parseInt(more[1], 10); item = more[2].toLowerCase(); }
+        }
+        if (!item || !shortfall || shortfall <= 0) {
+            console.log(`[psn] PREREQUISITE FAILED but could not parse missing item from: ${blob.slice(0, 200)}`);
+            return false;
+        }
+        const inv = this.observe().inventory;
+        const sub = this._subgoalToObtainItem(item, shortfall, inv);
+        if (!sub) {
+            console.log(`[psn] PREREQUISITE FAILED for ${item} but no learned producer subgoal (needs/produces + skill library)`);
+            return false;
+        }
+        const d = (this.progress.decomposed ||= {}), q = (this.progress.subgoals ||= []);
+        const depth = (this._curSub?.task === parentTask ? this._curSub.depth : 0);
+        d[parentTask] = { subs: [sub], skills: [], at: Date.now(), reason: `prerequisite: need ${shortfall} more ${item}` };
+        q.unshift({ task: sub, parent: parentTask, depth: depth + 1 }, { task: parentTask, retry: true, depth });
+        this._saveProgress();
+        console.log(`[psn] DECOMPOSE (prerequisite) "${parentTask}" -> ${sub} (missing ${shortfall} ${item})`);
+        return true;
+    }
+    // fix51: pick a subgoal task string from learned producers / consumes chain (depth-first on missing inputs)
+    _subgoalToObtainItem(item, shortfall, inv) {
+        const producers = this._producers(item);
+        if (!producers.length) return null;
+        const picked = this._boltzmann(producers);
+        const skill = picked.s;
+        for (const [consumed, amt] of Object.entries(skill.consumes || {})) {
+            const have = inv[consumed] || 0;
+            if (have < amt) {
+                const sub = this._subgoalToObtainItem(consumed, amt - have, inv);
+                if (sub) return sub;
+            }
+        }
+        if (skill.task) return skill.task;
+        return null;
+    }
+    // fix51: idle practice success requires real inventory/effect change (not empty delta / instant return)
+    _practiceRunChanged(skill, before, after) {
+        const effects = skill.effects || [];
+        if (effects.length) {
+            const gained = effects.filter(it => (after.inventory[it] || 0) > (before.inventory[it] || 0));
+            if (gained.length) return { ok: true, detail: `+${gained.join(',')}` };
+            return { ok: false, detail: `no gain for effects [${effects.join(',')}]` };
+        }
+        const inv0 = before.inventory, inv1 = after.inventory;
+        const keys = new Set([...Object.keys(inv0), ...Object.keys(inv1)]);
+        for (const k of keys) {
+            if ((inv1[k] || 0) !== (inv0[k] || 0)) return { ok: true, detail: `inv delta includes ${k}` };
+        }
+        return { ok: false, detail: 'empty inventory delta' };
     }
     // fix32 (H): does the root call of the last trace satisfy the skill's learned postcondition (and report success)?
     _postHolds(e) {
@@ -1636,77 +1698,24 @@ Use only c; no other globals.`;
         return { shortfall, plan: 'gather', producible };
     }
 
-    // fix37 (B): check if a goal is already satisfied BEFORE running any task, using learned postconditions/contracts
-    // Returns { satisfied: boolean, reason: string, noLearnedCheck?: boolean, plan?: object }
-    // Uses learned skill contracts (postconditions) and learned effects - no hard-coded special cases
-    // fix25: prefer smeltGoal so "Smelt X into Y" checks Y (product), not X (ingredient)
-    // fix45: use parseVerboseGoal as fallback for verbose goals like "craftItem: Craft 1 iron_pickaxe..."
-    // fix47: enhanced to compute producible items and shortfall
+    // fix51: goal satisfaction = ONE path only — resolved product item + exact inventory+equipment count
+    // Sub-skill / component contract posts must NEVER mark a parent goal satisfied
     _goalAlreadySatisfied(task, state) {
-        const goal = smeltGoal(task) || countGoal(task) || parseVerboseGoal(task);  // fix45: verbose fallback
-        if (!goal) return { satisfied: false, reason: 'goal not parseable as count/smelt/verbose', noLearnedCheck: true };
+        const goal = this._resolveGoalItemUnified(task);
+        if (!goal) {
+            console.log(`[fix51] LOUD: cannot resolve goal product item from task "${task}" — treating as NOT satisfied`);
+            return { satisfied: false, reason: `cannot resolve goal product item from task "${task}"`, noLearnedCheck: true };
+        }
 
         const inv = state.inventory;
-        
-        // fix51: inventory count is the EXACT item count, not producible count
-        // This fixes "have 68" bug when bot has 0 iron_pickaxe but 68 iron_ingot
-        const invCount = inv[goal.item] || 0;  // item may not exist in inventory
-        // Also check equipment for the exact item (e.g., held iron_pickaxe counts)
+        const invCount = inv[goal.item] || 0;
         const eq = state.equipment;
         const eqCount = Object.values(eq).filter(v => v === goal.item).length;
         const haveExact = invCount + eqCount;
-        
-        // fix47: compute what we can produce (for planning, not satisfaction)
         const shortfallInfo = this._computeShortfall(goal, inv);
-        const canProduce = shortfallInfo.producible.count;
 
-        // 1) Check inventory against learned skill contracts that produce the goal item
-        // Find skills whose learned effects include the goal item and have a postcondition
-        const producers = this.skills.filter(s => !s.demoted && !s.mergedInto && !s.candidate
-            && (s.effects || []).some(eff => goal.items?.includes(eff) || eff === goal.item)
-            && s.contract?.post);
-
-        for (const skill of producers) {
-            try {
-                // Build a synthetic contract context as if the skill just ran and produced the current state
-                // fix26: use 'inv' not 'inventory' to match CONTRACT_SPEC (c.post.inv, not c.post.inventory)
-                // fix26: include all state fields from CONTRACT_SPEC to avoid undefined errors
-                // fix43: include eq (equipment state) for idempotent equip contracts
-                const eqState = state.equipment;
-                const syntheticState = { inv, pos: state.pos || { x: 0, y: 64, z: 0 }, hp: 20, food: 20, sky: 15, alive: true, dim: 'overworld', eq: eqState };
-                const c = {
-                    args: [goal.item, goal.count],
-                    ret: true,
-                    pre: { inv: {}, pos: { x: 0, y: 64, z: 0 }, hp: 20, food: 20, sky: 15, alive: true, dim: 'overworld', eq: { heldItem: null, offHand: null, helmet: null, chestplate: null, leggings: null, boots: null } },
-                    post: syntheticState,
-                    delta: { [goal.item]: haveExact },
-                    dist: (a, b) => Math.hypot((a?.x || 0) - (b?.x || 0), (a?.y || 0) - (b?.y || 0), (a?.z || 0) - (b?.z || 0))
-                };
-                const postOk = this._compileContract(skill.contract.post)(c);
-                // fix51: use haveExact (inventory+equipment) not canProduce for satisfaction
-                if (postOk && haveExact >= goal.count) {
-                    return { satisfied: true, reason: `learned postcondition of ${skill.name} holds (have ${haveExact}/${goal.count} ${goal.item})` };
-                }
-            } catch (err) {
-                console.log(`[fix37] postcondition check for ${skill.name} threw: ${err.message}`);
-            }
-        }
-
-        // 2) Check learned effects: if a skill's learned effects include the item and we already have enough
-        // This is the "learned facts" approach: the skill library knows what produces what
-        const effectProducers = this.skills.filter(s => !s.demoted && !s.mergedInto && !s.candidate
-            && (s.effects || []).some(eff => goal.items?.includes(eff) || eff === goal.item));
-
-        // fix51: use haveExact (actual inventory+equipment count) not canProduce
-        if (effectProducers.length > 0 && haveExact >= goal.count) {
-            const skillNames = effectProducers.slice(0, 3).map(s => s.name).join(', ');
-            return { satisfied: true, reason: `already have ${haveExact}/${goal.count} ${goal.item} (learned producers: ${skillNames})` };
-        }
-
-        // fix45/fix51: if EXACT inventory+equipment count >= goal count, the goal is satisfied
-        // Rule: inventory count is the ground truth - never producible count
         if (haveExact >= goal.count) {
-            return { satisfied: true, reason: `already have ${haveExact}/${goal.count} ${goal.item} (inventory check; no learned producer)` };
+            return { satisfied: true, reason: `already have ${haveExact}/${goal.count} ${goal.item} (exact inventory+equipment)` };
         }
 
         // fix47: check if we can produce enough via learned producers (inventory-first planning)
@@ -2378,6 +2387,7 @@ Use only c; no other globals.`;
     async _runPracticeSkill(skill) {
         if (this._idlePracticeAbort) return null;
         const bot = this.agent.bot;
+        const before = this.observe();
         // safety gates: log clearly when skipped (not silent)
         if (!this.agent.isIdle()) {
             console.log(`[idle-practice] SKIPPED ${skill.name}: bot is not idle`);
@@ -2427,7 +2437,8 @@ Use only c; no other globals.`;
             await new Promise(r => setTimeout(r, 200));
         }
         try { await runPromise; } catch (e) { /* already logged above */ }
-        // record the practice run (updates stats)
+        const after = this.observe();
+        const changed = this._practiceRunChanged(skill, before, after);
         if (skill.stats) {
             skill.stats.lastRun = Date.now();
             skill.stats.practiceRuns = (skill.stats.practiceRuns || 0) + 1;
@@ -2436,7 +2447,11 @@ Use only c; no other globals.`;
         if (practiceError) {
             return false;
         }
-        return { message: `completed in ${Date.now() - practiceStart}ms` };
+        if (!changed.ok) {
+            console.log(`[idle-practice] NOT SUCCESS ${skill.name}: ${changed.detail} (no ranking bump)`);
+            return false;
+        }
+        return { message: `${changed.detail} in ${Date.now() - practiceStart}ms` };
     }
 
     // fix47: compute cheapest tool to break a block by recursing through recipes
@@ -4101,21 +4116,58 @@ Voyager.SEEDED_PRIMITIVES = [
         task: 'deposit items to free inventory space',
         code: `async function depositToChest(bot, itemName, count = 64) {
     if (!itemName) { log(bot, 'FAILED: depositToChest requires an item name'); return false; }
-    const chest = getNearestBlock(bot, b => /chest|barrel|shulker/.test(b.name), 32);
-    if (!chest) { log(bot, 'FAILED: no chest/barrel/shulker_box within 32 blocks to deposit items'); return false; }
-    const item = bot.inventory.items().find(it => it.name === itemName);
-    if (!item) { log(bot, \`Don't have any \${itemName} to deposit.\`); return false; }
-    const toDeposit = Math.min(count, item.count);
-    if (bot.entity.position.distanceTo(chest.position) > 4) {
-        await goToPosition(bot, chest.position.x, chest.position.y, chest.position.z, 3);
+    if (!bot.__knownChests) {
+        log(bot, 'FAIL LOUD: bot.__knownChests not initialized (voyager._prepareTossSignals not called before depositToChest)');
+        return false;
     }
-    const containerWindow = await bot.openContainer(chest);
-    if (!containerWindow) { log(bot, 'FAILED: could not open chest'); return false; }
+    const item = bot.inventory.items().find(it => it.name === itemName);
+    if (!item) { log(bot, \`[deposit] reject \${itemName}: not in inventory\`); return false; }
+    const toDeposit = Math.min(count, item.count);
+    const chestKeys = Object.keys(bot.__knownChests);
+    if (chestKeys.length === 0) {
+        log(bot, \`[deposit] reject all chests: chestMemory empty (0 known positions); have \${toDeposit} \${itemName} to deposit\`);
+        return false;
+    }
+    const botPos = bot.entity.position;
+    let nearest = null, nearestDist = Infinity;
+    for (const key of chestKeys) {
+        const parts = key.split(',');
+        if (parts.length !== 3) { console.log(\`[deposit] reject chest \${key}: invalid memory key\`); continue; }
+        const cx = Number(parts[0]), cy = Number(parts[1]), cz = Number(parts[2]);
+        if (Number.isNaN(cx)) { console.log(\`[deposit] reject chest \${key}: non-numeric coordinates\`); continue; }
+        const block = bot.blockAt(new Vec3(cx, cy, cz));
+        if (!block) { console.log(\`[deposit] reject chest \${key}: blockAt null (chunk unloaded or position invalid)\`); continue; }
+        if (!/chest|barrel|shulker/.test(block.name)) {
+            console.log(\`[deposit] reject chest \${key}: block is \${block.name}, not a container\`);
+            continue;
+        }
+        const dist = Math.hypot(cx - botPos.x, cy - botPos.y, cz - botPos.z);
+        if (dist < nearestDist) { nearestDist = dist; nearest = { block, dist, key }; }
+    }
+    if (!nearest) {
+        log(bot, \`[deposit] reject all \${chestKeys.length} known chest candidate(s): none reachable/loaded as container\`);
+        return false;
+    }
+    if (nearest.dist > 32) {
+        log(bot, \`[deposit] reject nearest chest \${nearest.key}: distance \${nearest.dist.toFixed(1)} > 32\`);
+        return false;
+    }
+    if (bot.entity.position.distanceTo(nearest.block.position) > 4) {
+        const reached = await goToPosition(bot, nearest.block.position.x, nearest.block.position.y, nearest.block.position.z, 3);
+        if (!reached) { log(bot, \`[deposit] reject chest \${nearest.key}: pathfinder could not reach within 4 blocks\`); return false; }
+    }
+    let containerWindow;
+    try { containerWindow = await bot.openContainer(nearest.block); }
+    catch (err) { log(bot, \`[deposit] reject chest \${nearest.key}: openContainer failed: \${err.message}\`); return false; }
+    if (!containerWindow) { log(bot, \`[deposit] reject chest \${nearest.key}: openContainer returned null\`); return false; }
     try {
         const slot = bot.inventory.items().find(it => it.name === itemName);
-        if (!slot) { containerWindow.close(); log(bot, \`Item \${itemName} not found after opening chest\`); return false; }
+        if (!slot) { log(bot, \`[deposit] reject \${itemName}: not in inventory after opening chest\`); return false; }
         await containerWindow.deposit(slot.type, null, toDeposit);
-        log(bot, \`[chest] Deposited \${toDeposit} \${itemName} to chest.\`);
+        log(bot, \`[chest] Deposited \${toDeposit} \${itemName} to known chest at \${nearest.key}.\`);
+    } catch (err) {
+        log(bot, \`[deposit] reject chest \${nearest.key}: deposit failed: \${err.message}\`);
+        return false;
     } finally {
         containerWindow.close();
     }

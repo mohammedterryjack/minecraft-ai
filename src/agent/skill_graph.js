@@ -178,7 +178,17 @@ const __wrap = (n, f) => async function (...a) {
     if (!n.startsWith('skills.')) rec.s0 = __st();
     const id = __T.push(rec) - 1;
     try { const r = await __als.run(id, () => f.apply(this, a)); rec.ret = r === undefined ? 'undefined' : String(JSON.stringify(r)).slice(0, 60); rec.rv = r === null || typeof r !== 'object' ? r : null; rec.fail = r === false || r === null || r === 0; return r; }
-    catch (e) { rec.fail = true; rec.err = String(e?.message || e).slice(0, 200); throw e; }
+    catch (e) {
+        rec.fail = true;
+        const msg = String(e?.message || e);
+        rec.err = msg.slice(0, 200);
+        if (e instanceof TypeError || /Cannot read propert(y|ies) of null/i.test(msg)) {
+            bot.output = (bot.output || '') + '\\nFAILED: ' + n + ' threw ' + msg + ' (check findBlock/blockAt result before .count/.name/.position)\\n';
+            rec.rv = false;
+            return false;
+        }
+        throw e;
+    }
     finally { rec.t1 = Date.now(); if (!n.startsWith('skills.')) rec.s1 = __st(); rec.o1 = (bot.output || '').length; bot.__psnOut = bot.output; const post = __inv(); rec.delta = {}; for (const k of new Set([...Object.keys(rec.pre), ...Object.keys(post)])) { const d = (post[k] || 0) - (rec.pre[k] || 0); if (d) rec.delta[k] = d; } delete rec.pre; rec.intr = !!bot.interrupt_code; }
 };`;
     // fix40: bare-name API - builtins and learned skills both use bare names

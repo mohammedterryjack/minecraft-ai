@@ -107,6 +107,16 @@ describe('fix51 issue 2: deposit uses only known chest memory', async () => {
             'should assign chestMemory directly without fallback');
     });
 
+    it('depositToChest uses known chest memory and logs reject reasons', () => {
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        const start = voyagerSrc.indexOf("name: 'depositToChest'");
+        const deps = voyagerSrc.indexOf('deps:', start);
+        const section = voyagerSrc.slice(start, deps);
+        assert.ok(section.includes('__knownChests'), 'depositToChest should use __knownChests');
+        assert.ok(!section.includes('getNearestBlock(bot, b => /chest'), 'depositToChest should not use getNearestBlock world scan');
+        assert.ok(section.includes('[deposit] reject'), 'depositToChest should log per-candidate reject reasons');
+    });
+
     it('finds nearest chest from known chests by distance', () => {
         const botPos = { x: 0, y: 64, z: 0 };
         const knownChests = {
@@ -876,55 +886,71 @@ describe('fix51 issue 18: seeded/handwritten skill identifier validation', async
 });
 
 describe('fix51 issue 19: sub-skill post must not satisfy parent goal', async () => {
-    let Voyager;
+    let Voyager, _setVersionForTest;
 
     before(async () => {
         const mod = await import('../src/agent/voyager.js');
         Voyager = mod.Voyager;
+        _setVersionForTest = mod._setVersionForTest;
+        _setVersionForTest('1.21.4');
     });
 
-    it('_resolveGoalItem extracts item from task text', () => {
-        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
-        assert.ok(voyagerSrc.includes('_resolveGoalItem'),
-            'voyager.js should have _resolveGoalItem function');
-        assert.ok(voyagerSrc.includes('itemsArray'),
-            '_resolveGoalItem should use minecraft-data itemsArray');
-    });
-
-    it('goal craft iron pickaxe with 7 sticks and 0 iron_pickaxe is NOT satisfied', async () => {
-        const mockBot = { 
-            version: '1.21.4', 
-            chat: () => {}, 
-            on: () => {}, 
-            off: () => {}, 
+    function mockVoyager(skills = []) {
+        const mockBot = {
+            version: '1.21.4',
+            chat: () => {},
+            on: () => {},
+            off: () => {},
             once: () => {},
-            removeListener: () => {} 
+            removeListener: () => {}
         };
         const v = new Voyager({ bot: mockBot, agent: { prompter: { task: () => {} }, npc: { constructs: {} } } });
-        v.skills = [
-            { name: 'craftThreeSticks', effects: ['stick'], contract: { post: 'c => c.post.inv.stick >= 3' } }
-        ];
-        v._compileContract = () => () => true;  // craftThreeSticks post passes
+        v.skills = skills;
+        v._compileContract = () => () => true;
+        return v;
+    }
 
-        const state = {
-            inventory: { stick: 7, iron_ingot: 3 },
-            equipment: { heldItem: null, offHand: null, helmet: null, chestplate: null, leggings: null, boots: null },
-            pos: { x: 0, y: 64, z: 0 }
-        };
+    const eq = { heldItem: null, offHand: null, helmet: null, chestplate: null, leggings: null, boots: null };
 
-        // Goal is iron_pickaxe, not stick
-        const result = v._goalAlreadySatisfied('craft iron pickaxe', state);
-        assert.strictEqual(result.satisfied, false,
-            'goal craft iron pickaxe should NOT be satisfied when iron_pickaxe=0 (regardless of stick count)');
+    it('_goalAlreadySatisfied uses _resolveGoalItemUnified only (no sub-skill post branch)', () => {
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        const fn = voyagerSrc.match(/_goalAlreadySatisfied\(task, state\)\s*\{[\s\S]*?^\s{4}\}/m);
+        assert.ok(fn, '_goalAlreadySatisfied should exist');
+        assert.ok(fn[0].includes('_resolveGoalItemUnified(task)'),
+            'should resolve goal via single unified resolver');
+        assert.ok(!fn[0].includes('learned postcondition of'),
+            'must not satisfy via learned sub-skill postcondition');
     });
 
-    it('parseVerboseGoal or _resolveGoalItem resolves iron_pickaxe from craft iron pickaxe', async () => {
-        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
-        // The fix should either make parseVerboseGoal handle "craft iron pickaxe" or _resolveGoalItem
-        assert.ok(
-            voyagerSrc.includes('_resolveGoalItem(task)') || voyagerSrc.includes('parseVerboseGoal'),
-            'Goal resolution should try _resolveGoalItem or parseVerboseGoal'
-        );
+    it('craft one iron pickaxe: 7 sticks, craftThreeSticks post would pass, NOT satisfied', async () => {
+        const v = mockVoyager([{ name: 'craftThreeSticks', effects: ['stick'], contract: { post: 'c => true' } }]);
+        const result = v._goalAlreadySatisfied('craft one iron pickaxe', {
+            inventory: { stick: 7, iron_ingot: 36 },
+            equipment: eq,
+            pos: { x: 0, y: 64, z: 0 }
+        });
+        assert.strictEqual(result.satisfied, false);
+    });
+
+    it('craft one iron pickaxe: 36 iron_ingot (smelt post fiction 116), NOT satisfied', async () => {
+        const v = mockVoyager([{ name: 'smeltWithFuel', effects: ['iron_ingot'], contract: { post: 'c => c.post.inv.iron_ingot >= 116' } }]);
+        const result = v._goalAlreadySatisfied('craft one iron pickaxe', {
+            inventory: { iron_ingot: 36, raw_iron: 77 },
+            equipment: eq,
+            pos: { x: 0, y: 64, z: 0 }
+        });
+        assert.strictEqual(result.satisfied, false);
+    });
+
+    it('unresolvable goal with passing sub-skill post is NOT satisfied', async () => {
+        const v = mockVoyager([{ name: 'craftThreeSticks', effects: ['stick'], contract: { post: 'c => true' } }]);
+        const result = v._goalAlreadySatisfied('xyzzy florp the widget', {
+            inventory: { stick: 7 },
+            equipment: eq,
+            pos: { x: 0, y: 64, z: 0 }
+        });
+        assert.strictEqual(result.satisfied, false);
+        assert.ok(result.reason.includes('cannot resolve'));
     });
 });
 
@@ -952,15 +978,45 @@ describe('fix51 issue 20: ensureCraftingTable dependency chain', async () => {
             'ensureCraftingTable should NOT use magic sleep timer');
     });
 
-    it('ensureCraftingTable provides prerequisite info for decomposition', async () => {
-        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
-        const ensureStart = voyagerSrc.indexOf("name: 'ensureCraftingTable'");
-        const depsStart = voyagerSrc.indexOf("deps:", ensureStart);
-        const section = voyagerSrc.slice(ensureStart, depsStart);
-        
-        // Should explain what ingredient is missing for decomposition
-        assert.ok(section.includes('Decompose to obtain'),
-            'ensureCraftingTable should suggest decomposition when missing ingredients');
+    it('PREREQUISITE FAILED for planks queues log producer not pickaxe retry', async () => {
+        const mod = await import('../src/agent/voyager.js');
+        const Voyager = mod.Voyager;
+        const mockBot = { version: '1.21.4', chat: () => {}, on: () => {}, off: () => {}, once: () => {}, removeListener: () => {} };
+        const v = new Voyager({ bot: mockBot, agent: { prompter: { task: () => {} }, npc: { constructs: {} } } });
+        v.progress = { decomposed: {}, subgoals: [] };
+        v.skills = [{
+            name: 'collectOakLog',
+            effects: ['oak_log'],
+            consumes: {},
+            task: 'Collect 8 oak_log',
+            stats: { success: 5, fail: 0 },
+            demoted: false,
+            mergedInto: null,
+            candidate: null,
+            code: 'async function collectOakLog(bot) {}'
+        }, {
+            name: 'craftPlanks',
+            effects: ['oak_planks'],
+            consumes: { oak_log: 1 },
+            task: 'Craft planks from logs',
+            stats: { success: 5, fail: 0 },
+            demoted: false,
+            mergedInto: null,
+            candidate: null,
+            code: 'async function craftPlanks(bot) {}'
+        }];
+        v.observe = () => ({
+            inventory: { iron_ingot: 36, stick: 6, oak_planks: 2 },
+            equipment: { heldItem: null, offHand: null, helmet: null, chestplate: null, leggings: null, boots: null },
+            pos: { x: 0, y: 64, z: 0 }
+        });
+        const reason = 'PREREQUISITE FAILED: ensureCraftingTable cannot craft - missing: oak_planks (need 4, have 2). Decompose to obtain prerequisites.';
+        const ok = v._tryDecomposePrerequisiteFailure('craft one iron pickaxe', reason);
+        assert.strictEqual(ok, true);
+        assert.ok(v.progress.subgoals.length >= 1);
+        const sub = v.progress.subgoals[0].task.toLowerCase();
+        assert.ok(sub.includes('oak_log') || sub.includes('log'), `expected log producer subgoal, got: ${sub}`);
+        assert.ok(!sub.includes('pickaxe'), `should not retry pickaxe as subgoal, got: ${sub}`);
     });
 });
 
@@ -988,5 +1044,34 @@ describe('fix51 issue 21: null dereference protection', async () => {
             'coder.js should have _checkNullDeref method');
         assert.ok(coderSrc.includes('Potential null dereference'),
             'lint should warn about potential null dereference on findBlock/blockAt');
+    });
+
+    it('__wrap converts TypeError on null deref to FAILED return (repair path, not crash)', () => {
+        const sgSrc = readFileSync('./src/agent/skill_graph.js', 'utf8');
+        assert.ok(sgSrc.includes('Cannot read propert'), '__wrap should handle null property TypeError');
+        assert.ok(sgSrc.includes("bot.output = (bot.output || '') +"), '__wrap should log FAILED to bot output');
+        assert.ok(sgSrc.includes('return false'), '__wrap should return false instead of rethrowing TypeError');
+    });
+});
+
+describe('fix51 issue 22: idle practice requires real effect change', async () => {
+    it('_practiceRunChanged rejects empty inventory delta', async () => {
+        const mod = await import('../src/agent/voyager.js');
+        const Voyager = mod.Voyager;
+        const mockBot = { version: '1.21.4', chat: () => {}, on: () => {}, off: () => {}, once: () => {}, removeListener: () => {} };
+        const v = new Voyager({ bot: mockBot, agent: { prompter: { task: () => {} }, npc: { constructs: {} } } });
+        const skill = { name: 'craftOneIronPickaxe', effects: ['iron_pickaxe'] };
+        const inv = { iron_ingot: 36, stick: 6 };
+        const before = { inventory: { ...inv }, equipment: {} };
+        const after = { inventory: { ...inv }, equipment: {} };
+        const r = v._practiceRunChanged(skill, before, after);
+        assert.strictEqual(r.ok, false);
+    });
+
+    it('_runPracticeSkill logs NOT SUCCESS when delta empty (source check)', () => {
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        assert.ok(voyagerSrc.includes('_practiceRunChanged'), 'voyager should define _practiceRunChanged');
+        assert.ok(voyagerSrc.includes('[idle-practice] NOT SUCCESS'),
+            'idle practice should not count empty delta as SUCCESS');
     });
 });
