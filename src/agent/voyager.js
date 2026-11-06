@@ -26,7 +26,7 @@ import minecraftData from 'minecraft-data';
 import { Ollama } from '../models/ollama.js';
 import { setCallDurationStore } from '../models/call_durations.js';
 import { setMovementStore, learnedKinds, recordStep, recordCut, stepBound, noteUnbounded } from '../utils/movement_model.js';
-import { signatureOf, depsOf, missingCalls, reservedNamesUsed, findCycle, findAllCycles, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf, thrownIn, declaredNames } from './skill_graph.js';
+import { signatureOf, depsOf, missingCalls, reservedNamesUsed, findCycle, findAllCycles, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf, thrownIn, declaredNames, skillSourceViolations, splitGeneratedCode, oneFunctionFeedback } from './skill_graph.js';
 import { getBareAPI, collectBareApiUsedInSource, PRECONDITION_UNMET_BINDING } from './coder.js';   // fix40: unified bare-name API helper
 import { withStallPhase } from '../utils/event_loop_guard.js';
 import { watchdogEvidencePath } from '../utils/main_thread_watchdog.js';
@@ -433,6 +433,7 @@ export class Voyager {
         this._migrateToBarenames();  // fix40: one-time migration from skills.*/world.* to bare names
         this._seedPrimitives();
         this._relink();
+        this._assertOneFunctionSources();   // fix82
         this._polyMerge();
         this._extractShared();
         this._settleDeadTrials(watchdogEvidencePath(`./bots/${agent.name}`));   // fix65: a run that killed the previous process counts
@@ -859,6 +860,19 @@ export class Voyager {
         }
         if (seeded || rehealed) this._saveSkills();
         if (rehealed) console.log(`[psn] rehealed ${rehealed} seeded primitive(s) with updated code`);
+    }
+    // fix82: a library source (incumbent or candidate) that is not exactly one top-level function of its own name is a hidden
+    //        global (or a call that runs on staging) in every bundle that stages it; a library holding one fails loud at load.
+    //        Entries saved before fix82 are reset by evidence (scripts/fix82_one_function_manifest.json), not here.
+    _assertOneFunctionSources() {
+        const bad = [];
+        for (const s of this.skills) for (const [which, src] of [['code', s.code], ['candidate', s.candidate ? s.candidate.code : null]]) {
+            if (src === null) continue;
+            if (typeof src !== 'string') throw new Error(`[fix82] skill ${s.name}: ${which} is not a string`);
+            const v = skillSourceViolations(src, s.name);
+            if (v.length) bad.push(`${s.name}.${which}: ${v.join('; ')}`);
+        }
+        if (bad.length) throw new Error(`[fix82] FATAL: ${bad.length} library source(s) are not one top-level function (each is a hidden global of every bundle that stages it): ${bad.join(' | ')}`);
     }
     // fix11: recompute every skill's dependency edges from its code at startup (catches hand edits of skill files)
     // fix39: seeded primitives keep their original deps (typically []) so they can't form cycles
@@ -3955,6 +3969,14 @@ current_health: ${Math.round(bot.health)}/${vmax.health}\ncurrent_food: ${bot.fo
         //        code (new, repaired, refactored) that names it is rejected. missingCalls cannot see it (camelCase calls only).
         const reserved = reservedNamesUsed(code, [PRECONDITION_UNMET_BINDING]);
         if (reserved.length) { gateLog(`REJECT ${name}: uses ${reserved.join(', ')}, reserved for seeded primitives (marks a failure as an unmet precondition)`); return false; }
+        // fix82: every path that puts model code into the library (writeCode, repair, joint repair, refactor, generalise,
+        //        split) passes here. One top-level function per source (a second one is a hidden global of every bundle that
+        //        stages this skill: live checkIronPickaxe, 18:23:44Z) and the static API gate writeCode already ran (only
+        //        writeCode ran it: the 18:27:59Z craftItem repair with bot.recipes was HELD and threw in both trials).
+        const shape = skillSourceViolations(code, name);
+        if (shape.length) { gateLog(`REJECT ${name}: not one top-level function: ${shape.join('; ')}`); return false; }
+        const apiErr = this.agent.coder._apiGate(code, [...names]);
+        if (apiErr) { gateLog(`REJECT ${name}: ${apiErr}`); return false; }
         // fix39: seeded primitives must not depend on learned skills (prevents cycles like
         // ensureCraftingTable -> depositToChest -> ensureChest -> ensureCraftingTable)
         // If a repair tries to add learned deps to a seeded skill, strip them and warn
@@ -4355,7 +4377,7 @@ IMPORTANT: All functions use bare names. Do NOT write skills.goToPosition - writ
         let code, body, desc, extra = '';
         let _repairStaged = null;
         // fix37: duplicate-reply detection state for repair loop
-        let prevRepairHash = null, repairDupes = 0;
+        let prevRepairHash = null, repairDupes = 0, accepted = false;
         for (let att = 1; att <= 2; att++) {   // fix19 (3): one retry with the lint/format error fed back
             // fix37: escalating duplicate feedback for repair loop
             const dupeWarn = repairDupes > 0 ? `\n\n!!! CRITICAL: Your previous reply was IDENTICAL. You MUST write DIFFERENT code. !!!` : '';
@@ -4382,19 +4404,30 @@ IMPORTANT: All functions use bare names. Do NOT write skills.goToPosition - writ
             if (!fn || fn[1] !== e.name) err = `reply did not define async function ${e.name}`;
             else {
                 desc = ((code.match(/\/\/\s*DESCRIPTION:\s*(.+)/) || [])[1] || e.description).trim();
-                body = code.replace(/\n\s*await\s+\w+\(bot[^)]*\);\s*$/, '').trim();
-                // fix49: check for dependency cycles BEFORE lint (feedback tells model which deps to avoid)
-                const cycleErr = this._cycleLint(e.name, body);
-                if (cycleErr) err = cycleErr;
+                // fix82: the repaired code gets the same static gate as writeCode (parse, timers, every bot.<member> real on the
+                //        live bot, every bare call defined) and the one-function shape. Repairs were only ESLint-staged: live
+                //        18:27:59Z the craftItem repair read `bot.recipes.find(...)` (mineflayer has recipesFor/recipesAll, no
+                //        bot.recipes), was HELD as a candidate, and both trials threw "Cannot read properties of undefined
+                //        (reading 'find')" at the table (-125,43,61) inside obtainItem and craftIronPickaxe
+                const gate = this.agent.coder.userGeneratedCodeLintBlockers(code, this.skills.map(s => s.name));
+                const split = gate ? null : splitGeneratedCode(code, e.name);
+                body = split ? split.skillSource : null;
+                if (gate) err = `lint: ${gate}`;
+                else if (split.violations.length) err = `lint: ${oneFunctionFeedback(e.name, split.violations)}`;
                 else {
-                    const repClosure = new Set([e.name, ...this._closure(e.name)]);
-                    const repBundle = this._libSrcSubset(repClosure, { [e.name]: body }) + '\n\nawait Promise.resolve();';
-                    const { lint, staged } = await this._stageLintExec(repBundle, repClosure, `voyager:repair:${e.name}`);
-                    _repairStaged = staged;
-                    if (lint) err = `lint: ${String(lint)}`;
+                    // fix49: check for dependency cycles BEFORE lint (feedback tells model which deps to avoid)
+                    const cycleErr = this._cycleLint(e.name, body);
+                    if (cycleErr) err = cycleErr;
+                    else {
+                        const repClosure = new Set([e.name, ...this._closure(e.name)]);
+                        const repBundle = this._libSrcSubset(repClosure, { [e.name]: body }) + '\n\nawait Promise.resolve();';
+                        const { lint, staged } = await this._stageLintExec(repBundle, repClosure, `voyager:repair:${e.name}`);
+                        _repairStaged = staged;
+                        if (lint) err = `lint: ${String(lint)}`;
+                    }
                 }
             }
-            if (!err) break;
+            if (!err) { accepted = true; break; }
             console.log(`[psn] repair attempt ${att} FAILED for ${e.name}: ${String(err).slice(0, 300)}${att < 2 ? '; retrying with the error fed back' : ''}`);
             if (att === 2) {
                 this._noteProposal(e, { task: q.task, kind: q.kind, evidence: q.evidence.slice(0, 200), desc: `invalid code: ${String(err).slice(0, 150)}`, outcome: 'lint failed' });
@@ -4403,6 +4436,13 @@ IMPORTANT: All functions use bare names. Do NOT write skills.goToPosition - writ
                 return false;
             }
             extra = `\n--- your previous reply was rejected ---\n${err}\n--- previous code ---\n${code || '(none)'}\nFix the error and write the fixed ${e.name} again:`;
+        }
+        // fix82: a duplicate reply on the last attempt left the loop with the REJECTED attempt's body, which was then submitted
+        //        to the gate as if it had passed (fail open). Only an accepted reply is submitted.
+        if (!accepted) {
+            console.log(`[psn] repair FAILED for ${e.name}: no reply passed (the last one repeated a rejected reply)`);
+            this._noteProposal(e, { task: q.task, kind: q.kind, evidence: q.evidence.slice(0, 200), desc: 'duplicate of a rejected reply', outcome: 'duplicate replies' });
+            return false;
         }
         this._lastEffects = e.effects;
         this._noteProposal(e, { task: q.task, kind: q.kind, evidence: q.evidence.slice(0, 200), desc: desc.slice(0, 200) });
@@ -4986,6 +5026,10 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             const execBundle = libSrc + (libSrc ? '\n\n' : '') + instrumentSrc(traced) + '\n\n' + code;
             console.log(`[staging] voyager:writeCode task="${task}" attempt=${i} bundle=${execBundle.length} chars closure_skills=${stageNameSet.size}`);
             let lint = this.agent.coder.userGeneratedCodeLintBlockers(code, this.skills.map(s => s.name));
+            // fix82: one top-level function (+ its call) before staging: a second top-level declaration is saved with the skill
+            //        and becomes a hidden global of every later bundle (live 18:23:44Z checkIronPickaxe, see skill_graph)
+            const split = lint ? null : splitGeneratedCode(code, own);
+            if (split && split.violations.length) lint = oneFunctionFeedback(own, split.violations);
             let staged = null;
             if (!lint) {
                 const { lint: lint2, staged: st } = await this._stageLintExecTraced(libSrc + (libSrc ? '\n\n' : '') + code, execBundle, stageNameSet, `voyager:writeCode:${task}:att${i}`);
@@ -5033,7 +5077,7 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             if (verdict.success) {
                 // fix73: no cap of 8 (b2e2338); _learnEffects below unions the full observation into the same entry anyway
                 this._lastEffects = Object.keys(after.inventory).filter(k => (after.inventory[k] || 0) > (runBefore.inventory[k] || 0));   // fix70: this attempt only
-                await this.saveSkill(fn[1], desc.trim(), code.replace(/\n\s*await\s+\w+\(bot\);\s*$/, '').trim(), task);
+                await this.saveSkill(own, desc.trim(), split.skillSource, task);   // fix82: the call cut by AST position
                 this.progress.completed.push(task);
                 this.progress.failed = this.progress.failed.filter(t => t !== task);
                 // fix47: clear blockers for this task when it passes

@@ -56,6 +56,69 @@ function stripStrings(code) {
         .replace(/"(?:[^"\\]|\\.)*"/g, '""')  // double-quoted strings
         .replace(/'(?:[^'\\]|\\.)*'/g, '""'); // single-quoted strings
 }
+// fix82: the library is ONE flat scope. Every staged bundle (writeCode, replay, repair, practice) concatenates the sources of
+// the skills it needs, so every top-level binding of a skill source is a global of every bundle that stages that skill, under
+// a name no catalogue, deps edge or dedupe knows about. Live 18:23:44Z writeCode "Verify the inventory contains the
+// iron_pickaxe": checkForIronPickaxe (NEW 17:50:41Z) had been saved with the reply's second top-level function
+// checkIronPickaxe; the new reply declared its own checkIronPickaxe, fix70's dedupe (by skill NAME only) kept the library
+// source, and the bundle did not parse ("Identifier 'checkIronPickaxe' has already been declared (65:15)").
+// A learned skill source is therefore exactly one top-level statement: the function declaration of its own name.
+function patternNames(p) {
+    if (p.type === 'Identifier') return [p.name];
+    if (p.type === 'AssignmentPattern') return patternNames(p.left);
+    if (p.type === 'RestElement') return patternNames(p.argument);
+    if (p.type === 'ObjectPattern') return p.properties.flatMap(q => patternNames(q.type === 'RestElement' ? q : q.value));
+    if (p.type === 'ArrayPattern') return p.elements.filter(e => e !== null).flatMap(patternNames);
+    throw new Error(`[skill_graph] patternNames: unexpected binding pattern ${p.type}`);
+}
+// topLevelStatements: every top-level statement of `code`, by kind and declared name (AST; comments are not statements).
+export function topLevelStatements(code) {
+    let ast;
+    try { ast = acorn.parse(String(code), { ecmaVersion: 'latest', sourceType: 'module', allowAwaitOutsideFunction: true }); }
+    catch (e) { throw new Error(`[skill_graph] topLevelStatements: parse failed: ${e.message}`); }
+    return ast.body.map(n => {
+        if (n.type === 'FunctionDeclaration' || n.type === 'ClassDeclaration') return { node: n, kind: n.type, names: [n.id.name] };
+        if (n.type === 'VariableDeclaration') return { node: n, kind: n.type, names: n.declarations.flatMap(d => patternNames(d.id)) };
+        if (n.type === 'ExpressionStatement') {
+            const x = n.expression.type === 'AwaitExpression' ? n.expression.argument : n.expression;
+            return { node: n, kind: 'ExpressionStatement', names: [], calls: x.type === 'CallExpression' && x.callee.type === 'Identifier' ? x.callee.name : null };
+        }
+        return { node: n, kind: n.type, names: [] };
+    });
+}
+// what in a skill source breaks the one-function rule above ([] = conforming)
+export function skillSourceViolations(code, name) {
+    if (typeof name !== 'string' || !name) throw new Error('skillSourceViolations: skill name required');
+    const out = [];
+    let own = 0;
+    for (const t of topLevelStatements(code)) {
+        if (t.kind === 'FunctionDeclaration' && t.names[0] === name) { own++; continue; }
+        if (t.names.length) out.push(`top-level ${t.kind === 'VariableDeclaration' ? 'variable' : t.kind === 'ClassDeclaration' ? 'class' : 'function'} ${t.names.join(', ')} besides ${name}`);
+        else if (t.kind === 'ExpressionStatement' && t.calls) out.push(`top-level call ${t.calls}(...) (runs whenever the skill is staged)`);
+        else out.push(`top-level ${t.kind}`);
+    }
+    if (own !== 1) out.push(`${own} top-level declarations of function ${name} (exactly 1 required)`);
+    return out;
+}
+
+// fix82: model code for a skill = the skill source plus, optionally, ONE trailing top-level call of it (writeCode runs the
+// reply as is; the call is not part of what is saved). The call is cut by its AST position: the regex this replaces
+// (/\n\s*await\s+\w+\(bot\);\s*$/) kept every call with arguments, so tossClutterForIron was saved ending in
+// `await tossClutterForIron(bot, 4);` and would run itself in any bundle that staged it.
+export function splitGeneratedCode(code, own) {
+    if (typeof own !== 'string' || !own) throw new Error('splitGeneratedCode: own function name required');
+    const src = String(code), body = topLevelStatements(src);
+    const last = body[body.length - 1];
+    const skillSource = last && last.kind === 'ExpressionStatement' && last.calls === own
+        ? (src.slice(0, last.node.start) + src.slice(last.node.end)).trim()
+        : src.trim();
+    return { skillSource, violations: skillSourceViolations(skillSource, own) };
+}
+// fix82: lint feedback for the model when its code breaks the one-function rule
+export function oneFunctionFeedback(own, violations) {
+    if (!Array.isArray(violations) || !violations.length) throw new Error('oneFunctionFeedback: violations required');
+    return `A learned skill is ONE top-level function: \`async function ${own}(bot, ...)\` (optionally followed by one call of it). Helper functions and constants go INSIDE ${own}, so they are not globals of other skills' code. Your code has: ${violations.join('; ')}`;
+}
 // fix70: names this code declares itself (function declarations, const/let/var). A name the code declares is its own
 // definition, even when a library skill has the same name: it is not a call into the library.
 export function declaredNames(code) {
