@@ -470,21 +470,8 @@ export class Coder {
     }
     // fix40: extract skills.*/world.* calls from code using acorn - these are NOW FORBIDDEN
     // All functions must be called by bare name, not with skills.*/world.* prefix
-    /** AST walk: true if node subtree contains an AwaitExpression */
-    _astHasAwait(node) {
-        if (!node || typeof node.type !== 'string') return false;
-        if (node.type === 'AwaitExpression') return true;
-        for (const k in node) {
-            const v = node[k];
-            if (Array.isArray(v)) {
-                for (const c of v) if (this._astHasAwait(c)) return true;
-            } else if (v && typeof v.type === 'string' && this._astHasAwait(v)) return true;
-        }
-        return false;
-    }
-
     /**
-     * Warn when a for/while/do-while loop body has no await (likely synchronous hot loop).
+     * Warn on loops inside non-async functions: they cannot yield, so the event loop waits for them to finish (fix64).
      * @param {string} code
      * @param {number} preludeLines
      */
@@ -497,22 +484,24 @@ export class Coder {
         }
         const out = [];
         const loopKinds = new Set(['ForStatement', 'WhileStatement', 'DoWhileStatement', 'ForInStatement', 'ForOfStatement']);
-        const walk = (node) => {
+        const fnTypes = new Set(['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression']);
+        // fix64: loops in async code get one event-loop turn per iteration at exec (_injectLoopTurns), so only a loop inside a
+        // non-async function can still hold the event loop; the old "body has no await" test flagged bounded for-of scans and
+        // missed the live hang (an async loop whose `continue` path had no await)
+        const walk = (node, inAsync) => {
             if (!node || typeof node.type !== 'string') return;
-            if (loopKinds.has(node.type)) {
-                const body = node.body;
-                const line = body.loc.start.line;
-                if (line > preludeLines && !this._astHasAwait(body)) {
-                    out.push({ line, text: _trimLineAt(code, line) });
-                }
+            const here = fnTypes.has(node.type) ? !!node.async : inAsync;
+            if (loopKinds.has(node.type) && !here) {
+                const line = node.body.loc.start.line;
+                if (line > preludeLines) out.push({ line, text: _trimLineAt(code, line) });
             }
             for (const k in node) {
                 const v = node[k];
-                if (Array.isArray(v)) v.forEach(walk);
-                else if (v && typeof v.type === 'string') walk(v);
+                if (Array.isArray(v)) v.forEach(c => walk(c, here));
+                else if (v && typeof v.type === 'string') walk(v, here);
             }
         };
-        walk(ast);
+        walk(ast, true);
         return out;
     }
 
@@ -666,6 +655,47 @@ export class Coder {
         insertAt.sort((a, b) => b - a);
         let out = src;
         for (const p of insertAt) out = out.slice(0, p) + GUARD + out.slice(p);
+        return out;
+    }
+
+    /**
+     * fix64: every loop iteration inside an async function (or the template's async top level) starts with
+     * `await __loopTurn__();`, one event-loop turn. The interrupt guard injected into each loop body (fix44) is a flag set by
+     * an event handler; on an iteration path with no await the handler can never run, so the guard was dead exactly when
+     * it was needed. Live 12:43Z: the collectBlock candidate's `excluded.add(..); i--; continue;` path re-ran a 64-block
+     * getNearestBlocks scan per remembered candidate without ever awaiting, keep_alive went unanswered and the server
+     * timed the bot out while the process stayed blocked. With a turn per iteration the loop still runs to completion,
+     * but keep_alive, interrupts and the stall watchdog's heartbeat are served between iterations.
+     * Loops inside non-async functions cannot await; they are left as written (lint names them, the watchdog backs them).
+     * Insertions add no lines, so lint/trace line numbers are unchanged.
+     * @param {string} code
+     */
+    _injectLoopTurns(code) {
+        const src = String(code);
+        const ast = acorn.parse(src, { ecmaVersion: 'latest', sourceType: 'module', allowAwaitOutsideFunction: true, allowReturnOutsideFunction: true });
+        const TURN = ' await __loopTurn__();';
+        /** @type {{ at: number, text: string }[]} */
+        const edits = [];
+        const fnTypes = new Set(['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression']);
+        const loopKinds = new Set(['ForStatement', 'WhileStatement', 'DoWhileStatement', 'ForInStatement', 'ForOfStatement']);
+        const walk = (node, inAsync) => {
+            if (!node || typeof node.type !== 'string') return;
+            const here = fnTypes.has(node.type) ? !!node.async : inAsync;
+            if (loopKinds.has(node.type) && here) {
+                const b = node.body;
+                if (b.type === 'BlockStatement') edits.push({ at: b.start + 1, text: TURN });
+                else { edits.push({ at: b.start, text: '{' + TURN + ' ' }); edits.push({ at: b.end, text: ' }' }); }
+            }
+            for (const k in node) {
+                const v = node[k];
+                if (Array.isArray(v)) v.forEach(c => walk(c, here));
+                else if (v && typeof v.type === 'string') walk(v, here);
+            }
+        };
+        walk(ast, true);   // the exec template runs staged code inside `(async (bot) => { ... })`
+        edits.sort((a, b) => b.at - a.at);
+        let out = src;
+        for (const e of edits) out = out.slice(0, e.at) + e.text + out.slice(e.at);
         return out;
     }
 
@@ -828,7 +858,7 @@ export class Coder {
 
         const syncLoopWarnings = this._syncLoopLint(code, preludeLines);
         if (syncLoopWarnings.length > 0) {
-            let w = 'WARNING: Loop body has no await (possible synchronous hot loop).\n';
+            let w = 'WARNING: Loop inside a non-async function cannot yield to the event loop; it blocks the bot until it ends. Make the function async or bound the loop by data it already holds.\n';
             for (const x of syncLoopWarnings) {
                 w += `  Line ${x.line}: ${x.text}\n`;
             }
@@ -916,6 +946,9 @@ export class Coder {
 
         // fix44: interrupt guard uses __mcLog__ (collision-safe binding injected into endowments)
         // String/template aware: naive `;\n` replacement breaks instrumentSrc template bodies that contain `;`+newline
+        // fix64: exec copy only (lint feedback is about the code as written); runs before the semicolon guards so every turn is
+        // followed by the interrupt check
+        if (!lintOnly) code = this._injectLoopTurns(code);
         code = this._injectSemicolonInterruptGuards(code);
         for (let line of code.split('\n')) {
             // every loop iteration checks for an interrupt
@@ -978,6 +1011,8 @@ export class Coder {
         const endowments = {};
         // fix44: __mcLog__ is a collision-safe binding for interrupt guards (user code cannot shadow it)
         endowments.__mcLog__ = skills.log;
+        // fix64: one event-loop turn per loop iteration (see _injectLoopTurns); collision-safe like __mcLog__
+        endowments.__loopTurn__ = () => new Promise(resolve => setImmediate(resolve));
         const skillKeysExec = bareApiFilter ? skillKeysForLint : allSkillKeys;
         const worldKeysExec = bareApiFilter ? worldKeysForLint : allWorldKeys;
         // Inject skills.* / world.* used by this bundle only when narrowing (full library otherwise)

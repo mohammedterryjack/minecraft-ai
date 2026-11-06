@@ -19,6 +19,7 @@ import { Task } from './tasks/tasks.js';
 import { speak } from './speak.js';
 import { log, validateNameFormat } from './connection_handler.js';
 import { startEventLoopStallGuard } from '../utils/event_loop_guard.js';
+import { startMainThreadWatchdog } from '../utils/main_thread_watchdog.js';
 import { inspect } from 'node:util';
 import { fatalExit, runUpdateLoop } from './fatal.js';   // fix59
 
@@ -97,6 +98,7 @@ export class Agent {
 
         this.bot.on('login', () => {
             console.log(this.name, 'logged in!');
+            startMainThreadWatchdog();   // fix64: off-thread; the guard below arms it with the learned keep_alive gap
             startEventLoopStallGuard(this.bot);
             serverProxy.login();
             

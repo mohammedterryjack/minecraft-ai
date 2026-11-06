@@ -8,9 +8,18 @@
  * stacks attribute stalls to labeled phases so the next step is diagnosis from real logs — not guessing.
  */
 import { monitorEventLoopDelay } from 'node:perf_hooks';
+import { mainThreadWatchdogStarted, armMainThreadWatchdog, beatMainThreadWatchdog, publishMainThreadEvidence } from './main_thread_watchdog.js';
 
 /** @type {string[]} */
 let _phaseStack = [];
+/** fix64: what the PSN harness is running right now (mirrored from bot.__psnRunningSkill / __psnStackStr) */
+let _psnSkill = '(none)';
+let _psnStack = '(none)';
+
+/** fix64: hand the current attribution to the off-thread watchdog, which cannot read main-thread state once it is blocked */
+function _publishEvidence() {
+    if (mainThreadWatchdogStarted()) publishMainThreadEvidence({ phases: [..._phaseStack], skill: _psnSkill, stack: _psnStack });
+}
 
 /**
  * Nyquist: sample the event-loop delay at least twice per keep-alive period.
@@ -41,6 +50,7 @@ export function stallThresholdMs(bot) {
 
 export function setStallPhase(phase) {
     _phaseStack = [String(phase)];
+    _publishEvidence();
 }
 
 export function getStallPhase() {
@@ -69,10 +79,12 @@ export function captureStallContext(bot) {
  */
 export function pushStallPhase(phase) {
     _phaseStack.push(String(phase));
+    _publishEvidence();
 }
 
 export function popStallPhase() {
     _phaseStack.pop();
+    _publishEvidence();
 }
 
 /**
@@ -84,6 +96,7 @@ export function runStallPollTickForTest(bot) {
 }
 
 function _stallPollTick(bot) {
+    if (mainThreadWatchdogStarted()) beatMainThreadWatchdog();   // fix64: this tick running at all is the heartbeat
     const threshold = bot.__eventLoopStallThresholdMs;
     if (typeof threshold !== 'number' || !Number.isFinite(threshold) || threshold <= 0) return;
     const h = bot.__stallEventLoopHist;
@@ -119,6 +132,13 @@ function _scheduleStallPoll(bot) {
     }
 
     bot.__stallPollInterval = setInterval(() => _stallPollTick(bot), pollMs);
+    // fix64: blocked = the loop could not run for one full learned keep_alive gap; a healthy loop beats every pollMs, so
+    // silence beyond gap + pollMs means a whole gap passed with no turn
+    if (mainThreadWatchdogStarted()) {
+        armMainThreadWatchdog(thresholdMs + pollMs);
+        beatMainThreadWatchdog();
+        console.log(`[watchdog] ARMED: SIGKILL after ${thresholdMs + pollMs}ms without a main-loop heartbeat (keep_alive gap ${thresholdMs}ms + beat period ${pollMs}ms)`);
+    }
 }
 
 /**
@@ -131,6 +151,17 @@ export function startEventLoopStallGuard(bot) {
     }
     if (bot.__eventLoopStallGuardHooked) return;
     bot.__eventLoopStallGuardHooked = true;
+    // fix64: the PSN harness (skill_graph instrumentSrc) assigns these on every traced call; mirror them to the watchdog
+    Object.defineProperty(bot, '__psnRunningSkill', {
+        configurable: true, enumerable: true,
+        get: () => (_psnSkill === '(none)' ? null : _psnSkill),
+        set: (v) => { _psnSkill = v == null ? '(none)' : String(v); _publishEvidence(); },
+    });
+    Object.defineProperty(bot, '__psnStackStr', {
+        configurable: true, enumerable: true,
+        get: () => (_psnStack === '(none)' ? '' : _psnStack),
+        set: (v) => { _psnStack = v ? String(v) : '(none)'; _publishEvidence(); },
+    });
 
     const onKeepAlive = () => {
         const now = Date.now();
