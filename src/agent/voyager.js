@@ -265,7 +265,9 @@ export function parseVerboseGoal(task) {
     }
     
     if (candidates.length === 0) {
-        console.log(`[fix46] LOUD: parseVerboseGoal failed for "${task.slice(0, 100)}": no valid item name found in registry`);
+        // fix51: enhanced LOUD logging - include full goal text and log to file for analysis
+        console.log(`[fix46] LOUD: parseVerboseGoal failed for "${task}": no valid item name found in registry`);
+        try { appendFileSync(`./bots/parseVerboseGoal_failures.jsonl`, JSON.stringify({ at: new Date().toISOString(), task, version: VERSION }) + '\n'); } catch (err) { void 0; }
         return null;
     }
     
@@ -777,7 +779,12 @@ Use only c; no other globals.`;
                 }
                 r.ok = false; r.fail = true; if (k === 'pre') r.preFail = true;
                 r.ownFail = [...(r.ownFail || []), `${k === 'pre' ? 'PRECONDITION' : 'POSTCONDITION'} violated: ${e.contract.text || e.contract[k]} (post pos ${r.s1.pos ? [r.s1.pos.x, r.s1.pos.y, r.s1.pos.z].map(Math.round).join(',') : '?'}, sky ${r.s1.sky}, alive ${r.s1.alive})`];
-                console.log(`[contract] ${e.name}(${(r.argv || []).join(',')}) ${k}condition VIOLATED: ${e.contract[k].slice(0, 160)}`);
+                // fix51: enhanced VIOLATED logging with exact context for debugging
+                const stateInfo = `pre.inv=${JSON.stringify(r.s0?.inv || {}).slice(0, 100)}, post.inv=${JSON.stringify(r.s1?.inv || {}).slice(0, 100)}, delta=${JSON.stringify(r.delta || {}).slice(0, 80)}`;
+                console.log(`[contract] VIOLATED ${e.name}(${(r.argv || []).join(',')}) ${k}condition: ${e.contract[k].slice(0, 200)}`);
+                console.log(`[contract] VIOLATED context: task=${this.currentTask?.slice(0, 80)}, ${stateInfo}`);
+                // Log to file for next run analysis
+                try { appendFileSync(`./bots/${this.agent.name}/violated_contracts.jsonl`, JSON.stringify({ at: new Date().toISOString(), skill: e.name, field: k, contract: e.contract[k], args: r.argv, task: this.currentTask, state: { pre: r.s0, post: r.s1, delta: r.delta } }) + '\n'); } catch (err) { void 0; }
                 // the task outcome disagrees with the contract: the contract itself may be wrong -> it is repairable
                 if (taskOk && k === 'post' && r.parent < 0) this._queueContractFix(e, `postcondition failed but the task check passed`);
             }
@@ -865,6 +872,8 @@ Use only c; no other globals.`;
     async _run(label, fn, timeout) {
         // fix42: populate bot.__safeToToss before any skill run (for tossClutter/freeInventory)
         this._prepareTossSignals();
+        // fix51: track inventory before run for death item-drop reporting
+        this._beforeRunInv = world.getInventoryCounts(this.agent.bot);
         // fix28: progress = position, inventory, health, food, open-window contents (crafting/furnace UI) or a lit furnace/smoker nearby (smelting wait)
         const bot = this.agent.bot;
         const lit = () => !!bot.findBlock({ matching: b => /furnace|smoker/.test(b.name) && b.getProperties?.().lit === true, maxDistance: 6 });
@@ -883,7 +892,8 @@ Use only c; no other globals.`;
     _diedInRun() { const d = this.agent.lastDeath; return d && d.t >= (this._runStart || Infinity) ? d : null; }
     _interruptReason(output = '') {
         const died = this._diedInRun();
-        if (died) return `died: ${died.message} at ${died.pos}${this._deathDetail(died)}`;
+        // fix51: pass beforeInv for items-dropped reporting
+        if (died) return `died: ${died.message} at ${died.pos}${this._deathDetail(died, this._beforeRunInv)}`;
         const st = this._stalledInRun(); if (st) return `stalled: no progress (no new ground reached, inventory, window, lit furnace) for 60s at ${st.pos}`;
         const bot = this.agent.bot, p = bot.entity.position, by = this.agent.actions.lastInterruptBy || 'unknown';
         const s = this._surfaceY(p.x, p.z), under = s !== null && p.y < s - 4;
@@ -910,7 +920,8 @@ Use only c; no other globals.`;
         const hit = prev && h < prev.h ? { t: now, dmg: +(prev.h - h).toFixed(1), near: (() => { const e = bot.nearestEntity(x => x !== bot.entity && x.type !== 'object' && x.position.distanceTo(p) < 8); return e ? `${e.name || e.username} ${e.position.distanceTo(p).toFixed(0)}m` : 'no entity within 8m'; })(), onGround: bot.entity.onGround, inLava: !!bot.entity.isInLava, inWater: !!bot.entity.isInWater } : null;
         this._samples.push({ t: now, y: p.y, h, o, hit }); if (this._samples.length > 30) this._samples.shift();
     }
-    _deathDetail(d) {
+    // fix51: _deathDetail now accepts optional beforeInv to compute items dropped on death
+    _deathDetail(d, beforeInv = null) {
         const ss = (this._samples || []).filter(x => x.t >= d.t - 10e3 && x.t <= d.t + 1500); if (!ss.length) return '';
         const dy = +d.pos.split(',')[1], fall = Math.max(0, Math.round(Math.max(...ss.map(x => x.y)) - dy));
         const hits = ss.filter(x => x.hit).map(x => `-${x.hit.dmg}hp (${x.hit.near}${x.hit.inLava ? ', in lava' : ''}${x.hit.inWater ? ', in water' : ''}${x.hit.onGround ? '' : ', airborne'})`);
@@ -925,7 +936,23 @@ Use only c; no other globals.`;
                 oxygenTrend = `; oxygen ${first} -> ${last} (min ${minO}) over ${elapsed}s`;
             }
         }
-        return `; fall height ${fall} blocks in the last 10s; damage taken: ${hits.length ? hits.join(', ') : 'none sampled'}${oxygenTrend}`;
+        // fix51: compute items dropped on death (inventory delta)
+        let itemsLost = '';
+        if (beforeInv) {
+            const afterInv = this.observe().inventory;
+            const lost = [];
+            for (const [item, beforeCount] of Object.entries(beforeInv)) {
+                const afterCount = afterInv[item] || 0;
+                const delta = beforeCount - afterCount;
+                if (delta > 0) {
+                    lost.push(`${item}:${delta}`);
+                }
+            }
+            if (lost.length > 0) {
+                itemsLost = `; items dropped: ${lost.slice(0, 10).join(', ')}${lost.length > 10 ? ` (+${lost.length - 10} more)` : ''}`;
+            }
+        }
+        return `; fall height ${fall} blocks in the last 10s; damage taken: ${hits.length ? hits.join(', ') : 'none sampled'}${oxygenTrend}${itemsLost}`;
     }
     update() {
         try { this._sample(); } catch (e) { console.log('[death] sampler error: ' + e.message); }
@@ -1009,7 +1036,8 @@ Use only c; no other globals.`;
         const [x, y, z] = d.pos.split(',').map(Number), k = `${Math.floor(x / 16)},${Math.floor(z / 16)}`;
         const c = ((this.progress.deathSpots ||= {})[k] ||= { n: 0, pos: d.pos, causes: [], tasks: [] });
         c.n++; c.last = Date.now(); c.times = [...(c.times || []), c.last].slice(-20); c.pos = d.pos; c.causes = [...c.causes, d.message].slice(-5); c.tasks = [...c.tasks, task].slice(-5); this._saveProgress();
-        console.log(`[psn] death during "${task}": ${d.message} at ${d.pos}${this._deathDetail(d)} (death #${c.n} in this area)${c.n >= 2 ? '; surfaced to the curriculum as a death hotspot' : ''}`);
+        // fix51: pass beforeInv for items-dropped reporting
+        console.log(`[psn] death during "${task}": ${d.message} at ${d.pos}${this._deathDetail(d, this._beforeRunInv)} (death #${c.n} in this area)${c.n >= 2 ? '; surfaced to the curriculum as a death hotspot' : ''}`);
     }
     // fix18: perception only (no policy): hostiles within 32 blocks, nearest first
     _threats() {
@@ -1427,9 +1455,17 @@ Use only c; no other globals.`;
 
         const inv = state.inventory || {};
         
-        // fix47: compute what we have + can produce (no fallback - producible is the single source)
+        // fix51: inventory count is the EXACT item count, not producible count
+        // This fixes "have 68" bug when bot has 0 iron_pickaxe but 68 iron_ingot
+        const invCount = inv[goal.item] || 0;
+        // Also check equipment for the exact item (e.g., held iron_pickaxe counts)
+        const eq = state.equipment || {};
+        const eqCount = Object.values(eq).filter(v => v === goal.item).length;
+        const haveExact = invCount + eqCount;
+        
+        // fix47: compute what we can produce (for planning, not satisfaction)
         const shortfallInfo = this._computeShortfall(goal, inv);
-        const have = shortfallInfo.producible.count;
+        const canProduce = shortfallInfo.producible.count;
 
         // 1) Check inventory against learned skill contracts that produce the goal item
         // Find skills whose learned effects include the goal item and have a postcondition
@@ -1443,19 +1479,20 @@ Use only c; no other globals.`;
                 // fix26: use 'inv' not 'inventory' to match CONTRACT_SPEC (c.post.inv, not c.post.inventory)
                 // fix26: include all state fields from CONTRACT_SPEC to avoid undefined errors
                 // fix43: include eq (equipment state) for idempotent equip contracts
-                const eq = state.equipment || { heldItem: null, offHand: null, helmet: null, chestplate: null, leggings: null, boots: null };
-                const syntheticState = { inv, pos: state.pos || { x: 0, y: 64, z: 0 }, hp: 20, food: 20, sky: 15, alive: true, dim: 'overworld', eq };
+                const eqState = state.equipment || { heldItem: null, offHand: null, helmet: null, chestplate: null, leggings: null, boots: null };
+                const syntheticState = { inv, pos: state.pos || { x: 0, y: 64, z: 0 }, hp: 20, food: 20, sky: 15, alive: true, dim: 'overworld', eq: eqState };
                 const c = {
                     args: [goal.item, goal.count],
                     ret: true,
                     pre: { inv: {}, pos: { x: 0, y: 64, z: 0 }, hp: 20, food: 20, sky: 15, alive: true, dim: 'overworld', eq: { heldItem: null, offHand: null, helmet: null, chestplate: null, leggings: null, boots: null } },
                     post: syntheticState,
-                    delta: { [goal.item]: have },
+                    delta: { [goal.item]: haveExact },
                     dist: (a, b) => Math.hypot((a?.x || 0) - (b?.x || 0), (a?.y || 0) - (b?.y || 0), (a?.z || 0) - (b?.z || 0))
                 };
                 const postOk = this._compileContract(skill.contract.post)(c);
-                if (postOk && have >= goal.count) {
-                    return { satisfied: true, reason: `learned postcondition of ${skill.name} holds (have ${have}/${goal.count} ${goal.item})` };
+                // fix51: use haveExact (inventory+equipment) not canProduce for satisfaction
+                if (postOk && haveExact >= goal.count) {
+                    return { satisfied: true, reason: `learned postcondition of ${skill.name} holds (have ${haveExact}/${goal.count} ${goal.item})` };
                 }
             } catch (err) {
                 console.log(`[fix37] postcondition check for ${skill.name} threw: ${err.message}`);
@@ -1467,19 +1504,20 @@ Use only c; no other globals.`;
         const effectProducers = this.skills.filter(s => !s.demoted && !s.mergedInto && !s.candidate
             && (s.effects || []).some(eff => goal.items?.includes(eff) || eff === goal.item));
 
-        if (effectProducers.length > 0 && have >= goal.count) {
+        // fix51: use haveExact (actual inventory+equipment count) not canProduce
+        if (effectProducers.length > 0 && haveExact >= goal.count) {
             const skillNames = effectProducers.slice(0, 3).map(s => s.name).join(', ');
-            return { satisfied: true, reason: `already have ${have}/${goal.count} ${goal.item} (learned producers: ${skillNames})` };
+            return { satisfied: true, reason: `already have ${haveExact}/${goal.count} ${goal.item} (learned producers: ${skillNames})` };
         }
 
-        // fix45: if inventory count >= goal count, the goal is satisfied regardless of producer graph
-        // Rule from #15/#25: inventory count is the ground truth; we don't need a learned producer to verify
-        // The "no learned skill produces it" case proceeds but is still satisfied - no failed attempts
-        if (have >= goal.count) {
-            return { satisfied: true, reason: `already have ${have}/${goal.count} ${goal.item} (inventory check; no learned producer)` };
+        // fix45/fix51: if EXACT inventory+equipment count >= goal count, the goal is satisfied
+        // Rule: inventory count is the ground truth - never producible count
+        if (haveExact >= goal.count) {
+            return { satisfied: true, reason: `already have ${haveExact}/${goal.count} ${goal.item} (inventory check; no learned producer)` };
         }
 
         // fix47: check if we can produce enough via learned producers (inventory-first planning)
+        // Note: this returns NOT satisfied but with a plan, so canProduce is appropriate here
         if (shortfallInfo.shortfall === 0 && shortfallInfo.produceItems?.length > 0) {
             const produceDesc = shortfallInfo.produceItems.map(s => `${s.count} ${s.item} via ${s.producer || s.type}`).join(', ');
             return {
@@ -1491,7 +1529,8 @@ Use only c; no other globals.`;
         }
 
         // 4) Not satisfied: don't have enough items
-        return { satisfied: false, reason: `need ${goal.count} ${goal.item}, have ${have}`, plan: shortfallInfo, goal };
+        // fix51: report exact inventory count, not producible count
+        return { satisfied: false, reason: `need ${goal.count} ${goal.item}, have ${haveExact}`, plan: shortfallInfo, goal };
     }
 
     // fix32 (PSN backward chaining): a goal item is produced by a learned skill whose learned effects contain it; the skill is
@@ -2764,7 +2803,8 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         }
         // fix19 (6): a death is a failure of the call that was running (deepest open call) and all its ancestors
         const died = this._diedInRun();
-        if (died) { let i = -1; for (let k = 0; k < trace.length; k++) if ((trace[k].t0 || 0) <= died.t && (trace[k].t1 ?? Infinity) >= died.t - 1500 && (i < 0 || trace[k].depth >= trace[i].depth)) i = k; if (i < 0) i = trace.length - 1; console.log(`[psn] death attributed to the call running at death time: ${trace[i].name} (depth ${trace[i].depth})`); trace[i].ownFail = [`DIED: ${died.message} at ${died.pos}${this._deathDetail(died)}`]; for (; i >= 0; i = trace[i].parent) { trace[i].intr = false; trace[i].ok = false; trace[i].fail = true; } ok = false; }
+        // fix51: pass beforeInv for items-dropped reporting
+        if (died) { let i = -1; for (let k = 0; k < trace.length; k++) if ((trace[k].t0 || 0) <= died.t && (trace[k].t1 ?? Infinity) >= died.t - 1500 && (i < 0 || trace[k].depth >= trace[i].depth)) i = k; if (i < 0) i = trace.length - 1; console.log(`[psn] death attributed to the call running at death time: ${trace[i].name} (depth ${trace[i].depth})`); trace[i].ownFail = [`DIED: ${died.message} at ${died.pos}${this._deathDetail(died, this._beforeRunInv)}`]; for (; i >= 0; i = trace[i].parent) { trace[i].intr = false; trace[i].ok = false; trace[i].fail = true; } ok = false; }
         const stalled = !died && this._stalledInRun();   // fix27: a stall is a failure of the deepest call open at stall time
         if (stalled) { let i = -1; for (let k = 0; k < trace.length; k++) if ((trace[k].t0 || 0) <= stalled.t && (trace[k].t1 ?? Infinity) >= stalled.t - 1500 && (i < 0 || trace[k].depth >= trace[i].depth)) i = k; if (i < 0) i = trace.length - 1; console.log(`[psn] stall attributed to the call running at stall time: ${trace[i].name} (depth ${trace[i].depth})`); trace[i].ownFail = [`FAILED: STALLED: no progress (no new ground reached, inventory, window, lit furnace) for 60s at ${stalled.pos}`]; for (; i >= 0; i = trace[i].parent) { trace[i].intr = false; trace[i].ok = false; trace[i].fail = true; } ok = false; }
         const timedOut = !died && !stalled && /timed out/i.test(this._lastRunMsg || '');   // fix33: a timeout is a failure of the deepest call running at the cut
@@ -3587,6 +3627,23 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
         const finalInvFull = this._detectInventoryFullFailure(task, before, this.observe(), '');
         const invFullReason = finalInvFull ? ` Inventory state: ${finalInvFull}` : '';
 
+        // fix51: track per-goal::reason failures using learned (s+1)/(n+2) Laplace-smoothed rate
+        // When stalls repeat on the same goal, the rate drops and backoff increases
+        const reasonKey = `${task}::${(anyCut || 'unknown').replace(/at \d+,\d+,\d+/g, 'at X,Y,Z').slice(0, 80)}`;
+        const goalStats = (this.progress.goalFailures ||= {});
+        const gs = (goalStats[reasonKey] ||= { success: 0, fail: 0 });
+        gs.fail++;
+        gs.lastFail = Date.now();
+        const rate = (gs.success + 1) / (gs.success + gs.fail + 2);  // Laplace-smoothed
+        console.log(`[fix51] goal::reason "${reasonKey.slice(0, 60)}" fail rate: ${(1 - rate).toFixed(2)} (${gs.fail} fails, ${gs.success} successes)`);
+        // If repeated stalls (rate < 0.3), increase backoff proportionally
+        if (rate < 0.3 && anyCut && /stall/i.test(anyCut)) {
+            const extraBackoff = Math.round(10000 * (1 - rate));  // up to 10s extra based on failure rate
+            this._backoffUntil = Math.max(this._backoffUntil || 0, Date.now() + extraBackoff);
+            console.log(`[fix51] repeated stall on same goal - extra backoff ${Math.round(extraBackoff / 1000)}s (rate ${rate.toFixed(2)})`);
+        }
+        this._saveProgress();
+
         // fix19 (1): failed twice (recently) or cut off -> decompose
         const fails = this.progress.failed.slice(-20).filter(t => t === task).length;
         if (fails >= 2 || anyCut || this._decomposeQueue?.task === task) { if (this._decomposeQueue?.task === task) this._decomposeQueue = null; await this._decompose(task, anyCut || `failed ${fails}x; last critic: ${String(feedback).slice(-300)}${invFullReason}`); }
@@ -3888,9 +3945,22 @@ Voyager.SEEDED_PRIMITIVES = [
         code: `async function tossClutter(bot, minFree = 4) {
     const start = bot.entity.position.clone();
     let tossed = 0;
-    const safeList = bot.__safeToToss || [];
-    const depositList = bot.__depositCandidates || [];
-    const uncertainList = bot.__uncertainItems || [];
+    // fix51: fail loud if signals not initialized (no fallback)
+    if (!Array.isArray(bot.__safeToToss)) {
+        log(bot, 'FAIL LOUD: bot.__safeToToss not initialized (voyager._prepareTossSignals not called before tossClutter)');
+        return bot.inventory.emptySlotCount();
+    }
+    if (!Array.isArray(bot.__depositCandidates)) {
+        log(bot, 'FAIL LOUD: bot.__depositCandidates not initialized');
+        return bot.inventory.emptySlotCount();
+    }
+    if (!Array.isArray(bot.__uncertainItems)) {
+        log(bot, 'FAIL LOUD: bot.__uncertainItems not initialized');
+        return bot.inventory.emptySlotCount();
+    }
+    const safeList = bot.__safeToToss;
+    const depositList = bot.__depositCandidates;
+    const uncertainList = bot.__uncertainItems;
     
     // Phase 1: toss safe items (items with POSITIVE learned producer signal + surplus)
     if (safeList.length) {
