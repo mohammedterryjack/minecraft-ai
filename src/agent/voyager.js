@@ -4514,7 +4514,7 @@ Voyager.SEEDED_PRIMITIVES = [
             else log(bot, collected ? \`No more \${blockType} nearby.\` : \`No \${blockType} nearby.\`);
             break;
         }
-        await bot.tool.equipForBlock(block);
+        await equipToolForBlock(bot, block);   // fix62: cheapest tool that works on this block (was mineflayer-tool equipForBlock: fastest dig = top tier)
         const itemId = bot.heldItem ? bot.heldItem.type : null;
         if (!block.canHarvest(itemId)) { log(bot, \`Don't have right tools to harvest \${blockType}.\`); return false; }
         const before = getInventoryCounts(bot);
@@ -4542,7 +4542,7 @@ Voyager.SEEDED_PRIMITIVES = [
     log(bot, \`Collected \${collected} \${blockType}.\`);
     return collected > 0;
 }`,
-        deps: ['pickupNearbyItems'],
+        deps: ['pickupNearbyItems', 'equipToolForBlock'],
     },
     {
         name: 'craftRecipe',
@@ -4653,8 +4653,8 @@ Voyager.SEEDED_PRIMITIVES = [
         name: 'breakBlockAt',
         description: 'Break the block at the given position. Equips the best available tool from inventory (no crafting) and moves within range if needed.',
         task: 'break a block',
-        // fix49: uses equipBestTool (inventory only, no crafting) to avoid dep cycle
-        // Obtaining a missing tool is the planner's job via harvestTools decompose
+        // fix49: equips from inventory only (no crafting) to avoid dep cycles; obtaining a missing tool is the planner's job (harvestTools decompose)
+        // fix62: the tool is chosen for THIS block by equipToolForBlock (cheapest tool that works), not the strongest of each type
         code: `async function breakBlockAt(bot, x, y, z) {
     if (x == null || y == null || z == null) { log(bot, 'breakBlockAt: invalid coordinates'); return false; }
     const block = bot.blockAt(new Vec3(x, y, z));
@@ -4666,24 +4666,15 @@ Voyager.SEEDED_PRIMITIVES = [
         await goToPosition(bot, block.position.x, block.position.y, block.position.z, 4);
     }
     if (bot.game.gameMode !== 'creative') {
-        // fix49: equip from inventory only (no crafting) - use equipBestTool for type needed
-        // mineflayer-tool's equipForBlock can craft, creating dep cycles
-        const harvestTools = block.harvestTools;
-        if (harvestTools) {
-            const toolTypes = ['pickaxe', 'axe', 'shovel', 'hoe'];
-            for (const tt of toolTypes) {
-                const equipped = await equipBestTool(bot, tt);
-                if (equipped && block.canHarvest(bot.heldItem?.type)) break;
-            }
-        }
+        await equipToolForBlock(bot, block);
         const itemId = bot.heldItem ? bot.heldItem.type : null;
-        if (!block.canHarvest(itemId)) { log(bot, \`FAILED: Don't have right tools to break \${block.name}. Need one of: \${Object.keys(harvestTools || {}).join(', ') || 'any tool'}\`); return false; }
+        if (!block.canHarvest(itemId)) { log(bot, \`FAILED: Don't have right tools to break \${block.name}. Need one of: \${Object.keys(block.harvestTools || {}).map(id => bot.registry.items[id].name).join(', ') || 'any tool'}\`); return false; }
     }
     await bot.dig(block, true);
     log(bot, \`Broke \${block.name} at \${x.toFixed(1)}, \${y.toFixed(1)}, \${z.toFixed(1)}.\`);
     return true;
 }`,
-        deps: ['equipBestTool'],
+        deps: ['equipToolForBlock'],
     },
     {
         name: 'pickupNearbyItems',
@@ -5041,21 +5032,22 @@ Voyager.SEEDED_PRIMITIVES = [
         deps: ['placeBlock'],
     },
     // fix44: equipBestTool with eq-based contract (idempotent: already-equipped = success)
+    // fix62: "best" (ported from ODYSSEY equipPickaxe/equipSword: equip the strongest before a fight/dig) is now ranked from game data
+    // (blocks it can harvest, dig-speed multiplier, max durability) instead of a hand-written tier list. Same contract.
     {
         name: 'equipBestTool',
         description: 'Equip the best tool of toolType (pickaxe, axe, sword, shovel, hoe) in the inventory; returns the item name or null.',
         task: 'equip a tool',
         code: `async function equipBestTool(bot, toolType = 'pickaxe') {
-    const tiers = ['netherite', 'diamond', 'iron', 'stone', 'golden', 'wooden'];
-    const inv = getInventoryCounts(bot);
-    for (const t of tiers) {
-        const name = \`\${t}_\${toolType}\`;
-        if (inv[name]) {
-            await bot.equip(bot.inventory.items().find(it => it.name === name), 'hand');
-            return name;
-        }
-    }
-    return null;
+    const reg = bot.registry;
+    const harvests = id => reg.blocksArray.filter(b => b.harvestTools && b.harvestTools[id]).length;
+    const speed = id => Math.max(...Object.values(reg.materials).map(m => m[id] || 0));
+    const cands = bot.inventory.items().filter(it => it.name.endsWith('_' + toolType));
+    if (!cands.length) return null;
+    const key = it => [harvests(it.type), speed(it.type), reg.items[it.type].maxDurability];
+    cands.sort((a, b) => { const ka = key(a), kb = key(b); for (let i = 0; i < ka.length; i++) if (ka[i] !== kb[i]) return kb[i] - ka[i]; return 0; });
+    await bot.equip(cands[0], 'hand');
+    return cands[0].name;
 }`,
         deps: [],
         // fix44/45: contract uses c.post.eq.heldItem NOT c.delta - idempotent (already-equipped = success)
@@ -5064,6 +5056,25 @@ Voyager.SEEDED_PRIMITIVES = [
             pre: 'c => true',
             post: 'c => c.ret === null || (c.post.eq ? c.post.eq.heldItem === c.ret : false)',
             text: 'returns null (no tool) or the equipped tool name matches c.post.eq.heldItem',
+        },
+    },
+    // fix62: per-block tool choice. Picks the CHEAPEST inventory item that works on this block, all from game data + live inventory:
+    //   works       - block.harvestTools has it (required to get the drop) or, when nothing is required, its material speeds it up
+    //   capability  - how many registry blocks the item is required for or speeds up; spending a more capable tool on this block
+    //                 wears capability the block does not need (an iron_pickaxe on iron_ore when a stone_pickaxe also harvests it)
+    //   wear cost   - its recipe ingredients weighted by inventory scarcity 1/(1+have), per point of max durability (uncraftable: Infinity)
+    //   remaining   - durability left (item.durabilityUsed); among equals the more worn one is used up first
+    // With nothing that works and nothing required, the hand is emptied so an unrelated tool is not worn (2 points per dig).
+    {
+        name: 'equipToolForBlock',
+        description: 'Equip the cheapest inventory tool that can harvest (or speeds up) the given block; returns the item name, or null when the hand is used.',
+        task: 'equip the cheapest tool for a block',
+        code: skills.equipToolForBlock.toString(),   // fix62: one source of truth, the library function (bot + log only, so it runs bare in the sandbox)
+        deps: [],
+        contract: {
+            pre: 'c => true',
+            post: 'c => c.ret === null || (c.post.eq ? c.post.eq.heldItem === c.ret : false)',
+            text: 'returns null (hand) or the equipped tool name matches c.post.eq.heldItem',
         },
     },
 ];

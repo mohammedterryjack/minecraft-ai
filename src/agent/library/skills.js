@@ -739,7 +739,7 @@ export async function collectBlock(bot, blockType, num=1, exclude=null) {
             break;
         }
         const block = blocks[0];
-        await bot.tool.equipForBlock(block);
+        await equipToolForBlock(bot, block);   // fix62: cheapest tool that works (mineflayer-tool equipForBlock sorts by dig time = top tier)
         if (isLiquid) {
             const bucket = bot.inventory.findInventoryItem('bucket');
             if (!bucket) {
@@ -858,7 +858,7 @@ export async function breakBlockAt(bot, x, y, z) {
             await goToGoal(bot, new pf.goals.GoalNear(pos.x, pos.y, pos.z, 4));
         }
         if (bot.game.gameMode !== 'creative') {
-            await bot.tool.equipForBlock(block);
+            await equipToolForBlock(bot, block);   // fix62: cheapest tool that works (mineflayer-tool equipForBlock sorts by dig time = top tier)
             const itemId = bot.heldItem ? bot.heldItem.type : null
             if (!block.canHarvest(itemId)) {
                 log(bot, `Don't have right tools to break ${block.name}.`);
@@ -1067,6 +1067,47 @@ export async function placeBlock(bot, blockType, x, y, z, placeOn='bottom', dont
         log(bot, `FAILED to place ${blockType} at ${target_dest}: ${errMsg}`);
         return false;
     }
+}
+
+// fix62: per-block tool choice: the CHEAPEST inventory item that works on this block, from game data + live inventory (no tier list).
+//   works       - block.harvestTools has it (required to get the drop) or, when nothing is required, its material speeds the dig up
+//   capability  - how many registry blocks the item is required for (harvestTools), then how many it speeds up; a more capable
+//                 tool spent on this block wears capability the block does not need (iron_pickaxe on iron_ore when stone also harvests it)
+//   wear cost   - its recipe ingredients weighted by inventory scarcity 1/(1+have), per point of max durability (uncraftable: Infinity)
+//   remaining   - durability left (item.durabilityUsed); among equals the more worn one is used up first
+// Nothing works and nothing is required: the hand is emptied so an unrelated tool is not worn. Uses only bot + log so the seeded
+// primitive is this exact source (Voyager.SEEDED_PRIMITIVES equipToolForBlock).
+export async function equipToolForBlock(bot, block) {
+    if (!block) { log(bot, 'FAILED: equipToolForBlock needs a block'); return null; }
+    const reg = bot.registry;
+    const speedsUp = (b, id) => !!(reg.materials[b.material] && reg.materials[b.material][id]);
+    const works = id => block.harvestTools ? !!block.harvestTools[id] : speedsUp(block, id);
+    const items = bot.inventory.items();
+    const cands = items.filter(it => works(it.type));
+    if (!cands.length) {
+        if (block.harvestTools) { log(bot, `FAILED: no inventory tool can harvest ${block.name}`); return null; }
+        if (bot.heldItem && reg.items[bot.heldItem.type].maxDurability) await bot.unequip('hand');
+        return null;
+    }
+    const have = {};
+    for (const it of items) have[it.type] = (have[it.type] || 0) + it.count;
+    const harvests = id => reg.blocksArray.filter(b => b.harvestTools && b.harvestTools[id]).length;
+    const speeds = id => reg.blocksArray.filter(b => speedsUp(b, id)).length;
+    const ingredientId = x => (x !== null && typeof x === 'object') ? x.id : x;
+    const replaceCost = id => {
+        const rs = reg.recipes[id];
+        if (!rs) return Infinity;
+        return Math.min(...rs.map(r => (r.inShape ? r.inShape.flat() : r.ingredients).map(ingredientId).filter(x => x !== null)
+            .reduce((sum, x) => sum + 1 / (1 + (have[x] || 0)), 0) / r.result.count));
+    };
+    const scored = cands.map(it => {
+        const max = reg.items[it.type].maxDurability;
+        if (!max) throw new Error(`equipToolForBlock: ${it.name} works on ${block.name} but has no maxDurability in the registry`);
+        return { it, key: [harvests(it.type), speeds(it.type), replaceCost(it.type) / max, max - it.durabilityUsed] };
+    });
+    scored.sort((a, b) => { for (let i = 0; i < a.key.length; i++) if (a.key[i] !== b.key[i]) return a.key[i] - b.key[i]; return 0; });
+    await bot.equip(scored[0].it, 'hand');
+    return scored[0].it.name;
 }
 
 export async function equip(bot, itemName) {
