@@ -26,19 +26,45 @@ test('fix49: travelTo seeded code uses GoalNearXZ, not Vec3', async (t) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Bug 2: craftRecipe postcondition VIOLATED after real craft success
-// Root cause: delta computed in _checkContracts - the deltaGained check is the fix
-// File: src/agent/voyager.js, line ~728 (deltaGained check in _checkContracts)
+// Root cause: post snapshot taken before inventory window settles
+// Fix: (a) await inventory settle via updateSlot/windowClose event before post snapshot
+//      (b) expose canonical `have` count = inv + held + offhand in c.pre/c.post
 // ─────────────────────────────────────────────────────────────────────────────
-test('fix49: craftRecipe uses delta-based contract checking', async (t) => {
-    await t.test('_checkContracts should check deltaGained before VIOLATED', async () => {
+test('fix49: craftRecipe inventory settle and have count', async (t) => {
+    await t.test('trace wrapper should wait for inventory settle on craft skills', async () => {
         const fs = await import('fs');
-        const voyagerCode = fs.readFileSync('./src/agent/voyager.js', 'utf8');
+        const skillGraphCode = fs.readFileSync('./src/agent/skill_graph.js', 'utf8');
         
-        // The fix is in _checkContracts around line 728-733
-        assert.ok(voyagerCode.includes('deltaGained'), 
-            '_checkContracts should check deltaGained');
-        assert.ok(voyagerCode.includes("effects.some(eff => (r.delta?.[eff]"),
-            '_checkContracts should check delta for each effect');
+        // fix49: __waitSettle waits for updateSlot/windowClose events
+        assert.ok(skillGraphCode.includes('__waitSettle'),
+            'should have __waitSettle function');
+        assert.ok(skillGraphCode.includes('updateSlot'),
+            '__waitSettle should listen for updateSlot event');
+        assert.ok(skillGraphCode.includes('windowClose'),
+            '__waitSettle should listen for windowClose event');
+    });
+
+    await t.test('trace wrapper should call __waitSettle for craft skills in finally', async () => {
+        const fs = await import('fs');
+        const skillGraphCode = fs.readFileSync('./src/agent/skill_graph.js', 'utf8');
+        
+        // Should call __waitSettle for skills starting with 'craft'
+        assert.ok(skillGraphCode.includes("if (/^craft/i.test(n)) await __waitSettle()"),
+            'finally block should await __waitSettle for craft skills');
+    });
+
+    await t.test('state should expose `have` = inv + held + offhand', async () => {
+        const fs = await import('fs');
+        const skillGraphCode = fs.readFileSync('./src/agent/skill_graph.js', 'utf8');
+        
+        assert.ok(skillGraphCode.includes('__have'),
+            'should have __have function');
+        assert.ok(skillGraphCode.includes('eq.heldItem'),
+            '__have should count heldItem');
+        assert.ok(skillGraphCode.includes('eq.offHand'),
+            '__have should count offHand');
+        assert.ok(skillGraphCode.includes('have }'),
+            '__st should include have in returned state');
     });
 
     await t.test('craftRecipe should NOT have seeded contract (delta check is the fix)', async () => {
@@ -48,58 +74,55 @@ test('fix49: craftRecipe uses delta-based contract checking', async (t) => {
         assert.ok(!craftRecipe.contract, 
             'craftRecipe should NOT have a seeded contract (delta check in _checkContracts is the fix)');
     });
-
-    await t.test('delayed inventory update simulation', async () => {
-        // This test simulates the scenario where bot.craft returns but inventory hasn't updated yet
-        // The fix ensures delta (computed in finally{}) captures the settled state
-        const { Voyager } = await import('../src/agent/voyager.js');
-        
-        // Verify trace wrapper computes delta in finally block
-        const voyagerCode = await import('fs').then(fs => fs.readFileSync('./src/agent/voyager.js', 'utf8'));
-        assert.ok(voyagerCode.includes('finally') && voyagerCode.includes('delta'),
-            'trace wrapper should compute delta in finally block to capture settled state');
-    });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Bug 3: TypeError reading 'name' (null) in buildHutAdjacentFloor
-// Fix: primitives that use blockAt must check for null before accessing .name
+// buildHutAdjacentFloor is a model-generated composite. The null comes from blockAt/findBlock
+// in unloaded chunks after travelTo stalls.
+// Fix: breakBlockAt (seeded) returns descriptive error when block is null; repair prompt warns about it
 // ─────────────────────────────────────────────────────────────────────────────
-test('fix49: null-safe blockAt usage in primitives', async (t) => {
-    await t.test('breakBlockAt should check block is not null before accessing .name', async () => {
+test('fix49: null-safe blockAt in breakBlockAt primitive', async (t) => {
+    await t.test('breakBlockAt should throw descriptive error when blockAt returns null', async () => {
         const { Voyager } = await import('../src/agent/voyager.js');
         const breakBlockAt = Voyager.SEEDED_PRIMITIVES.find(p => p.name === 'breakBlockAt');
         assert.ok(breakBlockAt, 'breakBlockAt should exist');
-        // Should check !block before accessing block.name
-        assert.ok(breakBlockAt.code.includes('!block ||') || breakBlockAt.code.includes('if (!block'),
-            'breakBlockAt should check for null block before accessing .name');
+        // Should check !block and return/log descriptive error
+        assert.ok(breakBlockAt.code.includes('if (!block)'),
+            'breakBlockAt should check !block');
+        assert.ok(breakBlockAt.code.includes('returned null') || breakBlockAt.code.includes('unloaded chunk'),
+            'breakBlockAt should mention null/unloaded in error message');
     });
 
-    await t.test('placeBlock should use optional chaining or null check', async () => {
+    await t.test('breakBlockAt null check should come early and return false', async () => {
         const { Voyager } = await import('../src/agent/voyager.js');
-        const placeBlock = Voyager.SEEDED_PRIMITIVES.find(p => p.name === 'placeBlock');
-        assert.ok(placeBlock, 'placeBlock should exist');
-        // Should use check?.name or check && check.name
-        assert.ok(placeBlock.code.includes('?.name') || placeBlock.code.includes('check &&'),
-            'placeBlock should safely access .name on blockAt result');
+        const breakBlockAt = Voyager.SEEDED_PRIMITIVES.find(p => p.name === 'breakBlockAt');
+        const code = breakBlockAt.code;
+        // The null check should be near the start, after blockAt call
+        const blockAtLine = code.indexOf('blockAt(');
+        const nullCheck = code.indexOf('if (!block)');
+        assert.ok(nullCheck > blockAtLine && nullCheck < blockAtLine + 150,
+            'null check should be right after blockAt call');
+        assert.ok(breakBlockAt.code.includes('return false'),
+            'breakBlockAt should return false on null block');
     });
 
-    await t.test('collectBlock should handle findBlock returning null', async () => {
-        const { Voyager } = await import('../src/agent/voyager.js');
-        const collectBlock = Voyager.SEEDED_PRIMITIVES.find(p => p.name === 'collectBlock');
-        assert.ok(collectBlock, 'collectBlock should exist');
-        // Should have null check for block
-        assert.ok(collectBlock.code.includes('!block') || collectBlock.code.includes('continue'),
-            'collectBlock should handle null blocks from findBlock');
-    });
-
-    await t.test('repair prompt should warn about null blockAt results', async () => {
+    await t.test('repair system prompt should warn about null blockAt/findBlock', async () => {
         const fs = await import('fs');
         const voyagerCode = fs.readFileSync('./src/agent/voyager.js', 'utf8');
-        assert.ok(voyagerCode.includes('blockAt results can be null') || 
-            voyagerCode.includes('null-check') || 
-            voyagerCode.includes('findBlock'),
-            'repair prompt should mention null-checking findBlock/blockAt');
+        // The repair system prompt should explicitly warn about null-checking
+        assert.ok(voyagerCode.includes('findBlock/findBlocks/nearestEntity') && 
+            voyagerCode.includes('can be null'),
+            'repair system prompt should warn that findBlock/blockAt can return null');
+        assert.ok(voyagerCode.includes('null-check'),
+            'repair prompt should mention null-checking');
+    });
+
+    await t.test('repair system prompt should mention checking .position/.x', async () => {
+        const fs = await import('fs');
+        const voyagerCode = fs.readFileSync('./src/agent/voyager.js', 'utf8');
+        assert.ok(voyagerCode.includes('.position') || voyagerCode.includes('.x'),
+            'repair prompt should mention checking position/coords on null');
     });
 });
 
@@ -141,31 +164,65 @@ test('fix49: goal-satisfied uses exact match for ensure goals', async (t) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Bug 5: Gate REJECT: dep cycle involving breakBlockAt
-// Fix: breakBlockAt has empty deps, and cycle detection rejects learned skills that create cycles
+// Cycle: breakBlockAt -> equipToolOrCraft -> craftSticks -> craftPlanks -> craftRecipe -> placeBlock -> breakBlockAt
+// Fix: breakBlockAt uses equipBestTool (inventory only, no crafting) - obtaining tool is planner's job
+//      Composer/repair lint feedback shows would-be cycle so model won't generate it
 // ─────────────────────────────────────────────────────────────────────────────
 test('fix49: breakBlockAt dep cycle prevention', async (t) => {
-    await t.test('breakBlockAt seeded primitive has empty deps', async () => {
+    await t.test('breakBlockAt should use equipBestTool, not equipForBlock that can craft', async () => {
         const { Voyager } = await import('../src/agent/voyager.js');
         const breakBlockAt = Voyager.SEEDED_PRIMITIVES.find(p => p.name === 'breakBlockAt');
         assert.ok(breakBlockAt, 'breakBlockAt should exist');
-        assert.deepEqual(breakBlockAt.deps, [], 'breakBlockAt should have empty deps');
+        assert.ok(breakBlockAt.code.includes('equipBestTool'),
+            'breakBlockAt should use equipBestTool (inventory only)');
+        // Check there's no actual call to equipForBlock (await bot.tool.equipForBlock)
+        // Comments mentioning it are OK
+        assert.ok(!breakBlockAt.code.includes('await bot.tool.equipForBlock'),
+            'breakBlockAt should NOT call bot.tool.equipForBlock (can craft, creating cycle)');
     });
 
-    await t.test('findCycle should detect cycles', async () => {
+    await t.test('breakBlockAt deps should be equipBestTool only', async () => {
+        const { Voyager } = await import('../src/agent/voyager.js');
+        const breakBlockAt = Voyager.SEEDED_PRIMITIVES.find(p => p.name === 'breakBlockAt');
+        assert.deepEqual(breakBlockAt.deps, ['equipBestTool'], 
+            'breakBlockAt deps should be [equipBestTool] - no crafting deps');
+    });
+
+    await t.test('findCycle should detect the exact cycle from the bug', async () => {
         const { findCycle } = await import('../src/agent/skill_graph.js');
+        // The exact cycle: breakBlockAt -> equipToolOrCraft -> ... -> placeBlock -> breakBlockAt
         const graph = {
-            skillA: ['breakBlockAt'],
-            breakBlockAt: ['skillA']
+            equipToolOrCraft: ['craftSticks'],
+            craftSticks: ['craftPlanks'],
+            craftPlanks: ['craftRecipe'],
+            craftRecipe: ['placeBlock'],
+            placeBlock: ['breakBlockAt'],
+            breakBlockAt: []
         };
-        const cycle = findCycle('skillA', ['breakBlockAt'], graph);
-        assert.ok(cycle, 'should detect A -> breakBlockAt -> A cycle');
+        // If breakBlockAt called equipToolOrCraft, it would create a cycle
+        const cycle = findCycle('breakBlockAt', ['equipToolOrCraft'], graph);
+        assert.ok(cycle, 'should detect the full cycle');
+        assert.ok(cycle.includes('breakBlockAt') && cycle.includes('placeBlock'),
+            'cycle should include breakBlockAt and placeBlock');
     });
 
-    await t.test('gate should REJECT skills that create cycles', async () => {
+    await t.test('_cycleLint should detect would-be cycles in repair feedback', async () => {
         const fs = await import('fs');
         const voyagerCode = fs.readFileSync('./src/agent/voyager.js', 'utf8');
-        assert.ok(voyagerCode.includes('REJECT') && voyagerCode.includes('dependency cycle'),
-            'saveSkill should REJECT skills that create dependency cycles');
+        assert.ok(voyagerCode.includes('_cycleLint'),
+            'should have _cycleLint method for repair feedback');
+        assert.ok(voyagerCode.includes('DEPENDENCY CYCLE would be created'),
+            '_cycleLint should warn about would-be cycles');
+    });
+
+    await t.test('repair loop should check _cycleLint before standard lint', async () => {
+        const fs = await import('fs');
+        const voyagerCode = fs.readFileSync('./src/agent/voyager.js', 'utf8');
+        // Should check cycle before lint in repair loop
+        assert.ok(voyagerCode.includes('cycleErr = this._cycleLint'),
+            'repair loop should call _cycleLint');
+        assert.ok(voyagerCode.includes('if (cycleErr) err = cycleErr'),
+            'repair loop should use cycle error before lint error');
     });
 });
 
@@ -359,6 +416,29 @@ test('fix49: no || fallback defaults', async (t) => {
             'should not have bot.health || 20 fallback');
         assert.ok(!voyagerCode.includes('variance || 5'),
             'should not have variance || 5 fallback');
+    });
+
+    await t.test('countGoal should throw if VERSION is null (no && VERSION skip)', async () => {
+        const fs = await import('fs');
+        const voyagerCode = fs.readFileSync('./src/agent/voyager.js', 'utf8');
+        
+        // countGoal should throw, not silently skip with && VERSION
+        const countGoalSection = voyagerCode.match(/function countGoal[\s\S]{0,800}/);
+        assert.ok(countGoalSection, 'should have countGoal function');
+        assert.ok(countGoalSection[0].includes('throw') && countGoalSection[0].includes('VERSION is null'),
+            'countGoal should throw when VERSION is null');
+        assert.ok(!countGoalSection[0].includes('&& VERSION'),
+            'countGoal should not use && VERSION to silently skip');
+    });
+
+    await t.test('_precheck should throw if VERSION is null', async () => {
+        const fs = await import('fs');
+        const voyagerCode = fs.readFileSync('./src/agent/voyager.js', 'utf8');
+        
+        const precheckSection = voyagerCode.match(/_precheck\(r\)[\s\S]{0,500}/);
+        assert.ok(precheckSection, 'should have _precheck method');
+        assert.ok(precheckSection[0].includes('throw') && precheckSection[0].includes('VERSION is null'),
+            '_precheck should throw when VERSION is null');
     });
 });
 

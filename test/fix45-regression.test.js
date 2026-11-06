@@ -173,7 +173,8 @@ describe('fix45: food/health restoration via learned skills', () => {
 
 describe('fix45: already-have goal satisfaction', () => {
     it('should satisfy goal when inventory count >= goal count even without learned producer', async () => {
-        const { Voyager } = await import('../src/agent/voyager.js');
+        const { Voyager, _setVersionForTest } = await import('../src/agent/voyager.js');
+        _setVersionForTest('1.20.4');  // fix49: VERSION must be set for countGoal
         
         // Create mock using Object.create to properly inherit prototype methods like _computeShortfall
         const mockVoyager = Object.create(Voyager.prototype);
@@ -191,7 +192,8 @@ describe('fix45: already-have goal satisfaction', () => {
     });
 
     it('should NOT satisfy goal when inventory count < goal count', async () => {
-        const { Voyager } = await import('../src/agent/voyager.js');
+        const { Voyager, _setVersionForTest } = await import('../src/agent/voyager.js');
+        _setVersionForTest('1.20.4');  // fix49: VERSION must be set for countGoal
         
         const mockVoyager = Object.create(Voyager.prototype);
         mockVoyager.skills = [];
@@ -207,7 +209,8 @@ describe('fix45: already-have goal satisfaction', () => {
     });
 
     it('should satisfy goal with multiple items in inventory sum', async () => {
-        const { Voyager } = await import('../src/agent/voyager.js');
+        const { Voyager, _setVersionForTest } = await import('../src/agent/voyager.js');
+        _setVersionForTest('1.20.4');  // fix49: VERSION must be set for countGoal
         
         const mockVoyager = Object.create(Voyager.prototype);
         mockVoyager.skills = [];
@@ -225,7 +228,8 @@ describe('fix45: already-have goal satisfaction', () => {
     it('should result in zero attempts when already satisfied', async () => {
         let attempts = 0;
         
-        const { Voyager } = await import('../src/agent/voyager.js');
+        const { Voyager, _setVersionForTest } = await import('../src/agent/voyager.js');
+        _setVersionForTest('1.20.4');  // fix49: VERSION must be set for countGoal
         
         const mockVoyager = Object.create(Voyager.prototype);
         mockVoyager.skills = [];

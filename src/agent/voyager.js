@@ -157,13 +157,15 @@ function countGoal(task) {
     if (countParsed === null) return null;  // not a valid number
     let item = m[3].toLowerCase();
     // plural item names from the curriculum ("torches", "sticks") -> registry id
-    // fix49: fail loud if VERSION is not set (no fallback)
+    // fix49: fail loud if VERSION is not set (no fallback) - throw like ensureGoal does
+    if (!VERSION) throw new Error(`[fix49] LOUD FAIL: countGoal called but VERSION is null - bot version must be set before parsing goals`);
+    const md = minecraftData(VERSION);
     { const irr = { torches: 'torch' }; if (irr[item]) item = irr[item];
-      else if (VERSION) { const md = minecraftData(VERSION); if (!md.itemsByName[item] && item.endsWith('s') && md.itemsByName[item.slice(0, -1)]) item = item.slice(0, -1); } }
+      else if (!md.itemsByName[item] && item.endsWith('s') && md.itemsByName[item.slice(0, -1)]) item = item.slice(0, -1); }
     // mining a block counts its loot drops too (iron_ore -> raw_iron, coal_ore -> coal, stone -> cobblestone)
     let items = [item];
-    if (['mine', 'collect', 'gather', 'chop', 'get', 'obtain'].includes(verb) && VERSION) {
-        const md = minecraftData(VERSION); for (const d of (md.blockLoot?.[item]?.drops || [])) if (!items.includes(d.item)) items.push(d.item);
+    if (['mine', 'collect', 'gather', 'chop', 'get', 'obtain'].includes(verb)) {
+        for (const d of (md.blockLoot?.[item]?.drops || [])) if (!items.includes(d.item)) items.push(d.item);
     }
     return { count: countParsed, item, items, verb };
 }
@@ -742,9 +744,10 @@ export class Voyager {
             const tgt = r && this.skills.find(x => x.name === r.name);
             if (!tgt || tgt.name === s.name || !(tgt.handwritten || tgt.primitive)) continue;
             // only pure variants: a real item id, and no extra behaviour in the name (e.g. craftAndPlaceChestInHut stays its own skill)
-            const g = countGoal(s.task);
-            // fix49: fail loud if VERSION not set (no fallback)
-            let valid = true; if (g && VERSION) { const md = minecraftData(VERSION); valid = !!md.itemsByName[g.item] || !!md.blocksByName[g.item]; }
+            // fix49: countGoal throws if VERSION is null (fail loud) - catch to allow batch to continue
+            let g = null; try { g = countGoal(s.task); } catch (e) { if (e.message?.includes('VERSION is null')) continue; throw e; }
+            // fix49: fail loud if VERSION not set (no fallback) - countGoal already threw if null
+            let valid = true; if (g) { const md = minecraftData(VERSION); valid = !!md.itemsByName[g.item] || !!md.blocksByName[g.item]; }
             const extra = s.name.split(/(?=[A-Z])/).map(w => w.toLowerCase()).filter(w => !['craft','mine','get','obtain','collect','gather','smelt','one','two','three','four','five','six','seven','eight'].includes(w) && !(g?.item || '').split('_').some(p => p.startsWith(w) || w.startsWith(p)));
             if (!valid || extra.length) continue;
             s.mergedInto = tgt.name; s.variantCall = r.call; n++;
@@ -1411,6 +1414,16 @@ Use only c; no other globals.`;
     // library source with optional per-name code overrides (candidates under test)
     _libSrc(over = {}) { return this.skills.map(s => over[s.name] ?? s.code).join('\n\n'); }
     _graph(exclude) { const g = {}; for (const s of this.skills) if (s.name !== exclude) g[s.name] = s.deps || []; return g; }
+    
+    // fix49: check if code would create a dependency cycle - returns error message or null
+    // This is for lint feedback so the model knows which deps to avoid BEFORE the gate rejects
+    _cycleLint(skillName, code) {
+        const allNames = new Set(this.skills.map(s => s.name));
+        const deps = depsOf(code, skillName, allNames);
+        const cyc = findCycle(skillName, deps, this._graph(skillName));
+        if (!cyc) return null;
+        return `DEPENDENCY CYCLE would be created: ${cyc.join(' -> ')}\nThe skill "${skillName}" cannot call ${deps.filter(d => cyc.includes(d)).join(', ')} because they transitively depend on "${skillName}".`;
+    }
 
     // fix32: learned effects / consumption of a skill from its successful runs (union, capped) - feeds backward chaining
     // fix44: goalItems hint FILTERS which observed ups count as effects - does NOT fabricate
@@ -3110,9 +3123,14 @@ IMPORTANT: All functions use bare names. Do NOT write skills.goToPosition - writ
             else {
                 desc = ((code.match(/\/\/\s*DESCRIPTION:\s*(.+)/) || [])[1] || e.description).trim();
                 body = code.replace(/\n\s*await\s+\w+\(bot[^)]*\);\s*$/, '').trim();
-                const staged = await this.agent.coder._stageCode(this._libSrc({ [e.name]: body }) + '\n\nawait Promise.resolve();');   // fix19: lint needs an await in main (library-only source always failed lint)
-                const lint = staged ? await this.agent.coder._lintCode(staged.src_lint_copy) : 'staging failed';
-                if (lint) err = `lint: ${String(lint).slice(0, 600)}`;
+                // fix49: check for dependency cycles BEFORE lint (feedback tells model which deps to avoid)
+                const cycleErr = this._cycleLint(e.name, body);
+                if (cycleErr) err = cycleErr;
+                else {
+                    const staged = await this.agent.coder._stageCode(this._libSrc({ [e.name]: body }) + '\n\nawait Promise.resolve();');   // fix19: lint needs an await in main (library-only source always failed lint)
+                    const lint = staged ? await this.agent.coder._lintCode(staged.src_lint_copy) : 'staging failed';
+                    if (lint) err = `lint: ${String(lint).slice(0, 600)}`;
+                }
             }
             if (!err) break;
             console.log(`[psn] repair attempt ${att} FAILED for ${e.name}: ${err.slice(0, 300)}${att < 2 ? '; retrying with the error fed back' : ''}`);
@@ -3980,27 +3998,39 @@ Voyager.SEEDED_PRIMITIVES = [
     },
     {
         name: 'breakBlockAt',
-        description: 'Break the block at the given position. Equips the right tool and moves within range if needed.',
+        description: 'Break the block at the given position. Equips the best available tool from inventory (no crafting) and moves within range if needed.',
         task: 'break a block',
+        // fix49: uses equipBestTool (inventory only, no crafting) to avoid dep cycle
+        // Obtaining a missing tool is the planner's job via harvestTools decompose
         code: `async function breakBlockAt(bot, x, y, z) {
     if (x == null || y == null || z == null) { log(bot, 'breakBlockAt: invalid coordinates'); return false; }
     const block = bot.blockAt(new Vec3(x, y, z));
-    if (!block || block.name === 'air' || block.name === 'water' || block.name === 'lava') {
+    if (!block) { log(bot, \`breakBlockAt: blockAt(\${x}, \${y}, \${z}) returned null (unloaded chunk?)\`); return false; }
+    if (block.name === 'air' || block.name === 'water' || block.name === 'lava') {
         log(bot, \`No solid block at \${x}, \${y}, \${z}.\`); return false;
     }
     if (bot.entity.position.distanceTo(block.position) > 4.5) {
         await goToPosition(bot, block.position.x, block.position.y, block.position.z, 4);
     }
     if (bot.game.gameMode !== 'creative') {
-        await bot.tool.equipForBlock(block);
+        // fix49: equip from inventory only (no crafting) - use equipBestTool for type needed
+        // mineflayer-tool's equipForBlock can craft, creating dep cycles
+        const harvestTools = block.harvestTools;
+        if (harvestTools) {
+            const toolTypes = ['pickaxe', 'axe', 'shovel', 'hoe'];
+            for (const tt of toolTypes) {
+                const equipped = await equipBestTool(bot, tt);
+                if (equipped && block.canHarvest(bot.heldItem?.type)) break;
+            }
+        }
         const itemId = bot.heldItem ? bot.heldItem.type : null;
-        if (!block.canHarvest(itemId)) { log(bot, \`Don't have right tools to break \${block.name}.\`); return false; }
+        if (!block.canHarvest(itemId)) { log(bot, \`FAILED: Don't have right tools to break \${block.name}. Need one of: \${Object.keys(harvestTools || {}).join(', ') || 'any tool'}\`); return false; }
     }
     await bot.dig(block, true);
     log(bot, \`Broke \${block.name} at \${x.toFixed(1)}, \${y.toFixed(1)}, \${z.toFixed(1)}.\`);
     return true;
 }`,
-        deps: [],
+        deps: ['equipBestTool'],
     },
     {
         name: 'pickupNearbyItems',

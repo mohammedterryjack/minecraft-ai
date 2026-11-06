@@ -242,7 +242,7 @@ function createMockState() {
 }
 
 describe('smoke: full step loop', { skip: !DEPS_AVAILABLE ? `Dependencies not installed: ${DEPS_ERROR}. Run npm install first.` : false }, () => {
-    let Voyager, parseVerboseGoal, extractFeedback;
+    let Voyager, parseVerboseGoal, extractFeedback, _setVersionForTest;
     let bot, prompter, agent, voyager;
     
     before(async () => {
@@ -254,6 +254,10 @@ describe('smoke: full step loop', { skip: !DEPS_AVAILABLE ? `Dependencies not in
         Voyager = voyagerModule.Voyager;
         parseVerboseGoal = voyagerModule.parseVerboseGoal;
         extractFeedback = voyagerModule.extractFeedback;
+        _setVersionForTest = voyagerModule._setVersionForTest;
+        
+        // fix49: VERSION must be set for countGoal/parseVerboseGoal
+        _setVersionForTest('1.20.4');
         
         bot = createMockBot();
         prompter = createMockPrompter();
