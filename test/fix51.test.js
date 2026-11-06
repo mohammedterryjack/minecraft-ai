@@ -689,8 +689,8 @@ describe('fix51 issue 16: smelt goal uses exact count not producible', async () 
 
         assert.ok(fnBody.includes('haveExact'),
             '_goalAlreadySatisfied should use haveExact variable');
-        assert.ok(fnBody.includes('invCount + eqCount'),
-            '_goalAlreadySatisfied should compute exact from inventory + equipment');
+        assert.ok(!fnBody.includes('eqCount'),
+            '_goalAlreadySatisfied must not add equipment on top of inventory counts (slots 5..45 already include it)');
         assert.ok(!fnBody.match(/if\s*\([^)]*canProduce[^)]*>=\s*goal\.count/),
             '_goalAlreadySatisfied should NOT use canProduce for satisfaction check');
     });
@@ -1095,5 +1095,53 @@ describe('fix51 rule fixes: structured prereq + deposit without name regex', asy
         const fn = body.slice(0, body.indexOf('}`,'));
         assert.ok(!fn.includes('chest|barrel'), 'no container name regex');
         assert.ok(fn.includes('[deposit] reject \\${cand.key}: \\${err.message}'), 'openContainer failure logs reject with error and moves on');
+    });
+});
+
+describe('fix51 exact equip / goal item resolution', async () => {
+    const mod = await import('../src/agent/voyager.js');
+    mod._setVersionForTest('1.21.4');
+    const mk = () => {
+        const bot = { version: '1.21.4', chat: () => {}, on: () => {}, off: () => {}, once: () => {}, removeListener: () => {} };
+        const v = new mod.Voyager({ bot, agent: { prompter: { task: () => {} }, npc: { constructs: {} } } });
+        v.skills = [{ name: 'craftThreeSticks', effects: ['stick'], contract: { post: 'c => c.delta.stick >= 3' } }];
+        return v;
+    };
+    // holding stone_pickaxe, 0 iron_pickaxe (inventory counts include the held hotbar slot)
+    const stoneHeld = {
+        inventory: { stone_pickaxe: 1, stick: 7, iron_ingot: 36 },
+        equipment: { hand: 'stone_pickaxe', off_hand: 'empty', head: 'empty', torso: 'empty', legs: 'empty', feet: 'empty' },
+        pos: { x: 0, y: 64, z: 0 },
+    };
+    for (const task of ['verify iron pickaxe', 'Verify the iron pickaxe is equipped', 'craft iron pickaxe', 'craft one iron pickaxe', 'craft 1 iron pickaxe']) {
+        it(`"${task}" resolves to iron_pickaxe (never iron / a component)`, () => {
+            assert.strictEqual(mk()._resolveGoalItemUnified(task).item, 'iron_pickaxe');
+        });
+        it(`"${task}": stone_pickaxe held, 0 iron_pickaxe, 7 sticks (craftThreeSticks post 7/3) -> NOT satisfied`, () => {
+            const r = mk()._goalAlreadySatisfied(task, stoneHeld);
+            assert.strictEqual(r.satisfied, false, r.reason);
+            assert.ok(r.reason.includes('iron_pickaxe') && r.reason.includes('have 0'), r.reason);
+        });
+    }
+    it('iron_pickaxe held counts once (no inventory+equipment double count)', () => {
+        const r = mk()._goalAlreadySatisfied('verify iron pickaxe', {
+            inventory: { iron_pickaxe: 1 },
+            equipment: { hand: 'iron_pickaxe', off_hand: 'empty', head: 'empty', torso: 'empty', legs: 'empty', feet: 'empty' },
+        });
+        assert.strictEqual(r.satisfied, true);
+        assert.ok(r.reason.includes('1/1 iron_pickaxe'), r.reason);
+    });
+    it('equipBestTool post: ret iron_pickaxe but held stone_pickaxe -> false (exact heldItem compare)', () => {
+        const v = mk();
+        const post = 'c => c.ret === null || (c.post.eq ? c.post.eq.heldItem === c.ret : false)';
+        const src = readFileSync('./src/agent/voyager.js', 'utf8');
+        assert.ok(src.includes(post), 'test uses the seeded equipBestTool post');
+        const s = { eq: { heldItem: 'stone_pickaxe' } };
+        assert.strictEqual(v._compileContract(post)({ ret: 'iron_pickaxe', pre: s, post: s, delta: {} }), false);
+    });
+    it('countGoal does not resolve a multi-word item to its first word', () => {
+        assert.strictEqual(mk()._resolveGoalItemUnified('Craft 3 sticks').item, 'stick');
+        assert.strictEqual(mk()._resolveGoalItemUnified('craft 4 torches').item, 'torch');
+        assert.strictEqual(mk()._resolveGoalItemUnified('mine 3 iron ore').item, 'iron_ore');
     });
 });

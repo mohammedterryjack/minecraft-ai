@@ -151,15 +151,23 @@ export function parseNumberWord(word) {
 
 function countGoal(task) {
     // fix47: support both numeric ("5") and word ("five") counts
-    const m = task.match(/^(mine|collect|gather|craft|smelt|obtain|get|chop|cook)\s+(\d+|[a-z]+)\s+([a-z_]+)\b/i);
+    const m = task.match(/^(mine|collect|gather|craft|smelt|obtain|get|chop|cook)\s+(\d+|[a-z]+)\s+([a-z_ ]+)/i);
     if (!m) return null;
     const verb = m[1].toLowerCase();
     const countParsed = parseNumberWord(m[2]);
     if (countParsed === null) return null;  // not a valid number
-    let item = m[3].toLowerCase();
-    // plural item names from the curriculum ("torches", "sticks") -> registry id
-    { const irr = { torches: 'torch' }; if (irr[item]) item = irr[item];
-      else { try { const md = minecraftData(VERSION || '1.20.4'); if (!md.itemsByName[item] && item.endsWith('s') && md.itemsByName[item.slice(0, -1)]) item = item.slice(0, -1); } catch (e) {} } }
+    // fix51: item = longest leading word run that is a registry item/block ("iron pickaxe" -> iron_pickaxe, never "iron")
+    const md = minecraftData(VERSION || '1.20.4');
+    const words = m[3].toLowerCase().trim().split(/[\s_]+/);
+    const inReg = n => Boolean(md.itemsByName[n] || md.blocksByName[n]);
+    let item = null;
+    for (let k = words.length; k > 0 && !item; k--) {
+        const cand = words.slice(0, k).join('_');
+        if (inReg(cand)) item = cand;
+        else if (cand.endsWith('s') && inReg(cand.slice(0, -1))) item = cand.slice(0, -1);
+        else if (cand.endsWith('es') && inReg(cand.slice(0, -2))) item = cand.slice(0, -2);
+    }
+    if (!item) return null;
     // mining a block counts its loot drops too (iron_ore -> raw_iron, coal_ore -> coal, stone -> cobblestone)
     let items = [item];
     if (['mine', 'collect', 'gather', 'chop', 'get', 'obtain'].includes(verb)) {
@@ -1182,17 +1190,8 @@ Use only c; no other globals.`;
     }
     // fix51: get inventory+equipment combined view (same as satisfaction check uses for __have)
     _getInventoryWithEquipment() {
-        const bot = this.agent.bot;
-        const inv = world.getInventoryCounts(bot);
-        // Add equipment items (same slots as observe().equipment)
-        const eqSlots = [45, 5, 6, 7, 8]; // off_hand, head, torso, legs, feet
-        const heldItem = bot.heldItem;
-        if (heldItem) inv[heldItem.name] = (inv[heldItem.name] || 0) + heldItem.count;
-        for (const slot of eqSlots) {
-            const item = bot.inventory.slots[slot];
-            if (item) inv[item.name] = (inv[item.name] || 0) + item.count;
-        }
-        return inv;
+        // fix51: getInventoryCounts reads slots 5..45, which already include armour (5-8), hotbar/held (36-44) and off-hand (45)
+        return world.getInventoryCounts(this.agent.bot);
     }
     // fix19 (6): places where the bot died 2+ times (16-block cells): a problem for the curriculum to learn to handle, no reflex
     _deathHotspots() {
@@ -1496,9 +1495,8 @@ Use only c; no other globals.`;
                 console.log(`[psn] LOUD: cannot resolve goal product item from task "${task}" — replay NOT satisfied`);
                 ok = false;
             } else {
-                const invCount = after.inventory[resolvedGoal.item] || 0;
-                const eqCount = Object.values(after.equipment).filter(v => v === resolvedGoal.item).length;
-                const haveNow = invCount + eqCount;
+                // fix51: inventory counts already include held/worn/off-hand slots (slots 5..45); exact item name only
+                const haveNow = after.inventory[resolvedGoal.item] || 0;
                 const targetCount = resolvedGoal.count || 1;
                 ok = haveNow >= targetCount;
                 console.log(`[psn] fix51 goal check: ${resolvedGoal.item} have=${haveNow} target=${targetCount} -> ${ok}`);
@@ -1718,10 +1716,8 @@ Use only c; no other globals.`;
         }
 
         const inv = state.inventory;
-        const invCount = inv[goal.item] || 0;
-        const eq = state.equipment;
-        const eqCount = Object.values(eq).filter(v => v === goal.item).length;
-        const haveExact = invCount + eqCount;
+        // fix51: inventory counts already include held/worn/off-hand slots; exact item name only (no double count)
+        const haveExact = inv[goal.item] || 0;
         const shortfallInfo = this._computeShortfall(goal, inv);
 
         if (haveExact >= goal.count) {
