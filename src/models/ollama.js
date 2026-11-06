@@ -1,4 +1,11 @@
 import { strictFormat } from '../utils/text.js';
+import { Agent } from 'undici';
+
+// fix60: Ollama with stream:false sends its response headers only after the whole generation, so undici's implicit
+// 300 s headersTimeout/bodyTimeout (the global Agent installed when cheerio loads undici) killed long but healthy local
+// calls with UND_ERR_HEADERS_TIMEOUT. A dedicated dispatcher with those implicit timers disabled (0) lets the call end
+// on Ollama's own reply or error, or on the connection failing.
+const OLLAMA_DISPATCHER = new Agent({ headersTimeout: 0, bodyTimeout: 0 });
 
 export class Ollama {
     static prefix = 'ollama';
@@ -94,7 +101,7 @@ export class Ollama {
         let method = 'POST';
         let headers = new Headers();
         const request = new Request(url, { method, headers, body: JSON.stringify(body) });
-        const res = await fetch(request);
+        const res = await fetch(request, { dispatcher: OLLAMA_DISPATCHER });
         if (!res.ok) {
             const errText = await res.text().catch(() => '');
             const errMsg = `Ollama ${res.status}: ${errText || res.statusText}`;

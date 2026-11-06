@@ -650,12 +650,9 @@ describe('fix51 issue 15: craftRecipe calls ensureCraftingTable', async () => {
         const section = voyagerSrc.slice(craftRecipeStart, depsStart);
         assert.ok(section.includes('ensureCraftingTable'),
             'craftRecipe code should call ensureCraftingTable');
-        assert.ok(section.includes('goToPosition'),
-            'craftRecipe code should navigate to crafting table');
-        assert.ok(section.includes('dist > 4'),
-            'craftRecipe should check distance to crafting table');
-        assert.ok(section.includes('canSeeBlock'),
-            'craftRecipe should check line of sight to crafting table');
+        // fix60: one walk to a spot with sight and reach (GoalLookAtBlock) replaces goToPosition + dist > 4 + canSeeBlock
+        assert.ok(section.includes('goToReachBlock(bot, craftingTable)'),
+            'craftRecipe code should walk to a spot that sees and reaches the crafting table');
         assert.ok(!section.includes('sleep(100)'),
             'craftRecipe should NOT use magic sleep timer');
     });

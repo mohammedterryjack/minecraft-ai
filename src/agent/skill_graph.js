@@ -285,6 +285,10 @@ export function blameAll(trace, isLeaf, isLearned) {
     const prop = failed.filter(([r]) => { for (let c = r, p = r.parent; p >= 0; c = trace[p], p = trace[p].parent) if (trace[p].ok || (c.err && !trace[p].err)) return false; return true; });
     const pool = prop.length ? prop : failed, swallowed = !prop.length;
     const out = new Map();
+    // fix60: a non-leaf library skill that failed although its own precondition held owns that failure; ancestors that
+    // merely propagated it (no FAILED line of their own) met the callee's contract and are not blamed for it
+    const owned = new Set();
+    for (const [r] of pool) if (r.preHeld && !isLeaf(r.name) && isLearned(r.name)) for (let p = r.parent; p >= 0; p = trace[p].parent) owned.add(p);
     // top-down: walk each failing call's ancestry from the root so a parent is credited before its children
     for (const [r, i] of [...pool].sort((x, y) => y[0].depth - x[0].depth)) {   // deepest failure first: it defines each skill's role
         const chain = []; for (let k = i; k >= 0; k = trace[k].parent) chain.unshift(k);
@@ -292,6 +296,7 @@ export function blameAll(trace, isLeaf, isLearned) {
         const evidence = (r.ownFail.join(' | ') || r.err || `returned ${r.ret}`).slice(0, 400);
         for (const k of chain) {
             const n = trace[k].name; if (isLeaf(n) || !isLearned(n) || (k === i && trace[k].preFail)) continue;   // fix22: violated precondition -> caller's fault
+            if (owned.has(k) && !trace[k].ownFail.length) continue;   // fix60: only propagated a callee-owned failure
             const kind = k === i ? 'callee_fix' : 'caller_fix';   // the failing call itself vs an ancestor that did not handle it
             const prev = out.get(n);
             if (!prev) out.set(n, { target: n, leaf: r.name, path, kind, swallowed, evidence, depth: trace[k].depth });
