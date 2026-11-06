@@ -101,7 +101,15 @@ export function getRealAPI() {
     return { set: new Set(list), list };
 }
 
-/** Which built-in skill/world bare names appear as call sites in source (for smaller lint/exec bindings). */
+/**
+ * Which built-in skill/world bare names the source references (for smaller lint/exec bindings).
+ * fix73: every reference counts, not only call sites. #44 (da3cfce) collected CallExpression callees only; fix68 (#61) made
+ * the PSN harness read inventory through a value reference (`const __rawInventoryCounts = getInventoryCounts;`), so a
+ * traced bundle that never called getInventoryCounts( itself was staged without that endowment, the SES compartment
+ * resolved the free name to undefined, and the first trace snapshot threw "__rawInventoryCounts is not a function"
+ * (15:06:47Z replay of scanForIronOreBlocks). A name passed, stored or rebound (`x = __wrap("x", x)`) is used as much as
+ * a called one. Not references: the property of `obj.name` and a non-computed object/class key.
+ */
 export function collectBareApiUsedInSource(combinedSrc) {
     const skillNames = new Set();
     const worldNames = new Set();
@@ -114,20 +122,24 @@ export function collectBareApiUsedInSource(combinedSrc) {
         const loc = e && typeof e.pos === 'number' ? ` (at offset ${e.pos})` : '';
         throw new Error(`[coder] collectBareApiUsedInSource: parse failed${loc}: ${e && e.message ? e.message : String(e)}`);
     }
-    const walk = (node) => {
+    const notReference = (parent, key, node) =>
+        (parent?.type === 'MemberExpression' && key === 'property' && !parent.computed)
+        || ((parent?.type === 'Property' || parent?.type === 'MethodDefinition' || parent?.type === 'PropertyDefinition') && key === 'key' && !parent.computed && !(parent.shorthand && parent.value === node))
+        || ((parent?.type === 'LabeledStatement' || parent?.type === 'BreakStatement' || parent?.type === 'ContinueStatement') && key === 'label');
+    const walk = (node, parent, key) => {
         if (!node || typeof node.type !== 'string') return;
-        if (node.type === 'CallExpression' && node.callee?.type === 'Identifier') {
-            const id = node.callee.name;
+        if (node.type === 'Identifier' && !notReference(parent, key, node)) {
+            const id = node.name;
             if (skillKeySet.has(id)) skillNames.add(id);
             if (worldKeySet.has(id)) worldNames.add(id);
         }
         for (const k in node) {
             const v = node[k];
-            if (Array.isArray(v)) v.forEach(walk);
-            else if (v && typeof v.type === 'string') walk(v);
+            if (Array.isArray(v)) v.forEach(c => walk(c, node, k));
+            else if (v && typeof v.type === 'string') walk(v, node, k);
         }
     };
-    walk(ast);
+    walk(ast, null, null);
     return { skillNames, worldNames };
 }
 

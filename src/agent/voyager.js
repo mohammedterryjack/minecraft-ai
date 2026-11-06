@@ -2087,9 +2087,12 @@ Use only c; no other globals.`;
         }
         // else: no goal hint -> keep ALL observed ups (no filtering)
         
-        const eff = [...new Set([...(e.effects || []), ...up])].slice(0, 12), con = { ...(e.consumes || {}) };
+        // fix73: every entry is created with effects and consumes (load, saveSkill NEW, split/generalise); the `|| {}` here hid
+        // the one creator that left consumes out, so a skill that consumed nothing kept it undefined. Missing is a bug: say so.
+        if (!Array.isArray(e.effects) || e.consumes === null || typeof e.consumes !== 'object') throw new Error(`[psn] _learnEffects: skill ${e.name} has no effects/consumes record (effects=${JSON.stringify(e.effects)}, consumes=${JSON.stringify(e.consumes)})`);
+        const eff = [...new Set([...e.effects, ...up])].slice(0, 12), con = { ...e.consumes };
         for (const k of down) con[k] = Math.max(con[k] || 0, (inv0[k] || 0) - (inv1[k] || 0));
-        if (JSON.stringify(eff) !== JSON.stringify(e.effects || []) || JSON.stringify(con) !== JSON.stringify(e.consumes || {})) { e.effects = eff; e.consumes = con; this._saveSkills(); }
+        if (JSON.stringify(eff) !== JSON.stringify(e.effects) || JSON.stringify(con) !== JSON.stringify(e.consumes)) { e.effects = eff; e.consumes = con; this._saveSkills(); }
     }
     // fix55: ONE goal resolver. Each kind comes from one rule over disjoint grammars (no fallback chain):
     //   item   - "Smelt N a into N b" / "<verb> N <item>" (smeltGoal / countGoal): verified by inventory gain
@@ -3542,7 +3545,11 @@ current_health: ${Math.round(bot.health)}/${vmax.health}\ncurrent_food: ${bot.fo
         const embedding = await this._embed(description);
         const idx = this.skills.findIndex(s => s.name === name);
         if (idx < 0) {
-            const entry = { name, description, task, code, deps, embedding, effects: this._lastEffects || [], saved: new Date().toISOString(), stats: recordRun(newStats(), task, true) };
+            // fix73: consumes starts as observed-nothing like every other entry (load-time init, split/generalise entries). It was
+            // missing here, and _learnEffects compares against `e.consumes || {}`, so a run that consumed nothing never set it:
+            // the skill stayed `consumes: undefined` in memory until a restart, and idle practice's Object.keys(skill.consumes)
+            // threw "Cannot convert undefined or null to object" (equipBestToolForIronOre, NEW 14:43:51Z, practice 15:02:47Z)
+            const entry = { name, description, task, code, deps, embedding, effects: this._lastEffects || [], consumes: {}, saved: new Date().toISOString(), stats: recordRun(newStats(), task, true) };
             this.skills.push(entry);
             writeAtomic(`${this.dir}/${name}.js`, `// ${description}\n${code}\n`);
             this._saveSkills();
