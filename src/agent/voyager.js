@@ -169,6 +169,22 @@ function countGoal(task) {
 let VERSION = null;
 // fix46: test-only setter for VERSION (parseVerboseGoal requires VERSION to be set)
 export function _setVersionForTest(v) { VERSION = v; }
+
+// fix49: parse "ensure X" goals - places a block/item nearby (furnace, crafting_table, chest, etc.)
+// The goal item must be placed, not just in inventory - so satisfaction requires the item to exist as a block nearby
+// or the skill ensureX to have run and succeeded
+function ensureGoal(task) {
+    const m = task.match(/^ensure\s+([a-z_]+)\b/i);
+    if (!m) return null;
+    const item = m[1].toLowerCase().replace(/ /g, '_');
+    // validate item exists in registry (no hard-coded list)
+    try {
+        const md = minecraftData(VERSION || '1.20.4');
+        if (!md.itemsByName[item] && !md.blocksByName[item]) return null;
+    } catch (e) { return null; }
+    return { count: 1, item, items: [item], verb: 'ensure' };
+}
+
 // "Smelt 6 raw_iron into 6 iron_ingot" -> verify by output gained
 function smeltGoal(task) {
     const m = task.match(/^(?:smelt|cook)\s+(\d+)\s+([a-z_]+)\s+into\s+(\d+)\s+([a-z_]+)/i);
@@ -1485,8 +1501,9 @@ Use only c; no other globals.`;
     // fix25: prefer smeltGoal so "Smelt X into Y" checks Y (product), not X (ingredient)
     // fix45: use parseVerboseGoal as fallback for verbose goals like "craftItem: Craft 1 iron_pickaxe..."
     // fix47: enhanced to compute producible items and shortfall
+    // fix49: added ensureGoal for "ensure X" tasks (places blocks, not just inventory)
     _goalAlreadySatisfied(task, state) {
-        const goal = smeltGoal(task) || countGoal(task) || parseVerboseGoal(task);  // fix45: verbose fallback
+        const goal = smeltGoal(task) || ensureGoal(task) || countGoal(task) || parseVerboseGoal(task);  // fix49: ensureGoal before countGoal
         if (!goal) return { satisfied: false, reason: 'goal not parseable as count/smelt/verbose', noLearnedCheck: true };
 
         const inv = state.inventory || {};
@@ -1497,9 +1514,24 @@ Use only c; no other globals.`;
 
         // 1) Check inventory against learned skill contracts that produce the goal item
         // Find skills whose learned effects include the goal item and have a postcondition
+        // fix49: for "ensure" goals, only match skills whose name/task contains "ensure" + the item
+        // This prevents ensureStorageChestNearby from satisfying "ensure furnace"
+        const matchesGoalVerb = (skill) => {
+            if (!goal.verb) return true;  // no verb filtering for general goals
+            if (goal.verb === 'ensure') {
+                const nameLower = (skill.name || '').toLowerCase();
+                const taskLower = (skill.task || '').toLowerCase();
+                const itemParts = goal.item.split('_');
+                const hasEnsure = nameLower.includes('ensure') || taskLower.includes('ensure');
+                const hasItem = itemParts.some(p => nameLower.includes(p) || taskLower.includes(goal.item));
+                return hasEnsure && hasItem;
+            }
+            return true;  // other verbs don't filter by skill name
+        };
         const producers = this.skills.filter(s => !s.demoted && !s.mergedInto && !s.candidate
             && (s.effects || []).some(eff => goal.items?.includes(eff) || eff === goal.item)
-            && s.contract?.post);
+            && s.contract?.post
+            && matchesGoalVerb(s));
 
         for (const skill of producers) {
             try {
@@ -1528,8 +1560,10 @@ Use only c; no other globals.`;
 
         // 2) Check learned effects: if a skill's learned effects include the item and we already have enough
         // This is the "learned facts" approach: the skill library knows what produces what
+        // fix49: apply same verb matching as contract producers
         const effectProducers = this.skills.filter(s => !s.demoted && !s.mergedInto && !s.candidate
-            && (s.effects || []).some(eff => goal.items?.includes(eff) || eff === goal.item));
+            && (s.effects || []).some(eff => goal.items?.includes(eff) || eff === goal.item)
+            && matchesGoalVerb(s));
 
         if (effectProducers.length > 0 && have >= goal.count) {
             const skillNames = effectProducers.slice(0, 3).map(s => s.name).join(', ');
@@ -3663,6 +3697,7 @@ Voyager.SEEDED_PRIMITIVES = [
         name: 'travelTo',
         description: 'Travel long distances (hundreds of blocks) in short hops of up to 32 blocks, so chunks load and paths stay short. Returns true once within 4 blocks (horizontally) of the target.',
         task: 'travel to a distant location',
+        // fix49: use GoalNearXZ (pathfinder goal with heuristic method), not Vec3 which lacks goal interface
         code: `async function travelTo(bot, x, y, z, maxHops = 120) {
     let fails = 0;
     for (let hop = 0; hop < maxHops; hop++) {
@@ -3674,7 +3709,7 @@ Voyager.SEEDED_PRIMITIVES = [
         const step = Math.min(32, d);
         const side = fails ? (fails % 2 ? 1 : -1) * 10 * fails : 0;
         const tx = Math.round(p.x + dx / d * step - dz / d * side), tz = Math.round(p.z + dz / d * step + dx / d * side);
-        try { await goToGoal(bot, new Vec3(tx, p.y, tz), 3); fails = 0; }
+        try { await goToGoal(bot, new GoalNearXZ(tx, tz, 3)); fails = 0; }
         catch (err) {
             if (bot.interrupt_code) return false;
             if (++fails >= 6) { log(bot, \`travelTo gave up at \${p.floored()} after 6 failed hops: \${err?.message}\`); return false; }
@@ -3779,6 +3814,14 @@ Voyager.SEEDED_PRIMITIVES = [
     log(bot, \`Crafting \${itemName} produced no items.\`); return false;
 }`,
         deps: ['placeBlock', 'collectBlock'],
+        // fix49: seeded contract for craftRecipe - checks delta for the FIRST argument (itemName)
+        // This fixes the postcondition VIOLATED bug where the contract compared against wrong key
+        contract: {
+            pre: 'c => true',  // ingredients check is internal
+            post: 'c => c.ret === false || c.ret === null || (c.args[0] && (c.delta[c.args[0]] || 0) > 0)',
+            text: 'post: if returns true, must have gained +1 of the requested item (args[0]); returns false/null = already failed',
+            seeded: true
+        }
     },
     {
         name: 'attackNearest',
