@@ -26,34 +26,25 @@ test('fix49: travelTo seeded code uses GoalNearXZ, not Vec3', async (t) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Bug 2: craftRecipe postcondition VIOLATED after real craft success
-// Root cause: post snapshot taken before inventory window settles
-// Fix: (a) await inventory settle via updateSlot/windowClose event before post snapshot
-//      (b) expose canonical `have` count = inv + held + offhand in c.pre/c.post
+// Root cause: post snapshot taken before inventory settles, auto-equip reads as -1
+// Fix: (a) use __have() (inv + held + offhand) for pre/post/delta on EVERY call
+//      (b) await bot.waitForTicks(1) before post snapshot (one server tick, not magic timers)
+//      (c) no name gating, no try/catch fallback in __have
 // ─────────────────────────────────────────────────────────────────────────────
 test('fix49: craftRecipe inventory settle and have count', async (t) => {
-    await t.test('trace wrapper should wait for inventory settle on craft skills', async () => {
+    await t.test('pre and delta computed from __have(), not __inv()', async () => {
         const fs = await import('fs');
         const skillGraphCode = fs.readFileSync('./src/agent/skill_graph.js', 'utf8');
         
-        // fix49: __waitSettle waits for updateSlot/windowClose events
-        assert.ok(skillGraphCode.includes('__waitSettle'),
-            'should have __waitSettle function');
-        assert.ok(skillGraphCode.includes('updateSlot'),
-            '__waitSettle should listen for updateSlot event');
-        assert.ok(skillGraphCode.includes('windowClose'),
-            '__waitSettle should listen for windowClose event');
+        // pre should use __have(), not __inv()
+        assert.ok(skillGraphCode.includes('pre: __have()'),
+            'rec.pre should use __have() for canonical have count');
+        // post/delta should also use __have()
+        assert.ok(skillGraphCode.includes('const post = __have()'),
+            'post snapshot should use __have() for delta computation');
     });
 
-    await t.test('trace wrapper should call __waitSettle for craft skills in finally', async () => {
-        const fs = await import('fs');
-        const skillGraphCode = fs.readFileSync('./src/agent/skill_graph.js', 'utf8');
-        
-        // Should call __waitSettle for skills starting with 'craft'
-        assert.ok(skillGraphCode.includes("if (/^craft/i.test(n)) await __waitSettle()"),
-            'finally block should await __waitSettle for craft skills');
-    });
-
-    await t.test('state should expose `have` = inv + held + offhand', async () => {
+    await t.test('__have = inv + held + offhand, no try/catch fallback', async () => {
         const fs = await import('fs');
         const skillGraphCode = fs.readFileSync('./src/agent/skill_graph.js', 'utf8');
         
@@ -63,8 +54,41 @@ test('fix49: craftRecipe inventory settle and have count', async (t) => {
             '__have should count heldItem');
         assert.ok(skillGraphCode.includes('eq.offHand'),
             '__have should count offHand');
-        assert.ok(skillGraphCode.includes('have }'),
-            '__st should include have in returned state');
+        // No try/catch fallback in __have
+        const haveMatch = skillGraphCode.match(/const __have = \(\) => \{[^}]+\}/);
+        assert.ok(haveMatch, 'should find __have definition');
+        assert.ok(!haveMatch[0].includes('try {') && !haveMatch[0].includes('catch'),
+            '__have should NOT have try/catch fallback - let it throw');
+    });
+
+    await t.test('waitForTicks(1) before post snapshot, no magic timers', async () => {
+        const fs = await import('fs');
+        const skillGraphCode = fs.readFileSync('./src/agent/skill_graph.js', 'utf8');
+        
+        // Should use waitForTicks(1) - one server tick (protocol unit, not tuned constant)
+        assert.ok(skillGraphCode.includes('await bot.waitForTicks(1)'),
+            'finally block should await bot.waitForTicks(1) before post snapshot');
+        
+        // No magic timers like setTimeout with 150/80/50/400ms
+        assert.ok(!skillGraphCode.includes('setTimeout(r, 150)'),
+            'should NOT have magic 150ms timer');
+        assert.ok(!skillGraphCode.includes('setTimeout(r, 80)'),
+            'should NOT have magic 80ms timer');
+        assert.ok(!skillGraphCode.includes('setTimeout(r, 400)'),
+            'should NOT have magic 400ms timer');
+        
+        // No __waitSettle function with event listeners
+        assert.ok(!skillGraphCode.includes('__waitSettle'),
+            'should NOT have __waitSettle function with event listeners');
+    });
+
+    await t.test('no name gating (/^craft/i regex)', async () => {
+        const fs = await import('fs');
+        const skillGraphCode = fs.readFileSync('./src/agent/skill_graph.js', 'utf8');
+        
+        // waitForTicks(1) should apply to every call, not just craft skills
+        assert.ok(!skillGraphCode.includes("/^craft/i.test(n)"),
+            'should NOT gate by /^craft/i regex - applies to every call');
     });
 
     await t.test('craftRecipe should NOT have seeded contract (delta check is the fix)', async () => {

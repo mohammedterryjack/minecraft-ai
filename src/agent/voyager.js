@@ -301,8 +301,16 @@ export class Voyager {
         this.indexFile = `${this.dir}/index.json`;
         this.progressFile = `${this.dir}/progress.json`;
         this.skills = existsSync(this.indexFile) ? JSON.parse(readFileSync(this.indexFile, 'utf8')) : [];
+        // fix49: ensure every skill has effects/consumes/stats (older skill files may not have them)
+        for (const s of this.skills) {
+            if (!s.effects) s.effects = [];
+            if (!s.consumes) s.consumes = {};
+            if (!s.stats) s.stats = newStats();
+        }
         this.progress = existsSync(this.progressFile) ? JSON.parse(readFileSync(this.progressFile, 'utf8'))
-            : { completed: [], failed: [], enabled: true };
+            : { completed: [], failed: [], enabled: true, goalStats: {} };
+        // fix49: ensure goalStats exists (older progress files may not have it)
+        if (!this.progress.goalStats) this.progress.goalStats = {};
         this.running = false;
         this.abort = false;
         this.lastPlayerMsg = 0;
@@ -665,6 +673,8 @@ export class Voyager {
                 deps: prim.deps,
                 seeded: true,
                 stats: newStats(),
+                effects: [],  // fix49: initialize effects
+                consumes: {},  // fix49: initialize consumes
                 saved: new Date().toISOString(),
             };
             // fix45: copy seeded contract if present
@@ -2066,7 +2076,7 @@ Use only c; no other globals.`;
     // Learning value: low success rate, high streakFail, few trials
     // Plan relevance: shares needs/produces with pending goal
     _selectPracticeSkill() {
-        const inv = this.observe().inventory || {};
+        const inv = this.observe().inventory;
         const pending = this._getPendingGoalItems();  // items needed by pending/failed tasks
         const candidates = this.skills.filter(s =>
             !s.primitive && !s.handwritten && !s.demoted && !s.mergedInto && !s.candidate &&
@@ -2086,18 +2096,19 @@ Use only c; no other globals.`;
         // fix49: rank by Beta-posterior uncertainty * (1 + plan_relevance)
         // Uncertainty = (s+1)(f+1) / ((n+2)^2 * (n+3)) where s=successes, f=failures, n=s+f
         // Skills with n=0 get max variance naturally. No hand weights or recency constants.
+        // Note: filter above ensures s.stats exists (via `s.stats &&`)
         const pendingSize = pending.size;
         const scored = filtered.map(s => {
-            const stats = s.stats || {};
-            const successes = stats.success || 0;
-            const failures = stats.fail || 0;
+            const successes = s.stats.success;
+            const failures = s.stats.fail;
             const n = successes + failures;
             
             // Beta-posterior variance: (s+1)(f+1) / ((n+2)^2 * (n+3))
             const uncertainty = ((successes + 1) * (failures + 1)) / (Math.pow(n + 2, 2) * (n + 3));
             
             // plan relevance = |effects ∩ pending needs| / |pending needs|
-            const effects = s.effects || [];
+            // effects may be empty array but never undefined (initialized at save time)
+            const effects = s.effects;
             const intersection = effects.filter(eff => pending.has(eff)).length;
             const planRelevance = pendingSize > 0 ? intersection / pendingSize : 0;
             
@@ -2133,22 +2144,23 @@ Use only c; no other globals.`;
     }
     // fix42: check if a practice skill should be skipped (postcondition already met or would consume scarce inputs)
     // Returns a skip reason string, or null if practice is allowed
+    // fix49: effects/consumes/stats initialized at load time - read directly
     _shouldSkipPractice(skill, inv, pendingItems) {
         // 1) Check if postcondition is already satisfied (learned path: check effects + inventory)
-        const effects = skill.effects || [];
+        const effects = skill.effects;
         if (effects.length > 0) {
-            const produced = effects.filter(eff => (inv[eff] || 0) > 0);
+            const produced = effects.filter(eff => inv[eff] > 0);
             // if all effects are already in inventory, postcondition is likely met
             if (produced.length === effects.length) {
                 return `postcondition already met (has all of: ${effects.join(', ')})`;
             }
         }
         // 2) Check if skill would consume scarce inputs needed by pending goals
-        const consumes = Object.keys(skill.consumes || {});
+        const consumes = Object.keys(skill.consumes);
         if (consumes.length > 0) {
             for (const item of consumes) {
-                const have = inv[item] || 0;
-                const need = skill.consumes[item] || 0;
+                const have = inv[item] || 0;  // inventory lookup: missing item = 0
+                const need = skill.consumes[item];
                 // if pending items include this consumable and we don't have much
                 if (pendingItems.has(item) && have < need * 3) {
                     return `would consume scarce ${item} (have ${have}, need ${need}, pending goal needs it)`;
@@ -2616,7 +2628,7 @@ Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
     // Decay comes only from new evidence (new successes/failures), no time constants
     _goalBackoffMultiplier(task, reason) {
         const key = `${task}::${reason || ''}`;
-        const stats = (this.progress.goalStats || {})[key];
+        const stats = this.progress.goalStats[key];
         if (!stats) return 1;  // no evidence = no backoff
         const s = stats.success;
         const n = stats.success + stats.fail;
@@ -2625,10 +2637,13 @@ Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
     }
     
     // fix49: record goal outcome for backoff learning (keyed by goal + failure reason)
+    // goalStats initialized at load time, entry created here on first outcome
     _recordGoalOutcome(task, success, reason) {
         const key = `${task}::${reason || ''}`;
-        const goalStats = this.progress.goalStats ||= {};
-        const entry = goalStats[key] ||= { success: 0, fail: 0 };
+        if (!this.progress.goalStats[key]) {
+            this.progress.goalStats[key] = { success: 0, fail: 0 };
+        }
+        const entry = this.progress.goalStats[key];
         if (success) entry.success++;
         else entry.fail++;
         this._saveProgress();
