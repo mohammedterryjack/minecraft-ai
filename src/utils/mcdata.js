@@ -53,6 +53,14 @@ export const WOOL_COLORS = [
 ]
 
 
+function _loadVersion(version) {
+    mc_version = version;
+    mcdata = minecraftData(mc_version);
+    Item = prismarine_items(mc_version);
+}
+// fix69: tests load the registry the way the login handler does, without a server connection
+export function _setVersionForTest(version) { _loadVersion(version); }
+
 export function initBot(username) {
     if (settings.minecraft_version && settings.minecraft_version !== "auto") mc_version = settings.minecraft_version;
     const options = {
@@ -130,11 +138,7 @@ export function initBot(username) {
         bot.acceptResourcePack();
     });
 
-    bot.once('login', () => {
-        mc_version = bot.version;
-        mcdata = minecraftData(mc_version);
-        Item = prismarine_items(mc_version);
-    });
+    bot.once('login', () => _loadVersion(bot.version));
 
     return bot;
 }
