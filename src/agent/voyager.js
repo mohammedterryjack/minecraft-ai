@@ -13,8 +13,9 @@ import { RepairMemory } from './repair_memory.js';
 import { IdlePractice } from './idle_practice.js';
 import { VitalsModel } from './vitals_model.js';   // fix58
 import { checkNeedSource, needInterruptSource, isUnblamedInterruptKind, sampleBeta, pickUrgentCandidate } from './urgent_need.js';   // fix80
-import { markPreconditionUnmet, peekPreconditionUnmet, clearPreconditionUnmet } from './precondition.js';   // fix76
+import { peekPreconditionUnmet, clearPreconditionUnmet, checkNeed } from './precondition.js';   // fix76; fix81: structured needs (markPreconditionUnmet is called by seeded code)
 import { SlotEffects } from './slot_effects.js';   // fix59
+import { obtainPlanner } from './recipe_plan.js';   // fix81
 // fix14: crash-safe writes (tmp file + rename)
 export function writeAtomic(fp, text) { const tmp = `${fp}.tmp-${process.pid}`; writeFileSync(tmp, text); renameSync(tmp, fp); }
 import * as world from './library/world.js';
@@ -391,6 +392,11 @@ export class Voyager {
             : { completed: [], failed: [], enabled: true, goalStats: {} };
         // fix49: ensure goalStats exists (older progress files may not have it)
         if (!this.progress.goalStats) this.progress.goalStats = {};
+        // fix81: structured needs of failed goals (curriculum BLOCKERS) and game-data producer edges (untried until a run proves them).
+        //        A blocker in the old fix47 { tool, block } shape cannot be resolved by item: refuse it loudly (the live file has none).
+        if (!Object.hasOwn(this.progress, 'blockers')) this.progress.blockers = [];
+        for (const b of this.progress.blockers) if (typeof b.item !== 'string' || !Number.isInteger(b.count) || typeof b.reason !== 'string') throw new Error(`[fix81] progress.blockers entry is not a structured need { item, count, reason, task }: ${JSON.stringify(b)}`);
+        if (!Object.hasOwn(this.progress, 'recipeEdges')) this.progress.recipeEdges = {};
         // fix58: learned vitals relations (food level -> hp regen, skill -> food/hp change), persisted with progress
         if (!this.progress.vitals) this.progress.vitals = { regen: {}, runs: {}, foodSamples: { drop: { n: 0, sum: 0 }, rise: { n: 0, sum: 0 } } };
         if (!this.progress.vitals.foodSamples) this.progress.vitals.foodSamples = { drop: { n: 0, sum: 0 }, rise: { n: 0, sum: 0 } };
@@ -1410,6 +1416,16 @@ Use only c; no other globals.`;
         }
         return this._foodRaiseSaturated(skillName, foodAtStart);
     }
+    // fix81: a violated pre-contract names what it lacks: the registry items it READ from c.pre.inv (a Proxy records the
+    //        reads; the contract is evaluated again on the same state) that the bot has none of. Presence is what an inventory
+    //        read can show, so the count is one of any of them; the cheapest is chosen from the game data.
+    _contractNeed(e, c, r) {
+        const inv = c.pre.inv, reads = new Set(), reg = this.agent.bot.registry;
+        const probe = new Proxy(inv, { get: (t, p) => { if (typeof p === 'string') reads.add(p); return t[p]; } });
+        this._compileContract(e.contract.pre)({ ...c, pre: { ...c.pre, inv: probe } });
+        const lacking = [...reads].filter(k => Object.hasOwn(reg.itemsByName, k) && !(Object.hasOwn(inv, k) && inv[k] > 0));
+        if (lacking.length) { r.need = { anyOf: lacking, count: 1, reason: 'contract' }; console.log(`[contract] ${e.name} precondition lacks one of: ${lacking.join(', ')}`); }
+    }
     // evaluate contracts on every traced library call; violations become contract failures in the trace
     _checkContracts(trace, taskOk) {
         const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
@@ -1450,6 +1466,7 @@ Use only c; no other globals.`;
                     }
                 }
                 r.ok = false; r.fail = true; if (k === 'pre') r.preFail = true;
+                if (k === 'pre') this._contractNeed(e, c, r);   // fix81: which inventory item the violated precondition lacks
                 r.ownFail = [...(r.ownFail || []), `${k === 'pre' ? 'PRECONDITION' : 'POSTCONDITION'} violated: ${e.contract.text || e.contract[k]} (post pos ${r.s1.pos ? [r.s1.pos.x, r.s1.pos.y, r.s1.pos.z].map(Math.round).join(',') : '?'}, sky ${r.s1.sky}, alive ${r.s1.alive})`];
                 // fix51: enhanced VIOLATED logging with exact context for debugging
                 const stateInfo = `pre.inv=${JSON.stringify(r.s0.inv)}, post.inv=${JSON.stringify(r.s1.inv)}, delta=${JSON.stringify(r.delta)}`;
@@ -1642,11 +1659,28 @@ Use only c; no other globals.`;
     }
     _stalledInRun() { const s = this._stall; return s && s.t >= (this._runStart || Infinity) ? s : null; }
     /** fix65: candidate code staged in place for a replay of `root`; `rootTrial` = the goal-overlap gate's verdict on root's own candidate */
-    _replayOverrides(root, rootTrial) {
-        const closure = this._closure(root);
-        const over = {};
-        for (const s of this.skills) if (s.candidate && (s.name === root ? rootTrial : closure.has(s.name))) over[s.name] = s.candidate.code;
-        return over;
+    // fix81: the closure of a replay follows the deps of the version that will run: a candidate under trial is staged with
+    //        ITS deps, not the incumbent's. Before, the closure came from the incumbents' deps only, so a repaired candidate
+    //        that calls a new helper ran without it: live 17:56:15Z the joint repair's craftIronPickaxe candidate calls
+    //        checkForIronPickaxe (NEW 17:50:41Z), the incumbent's deps are [craftRecipe], and every trial lint-failed
+    //        "'checkForIronPickaxe' is not defined" (bundle "8 skill names in closure", the helper not among them).
+    _replayOverrides(root, rootTrial) { return this._trialClosure(root, rootTrial).over; }
+    _trialClosure(root, rootTrial) {
+        const g = this._graph(), byName = new Map(this.skills.map(s => [s.name, s]));
+        const closure = new Set(), over = {}, st = [root];
+        while (st.length) {
+            const n = st.pop();
+            if (closure.has(n)) continue;
+            closure.add(n);
+            const e = byName.get(n);
+            const trial = e !== undefined && Boolean(e.candidate) && (n === root ? rootTrial : true);
+            if (trial) {
+                if (!Array.isArray(e.candidate.deps)) throw new Error(`[fix81] candidate of ${n} has no deps array`);
+                over[n] = e.candidate.code;
+                st.push(...e.candidate.deps);
+            } else if (Object.hasOwn(g, n)) st.push(...g[n]);
+        }
+        return { closure, over };
     }
     _crashedInRun() { const c = this._crash; return c && c.t >= (this._runStart || Infinity) ? c : null; }
     // fix65: a run that kills the process (watchdog SIGKILL on a blocked main loop) never reaches _attribute, so its trial
@@ -1665,7 +1699,7 @@ Use only c; no other globals.`;
         for (const n of new Set([root, ...closure])) {
             const e = this.skills.find(s => s.name === n);
             if (!e) continue;
-            const cand = names.includes(n) && e.candidate;   // the candidate code is what runs (staged by _replayOverrides)
+            const cand = names.includes(n) && e.candidate;   // the candidate code is what runs (staged by _trialClosure)
             ran[n] = cand ? { as: 'candidate', hash: this._skillHash({ code: e.candidate.code }) } : { as: 'incumbent', hash: this._skillHash(e) };
         }
         writeAtomic(this._trialJournalFile, JSON.stringify({ pid: process.pid, root, task, ran, candidates: Object.keys(ran).filter(n => ran[n].as === 'candidate'), startedAt: Date.now() }));
@@ -2245,8 +2279,7 @@ Use only c; no other globals.`;
                 return { ok: false, name: r.name, output: '', unmetPrecondition: sat, unverified: true };
             }
         }
-        const replayClosure = new Set([r.name, ...this._closure(r.name)]);
-        const over = this._replayOverrides(r.name, trial);
+        const { closure: replayClosure, over } = this._trialClosure(r.name, trial);
         const tracedNames = Voyager._tracedSkillNamesForInstrument(this, replayClosure, over);
         const libPart = this._libSrcSubset(replayClosure, over);
         const call = '\n\nasync function __replay(bot) {\n    try { ' + r.call + ' } finally { bot.__psnOut = bot.output; }\n}\nawait __replay(bot);';
@@ -2301,8 +2334,11 @@ Use only c; no other globals.`;
                 console.log(`[psn] fix55 open goal "${task}": ${r.name} learned post ${entry.contract.post} -> held=${held}, verifies run=${v.ok} -> ${ok}`);
             }
         }
-        if (!ok) this._tryDecomposePrerequisiteFailure(task);
-        else { delete this.agent.bot.__prereqFail; clearPreconditionUnmet(this.agent.bot); }
+        // fix81: what this failed run lacks, as structured facts (reported by the code, a violated contract's inventory reads,
+        //        or the goal's game-data prerequisites); read before the marker is cleared and the trace consumed below
+        const failTrace = this.agent.bot.__psnTrace;
+        const reported = ok ? null : peekPreconditionUnmet(this.agent.bot);
+        if (ok) clearPreconditionUnmet(this.agent.bot);
         // fix44: pass goal items to filter learned effects and produces (denoise)
         const goalItems = goal?.items || (goal?.item ? [goal.item] : null);
         if (entry && ok && !trial) this._learnEffects(entry, runBefore, after, goalItems);
@@ -2312,6 +2348,7 @@ Use only c; no other globals.`;
         const libFault = !ok && this._libraryFault(this.agent.bot.__psnTrace, r.name);
         const unmet = !ok && !libFault && this._classifyUnmetPrecondition(r.name, runBefore.food_value);
         if (unmet) console.log(`!!! [blame] UNMET PRECONDITION (${unmet}): ${r.name} — not counted against stats or gate`);
+        clearPreconditionUnmet(this.agent.bot);   // fix81: read above (reported); a library fault must not leave it for the next run
         // fix10: per-call trace -> contract results -> blame -> targeted repair. fix79: runs before the stats so a misroute
         //        (every call met its contract; the route had no learned evidence for the goal) is not a failure of the skill
         const verdict = this._attribute(r.name, task, unverified ? true : ok, over, routeFit);
@@ -2319,6 +2356,8 @@ Use only c; no other globals.`;
         if (entry && !unverified && !libFault && !unmet && !misrouted) this._recordRun(entry, task, ok, trial);
         // ADAM-style: record inventory delta for needs/produces learning
         if (ok) this.npGraph.recordDelta(r.name, runBefore.inventory, after.inventory, goalItems);   // fix70: this run only
+        // fix81: what the failed run lacked (not for a misroute: the wrong skill's needs are not the goal's)
+        const needs = !ok && !libFault && !cut && !misrouted ? this._failureNeeds(task, reported, failTrace, after) : null;
 
         // fix37 (D): detect and log inventory-full as a fact for learning
         const invFullFact = !ok ? this._detectInventoryFullFailure(task, before, after, String(res.message || '')) : null;
@@ -2331,7 +2370,7 @@ Use only c; no other globals.`;
             if (invFullFact) console.log(`[voyager] replay ${r.name} INVENTORY FULL DETECTED: ${invFullFact}`);
         }
         if (!ok) console.log(`[voyager] replay ${r.name} output: ${String(res.message || '(none)').slice(-600).replace(/\n+/g, ' | ')}`);
-        const out = { ok, name: r.name, output: String(res.message || ''), cut, invFullFact, unverified };
+        const out = { ok, name: r.name, output: String(res.message || ''), cut, invFullFact, unverified, needs };
         // fix79: the route takes the blame: ok stays false (goal outcome, learned embedding threshold) and the reason names the route
         if (misrouted) return { ...out, misrouted: routeFit, reason: `misrouted: ${r.name} has no learned evidence it produces ${routeFit.items.join('/')}` };
         return out;
@@ -2455,28 +2494,142 @@ Use only c; no other globals.`;
         }
         throw new Error(`[fix55] _ensureHolds called for a non-ensure goal (${goal.verb})`);
     }
-    // fix51: decompose a structured prerequisite failure (bot.__prereqFail = { item, need, have }) via learned graph
-    _tryDecomposePrerequisiteFailure(parentTask) {
+    // fix81: the items being sought by the subgoal entry's ancestors (root first); a fresh task has none
+    _prereqChain(entry) {
+        if (entry === null) return [];
+        if (!Object.hasOwn(entry, 'chain')) return [];
+        if (!Array.isArray(entry.chain)) throw new Error(`[fix81] subgoal entry "${entry.task}" has a non-array chain`);
+        return entry.chain;
+    }
+    // fix81: the game-data planner (recipe_plan.js) over the live registry and bot.recipesAll (every recipe, not only the
+    //        ones the inventory can make now). "known" is learned or observed: a source block of the item in
+    //        observe().nearby_blocks, or a learned producer of it. Exact ties are a uniform choice.
+    _obtainPlanner(state) {
         const bot = this.agent.bot;
-        if (!Object.hasOwn(bot, '__prereqFail')) return false;
-        const { item, need, have } = bot.__prereqFail;
-        delete bot.__prereqFail;
-        const shortfall = need - have;
-        if (!(shortfall > 0)) throw new Error(`__prereqFail for ${item} has non-positive shortfall (need ${need}, have ${have})`);
-        const inv = this.observe().inventory;
-        const sub = this._subgoalToObtainItem(item, shortfall, inv, new Set());
-        if (!sub) {
-            markPreconditionUnmet(this.agent.bot, { item });
-            console.log(`[psn] PREREQUISITE FAILED for ${item} but no learned producer subgoal (needs/produces + skill library)`);
-            return false;
+        if (!Array.isArray(state.nearby_blocks)) throw new Error('[fix81] _obtainPlanner: state.nearby_blocks (array) required');
+        if (typeof bot.recipesAll !== 'function') throw new Error('[fix81] _obtainPlanner: bot.recipesAll required');
+        const near = new Set(state.nearby_blocks), memo = new Map();
+        return obtainPlanner({
+            registry: bot.registry,
+            recipesOf: id => bot.recipesAll(id, null, true),
+            known: (item, src) => {
+                if (!memo.has(item)) memo.set(item, src.some(b => near.has(b)) || this._producers(item).length > 0);
+                return memo.get(item);
+            },
+            proven: item => Object.hasOwn(this.progress.recipeEdges, item) && this.progress.recipeEdges[item].status === 'proven',
+        });
+    }
+    // fix81: the goal key a subgoal chain is seeking: an item goal seeks the item, an ensure goal the block PLACED nearby
+    _goalKey(goal) {
+        if (goal.kind === 'ensure') return `placed ${goal.item}`;
+        return goal.item;
+    }
+    _needKey(need) { return need.reason === 'proximity' ? `placed ${need.item}` : need.item; }
+    // fix81: every failure that is not a library fault says what it lacks, as structured facts { item | anyOf, count, reason }:
+    //   1. reported by the code that failed (markPreconditionUnmet(bot, { need }): seeded craftRecipe "ingredients",
+    //      collectBlock "tool", tossClutter "proximity", ensureCraftingTable "ingredients")
+    //   2. a violated learned pre-contract: the inventory items it read and the bot has none of (_checkContracts r.need)
+    //   3. the goal's own prerequisites in the game data (recipe_plan.js): an item goal's missing harvest tool or
+    //      ingredients; an ensure goal whose block is not in the inventory to place
+    //   null when none of them names anything (an open goal whose code reported nothing): the model decomposes it.
+    _failureNeeds(task, reported, trace, state) {
+        if (reported !== null && Object.hasOwn(reported, 'need')) return [this._checkNeed(reported.need, 'reported')];
+        if (Array.isArray(trace)) {
+            const rec = trace.filter(r => r.preFail && Object.hasOwn(r, 'need'));
+            if (rec.length) return [this._checkNeed(rec[rec.length - 1].need, `contract of ${rec[rec.length - 1].name}`)];
         }
+        const goal = this._resolveGoal(task);
+        if (goal.kind === 'ensure') {
+            const inv = state.inventory;
+            if (Object.hasOwn(inv, goal.item) && inv[goal.item] > 0) return null;
+            return [this._checkNeed({ item: goal.item, count: 1, reason: 'place' }, 'game data')];
+        }
+        // smelt goals ("Smelt N <raw> into N <out>") are furnace work the crafting recipes do not describe
+        if (goal.kind !== 'item' || Object.hasOwn(goal, 'input')) return null;
+        const pre = this._obtainPlanner(state).prerequisites(goal.item, goal.count, state.inventory);
+        for (const t of pre.ties) console.log(`[backchain] cost tie broken (proven edges, then name) planning ${goal.item}: ${t}`);
+        if (pre.cycles.length) console.log(`[backchain] LOUD: ${pre.cycles.length} recipe cycle(s) in the game data excluded while planning ${goal.item}, through: ${[...new Set(pre.cycles.flatMap(c => c.split(' -> ')))].join(', ')}`);
+        if (!pre.steps.length) return null;
+        return pre.steps.map(st => this._checkNeed({ item: st.item, count: st.count, reason: pre.tool === null ? 'ingredients' : 'tool' }, 'game data'));
+    }
+    _checkNeed(need, source) { return { ...checkNeed(need, source), source }; }
+    // fix81: chain on what the failed goal lacks (not only on the goal item). Each need becomes a subgoal in
+    //        progress.subgoals (ahead of a {retry, prereq} entry for the goal), pursued by the normal path: a learned
+    //        producer's replay if there is one, else code generation; when IT fails, its own needs are chained the same way
+    //        (stone_pickaxe -> stick -> oak_planks -> oak_log). anyOf is resolved by the game-data cost (recipe_plan.js).
+    //        A subgoal chain that comes back to something an ancestor seeks throws; a prereq retry that still lacks it is a
+    //        failed goal, not re-run and not re-queued. Returns true when it handled the goal.
+    _chainNeeds(task, needs, state) {
+        const cur = this._curSub !== null && this._curSub !== undefined && this._curSub.task === task ? this._curSub : null;
+        const chain = this._prereqChain(cur);
+        const goal = this._resolveGoal(task);
+        const inv = state.inventory;
+        const resolved = [];
+        for (const n of needs) {
+            let item = n.item;
+            if (Object.hasOwn(n, 'anyOf')) {
+                const ch = this._obtainPlanner(state).cheapest(n.anyOf, n.count, inv);
+                for (const t of ch.ties) console.log(`[backchain] cost tie broken (proven edges, then name): ${t}`);
+                item = ch.item;
+            }
+            const need = { item, count: n.count, reason: n.reason, source: n.source };
+            if (goal.kind === 'item' && item === goal.item && n.reason !== 'proximity') {
+                // the goal's own item could not be made: what it lacks is its own game-data prerequisites
+                const own = this._failureNeeds(task, null, null, state);
+                if (own === null) { console.log(`[backchain] "${task}": ${item} reported missing, but the game data shows nothing it lacks`); continue; }
+                resolved.push(...own.map(o => ({ item: o.item, count: o.count, reason: o.reason, source: o.source })));
+                continue;
+            }
+            resolved.push(need);
+        }
+        if (!resolved.length) return false;
+        const desc = resolved.map(n => `${n.count} ${n.item} (${n.reason}, ${n.source})`).join(', ');
+        if (cur !== null && cur.retry === true && cur.prereq === true) {
+            console.log(`!!! [backchain] LOUD: "${task}" still lacks ${desc} after its prerequisite subgoals ran; not re-queued`);
+            this._recordGoalOutcome(task, false, `prerequisite still missing: ${desc}`);
+            return true;
+        }
+        const below = goal.kind === 'item' || goal.kind === 'ensure' ? [...chain, this._goalKey(goal)] : chain;
+        for (const n of resolved) if (below.includes(this._needKey(n))) throw new Error(`[fix81] LOUD: subgoal cycle ${[...below, this._needKey(n)].join(' -> ')} (need of "${task}")`);
+        const subs = resolved.map(n => {
+            if (n.reason === 'proximity') return { task: `ensure ${n.item}`, need: n, edge: null };
+            // a learned producer first (its learned task); else the game's recipe/loot data, an UNTRIED edge until a run proves it
+            const learned = this._subgoalToObtainItem(n.item, n.count, inv, new Set());
+            if (learned !== null) return { task: learned, need: n, edge: null };
+            return { task: this._obtainPlanner(state).prerequisites(n.item, n.count, inv).task, need: n, edge: n.item };
+        });
+        const edges = this.progress.recipeEdges;
+        for (const sb of subs) if (sb.edge !== null && !Object.hasOwn(edges, sb.edge)) edges[sb.edge] = { task: sb.task, status: 'untried', runs: 0, fails: 0 };
         const d = (this.progress.decomposed ||= {}), q = (this.progress.subgoals ||= []);
-        const depth = (this._curSub?.task === parentTask ? this._curSub.depth : 0);
-        d[parentTask] = { subs: [sub], skills: [], at: Date.now(), reason: `prerequisite: need ${shortfall} more ${item}` };
-        q.unshift({ task: sub, parent: parentTask, depth: depth + 1 }, { task: parentTask, retry: true, depth });
+        const depth = cur === null ? 0 : cur.depth;
+        d[task] = { subs: subs.map(sb => sb.task), skills: [], at: Date.now(), reason: `needs: ${desc}` };
+        q.unshift(...subs.map(sb => ({ task: sb.task, parent: task, depth: depth + 1, chain: below, edge: sb.edge })), { task, retry: true, prereq: true, depth, chain });
+        // fix47's curriculum blockers, now from the structured needs (was the "Cannot break X" critic text)
+        this.progress.blockers = this.progress.blockers.filter(b => b.task !== task);
+        for (const n of resolved) this.progress.blockers.push({ item: n.item, count: n.count, reason: n.reason, task, at: Date.now() });
         this._saveProgress();
-        console.log(`[psn] DECOMPOSE (prerequisite) "${parentTask}" -> ${sub} (missing ${shortfall} ${item})`);
+        console.log(`[psn] DECOMPOSE (needs) "${task}" -> ${subs.map(sb => sb.task).join(', ')}; lacks ${desc}`);
         return true;
+    }
+    // fix81: the curriculum's BLOCKERS line, from the structured needs of failed goals (_chainNeeds); a need is resolved once held
+    _blockerHint(inv) {
+        this.progress.blockers = this.progress.blockers.filter(b => !(Object.hasOwn(inv, b.item) && inv[b.item] >= b.count));
+        if (this.progress.blockers.length > 0) this._saveProgress();
+        const blockers = this.progress.blockers;
+        return blockers.length > 0
+            ? `\nBLOCKERS (prioritize these - what failed goals lack): ${blockers.map(b => `"${b.task}" needs ${b.count} ${b.item} (${b.reason})`).join('; ')}`
+            : '';
+    }
+    // fix81: a game-data producer edge (progress.recipeEdges[item] = { task, status }) is a fact only once a run of its task proves it
+    _noteEdgeOutcome(task, ok) {
+        if (!Object.hasOwn(this.progress, 'recipeEdges')) return;
+        for (const [item, e] of Object.entries(this.progress.recipeEdges)) {
+            if (e.task !== task) continue;
+            e.runs++;
+            if (ok) e.status = 'proven';
+            else e.fails++;
+            console.log(`[backchain] game-data edge for ${item} ("${task}"): ${ok ? 'PROVEN by a run' : `failed (${e.fails}/${e.runs})`}`);
+        }
     }
     // fix51: pick a subgoal task string from learned producers / consumes chain (depth-first on missing inputs)
     // fix54: `path` = items already being sought on this branch; a learned consumes cycle (A needs B needs A)
@@ -2740,9 +2893,24 @@ Use only c; no other globals.`;
         plan.push({ name: pick.s.name, item, need });
         return true;
     }
-    async _backchain(task, before) {
+    // fix81: with structured needs, the chain target is the missing item (a single named need), not only the goal item
+    async _backchain(task, before, needs) {
         const goal = countGoal(task); if (!goal) return null;
         const plan = [];
+        const target = Array.isArray(needs) && needs.length === 1 && Object.hasOwn(needs[0], 'item') && needs[0].item !== goal.item ? needs[0] : null;
+        if (target !== null) {
+            const have = Object.hasOwn(before.inventory, target.item) ? before.inventory[target.item] : 0;
+            if (!this._chain(target.item, have + target.count, before.inventory, 0, plan, []) || !plan.length) return null;
+            console.log(`[backchain] plan for missing ${target.count} ${target.item} (${target.reason}) of "${task}": ${plan.map(x => `${x.name}(+${x.item})`).join(' -> ')}`);
+            for (let i = 0; i < plan.length; i++) {
+                const st = plan[i], last = await this._replay(`obtain 1 ${st.item}`, this.observe(), { name: st.name, call: `await ${st.name}(bot);` });
+                if (last === null) { console.log(`[backchain] step ${i + 1}/${plan.length} ${st.name} not replayable; plan abandoned`); return { ok: false }; }
+                if (!last.ok) { console.log(`[backchain] step ${i + 1}/${plan.length} ${st.name} ${last.interrupted ? 'interrupted' : 'failed'}; plan abandoned`); return last; }
+            }
+            console.log(`[backchain] missing ${target.item} produced by learned skills; retrying "${task}"`);
+            const route = this._findReplay(task);
+            return route ? await this._replay(task, before, route) : null;
+        }
         if (!this._chain(goal.item, (before.inventory[goal.item] || 0) + goal.count, before.inventory, 0, plan, []) || !plan.length) return null;
         console.log(`[backchain] plan for "${task}": ${plan.map(x => `${x.name}(+${x.item})`).join(' -> ')}`);
         let last = null;
@@ -3502,110 +3670,6 @@ Use only c; no other globals.`;
         return finish({ ...verdict, detail: `${verdict.detail} in ${Date.now() - practiceStart}ms` });
     }
 
-    // fix47: compute cheapest tool to break a block by recursing through recipes
-    // Returns { tool, chain: [{item, count}] } where chain is the recipe steps from gatherable materials
-    _cheapestHarvestTool(blockName, inv) {
-        if (!VERSION) return null;
-        try {
-            const md = minecraftData(VERSION);
-            const block = md.blocksByName[blockName];
-            if (!block?.harvestTools) return null;
-            
-            // Get all valid tools from harvestTools (keys are item IDs)
-            const validToolIds = Object.keys(block.harvestTools).map(Number);
-            if (!validToolIds.length) return null;
-            
-            // Find the cheapest tool by recipe depth
-            let cheapest = null;
-            let cheapestDepth = Infinity;
-            
-            for (const toolId of validToolIds) {
-                const toolItem = md.items[toolId];
-                if (!toolItem) continue;
-                
-                // Check if we already have it
-                if ((inv[toolItem.name] || 0) > 0) {
-                    return { tool: toolItem.name, chain: [], reason: 'already have' };
-                }
-                
-                // Compute recipe chain depth
-                const chain = this._recipeChain(toolItem.name, inv, md, 0, new Set());
-                if (chain && chain.length < cheapestDepth) {
-                    cheapestDepth = chain.length;
-                    cheapest = { tool: toolItem.name, chain };
-                }
-            }
-            return cheapest;
-        } catch (e) {
-            console.log(`[fix47] _cheapestHarvestTool failed for ${blockName}: ${e.message}`);
-            return null;
-        }
-    }
-    
-    // fix47: compute recipe chain from gatherable materials (harvestTools undefined = can break by hand)
-    _recipeChain(itemName, inv, md, depth, visited) {
-        if (depth > 10 || visited.has(itemName)) return null;
-        visited.add(itemName);
-        
-        // Already have it
-        if ((inv[itemName] || 0) > 0) return [];
-        
-        const item = md.itemsByName[itemName];
-        if (!item) return null;
-        
-        // Check recipes
-        const recipes = md.recipes?.[item.id];
-        if (!recipes?.length) {
-            // No recipe - check if it's a gatherable block (can break by hand)
-            const block = md.blocksByName[itemName];
-            if (block && !block.harvestTools) {
-                // Can gather by hand
-                return [{ item: itemName, count: 1, action: 'gather' }];
-            }
-            return null;
-        }
-        
-        // Find simplest recipe
-        let bestChain = null;
-        for (const recipe of recipes) {
-            const ingredients = [];
-            if (recipe.inShape) {
-                for (const row of recipe.inShape) {
-                    for (const slot of row) {
-                        if (slot?.id >= 0) {
-                            const ingName = md.items[slot.id]?.name;
-                            if (ingName) ingredients.push({ name: ingName, count: slot.count || 1 });
-                        }
-                    }
-                }
-            } else if (recipe.ingredients) {
-                for (const ing of recipe.ingredients) {
-                    if (ing?.id >= 0) {
-                        const ingName = md.items[ing.id]?.name;
-                        if (ingName) ingredients.push({ name: ingName, count: ing.count || 1 });
-                    }
-                }
-            }
-            
-            // Recurse for each ingredient
-            let totalChain = [];
-            let valid = true;
-            for (const ing of ingredients) {
-                const subChain = this._recipeChain(ing.name, inv, md, depth + 1, new Set(visited));
-                if (!subChain) { valid = false; break; }
-                totalChain = [...totalChain, ...subChain];
-            }
-            
-            if (valid) {
-                totalChain.push({ item: itemName, count: recipe.result?.count || 1, action: 'craft' });
-                if (!bestChain || totalChain.length < bestChain.length) {
-                    bestChain = totalChain;
-                }
-            }
-        }
-        return bestChain;
-    }
-    
     // ---------- automatic curriculum ----------
     // fix29: restored fix19 PSN decomposition (removed with the milestone planner in fix27c while its callers stayed):
     // a goal that keeps failing is split by the local model into 2-4 subgoals (depth <= 2, 30-min cooldown per goal);
@@ -3617,35 +3681,8 @@ Use only c; no other globals.`;
         if (depth >= 2) { console.log(`[psn] decompose skipped for "${task}": already a depth-${depth} subgoal`); return false; }
         if (d[task] && Date.now() - d[task].at < 30 * 60e3) { console.log(`[psn] decompose skipped for "${task}": decomposed ${Math.round((Date.now() - d[task].at) / 60e3)} min ago`); return false; }
         
-        const reasonStr = String(reason);
-        const inv = this.observe().inventory || {};
-        
-        // fix47: detect "Cannot break X with current tools" and compute cheapest tool via harvestTools
-        const cannotBreak = reasonStr.match(/Cannot break (\w+) with current tools/i);
-        if (cannotBreak) {
-            const blockName = cannotBreak[1].toLowerCase();
-            const toolInfo = this._cheapestHarvestTool(blockName, inv);
-            if (toolInfo?.chain?.length > 0) {
-                // Queue the recipe chain as subgoals
-                const subs = toolInfo.chain.map(step => {
-                    if (step.action === 'gather') return `Collect 1 ${step.item}`;
-                    return `Craft 1 ${step.item}`;
-                });
-                d[task] = { subs, skills: [], at: Date.now(), reason: `need ${toolInfo.tool} to break ${blockName}` };
-                q.unshift(...subs.map(t => ({ task: t, parent: task, depth: depth + 1 })), { task, retry: true, depth });
-                // fix47: track this as a blocker so curriculum prioritizes tool acquisition
-                // Blockers are cleared when: (1) tool appears in inventory, (2) blocked task passes
-                this.progress.blockers = this.progress.blockers || [];
-                const blockerEntry = { tool: toolInfo.tool, block: blockName, task, at: Date.now() };
-                // Remove duplicate blockers for same block/tool, keep only most recent 5
-                this.progress.blockers = this.progress.blockers.filter(b => b.block !== blockName).slice(-4);
-                this.progress.blockers.push(blockerEntry);
-                this._saveProgress();
-                console.log(`[psn] DECOMPOSE (harvestTools) "${task}" -> need ${toolInfo.tool}: ${subs.join(', ')}`);
-                return true;
-            }
-        }
-        
+        // fix81: the fix47 "Cannot break X with current tools" reason-text branch is gone; a missing harvest tool is read
+        //        from the failed run's structured needs and the game data (_failureNeeds / _chainNeeds)
         // fix47: inventory-first planning - before queuing gather/mine subgoals, check if we can produce
         const goal = smeltGoal(task) || countGoal(task) || parseVerboseGoal(task);
         if (goal) {
@@ -3833,14 +3870,9 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "task": "...", "contex
         const knownSkillsFacts = this._knownSkillsFacts();
         const replayableTasks = this.skills.filter(s => s.task && !s.primitive).map(s => s.task.split(/\s+(?:within|at|using|from)\b/i)[0]).slice(-25);
         // fix47: include active blockers so curriculum prioritizes unblocking goals
-        // Clear resolved blockers: tool now in inventory
+        // fix81: blockers are structured needs { item, count, reason, task } (from _chainNeeds); resolved once held
         const inv = state.inventory || {};
-        this.progress.blockers = (this.progress.blockers || []).filter(b => !(inv[b.tool] > 0));
-        if (this.progress.blockers.length > 0) this._saveProgress();
-        const blockers = this.progress.blockers;
-        const blockerHint = blockers.length > 0 
-            ? `\nBLOCKERS (prioritize these - failures need tools): ${blockers.map(b => `need ${b.tool} to break ${b.block}`).join('; ')}`
-            : '';
+        const blockerHint = this._blockerHint(inv);
         // fix49: pass edible inventory (from minecraft-data foods) to curriculum - let the model rank
         const edible = VERSION ? this._getEdibleInventory(inv) : [];
         const edibleHint = edible.length > 0 
@@ -4851,9 +4883,10 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
             : this._findReplay(task) || await this._embedReplay(task);   // fix28 (D): replay a matching learned skill before any code-model call
         let rp = route ? await this._replay(task, before, route) : null;
         if (route?.embed) this._learnReplayThreshold(rp);
-        if (!rp?.ok && !rp?.interrupted) { const bc = await this._backchain(task, rp ? this.observe() : before); if (bc) rp = bc; }   // fix32 PSN backward chaining
+        if (!rp?.ok && !rp?.interrupted) { const bc = await this._backchain(task, rp ? this.observe() : before, rp ? rp.needs : null); if (bc) rp = { ...bc, needs: rp ? rp.needs : null }; }   // fix32 PSN backward chaining (fix81: on the missing item too)
         if (rp?.interrupted) { console.log('[voyager] task interrupted'); return; }
         if (rp?.ok) {
+            this._noteEdgeOutcome(task, true);   // fix81
             this.progress.completed.push(task); this.progress.failed = this.progress.failed.filter(t => t !== task);
             // fix47: clear blockers for this task when it passes
             this.progress.blockers = (this.progress.blockers || []).filter(b => b.task !== task);
@@ -4868,6 +4901,9 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
             this._recordGoalOutcome(task, false, rp.reason || 'replay failed');  // fix49: backoff tracking
             this.progress.failed.push(task); this._saveProgress(); this._windowCheck(false); 
         }
+        // fix81: the run said what it lacks: chain on that (subgoals) instead of writing new code for a goal that cannot pass yet
+        if (rp && !rp.ok && !rp.interrupted) this._noteEdgeOutcome(task, false);
+        if (rp && !rp.ok && Array.isArray(rp.needs)) { if (this._chainNeeds(task, rp.needs, this.observe())) return; }
         // fix55: a skill goal is that skill; its failure is already blamed/queued for repair by _attribute, so no new code is written for it
         if (goalKind.kind === 'skill') { console.log(`[voyager] skill goal ${task} failed its learned post-contract; repair of the skill handles it (no code generation)`); return; }
         if (this._cursorLimited()) { console.log(`[voyager] skipped "${task}": needs new code but Cursor is at its limit (replay-only mode)`); return; }
@@ -5109,6 +5145,14 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
         }
         this._saveProgress();
 
+        // fix81: the last failed run's structured needs (reported marker, violated contract, game data) chain first
+        if (!anyCut) {
+            const bot = this.agent.bot, reported = peekPreconditionUnmet(bot);
+            clearPreconditionUnmet(bot);
+            const needs = this._failureNeeds(task, reported, bot.__psnTrace, this.observe());
+            this._noteEdgeOutcome(task, false);
+            if (needs !== null && this._chainNeeds(task, needs, this.observe())) return;
+        }
         // fix19 (1): failed twice (recently) or cut off -> decompose
         const fails = this.progress.failed.slice(-20).filter(t => t === task).length;
         if (fails >= 2 || anyCut || this._decomposeQueue?.task === task) { if (this._decomposeQueue?.task === task) this._decomposeQueue = null; await this._decompose(task, anyCut || `failed ${fails}x; last critic: ${String(feedback).slice(-300)}${invFullReason}`); }
@@ -5214,7 +5258,7 @@ Voyager.SEEDED_PRIMITIVES = [
         }
         await equipToolForBlock(bot, block);   // fix62: cheapest tool that works on this block (was mineflayer-tool equipForBlock: fastest dig = top tier)
         const itemId = bot.heldItem ? bot.heldItem.type : null;
-        if (!block.canHarvest(itemId)) { log(bot, \`Don't have right tools to harvest \${blockType}.\`); return false; }
+        if (!block.canHarvest(itemId)) { __mcPreconditionUnmet__(bot, { need: { anyOf: Object.keys(block.harvestTools).map(id => bot.registry.items[id].name), count: 1, reason: 'tool' } }); log(bot, \`Don't have right tools to harvest \${blockType}.\`); return false; }
         const before = getInventoryCounts(bot);
         const startPos = bot.entity.position.clone();
         const targetDist = startPos.distanceTo(block.position);
@@ -5249,11 +5293,33 @@ Voyager.SEEDED_PRIMITIVES = [
         // fix42: retry placing crafting_table at multiple cells (no same-cell reuse on failure)
         code: `async function craftRecipe(bot, itemName, num = 1) {
     if (!itemName) { log(bot, 'craftRecipe: no item specified'); return false; }
-    let recipes = bot.recipesFor(bot.registry.itemsByName[itemName]?.id, null, 1, null);
+    const target = bot.registry.itemsByName[itemName];
+    if (!target) { log(bot, \`craftRecipe: \${itemName} is not an item in this version\`); return false; }
+    // fix81: recipesFor returns only what the inventory can make now, so [] was "No recipe for X or missing ingredients"
+    //        ("No recipe for stick" x25 with 0 planks/logs). recipesAll (every recipe) tells the two apart; missing
+    //        ingredients are a structured unmet precondition (the recipe closest to makeable) the planner backchains on.
+    const unmakeable = () => {
+        const all = bot.recipesAll(target.id, null, true);
+        if (!all.length) { log(bot, \`No recipe for \${itemName}.\`); return false; }
+        const inv = getInventoryCounts(bot);
+        const shortOf = r => r.delta.filter(d => d.count < 0).map(d => {
+            const name = bot.registry.items[d.id].name, have = Object.hasOwn(inv, name) ? inv[name] : 0;
+            return { item: name, need: -d.count * num, have };
+        }).filter(m => m.have < m.need);
+        const units = ms => ms.reduce((t, m) => t + m.need - m.have, 0);
+        const closest = all.map(r => ({ r, missing: shortOf(r) })).sort((a, b) => units(a.missing) - units(b.missing))[0];
+        const missing = closest.missing;
+        if (!missing.length) { log(bot, \`FAILED: craftRecipe(\${itemName}): no recipe is makeable now, yet every ingredient of the closest one is held\`); return false; }
+        // the need is the item itself: which ingredient variant to get (oak or birch planks ...) is the planner's choice
+        __mcPreconditionUnmet__(bot, { need: { item: itemName, count: num * closest.r.result.count, reason: 'ingredients' }, missing });
+        log(bot, \`Cannot craft \${itemName}: missing ingredients \${missing.map(m => \`\${m.item} (need \${m.need}, have \${m.have})\`).join(', ')}.\`);
+        return false;
+    };
+    let recipes = bot.recipesFor(target.id, null, 1, null);
     let craftingTable = null, placedTable = false;
-    if (!recipes || !recipes.length) {
-        recipes = bot.recipesFor(bot.registry.itemsByName[itemName]?.id, null, 1, true);
-        if (!recipes || !recipes.length) { log(bot, \`No recipe for \${itemName} or missing ingredients.\`); return false; }
+    if (!recipes.length) {
+        recipes = bot.recipesFor(target.id, null, 1, true);
+        if (!recipes.length) return unmakeable();
         craftingTable = getNearestBlock(bot, 'crafting_table', 16);
         if (!craftingTable) {
             // fix51: call ensureCraftingTable to get/craft/place a table (fail loud if can't)
@@ -5263,9 +5329,9 @@ Voyager.SEEDED_PRIMITIVES = [
             if (!craftingTable) { log(bot, \`FAILED: ensureCraftingTable returned true but no table found\`); return false; }
             placedTable = true;
         }
-        if (craftingTable) recipes = bot.recipesFor(bot.registry.itemsByName[itemName]?.id, null, 1, craftingTable);
+        if (craftingTable) recipes = bot.recipesFor(target.id, null, 1, craftingTable);
     }
-    if (!recipes || !recipes.length) { log(bot, \`Cannot craft \${itemName}: missing ingredients.\`); if (placedTable) await collectBlock(bot, 'crafting_table', 1); return false; }
+    if (!recipes.length) { if (placedTable) await collectBlock(bot, 'crafting_table', 1); return unmakeable(); }
     // fix60: walk to a spot that sees and reaches a face of the table (GoalLookAtBlock, game reach), not just near it
     if (craftingTable) {
         const reached = await goToReachBlock(bot, craftingTable);
@@ -5528,10 +5594,11 @@ Voyager.SEEDED_PRIMITIVES = [
     // Phase 2: if still low on space, try depositToChest
     if (bot.inventory.emptySlotCount() < minFree && !bot.interrupt_code) {
         // fix43: check for chest FIRST and fail loud with PREREQUISITE if missing
-        const chest = getNearestBlock(bot, b => /chest|barrel|shulker/.test(b.name), 32);
+        const isStore = b => /chest|barrel|shulker/.test(b.name);
+        const chest = getNearestBlock(bot, isStore, 32);
         if (!chest) {
             if (depositList.length || (bot.inventory.emptySlotCount() < 2 && uncertainList.length)) {
-                __mcPreconditionUnmet__(bot);
+                __mcPreconditionUnmet__(bot, { need: { anyOf: bot.registry.blocksArray.filter(isStore).map(b => b.name), count: 1, reason: 'proximity' } });
                 log(bot, \`PREREQUISITE FAILED: tossClutter needs chest within 32 blocks to deposit items (have \${depositList.length} deposit candidates, \${uncertainList.length} uncertain items). Place or find a chest first.\`);
                 return false;
             }
@@ -5661,8 +5728,7 @@ Voyager.SEEDED_PRIMITIVES = [
                 
                 if (!crafted && shortfall > 0) {
                     // fix51: fail loud with structured prerequisite info for decomposition/needs-produces
-                    bot.__prereqFail = { item: ingItem.name, need: shortfall + (inv[ingItem.name] || 0), have: inv[ingItem.name] || 0 };
-                    __mcPreconditionUnmet__(bot);
+                    __mcPreconditionUnmet__(bot, { need: { item: ingItem.name, count: shortfall, reason: 'ingredients' } });
                     log(bot, \`PREREQUISITE FAILED: ensureCraftingTable needs \${shortfall} more \${ingItem.name} but cannot craft it (no 2x2 recipe or missing sub-ingredients). Decompose to obtain \${ingItem.name} first.\`);
                     return false;
                 }
@@ -5694,14 +5760,11 @@ Voyager.SEEDED_PRIMITIVES = [
                 if (ingItem) {
                     const have = inv[ingItem.name] || 0;
                     const need = Math.abs(ing.count);
-                    if (have < need) {
-                        if (!bot.__prereqFail) bot.__prereqFail = { item: ingItem.name, need, have };
-                        missingIngredients.push(\`\${ingItem.name} (need \${need}, have \${have})\`);
-                    }
+                    if (have < need) missingIngredients.push({ item: ingItem.name, count: need - have, have });
                 }
             }
-            __mcPreconditionUnmet__(bot);
-            log(bot, \`PREREQUISITE FAILED: ensureCraftingTable cannot craft - missing: \${missingIngredients.join(', ')}. Decompose to obtain prerequisites.\`);
+            __mcPreconditionUnmet__(bot, { need: { item: missingIngredients[0].item, count: missingIngredients[0].count, reason: 'ingredients' } });
+            log(bot, \`PREREQUISITE FAILED: ensureCraftingTable cannot craft - missing: \${missingIngredients.map(m => \`\${m.item} (need \${m.count + m.have}, have \${m.have})\`).join(', ')}. Decompose to obtain prerequisites.\`);
             return false;
         }
     }

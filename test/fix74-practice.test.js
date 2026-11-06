@@ -174,7 +174,7 @@ describe('fix74: the practice cap is learned per skill', () => {
 describe('fix74 on fix76: an unmet precondition is no verdict in practice either', () => {
     it('a practice run that fails after marking its precondition unmet leaves stats alone and clears the marker', async () => {
         const s = live();
-        const { v, bot } = mkPracticeV([s], async b => { markPreconditionUnmet(b, { item: 'cooked_mutton' }); b.__psnTrace.push(rootRec(s.name, { t0: 0, t1: 5000, from: { x: -25, y: 69, z: 70 }, to: { x: -30, y: 69, z: 70 } })); });
+        const { v, bot } = mkPracticeV([s], async b => { markPreconditionUnmet(b, { need: { item: 'cooked_mutton', count: 1, reason: 'ingredients' } }); b.__psnTrace.push(rootRec(s.name, { t0: 0, t1: 5000, from: { x: -25, y: 69, z: 70 }, to: { x: -30, y: 69, z: 70 } })); });
         const r = await v._runPracticeSkill(s);
         assert.strictEqual(r.ok, null, r.detail);
         assert.match(r.detail, /unmet precondition \(precondition\)/);
@@ -184,7 +184,7 @@ describe('fix74 on fix76: an unmet precondition is no verdict in practice either
     it('a stale marker from before the run cannot void a real failure', async () => {
         const s = live();
         const { v, bot } = mkPracticeV([s], async b => { b.__psnTrace.push(rootRec(s.name, { t0: 0, t1: 5000, from: { x: -25, y: 69, z: 70 }, to: { x: -30, y: 69, z: 70 } })); });
-        markPreconditionUnmet(bot);
+        markPreconditionUnmet(bot, { need: { item: 'cooked_mutton', count: 1, reason: 'ingredients' } });
         const r = await v._runPracticeSkill(s);
         assert.strictEqual(r.ok, false);
         assert.deepStrictEqual([s.stats.success, s.stats.fail], [1, 1]);
@@ -195,7 +195,7 @@ describe('fix74: no magic timers or fallbacks in practice', () => {
     const body = (start, end) => SRC.slice(SRC.indexOf(start), SRC.indexOf(end, SRC.indexOf(start))).split('\n').map(l => l.replace(/\s\/\/ .*$/, '')).join('\n');   // code only
     it('the practice loop and run have no sleeps; the only timer is the learned bound', () => {
         const loop = body('    async _startIdlePractice(callNum) {', '    _armPracticeAbort() {');
-        const run = body('    async _runPracticeSkill(skill) {', '    // fix47: compute cheapest tool');
+        const run = body('    async _runPracticeSkill(skill) {', '    // ---------- automatic curriculum ----------');
         assert.doesNotMatch(loop, /setTimeout|setInterval|\b\d{3,}\b/);
         assert.deepStrictEqual(run.match(/setTimeout\([^;]*;/g), ["setTimeout(() => resolve({ kind: 'cut' }), bound);"]);
         assert.doesNotMatch(run, /maxPracticeMs|10000/);

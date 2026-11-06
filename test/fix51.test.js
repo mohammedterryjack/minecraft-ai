@@ -984,7 +984,7 @@ describe('fix51 issue 20: ensureCraftingTable dependency chain', async () => {
         const Voyager = mod.Voyager;
         const mockBot = { version: '1.21.4', chat: () => {}, on: () => {}, off: () => {}, once: () => {}, removeListener: () => {} };
         const v = new Voyager({ bot: mockBot, agent: { prompter: { task: () => {} }, npc: { constructs: {} } } });
-        v.progress = { decomposed: {}, subgoals: [] };
+        v.progress = { decomposed: {}, subgoals: [], blockers: [], recipeEdges: {} };
         v.skills = [{
             name: 'collectOakLog',
             effects: ['oak_log'],
@@ -1011,10 +1011,9 @@ describe('fix51 issue 20: ensureCraftingTable dependency chain', async () => {
             equipment: { heldItem: null, offHand: null, helmet: null, chestplate: null, leggings: null, boots: null },
             pos: { x: 0, y: 64, z: 0 }
         });
-        assert.strictEqual(v._tryDecomposePrerequisiteFailure('craft one iron pickaxe'), false, 'no structured prereq -> no decomposition');
-        mockBot.__prereqFail = { item: 'oak_planks', need: 4, have: 2 };
-        const ok = v._tryDecomposePrerequisiteFailure('craft one iron pickaxe');
-        assert.ok(!Object.hasOwn(mockBot, '__prereqFail'), 'decomposition clears __prereqFail');
+        // fix81: the structured need (was bot.__prereqFail) is chained by _chainNeeds
+        assert.strictEqual(v._chainNeeds('craft one iron pickaxe', [], v.observe()), false, 'no structured need -> no decomposition');
+        const ok = v._chainNeeds('craft one iron pickaxe', [{ item: 'oak_planks', count: 2, reason: 'ingredients', source: 'reported' }], v.observe());
         assert.strictEqual(ok, true);
         assert.ok(v.progress.subgoals.length >= 1);
         const sub = v.progress.subgoals[0].task.toLowerCase();
@@ -1081,10 +1080,10 @@ describe('fix51 issue 22: idle practice requires real effect change', async () =
 });
 
 describe('fix51 rule fixes: structured prereq + deposit without name regex', async () => {
-    it('seeded ensureCraftingTable sets bot.__prereqFail; decomposition does not parse text', () => {
+    it('seeded ensureCraftingTable reports a structured need; decomposition does not parse text', () => {
         const src = readFileSync('./src/agent/voyager.js', 'utf8');
-        assert.ok(src.includes('bot.__prereqFail = { item: ingItem.name'), 'ensureCraftingTable should set structured __prereqFail');
-        const body = src.slice(src.indexOf('    _tryDecomposePrerequisiteFailure(parentTask)'), src.indexOf('    _subgoalToObtainItem('));
+        assert.ok(src.includes("__mcPreconditionUnmet__(bot, { need: { item: ingItem.name, count: shortfall, reason: 'ingredients' } })"), 'ensureCraftingTable should report the structured need (fix81; was __prereqFail)');
+        const body = src.slice(src.indexOf('    _failureNeeds(task, reported, trace, state)'), src.indexOf('    _subgoalToObtainItem('));
         assert.ok(!body.includes('match(') && !body.includes('could not parse'), 'decomposition must not parse text');
     });
     it('seeded depositToChest has no container name regex and logs each openContainer reject', () => {

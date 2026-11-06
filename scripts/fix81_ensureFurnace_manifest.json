@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "bot": "icefox2000",
+  "inventory": "PR #76 (fix81): ensureFurnace effects recorded from a whole code-model-call delta. Live log logs/mindcraft.log.3 line 160720 (2026-11-05 22:49:22Z): '[needs/produces] recorded delta for \"ensureFurnace\": -[granite,cobblestone] +[oak_log,oak_planks,gravel]', right after '[idle-practice] completed 9 practice run(s) during code-model call #11' (other skills' gains inside the window). The skill's code collects no log, plank or gravel: it mines stone, crafts and PLACES a furnace (line 118835: -[oak_planks,cobblestone] +[furnace] is the only own-run delta). With these effects the learned producer graph routes oak_log / oak_planks / gravel needs to ensureFurnace. The window bug is fixed by fix70 (5d378f9, recordDelta 'this run only'); this resets the record it left. Apply after the fix81 deploy: node scripts/reset_bug_poisoned.js --manifest=scripts/fix81_ensureFurnace_manifest.json --bots-dir=bots/icefox2000 (dry run), then with --apply.",
+  "files": { "index": "skills/index.json", "progress": "skills/progress.json" },
+  "records": [
+    {
+      "id": "ensureFurnace.effects",
+      "file": "index",
+      "skill": "ensureFurnace",
+      "cause": { "fix": "#65", "commit": "5d378f9", "name": "fix70 delta window: idle-practice gains inside a code-model call recorded as ensureFurnace effects (log.3:160720, 2026-11-05 22:49:22Z)" },
+      "expect": { "effects": ["oak_log", "oak_planks", "gravel"] },
+      "set": { "effects": [] },
+      "delete": []
+    }
+  ]
+}

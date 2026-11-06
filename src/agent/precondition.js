@@ -1,12 +1,25 @@
 // fix76: typed unmet-precondition marker. Seeded skills that cannot run because a world
-// prerequisite is missing call markPreconditionUnmet(bot) before returning false. The learner
+// prerequisite is missing call markPreconditionUnmet(bot, { need }) before returning false. The learner
 // checks kind === 'precondition' — never message text.
+// fix81: the marker must say WHAT is missing: need = { item | anyOf: [items], count, reason } (reason kind: 'tool',
+// 'ingredients', 'proximity', 'place', 'contract', ...). The learner chains subgoals on it (voyager _chainNeeds).
+export function checkNeed(need, source) {
+    if (!need) throw new Error(`[fix81] need from ${source} must be an object`);
+    if (typeof need !== 'object') throw new Error(`[fix81] need from ${source} must be an object`);
+    if (typeof need.reason !== 'string') throw new Error(`[fix81] need from ${source} has no reason kind: ${JSON.stringify(need)}`);
+    if (!Number.isInteger(need.count)) throw new Error(`[fix81] need from ${source} has no integer count: ${JSON.stringify(need)}`);
+    if (need.count < 1) throw new Error(`[fix81] need from ${source} has count < 1: ${JSON.stringify(need)}`);
+    const hasItem = typeof need.item === 'string', hasAny = Array.isArray(need.anyOf);
+    if (hasItem === hasAny) throw new Error(`[fix81] need from ${source} must name exactly one of item / anyOf: ${JSON.stringify(need)}`);
+    if (hasAny && !need.anyOf.length) throw new Error(`[fix81] need from ${source} has an empty anyOf`);
+    return need;
+}
 export function markPreconditionUnmet(bot, detail) {
     if (!bot) throw new Error('[fix76] markPreconditionUnmet: bot object required');
     if (typeof bot !== 'object') throw new Error('[fix76] markPreconditionUnmet: bot object required');
-    if (detail === undefined) detail = {};
-    else if (detail === null) throw new Error('[fix76] markPreconditionUnmet: detail must be an object when provided');
-    else if (typeof detail !== 'object') throw new Error('[fix76] markPreconditionUnmet: detail must be an object when provided');
+    if (!detail) throw new Error('[fix81] markPreconditionUnmet: detail { need: { item | anyOf, count, reason } } required');
+    if (typeof detail !== 'object') throw new Error('[fix81] markPreconditionUnmet: detail must be an object');
+    checkNeed(detail.need, 'markPreconditionUnmet');
     bot.__unmetPrecondition = Object.assign({ kind: 'precondition' }, detail);
     return bot.__unmetPrecondition;
 }
