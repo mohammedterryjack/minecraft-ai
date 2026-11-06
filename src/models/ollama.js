@@ -1,6 +1,6 @@
 import { strictFormat } from '../utils/text.js';
 import { Agent } from 'undici';
-import { recordCallDuration, callDurationBound, noteUnboundedCall, takeLearnedBound } from './call_durations.js';
+import { recordCall, recordCut, callBound, requestShape, workOf, noteUnboundedCall, takeLearnedBound } from './call_durations.js';
 
 // fix60: Ollama with stream:false sends its response headers only after the whole generation, so undici's implicit
 // 300 s headersTimeout/bodyTimeout (the global Agent installed when cheerio loads undici) killed long but healthy local
@@ -103,17 +103,19 @@ export class Ollama {
         let method = 'POST';
         let headers = new Headers();
         const request = new Request(url, { method, headers, body: JSON.stringify(body) });
-        // fix60: the wait is bounded only by this model+endpoint's learned successful-call durations (see call_durations.js)
+        // fix60/fix63: the wait is bounded by this model+endpoint's learned per-token rates scaled to this request (see call_durations.js)
         const key = `${this.model_name} ${endpoint}`;
-        const bound = callDurationBound(key);
-        if (!bound && noteUnboundedCall(key)) console.log(`!!! [ollama] UNBOUNDED calls ${key}: no learned duration distribution yet (needs two different successful durations); a hang here would not be cut (logged once per model+endpoint until a bound is learned)`);
+        const shape = requestShape(endpoint, body);
+        const bound = callBound(key, shape);
+        if (bound.ms === null && noteUnboundedCall(key)) console.log(`!!! [ollama] UNBOUNDED calls ${key}: ${bound.why}; a hang here would not be cut (logged once per model+endpoint until a bound is learned)`);
         const t0 = Date.now();
         let res;
-        try { res = await fetch(request, bound ? { dispatcher: OLLAMA_DISPATCHER, signal: AbortSignal.timeout(bound.ms) } : { dispatcher: OLLAMA_DISPATCHER }); }
+        try { res = await fetch(request, bound.ms !== null ? { dispatcher: OLLAMA_DISPATCHER, signal: AbortSignal.timeout(bound.ms) } : { dispatcher: OLLAMA_DISPATCHER }); }
         catch (err) {
-            if (bound && err?.name === 'TimeoutError') {
-                const e = new Error(`[ollama] ${key} exceeded its learned bound ${bound.ms}ms (successful calls: n=${bound.stats.n}, min ${bound.stats.min}ms, max ${bound.stats.max}ms); aborted as a hang`);
-                recordCallDuration(key, Date.now() - t0);   // censored: it took at least this long; widens the next bound
+            if (bound.ms !== null && err?.name === 'TimeoutError') {
+                const s = bound.stats;
+                const e = new Error(`[ollama] ${key} exceeded its learned bound ${bound.ms}ms for this request (~${bound.pTok} prompt tokens, up to ${bound.gen} generated; learned over ${Math.round(s.over)}ms, prompt ${s.pRate.toFixed(2)}ms/tok, gen ${s.gRate === undefined ? '-' : s.gRate.toFixed(2)}ms/tok, n=${s.n}); aborted as a hang`);
+                recordCut(key, Date.now() - t0, bound);   // censored: it took at least this long; widens the next bound
                 e.code = 'OLLAMA_LEARNED_BOUND'; console.error('!!! ' + e.message); throw e;
             }
             throw err;
@@ -125,9 +127,9 @@ export class Ollama {
             throw new Error(errMsg);
         }
         const json = await res.json();
-        recordCallDuration(key, Date.now() - t0);
-        const learned = takeLearnedBound(key);
-        if (learned) console.log(`[ollama] ${key} now bounded at ${learned.bound.ms}ms (learned from n=${learned.bound.stats.n} successful calls; ${learned.calls} call(s) ran unbounded)`);
+        recordCall(key, Date.now() - t0, shape.chars, workOf(endpoint, json));
+        const learned = takeLearnedBound(key, shape);
+        if (learned) console.log(`[ollama] ${key} now bounded (${learned.bound.ms}ms for a request like this one; learned from n=${learned.bound.stats.n} calls; ${learned.calls} call(s) ran unbounded)`);
         return json;
     }
 

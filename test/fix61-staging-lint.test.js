@@ -103,17 +103,17 @@ describe('fix61: parse errors are attributed', () => {
 });
 
 describe('fix61: UNBOUNDED logged once per model+endpoint until a bound is learned', () => {
-    const serve = () => new Promise(r => { let n = 0; const srv = http.createServer((req, res) => { req.resume(); req.on('end', () => { n++; setTimeout(() => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ embeddings: [[1]], message: { content: 'ok' } })); }, n % 2 ? 5 : 40); }); }); srv.listen(0, '127.0.0.1', () => r(srv)); });
+    const serve = () => new Promise(r => { let n = 0; const srv = http.createServer((req, res) => { req.resume(); req.on('end', () => { n++; setTimeout(() => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ embeddings: [[1]], message: { content: 'ok' }, prompt_eval_count: 4, prompt_eval_duration: 1e6, eval_count: 2, eval_duration: 2e6, total_duration: 3e6, load_duration: 0 })); }, n % 2 ? 5 : 40); }); }); srv.listen(0, '127.0.0.1', () => r(srv)); });
     it('noteUnboundedCall is true once per key; takeLearnedBound fires once, when the bound appears', () => {
         cd.setCallDurationStore({});
         assert.strictEqual(cd.noteUnboundedCall('k /api/embed'), true);
         assert.strictEqual(cd.noteUnboundedCall('k /api/embed'), false);
         assert.strictEqual(cd.noteUnboundedCall('k /api/chat'), true, 'each endpoint has its own announcement');
-        cd.recordCallDuration('k /api/embed', 10);
-        assert.strictEqual(cd.takeLearnedBound('k /api/embed'), null);
-        cd.recordCallDuration('k /api/embed', 30);
-        assert.deepStrictEqual(cd.takeLearnedBound('k /api/embed'), { calls: 2, bound: cd.callDurationBound('k /api/embed') });
-        assert.strictEqual(cd.takeLearnedBound('k /api/embed'), null);
+        const shape = { chars: 8, genBudget: () => 0 };
+        assert.strictEqual(cd.takeLearnedBound('k /api/embed', shape), null, 'nothing learned yet');
+        cd.recordCall('k /api/embed', 10, 8, { pTok: 2, pMs: 4, gTok: 0, gMs: 0 });   // fix63: one call with reply counters gives the rates
+        assert.deepStrictEqual(cd.takeLearnedBound('k /api/embed', shape), { calls: 2, bound: cd.callBound('k /api/embed', shape) });
+        assert.strictEqual(cd.takeLearnedBound('k /api/embed', shape), null);
     });
     it('20 concurrent embeds + 3 chats on a fresh store print one UNBOUNDED line per endpoint', async () => {
         cd.setCallDurationStore({});
@@ -123,7 +123,7 @@ describe('fix61: UNBOUNDED logged once per model+endpoint until a bound is learn
         console.log = (...a) => { lines.push(a.join(' ')); };
         try {
             await Promise.all(Array.from({ length: 20 }, () => o.embed('x')));
-            for (let i = 0; i < 3; i++) await o.send('/api/chat', { model: 'burst' });
+            for (let i = 0; i < 3; i++) await o.send('/api/chat', { model: 'burst', messages: [{ role: 'user', content: 'hi' }], options: { num_ctx: 64 } });
         } finally { console.log = orig; srv.close(); }
         assert.strictEqual(lines.filter(l => l.includes('UNBOUNDED calls burst /api/embed')).length, 1);
         assert.strictEqual(lines.filter(l => l.includes('UNBOUNDED calls burst /api/chat')).length, 1);
