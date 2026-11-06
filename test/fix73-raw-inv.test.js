@@ -86,6 +86,23 @@ describe('fix73: a NEW skill carries a consumes record', () => {
         // _shouldSkipPractice is what threw "Cannot convert undefined or null to object"
         assert.strictEqual(v._shouldSkipPractice(e, { cobblestone: 5 }, new Set()), null);
     });
+    it('saveSkill takes the observed effects from its caller once: missing throws, a stale value is never reused', async () => {
+        const v = mkSaver();
+        const code = n => `async function ${n}(bot) {\n    return true;\n}`;
+        await assert.rejects(v.saveSkill('noEffects', 'd', code('noEffects'), 't'), /saveSkill noEffects: no observed effects set by the caller/);
+        v._lastEffects = ['iron_ingot'];
+        assert.strictEqual(await v.saveSkill('first', 'd', code('first'), 't'), true);
+        assert.deepStrictEqual(v.skills.find(s => s.name === 'first').effects, ['iron_ingot']);
+        assert.strictEqual(v._lastEffects, null);
+        await assert.rejects(v.saveSkill('second', 'd', code('second'), 't'), /no observed effects set by the caller/);   // was: first's effects
+    });
+    it('learned effects are not capped (fix32 kept the first 12; a 13th real effect was dropped)', () => {
+        const v = mkSaver();
+        const seen = Array.from({ length: 12 }, (_, i) => `item_${i}`);
+        const e = { name: 'x', effects: [...seen], consumes: {} };
+        v._learnEffects(e, { inventory: {} }, { inventory: { iron_ingot: 1 } });
+        assert.deepStrictEqual(e.effects, [...seen, 'iron_ingot']);
+    });
     it('_learnEffects fails loudly on an entry without the record instead of comparing against a default', () => {
         const v = mkSaver();
         assert.throws(() => v._learnEffects({ name: 'x', effects: [] }, { inventory: {} }, { inventory: {} }), /skill x has no effects\/consumes record/);

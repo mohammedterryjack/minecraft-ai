@@ -148,6 +148,7 @@ describe('fix68: deps are library skills only; async built-ins are traced by nam
         const v = Object.create(Voyager.prototype);
         v.skills = [{ name: 'travelTo', code: 'async function travelTo(bot) { return true; }', deps: [] }];
         v._embed = async () => null; v._saveSkills = () => {}; v._extractShared = () => {}; v._learnContracts = async () => 0; v._cursorLimited = () => true; v.dir = `./bots/${NAME}`; mkdirSync(v.dir, { recursive: true });
+        v._lastEffects = [];   // fix73: the caller sets the observed effects
         const ok = await v.saveSkill('mineOne', 'd', 'async function mineOne(bot) {\n    const c = getInventoryCounts(bot);\n    await goToPosition(bot, 1, 2, 3, 1);\n    return await travelTo(bot);\n}', 'task');
         assert.notStrictEqual(ok, false);
         assert.deepStrictEqual(v.skills.find(s => s.name === 'mineOne').deps, ['travelTo']);

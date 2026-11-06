@@ -2090,7 +2090,10 @@ Use only c; no other globals.`;
         // fix73: every entry is created with effects and consumes (load, saveSkill NEW, split/generalise); the `|| {}` here hid
         // the one creator that left consumes out, so a skill that consumed nothing kept it undefined. Missing is a bug: say so.
         if (!Array.isArray(e.effects) || e.consumes === null || typeof e.consumes !== 'object') throw new Error(`[psn] _learnEffects: skill ${e.name} has no effects/consumes record (effects=${JSON.stringify(e.effects)}, consumes=${JSON.stringify(e.consumes)})`);
-        const eff = [...new Set([...e.effects, ...up])].slice(0, 12), con = { ...e.consumes };
+        // fix73: no cap. fix32 (d1ea48e) kept the first 12 of the union: once 12 items had been seen (incidental ups count when
+        // there is no goal hint), a real effect learned later was silently dropped. The set is bounded by the registry's item
+        // names, and no reader of effects needs a bound (producers, practice skip, regression goal overlap, contract prompt).
+        const eff = [...new Set([...e.effects, ...up])], con = { ...e.consumes };
         for (const k of down) con[k] = Math.max(con[k] || 0, (inv0[k] || 0) - (inv1[k] || 0));
         if (JSON.stringify(eff) !== JSON.stringify(e.effects) || JSON.stringify(con) !== JSON.stringify(e.consumes)) { e.effects = eff; e.consumes = con; this._saveSkills(); }
     }
@@ -3516,6 +3519,12 @@ current_health: ${Math.round(bot.health)}/${vmax.health}\ncurrent_food: ${bot.fo
         return selected.map(x => x.s);
     }
     async saveSkill(name, description, code, task, opts = {}) {
+        // fix73: effects observed by the run that produced this code. Every caller sets this._lastEffects right before calling
+        // (writeCode success, repair, joint repair, refactor, generalise, split); it is taken here and cleared, so a caller that
+        // forgot it throws instead of saving the previous save's effects (the field used to persist across calls) or a default
+        const observedEffects = this._lastEffects;
+        this._lastEffects = null;
+        if (!Array.isArray(observedEffects)) throw new Error(`[psn] saveSkill ${name}: no observed effects set by the caller (this._lastEffects=${JSON.stringify(observedEffects)})`);
         // fix26: names must include BOTH learned skills AND built-in bare API (skills.*/world.* exports)
         // so missingCalls doesn't reject repairs that call getNearestBlock, getInventoryCounts, etc.
         const bareAPI = getBareAPI();
@@ -3545,11 +3554,11 @@ current_health: ${Math.round(bot.health)}/${vmax.health}\ncurrent_food: ${bot.fo
         const embedding = await this._embed(description);
         const idx = this.skills.findIndex(s => s.name === name);
         if (idx < 0) {
-            // fix73: consumes starts as observed-nothing like every other entry (load-time init, split/generalise entries). It was
+            // fix73: effects are what this run observed (observedEffects); consumes starts as observed-nothing like every other entry (load-time init, split/generalise entries). It was
             // missing here, and _learnEffects compares against `e.consumes || {}`, so a run that consumed nothing never set it:
             // the skill stayed `consumes: undefined` in memory until a restart, and idle practice's Object.keys(skill.consumes)
             // threw "Cannot convert undefined or null to object" (equipBestToolForIronOre, NEW 14:43:51Z, practice 15:02:47Z)
-            const entry = { name, description, task, code, deps, embedding, effects: this._lastEffects || [], consumes: {}, saved: new Date().toISOString(), stats: recordRun(newStats(), task, true) };
+            const entry = { name, description, task, code, deps, embedding, effects: observedEffects, consumes: {}, saved: new Date().toISOString(), stats: recordRun(newStats(), task, true) };
             this.skills.push(entry);
             writeAtomic(`${this.dir}/${name}.js`, `// ${description}\n${code}\n`);
             this._saveSkills();
@@ -3562,7 +3571,7 @@ current_health: ${Math.round(bot.health)}/${vmax.health}\ncurrent_food: ${bot.fo
         // updating an existing skill (learned or handwritten): never overwrite directly
         const entry = this.skills[idx];
         if (entry.handwritten && !entry.handwritten_original) entry.handwritten_original = { code: entry.code, description: entry.description, deps: entry.deps };
-        const cand = { code, description, deps, embedding, task, effects: this._lastEffects || entry.effects || [], stats: newStats() };   // fix11 (B2): no seeded success; trial runs only
+        const cand = { code, description, deps, embedding, task, effects: observedEffects, stats: newStats() };   // fix11 (B2): no seeded success; trial runs only
         if (!opts.repair && !opts.refactor && !this._updateAllowed(entry, 'new version from a task')) return false;
         if (opts.refactor) cand.refactor = opts.refactor;
         const reg = await this._regressionRun(entry, code);
@@ -4273,8 +4282,8 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
         const spBundle = this._libSrcSubset(spNames, over) + `\n\n${subs.map(s => s[1]).join('\n\n')}\n\nawait Promise.resolve();`;
         const { lint } = await this._stageLintExec(spBundle, spNames, `voyager:split:${id}`);
         if (lint) { console.log(`[psn] split ${id} FAILED lint: ${String(lint).slice(0, 300)}`); return false; }
-        this._lastEffects = [];
         for (const [n, c] of subs) {
+            this._lastEffects = [];   // fix73: a new sub-skill has no run of its own yet (saveSkill takes the effects per call)
             const desc = ((c.match(/\/\/\s*DESCRIPTION:\s*(.+)/) || [])[1] || `sub-skill of ${e.name}`).trim();
             if (!(await this.saveSkill(n, desc, c, `split ${id}`))) { console.log(`[psn] split ${id} FAILED: sub-skill ${n} rejected`); return false; }
         }
@@ -4584,7 +4593,8 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             const lastTry = i >= MAX_ATTEMPTS || same || (!verdict.success && /travel|underground|died/.test(cut) && i >= 2);   // fix23: repeated travel cut-offs -> stop at 2 and decompose; fix32: unchanged critique -> stop
             if (this._decomposeQueue?.task === task && !lastTry) this._decomposeQueue = null;   // still iterating; decomposition decided after the last attempt
             if (verdict.success) {
-                this._lastEffects = Object.keys(after.inventory).filter(k => (after.inventory[k] || 0) > (before.inventory[k] || 0)).slice(0, 8);
+                // fix73: no cap of 8 (b2e2338); _learnEffects below unions the full observation into the same entry anyway
+                this._lastEffects = Object.keys(after.inventory).filter(k => (after.inventory[k] || 0) > (before.inventory[k] || 0));
                 await this.saveSkill(fn[1], desc.trim(), code.replace(/\n\s*await\s+\w+\(bot\);\s*$/, '').trim(), task);
                 this.progress.completed.push(task);
                 this.progress.failed = this.progress.failed.filter(t => t !== task);

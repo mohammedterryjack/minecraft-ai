@@ -122,10 +122,11 @@ export function collectBareApiUsedInSource(combinedSrc) {
         const loc = e && typeof e.pos === 'number' ? ` (at offset ${e.pos})` : '';
         throw new Error(`[coder] collectBareApiUsedInSource: parse failed${loc}: ${e && e.message ? e.message : String(e)}`);
     }
-    const notReference = (parent, key, node) =>
-        (parent?.type === 'MemberExpression' && key === 'property' && !parent.computed)
-        || ((parent?.type === 'Property' || parent?.type === 'MethodDefinition' || parent?.type === 'PropertyDefinition') && key === 'key' && !parent.computed && !(parent.shorthand && parent.value === node))
-        || ((parent?.type === 'LabeledStatement' || parent?.type === 'BreakStatement' || parent?.type === 'ContinueStatement') && key === 'label');
+    // the Program node has no parent: everything below it does
+    const notReference = (parent, key, node) => parent !== null && (
+        (parent.type === 'MemberExpression' && key === 'property' && !parent.computed)
+        || ((parent.type === 'Property' || parent.type === 'MethodDefinition' || parent.type === 'PropertyDefinition') && key === 'key' && !parent.computed && !(parent.shorthand && parent.value === node))
+        || ((parent.type === 'LabeledStatement' || parent.type === 'BreakStatement' || parent.type === 'ContinueStatement') && key === 'label'));
     const walk = (node, parent, key) => {
         if (!node || typeof node.type !== 'string') return;
         if (node.type === 'Identifier' && !notReference(parent, key, node)) {
