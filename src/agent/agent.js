@@ -22,6 +22,7 @@ import { startEventLoopStallGuard } from '../utils/event_loop_guard.js';
 import { startMainThreadWatchdog, watchdogEvidencePath } from '../utils/main_thread_watchdog.js';
 import { inspect } from 'node:util';
 import { fatalExit, runUpdateLoop } from './fatal.js';   // fix59
+import { logExitCause, writeProcessLoud } from '../process/exit_log.js';
 
 export class Agent {
     async start(load_mem=false, init_message=null, count_id=0) {
@@ -39,6 +40,7 @@ export class Agent {
         // connection_handler now ensures the message has [LoginGuard] prefix
         const nameCheck = validateNameFormat(this.name);
         if (!nameCheck.success) {
+            logExitCause(nameCheck.msg);
             log(this.name, nameCheck.msg);
             process.exit(1);
             return;
@@ -84,7 +86,7 @@ export class Agent {
             this._disconnectHandled = true;
 
             const raw = verbatimReason(reason);
-            console.error(`[connection] ${event}; reason verbatim: ${raw}`);
+            logExitCause(`[connection] ${event}; reason verbatim: ${raw}`);
             log(this.name, `[connection] ${event}; reason verbatim: ${raw}`);
             process.exit(1);
         };
@@ -111,6 +113,7 @@ export class Agent {
 		const spawnTimeoutDuration = settings.spawn_timeout;
         const spawnTimeout = setTimeout(() => {
             const msg = `Bot has not spawned after ${spawnTimeoutDuration} seconds. Exiting.`;
+            logExitCause(msg);
             log(this.name, msg);
             process.exit(1);
         }, spawnTimeoutDuration * 1000);
@@ -146,7 +149,7 @@ export class Agent {
                 this.checkAllPlayersPresent();
 
             } catch (error) {
-                console.error('Error in spawn event:', error);
+                logExitCause(`Error in spawn event: ${error instanceof Error ? error.stack : error}`);
                 process.exit(1);
             }
         });
@@ -553,9 +556,16 @@ export class Agent {
     
 
     cleanKill(msg='Killing agent process...', code=1) {
-        this.history.add('system', msg);
-        this.bot.chat(code > 1 ? 'Restarting.': 'Exiting.');
-        this.history.save();
+        logExitCause(`${msg} (code ${code})`);
+        try { this.history.add('system', msg); }
+        catch (e) { writeProcessLoud(`history.add failed during shutdown: ${e instanceof Error ? e.stack : e}`); }
+        if (!this.bot) writeProcessLoud('no bot to announce the shutdown to');
+        else {
+            try { this.bot.chat(code > 1 ? 'Restarting.' : 'Exiting.'); }
+            catch (e) { writeProcessLoud(`bot.chat failed during shutdown: ${e instanceof Error ? e.stack : e}`); }
+        }
+        try { this.history.save(); }
+        catch (e) { writeProcessLoud(`history.save failed during shutdown: ${e instanceof Error ? e.stack : e}`); }
         process.exit(code);
     }
     async checkTaskDone() {

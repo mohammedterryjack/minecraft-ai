@@ -1,10 +1,13 @@
+import { installExitLogging, logExitCause } from './exit_log.js';
 import { Agent } from '../agent/agent.js';
 import { serverProxy } from '../agent/mindserver_proxy.js';
 import yargs from 'yargs';
 
+installExitLogging();
+
 const args = process.argv.slice(2);
 if (args.length < 1) {
-    console.log('Usage: node init_agent.js -n <agent_name> -p <port> -l <load_memory> -m <init_message> -c <count_id>');
+    logExitCause('init_agent: missing arguments. Usage: node init_agent.js -n <agent_name> -p <port> -l <load_memory> -m <init_message> -c <count_id>');
     process.exit(1);
 }
 
@@ -46,9 +49,7 @@ const argv = yargs(args)
         serverProxy.setAgent(agent);
         await agent.start(argv.load_memory, argv.init_message, argv.count_id);
     } catch (error) {
-        console.error('Failed to start agent process:');
-        console.error(error.message);
-        console.error(error.stack);
+        logExitCause(`init_agent failed to start: ${error instanceof Error ? error.stack : error}`);
         process.exit(1);
     }
 })();

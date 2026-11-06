@@ -5,6 +5,8 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import * as mindcraft from './mindcraft.js';
 import { readFileSync } from 'fs';
+import { inspect } from 'node:util';
+import { logExitCause, writeProcessLoud } from '../process/exit_log.js';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // Mindserver is:
@@ -185,7 +187,9 @@ export function createMindServer(host_public = false, port = 8080) {
             }
         });
 
-        socket.on('disconnect', () => {
+        socket.on('disconnect', (reason) => {
+            const raw = typeof reason === 'string' ? reason : inspect(reason, { depth: 4, breakLength: 120 });
+            writeProcessLoud(`MindServer client disconnected; reason: ${raw}; agent: ${curAgentName}`);
             if (agent_connections[curAgentName]) {
                 console.log(`Agent ${curAgentName} disconnected`);
                 agent_connections[curAgentName].in_game = false;
@@ -249,7 +253,7 @@ export function createMindServer(host_public = false, port = 8080) {
             }
             // wait 2 seconds
             setTimeout(() => {
-                console.log('Exiting MindServer');
+                logExitCause('MindServer socket shutdown');
                 globalThis.process.exit(0);
             }, 2000);
             

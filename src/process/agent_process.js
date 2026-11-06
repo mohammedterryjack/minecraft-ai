@@ -1,6 +1,7 @@
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import { logoutAgent } from '../mindcraft/mindserver.js';
+import { logExitCause, writeProcessLoud } from './exit_log.js';
 
 const init_agent_path = fileURLToPath(new URL('./init_agent.js', import.meta.url));
 
@@ -29,21 +30,21 @@ export class AgentProcess {
         });
         
         agentProcess.on('exit', (code, signal) => {
-            console.log(`Agent process exited with code ${code} and signal ${signal}`);
             this.running = false;
             logoutAgent(this.name);
             // Parent must exit so launchd/supervisor restarts; do not keep a zombie main or respawn here.
             if (signal === 'SIGINT' && (code === 0 || code === null)) {
+                logExitCause(`agent child ${this.name} exited on SIGINT code=${code} signal=${signal}`);
                 process.exit(0);
                 return;
             }
             const exitCode = typeof code === 'number' && code !== 0 ? code : 1;
-            console.error(`Main process exiting with ${exitCode} because agent child exited (signal=${signal})`);
+            logExitCause(`agent child ${this.name} exited code=${code} signal=${signal}; parent exiting ${exitCode}`);
             process.exit(exitCode);
         });
     
         agentProcess.on('error', (err) => {
-            console.error('Agent process error:', err);
+            writeProcessLoud(`agent child ${this.name} process error: ${err instanceof Error ? err.stack : err}`);
         });
 
         this.process = agentProcess;
