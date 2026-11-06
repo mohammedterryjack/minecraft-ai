@@ -916,11 +916,11 @@ describe('fix51 issue 19: sub-skill post must not satisfy parent goal', async ()
 
     const eq = { heldItem: null, offHand: null, helmet: null, chestplate: null, leggings: null, boots: null };
 
-    it('_goalAlreadySatisfied uses _resolveGoalItemUnified only (no sub-skill post branch)', () => {
+    it('_goalAlreadySatisfied uses the single goal resolver _resolveGoal (no sub-skill post branch)', () => {
         const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
         const fn = voyagerSrc.match(/_goalAlreadySatisfied\(task, state\)\s*\{[\s\S]*?^\s{4}\}/m);
         assert.ok(fn, '_goalAlreadySatisfied should exist');
-        assert.ok(fn[0].includes('_resolveGoalItemUnified(task)'),
+        assert.ok(fn[0].includes('_resolveGoal(task)'),
             'should resolve goal via single unified resolver');
         assert.ok(!fn[0].includes('learned postcondition of'),
             'must not satisfy via learned sub-skill postcondition');
@@ -954,7 +954,7 @@ describe('fix51 issue 19: sub-skill post must not satisfy parent goal', async ()
             pos: { x: 0, y: 64, z: 0 }
         });
         assert.strictEqual(result.satisfied, false);
-        assert.ok(result.reason.includes('cannot resolve'));
+        assert.ok(result.reason.includes('open goal'), result.reason);   // fix55: free text is an open goal, never item-counted
     });
 });
 
@@ -1113,9 +1113,10 @@ describe('fix51 exact equip / goal item resolution', async () => {
         equipment: { hand: 'stone_pickaxe', off_hand: 'empty', head: 'empty', torso: 'empty', legs: 'empty', feet: 'empty' },
         pos: { x: 0, y: 64, z: 0 },
     };
-    for (const task of ['verify iron pickaxe', 'Verify the iron pickaxe is equipped', 'craft iron pickaxe', 'craft one iron pickaxe', 'craft 1 iron pickaxe']) {
+    // fix55: counted item goals resolve to the exact item; free text is an open goal (never item-counted)
+    for (const task of ['craft one iron pickaxe', 'craft 1 iron pickaxe']) {
         it(`"${task}" resolves to iron_pickaxe (never iron / a component)`, () => {
-            assert.strictEqual(mk()._resolveGoalItemUnified(task).item, 'iron_pickaxe');
+            assert.strictEqual(mk()._resolveGoal(task).item, 'iron_pickaxe');
         });
         it(`"${task}": stone_pickaxe held, 0 iron_pickaxe, 7 sticks (craftThreeSticks post 7/3) -> NOT satisfied`, () => {
             const r = mk()._goalAlreadySatisfied(task, stoneHeld);
@@ -1123,8 +1124,15 @@ describe('fix51 exact equip / goal item resolution', async () => {
             assert.ok(r.reason.includes('iron_pickaxe') && r.reason.includes('have 0'), r.reason);
         });
     }
+    for (const task of ['verify iron pickaxe', 'Verify the iron pickaxe is equipped', 'craft iron pickaxe']) {
+        it(`"${task}" is an open goal, NOT satisfied in advance`, () => {
+            assert.strictEqual(mk()._resolveGoal(task).kind, 'open');
+            const r = mk()._goalAlreadySatisfied(task, stoneHeld);
+            assert.strictEqual(r.satisfied, false, r.reason);
+        });
+    }
     it('iron_pickaxe held counts once (no inventory+equipment double count)', () => {
-        const r = mk()._goalAlreadySatisfied('verify iron pickaxe', {
+        const r = mk()._goalAlreadySatisfied('obtain 1 iron pickaxe', {
             inventory: { iron_pickaxe: 1 },
             equipment: { hand: 'iron_pickaxe', off_hand: 'empty', head: 'empty', torso: 'empty', legs: 'empty', feet: 'empty' },
         });
@@ -1140,9 +1148,9 @@ describe('fix51 exact equip / goal item resolution', async () => {
         assert.strictEqual(v._compileContract(post)({ ret: 'iron_pickaxe', pre: s, post: s, delta: {} }), false);
     });
     it('countGoal does not resolve a multi-word item to its first word', () => {
-        assert.strictEqual(mk()._resolveGoalItemUnified('Craft 3 sticks').item, 'stick');
-        assert.strictEqual(mk()._resolveGoalItemUnified('craft 4 torches').item, 'torch');
-        assert.strictEqual(mk()._resolveGoalItemUnified('mine 3 iron ore').item, 'iron_ore');
+        assert.strictEqual(mk()._resolveGoal('Craft 3 sticks').item, 'stick');
+        assert.strictEqual(mk()._resolveGoal('craft 4 torches').item, 'torch');
+        assert.strictEqual(mk()._resolveGoal('mine 3 iron ore').item, 'iron_ore');
     });
 });
 

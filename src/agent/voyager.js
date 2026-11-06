@@ -211,6 +211,18 @@ function smeltGoal(task) {
     return m ? { count: parseInt(m[1]), input: m[2].toLowerCase(), verb: 'smelt', item: m[4].toLowerCase(), items: [m[4].toLowerCase()] } : null;
 }
 
+// fix55: required params of a skill besides bot (from its signature; params with defaults are optional)
+function requiredArgs(e) {
+    const sig = signatureOf(e.code, e.name), m = sig.match(/\(([^)]*)\)/);
+    if (!m) throw new Error(`[fix55] LOUD FAIL: cannot read the parameter list of skill ${e.name} from signature "${sig}"`);
+    return m[1].split(',').slice(1).map(x => x.trim()).filter(x => x && !x.includes('='));
+}
+// fix55: the whole text is one JS identifier (acorn's own identifier tables; syntax only, no name lists)
+function isBareIdentifier(t) {
+    const cps = [...t].map(ch => ch.codePointAt(0));
+    return cps.length > 0 && acorn.isIdentifierStart(cps[0], true) && cps.every(cp => acorn.isIdentifierChar(cp, true));
+}
+
 // fix46: parse verbose goal strings like "craftItem: Craft 1 iron_pickaxe using 1 iron_ingot..."
 // Uses minecraft-data registry to validate item names (no hard-coded tables per owner rules)
 // Returns {item, count, items} or null if unparseable; logs loudly if VERSION is missing
@@ -1632,7 +1644,10 @@ Use only c; no other globals.`;
                 r = { name: pc.reroute, call: `await ${pc.reroute}(bot, ${JSON.stringify(pc.item)}, ${pc.count});` };
             } else { console.log(`[skillv] precheck ${r.name}: not applicable (${pc.why}); skipping replay, writing code instead`); return null; }
         } else if (ct) console.log(`[skillv] precheck ${r.name}: applicable`);
-        const goal = smeltGoal(task) || countGoal(task);
+        // fix55: one goal resolver; item/smelt goals are verified by gain, ensure by placement, skill/open goals by a learned post-contract
+        const g = this._resolveGoal(task);
+        if (g.kind === 'invalid') { console.log(`[fix55] LOUD: not replaying ${r.name} for invalid goal "${task}": ${g.why}`); return { ok: false, name: r.name, output: '', reason: `invalid goal: ${g.why}` }; }
+        const goal = g.kind === 'item' ? g : null;
         CALLS.replay++;
         console.log(`[voyager] REPLAY skill ${r.name} for "${task}" (no code model)`);
         const entry = this.skills.find(s => s.name === r.name);
@@ -1665,18 +1680,21 @@ Use only c; no other globals.`;
         if (!res.success) { ok = false; console.log(`[voyager] replay ${r.name} EXEC_FAILED: ${String(res.message)}`); } else
         if (r.free) { const e = this.agent.bot.inventory.emptySlotCount(); ok = e >= r.free; console.log(`[voyager] inventory check: ${e} empty slots (need ${r.free})`); }
         else if (r.at) { const p = this.agent.bot.entity.position; ok = Math.hypot(p.x - r.at.x, p.z - r.at.z) <= 8; }
-        else if (goal && ['mine','collect','gather','chop','craft','smelt','cook','get','obtain'].includes(goal.verb)) ok = gainedFor(goal, before, after) >= goal.count;
-        else {
-            const resolvedGoal = this._resolveGoalItemUnified(task);
-            if (!resolvedGoal) {
-                console.log(`[psn] LOUD: cannot resolve goal product item from task "${task}" — replay NOT satisfied`);
+        else if (g.kind === 'item') ok = gainedFor(goal, before, after) >= goal.count;
+        else if (g.kind === 'ensure') { ok = this._ensureHolds(g, after); console.log(`[psn] fix55 ensure goal ${g.item}: placed nearby -> ${ok}`); }
+        else if (g.kind === 'skill') {
+            // a different skill run on a skill goal cannot show that the named skill succeeded
+            if (r.name !== g.skill.name) { ok = false; console.log(`[psn] LOUD: skill goal "${task}" was run by ${r.name}, not ${g.skill.name}; NOT satisfied`); }
+            else { ok = this._postHolds(g.skill); console.log(`[psn] fix55 skill goal ${g.skill.name}: learned post ${g.skill.contract.post} -> ${ok}`); }
+        } else {
+            // fix55: open (free-text) goal: only the routed skill's learned post-contract verifies it, never item counts
+            if (!entry?.contract?.post) {
+                console.log(`[psn] LOUD: open goal "${task}" routed to ${r.name}, which has no learned post-contract; cannot verify -> NOT satisfied (contract learning queued)`);
+                if (entry) delete entry.contractTried;
                 ok = false;
             } else {
-                // fix51: inventory counts already include held/worn/off-hand slots (slots 5..45); exact item name only
-                const haveNow = after.inventory[resolvedGoal.item] || 0;
-                const targetCount = resolvedGoal.count || 1;
-                ok = haveNow >= targetCount;
-                console.log(`[psn] fix51 goal check: ${resolvedGoal.item} have=${haveNow} target=${targetCount} -> ${ok}`);
+                ok = this._postHolds(entry);
+                console.log(`[psn] fix55 open goal "${task}": ${r.name} learned post ${entry.contract.post} -> ${ok}`);
             }
         }
         if (!ok) this._tryDecomposePrerequisiteFailure(task);
@@ -1738,42 +1756,43 @@ Use only c; no other globals.`;
         for (const k of down) con[k] = Math.max(con[k] || 0, (inv0[k] || 0) - (inv1[k] || 0));
         if (JSON.stringify(eff) !== JSON.stringify(e.effects || []) || JSON.stringify(con) !== JSON.stringify(e.consumes || {})) { e.effects = eff; e.consumes = con; this._saveSkills(); }
     }
-    // fix51: UNIFIED goal item resolver - ONE path, no fallbacks
-    // Combines smeltGoal, countGoal, parseVerboseGoal, and minecraft-data registry lookup
-    // Returns { item, count, items } or null if not resolvable
-    _resolveGoalItemUnified(task) {
-        if (!task || typeof task !== 'string') return null;
-        
-        // Try structured parsers first (they extract count too)
-        const smelt = smeltGoal(task);
-        if (smelt) return smelt;
-        
-        const ensure = ensureGoal(task);  // fix49: before countGoal
-        if (ensure) return ensure;
-
-        const count = countGoal(task);
-        if (count) return count;
-        
-        const verbose = parseVerboseGoal(task);
-        if (verbose) return verbose;
-        
-        // Final attempt: find item name in task text using minecraft-data registry
-        const t = task.toLowerCase().replace(/_/g, ' ').trim();
-        const md = minecraftData(VERSION);
-        if (!md || !md.itemsArray) return null;
-        
-        // Look for the longest matching item name in the task
-        let best = null;
-        for (const item of md.itemsArray) {
-            const itemName = item.name.replace(/_/g, ' ');
-            if (t.includes(itemName) && (!best || item.name.length > best.name.length)) {
-                best = item;
-            }
+    // fix55: ONE goal resolver. Each kind comes from one rule over disjoint grammars (no fallback chain):
+    //   item   - "Smelt N a into N b" / "<verb> N <item>" (smeltGoal / countGoal): verified by inventory gain
+    //   ensure - "ensure <block>" (ensureGoal): verified by the block being placed nearby
+    //   skill  - the text IS the name of a library skill (learned names): verified by that skill's learned post-contract
+    //   invalid- a bare identifier that is not a usable skill: rejected loudly back to the planner
+    //   open   - any other free text: verified only by the routed skill's learned post-contract, never by item counts
+    _resolveGoal(task) {
+        if (typeof task !== 'string' || !task.trim()) throw new Error(`[fix55] LOUD FAIL: _resolveGoal needs a non-empty task string, got ${JSON.stringify(task)}`);
+        const t = task.trim();
+        const smelt = smeltGoal(t);
+        if (smelt) return { kind: 'item', ...smelt };
+        const ensure = ensureGoal(t);  // fix49: before countGoal
+        if (ensure) return { kind: 'ensure', ...ensure };
+        const count = countGoal(t);
+        if (count) return { kind: 'item', ...count };
+        if (!isBareIdentifier(t)) return { kind: 'open' };
+        const e = this.skills.find(s => s.name === t);
+        if (!e) return { kind: 'invalid', why: `"${t}" is neither an item goal ("<verb> N <item>", "Smelt N <raw> into N <out>", "ensure <block>") nor the name of a known skill` };
+        if (e.demoted) return { kind: 'invalid', why: `skill ${t} is demoted` };
+        if (e.mergedInto) return { kind: 'invalid', why: `skill ${t} was merged into ${e.mergedInto}; propose ${e.mergedInto}` };
+        const need = requiredArgs(e);
+        if (need.length) return { kind: 'invalid', why: `skill ${t} needs arguments (${need.join(', ')}); propose an item goal instead` };
+        if (!e.contract?.post) {
+            delete e.contractTried;   // fix55: _backfillContracts learns it on the next step
+            console.log(`[fix55] LOUD: skill goal ${t} has no learned post-contract; contract learning queued`);
+            return { kind: 'invalid', why: `skill ${t} has no learned post-contract yet, so its success cannot be verified` };
         }
-        if (best) {
-            return { item: best.name, count: 1, items: [best.name] };
+        return { kind: 'skill', skill: e };
+    }
+    // fix55: an "ensure" goal holds when the block is placed nearby (exact block name in observe().nearby_blocks)
+    _ensureHolds(goal, state) {
+        if (goal.verb === 'ensure') {
+            const blocks = state.nearby_blocks;
+            if (!Array.isArray(blocks)) throw new Error('[fix55] state.nearby_blocks (array) required for ensure goals');
+            return blocks.some(b => b === goal.item);
         }
-        return null;
+        throw new Error(`[fix55] _ensureHolds called for a non-ensure goal (${goal.verb})`);
     }
     // fix51: decompose a structured prerequisite failure (bot.__prereqFail = { item, need, have }) via learned graph
     _tryDecomposePrerequisiteFailure(parentTask) {
@@ -1837,11 +1856,16 @@ Use only c; no other globals.`;
         return { ok: false, detail: 'empty inventory delta' };
     }
     // fix32 (H): does the root call of the last trace satisfy the skill's learned postcondition (and report success)?
+    // fix55: the verifier of skill and open goals; every "does not hold" says why
     _postHolds(e) {
-        const tr = this.agent.bot.__psnTrace; if (!e?.contract || !Array.isArray(tr)) return false;
-        const r = tr.find(t => t.name === e.name && (t.parent ?? -1) < 0); if (!r || r.intr || !r.s0 || !r.s1 || r.fail || r.rv === false || r.rv === null) return false;
+        if (!e?.contract?.post) throw new Error(`[fix55] LOUD FAIL: _postHolds(${e?.name}) without a learned post-contract`);
+        const tr = this.agent.bot.__psnTrace;
+        if (!Array.isArray(tr)) { console.log(`[psn] post of ${e.name}: no execution trace recorded -> does not hold`); return false; }
+        const r = tr.find(t => t.name === e.name && (t.parent ?? -1) < 0);
+        const why = !r ? 'no root call in the trace' : r.intr ? 'interrupted' : !r.s0 || !r.s1 ? 'no pre/post state snapshot' : r.fail ? 'the call failed' : r.rv === false || r.rv === null ? `it returned ${r.rv}` : null;
+        if (why) { console.log(`[psn] post of ${e.name}: ${why} -> does not hold`); return false; }
         try { return this._compileContract(e.contract.post)({ args: r.argv, ret: r.rv, pre: r.s0, post: r.s1, delta: r.delta, dist: (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z) }) === true; }
-        catch (err) { this._queueContractFix(e, `post threw: ${err.message}`); return false; }
+        catch (err) { console.log(`!!! [contract] ${e.name}.post THREW: ${err.message}; does not hold, queued contract repair`); this._queueContractFix(e, `post threw: ${err.message}`); return false; }
     }
 
     // fix47: compute what can be produced from current inventory via learned producers ONLY
@@ -1906,18 +1930,15 @@ Use only c; no other globals.`;
     // fix51: goal satisfaction = ONE path only — resolved product item + exact inventory+equipment count
     // Sub-skill / component contract posts must NEVER mark a parent goal satisfied
     _goalAlreadySatisfied(task, state) {
-        const goal = this._resolveGoalItemUnified(task);
-        if (!goal) {
-            console.log(`[fix51] LOUD: cannot resolve goal product item from task "${task}" — treating as NOT satisfied`);
-            return { satisfied: false, reason: `cannot resolve goal product item from task "${task}"`, noLearnedCheck: true };
-        }
+        const goal = this._resolveGoal(task);
+        if (goal.kind === 'invalid') throw new Error(`[fix55] LOUD FAIL: satisfaction check of invalid goal "${task}": ${goal.why}`);
+        // fix55: skill/open goals have no learned pre-run predicate (posts read c.ret/c.delta of a run): verified after running, never by item counts
+        if (goal.kind === 'skill') return { satisfied: false, reason: `skill goal: verified by ${goal.skill.name}'s learned post-contract after it runs`, goal };
+        if (goal.kind === 'open') return { satisfied: false, reason: 'open goal: verified by the routed skill\'s learned post-contract after it runs', goal };
 
         // fix49: for "ensure" goals, check observed state directly (exact block-name match)
-        if (goal.verb === 'ensure') {
-            if (!state.nearby) throw new Error('[fix49] state.nearby required for ensure goals');
-            const blocks = state.nearby.blocks;
-            if (!Array.isArray(blocks)) throw new Error('[fix49] state.nearby.blocks must be an array');
-            if (blocks.some(b => b === goal.item)) return { satisfied: true, reason: `${goal.item} is already placed nearby (observed state)` };
+        if (goal.kind === 'ensure') {
+            if (this._ensureHolds(goal, state)) return { satisfied: true, reason: `${goal.item} is already placed nearby (observed state)` };
             return { satisfied: false, reason: `${goal.item} not found nearby (need to place it)`, goal };
         }
 
@@ -2955,14 +2976,36 @@ Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
     
     // fix49: goal backoff multiplier = posterior mean success (s+1)/(n+2) per goal+reason
     // Decay comes only from new evidence (new successes/failures), no time constants
-    _goalBackoffMultiplier(task, reason) {
-        const key = `${task}::${reason || ''}`;
-        const stats = this.progress.goalStats[key];
-        if (!stats) return 1;  // no evidence = no backoff
-        const s = stats.success;
-        const n = stats.success + stats.fail;
+    // fix55: summed over every failure reason of the goal; a goal with no recorded failure has nothing to back off from (multiplier 1)
+    _goalOutcomes(task) {
+        const prefix = `${task}::`;
+        let s = 0, f = 0;
+        for (const [k, v] of Object.entries(this.progress.goalStats)) if (k.startsWith(prefix)) { s += v.success; f += v.fail; }
+        return { s, f };
+    }
+    _goalBackoffMultiplier(task) {
+        const { s, f } = this._goalOutcomes(task);
+        if (f === 0) return 1;
+        const n = s + f;
         // posterior mean: (s+1)/(n+2) - Bayesian with uniform prior
         return (s + 1) / (n + 2);
+    }
+    // fix55: a proposed goal runs with probability = its posterior success; otherwise it is backed off to the planner.
+    // No constants: the odds come only from learned outcomes, and a backed-off goal still gets retried at that rate.
+    _goalBackedOff(task) {
+        const m = this._goalBackoffMultiplier(task);
+        if (m === 1 || Math.random() < m) return null;
+        const { s, f } = this._goalOutcomes(task);
+        return `backed off: it succeeded ${s} of ${s + f} tries (posterior success ${m.toFixed(2)}); propose something else`;
+    }
+    // fix55: gate for a proposed task: syntax check, one goal resolver, learned backoff (planner proposals only)
+    _rejectTask(task, fromPlanner) {
+        if (!task) return 'empty task';
+        const bad = validateTask(task);
+        if (bad) return bad;
+        const g = this._resolveGoal(task);
+        if (g.kind === 'invalid') return g.why;
+        return fromPlanner ? this._goalBackedOff(task) : null;
     }
     
     // fix49: record goal outcome for backoff learning (keyed by goal + failure reason)
@@ -2987,6 +3030,7 @@ Rules:
 - Propose ONE concrete, verifiable task achievable in a few minutes with the current inventory and surroundings (e.g. "Mine 5 birch_log", "Craft 1 stone_pickaxe", "Smelt 3 iron_ingot", "Build a 5x5 cobblestone floor next to the hut").
 - Do not repeat completed tasks unless needed for progress; avoid tasks that failed recently unless prerequisites are now met.
 - The bot must survive: dying loses its inventory. Nothing keeps it alive automatically (no eating, fleeing, fighting or sheltering reflexes), so survival is your job too: read time, health, food, threats and inventory space in the state and decide.
+- A task is either an item goal ("<verb> N <item>", "Smelt N <raw> into N <out>", "ensure <block>"), the bare name of a known skill that takes no arguments besides bot (it is verified by that skill's learned postcondition), or a short free-text task.
 Reply ONLY with JSON: {"reasoning": "ONE short sentence", "task": "...", "context": "short hint how to do it"}`;
         const bot = this.agent.bot;   // fix29: current vitals as plain facts, read now (an overlapped plan's state may be minutes old)
         // AWM-style: retrieve relevant workflows for context
@@ -3908,13 +3952,13 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
         const sub = this._subgoalTask(), ms = null, fromCurr = !sub && !ms;
         let proposal = sub || ms || await this._takePlan(before);
         let task = String(proposal.task || '').trim();
-        let invalid = task ? validateTask(task) : 'empty task';
+        let invalid = this._rejectTask(task, fromCurr);   // fix55: invalid goals and learned backoff go back to the planner
         if (invalid) {
             console.log(`[voyager] rejected task "${task}": ${invalid}`);
             this.progress.failed.push(`${task} (invalid: ${invalid})`);
             proposal = await this.proposeTask({ ...before, note: `Your last proposal "${task}" was rejected: ${invalid}` });
             task = String(proposal.task || '').trim();
-            invalid = task ? validateTask(task) : 'empty task';
+            invalid = this._rejectTask(task, true);
             if (invalid) { console.log(`[voyager] rejected again "${task}": ${invalid}; skipping`); this._saveProgress(); return; }
         }
         console.log(`[voyager] new task: ${task} (${proposal.reasoning})`);
@@ -3935,11 +3979,12 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
             this.agent.openChat?.(`Done: ${task} (already satisfied: ${alreadySatisfied.reason}).`);
             this._afterSuccess();
             return;
-        } else if (alreadySatisfied.noLearnedCheck) {
-            console.log(`[voyager] WARN: no learned way to check if goal "${task}" is already satisfied (${alreadySatisfied.reason}); proceeding with execution`);
         }
+        console.log(`[voyager] goal "${task}" not yet satisfied: ${alreadySatisfied.reason}`);
 
-        const route = this._findReplay(task) || await this._embedReplay(task);   // fix28 (D): replay a matching learned skill before any code-model call
+        // fix55: a skill goal runs exactly that skill (never a different skill whose task text matches)
+        const goalKind = this._resolveGoal(task);
+        const route = goalKind.kind === 'skill' ? { name: goalKind.skill.name, call: `await ${goalKind.skill.name}(bot);` } : this._findReplay(task) || await this._embedReplay(task);   // fix28 (D): replay a matching learned skill before any code-model call
         let rp = route ? await this._replay(task, before, route) : null;
         if (route?.embed) this._learnReplayThreshold(rp);
         if (!rp?.ok && !rp?.interrupted) { const bc = await this._backchain(task, rp ? this.observe() : before); if (bc) rp = bc; }   // fix32 PSN backward chaining
@@ -3959,6 +4004,8 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
             this._recordGoalOutcome(task, false, rp.reason || 'replay failed');  // fix49: backoff tracking
             this.progress.failed.push(task); this._saveProgress(); this._windowCheck(false); 
         }
+        // fix55: a skill goal is that skill; its failure is already blamed/queued for repair by _attribute, so no new code is written for it
+        if (goalKind.kind === 'skill') { console.log(`[voyager] skill goal ${task} failed its learned post-contract; repair of the skill handles it (no code generation)`); return; }
         if (this._cursorLimited()) { console.log(`[voyager] skipped "${task}": needs new code but Cursor is at its limit (replay-only mode)`); return; }
         this.agent.openChat?.(`New goal: ${task}`);
         // fix28 (B): the prompt carries only the skills nomic-embed-text ranks relevant, plus their dependency closures (all skills stay defined in scope)
