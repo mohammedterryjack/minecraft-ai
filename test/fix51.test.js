@@ -574,3 +574,153 @@ describe('fix51 issue 12: enhanced VIOLATED and LOUD logging', async () => {
         }
     });
 });
+
+describe('fix51 issue 14: targetBlock undefined reference fix', async () => {
+    it('skills.js tillAndSow function uses block not targetBlock', () => {
+        const skillsSrc = readFileSync('./src/agent/library/skills.js', 'utf8');
+        const tillMatch = skillsSrc.match(/export async function tillAndSow[\s\S]*?^}/m);
+        assert.ok(tillMatch, 'tillAndSow function should exist');
+        const tillBody = tillMatch[0];
+        assert.ok(!tillBody.includes('targetBlock'),
+            'tillAndSow function should use block variable, not targetBlock');
+        assert.ok(tillBody.includes('bot.canSeeBlock(block)'),
+            'tillAndSow function should use bot.canSeeBlock(block)');
+    });
+
+    it('skills.js activateNearestBlock uses block not targetBlock', () => {
+        const skillsSrc = readFileSync('./src/agent/library/skills.js', 'utf8');
+        const activateMatch = skillsSrc.match(/export async function activateNearestBlock[\s\S]*?^export/m);
+        assert.ok(activateMatch, 'activateNearestBlock function should exist');
+        const activateBody = activateMatch[0];
+        assert.ok(!activateBody.includes('targetBlock'),
+            'activateNearestBlock should use block variable, not targetBlock');
+        assert.ok(activateBody.includes('bot.canSeeBlock(block)'),
+            'activateNearestBlock should use bot.canSeeBlock(block)');
+    });
+
+    it('targetBlock is declared before use in placeBlock and digDown', async () => {
+        const skillsSrc = readFileSync('./src/agent/library/skills.js', 'utf8');
+        const placeBlock = skillsSrc.match(/export async function placeBlock[\s\S]*?^export/m);
+        const digDown = skillsSrc.match(/export async function digDown[\s\S]*?^export/m);
+        
+        if (placeBlock) {
+            const body = placeBlock[0];
+            assert.ok(body.includes('const targetBlock = bot.blockAt'),
+                'placeBlock should declare targetBlock before use');
+        }
+        if (digDown) {
+            const body = digDown[0];
+            assert.ok(body.includes('const targetBlock = bot.blockAt'),
+                'digDown should declare targetBlock before use');
+        }
+    });
+});
+
+describe('fix51 issue 15: craftRecipe calls ensureCraftingTable', async () => {
+    it('craftRecipe seeded skill includes ensureCraftingTable in deps', async () => {
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        const craftRecipeSection = voyagerSrc.match(/name:\s*['"]craftRecipe['"][\s\S]*?deps:\s*\[([^\]]+)\]/);
+        assert.ok(craftRecipeSection, 'craftRecipe seeded skill should exist');
+        const deps = craftRecipeSection[1];
+        assert.ok(deps.includes('ensureCraftingTable'),
+            `craftRecipe deps should include ensureCraftingTable, got: ${deps}`);
+    });
+
+    it('craftRecipe code calls ensureCraftingTable and goToPosition', async () => {
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        const craftRecipeStart = voyagerSrc.indexOf("name: 'craftRecipe'");
+        assert.ok(craftRecipeStart > 0, 'craftRecipe seeded skill should exist');
+        const depsStart = voyagerSrc.indexOf('deps:', craftRecipeStart);
+        assert.ok(depsStart > craftRecipeStart, 'craftRecipe should have deps');
+        const section = voyagerSrc.slice(craftRecipeStart, depsStart);
+        assert.ok(section.includes('ensureCraftingTable'),
+            'craftRecipe code should call ensureCraftingTable');
+        assert.ok(section.includes('goToPosition'),
+            'craftRecipe code should navigate to crafting table');
+    });
+});
+
+describe('fix51 issue 16: smelt goal uses exact count not producible', async () => {
+    let Voyager;
+
+    before(async () => {
+        const mod = await import('../src/agent/voyager.js');
+        Voyager = mod.Voyager;
+    });
+
+    it('smeltGoal parses output item correctly (source inspection)', () => {
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        const smeltGoalFn = voyagerSrc.match(/function smeltGoal\(task\)\s*\{[\s\S]*?return[^;]*;[\s\S]*?\}/);
+        assert.ok(smeltGoalFn, 'smeltGoal function should exist');
+        const fnBody = smeltGoalFn[0];
+        assert.ok(fnBody.includes('item: m[4]'),
+            'smeltGoal should return m[4] (output item) as item, not m[2] (input)');
+        assert.ok(fnBody.includes('input: m[2]'),
+            'smeltGoal should store m[2] (input item) separately');
+    });
+
+    it('satisfaction check uses exact inventory count not producible', async () => {
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        const satisfiedStart = voyagerSrc.indexOf('_goalAlreadySatisfied(task, state)');
+        assert.ok(satisfiedStart > 0, '_goalAlreadySatisfied function should exist');
+        const fnEnd = voyagerSrc.indexOf('\n    }', satisfiedStart + 200);
+        const fnBody = voyagerSrc.slice(satisfiedStart, fnEnd + 6);
+
+        assert.ok(fnBody.includes('haveExact'),
+            '_goalAlreadySatisfied should use haveExact variable');
+        assert.ok(fnBody.includes('invCount + eqCount'),
+            '_goalAlreadySatisfied should compute exact from inventory + equipment');
+        assert.ok(!fnBody.match(/if\s*\([^)]*canProduce[^)]*>=\s*goal\.count/),
+            '_goalAlreadySatisfied should NOT use canProduce for satisfaction check');
+    });
+
+    it('77 raw_iron + 36 iron_ingot does NOT satisfy iron_ingot x50 goal', async () => {
+        const mockBot = { 
+            version: '1.21.4', 
+            chat: () => {}, 
+            on: () => {}, 
+            off: () => {}, 
+            once: () => {},
+            removeListener: () => {} 
+        };
+        const v = new Voyager({ bot: mockBot, agent: { prompter: { task: () => {} }, npc: { constructs: {} } } });
+        v.skills = [];
+        v._compileContract = () => () => false;
+
+        const state = {
+            inventory: { raw_iron: 77, iron_ingot: 36 },
+            equipment: { heldItem: null, offHand: null, helmet: null, chestplate: null, leggings: null, boots: null },
+            pos: { x: 0, y: 64, z: 0 }
+        };
+
+        const result = v._goalAlreadySatisfied('Collect 50 iron_ingot', state);
+        assert.strictEqual(result.satisfied, false,
+            '36 iron_ingot should NOT satisfy goal of 50 (raw_iron is not iron_ingot)');
+        assert.ok(result.reason.includes('have 36') || result.reason.includes('need 50'),
+            `Reason should show exact count 36, got: ${result.reason}`);
+    });
+
+    it('smelt goal checks output item only', async () => {
+        const mockBot = { 
+            version: '1.21.4', 
+            chat: () => {}, 
+            on: () => {}, 
+            off: () => {}, 
+            once: () => {},
+            removeListener: () => {} 
+        };
+        const v = new Voyager({ bot: mockBot, agent: { prompter: { task: () => {} }, npc: { constructs: {} } } });
+        v.skills = [];
+        v._compileContract = () => () => false;
+
+        const state = {
+            inventory: { raw_iron: 77, iron_ingot: 36 },
+            equipment: { heldItem: null, offHand: null, helmet: null, chestplate: null, leggings: null, boots: null },
+            pos: { x: 0, y: 64, z: 0 }
+        };
+
+        const result = v._goalAlreadySatisfied('Smelt 77 raw_iron into 77 iron_ingot', state);
+        assert.strictEqual(result.satisfied, false,
+            'smelt goal should check iron_ingot count (36), not raw_iron count (77)');
+    });
+});

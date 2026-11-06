@@ -3853,33 +3853,30 @@ Voyager.SEEDED_PRIMITIVES = [
         if (!recipes || !recipes.length) { log(bot, \`No recipe for \${itemName} or missing ingredients.\`); return false; }
         craftingTable = getNearestBlock(bot, 'crafting_table', 16);
         if (!craftingTable) {
-            const hasTable = (getInventoryCounts(bot)['crafting_table'] || 0) > 0;
-            if (hasTable) {
-                const freeSpaces = getAllFreeSpaces(bot, 1, 6, 5);
-                if (!freeSpaces.length) { log(bot, \`FAILED: no free space within 6 blocks to place crafting_table\`); return false; }
-                for (const pos of freeSpaces) {
-                    const ok = await placeBlock(bot, 'crafting_table', pos.x, pos.y, pos.z);
-                    await sleep(150);
-                    const check = bot.blockAt(pos.floored ? pos.floored() : pos);
-                    if (ok && check && check.name === 'crafting_table') { placedTable = true; break; }
-                }
-                if (!placedTable) { log(bot, \`FAILED: could not place crafting_table at any of \${freeSpaces.length} free space(s)\`); return false; }
-                craftingTable = getNearestBlock(bot, 'crafting_table', 16);
-            } else { log(bot, \`Crafting \${itemName} requires a crafting table.\`); return false; }
+            // fix51: call ensureCraftingTable to get/craft/place a table (fail loud if can't)
+            const ensured = await ensureCraftingTable(bot);
+            if (!ensured) { log(bot, \`FAILED: craftRecipe(\${itemName}) needs a crafting table but ensureCraftingTable failed\`); return false; }
+            craftingTable = getNearestBlock(bot, 'crafting_table', 16);
+            if (!craftingTable) { log(bot, \`FAILED: ensureCraftingTable returned true but no table found\`); return false; }
+            placedTable = true;
         }
         if (craftingTable) recipes = bot.recipesFor(bot.registry.itemsByName[itemName]?.id, null, 1, craftingTable);
     }
     if (!recipes || !recipes.length) { log(bot, \`Cannot craft \${itemName}: missing ingredients.\`); if (placedTable) await collectBlock(bot, 'crafting_table', 1); return false; }
-    if (craftingTable) await goToPosition(bot, craftingTable.position.x, craftingTable.position.y, craftingTable.position.z, 3);
+    // fix51: navigate to within reach of the crafting table, then wait for movement to settle
+    if (craftingTable) {
+        await goToPosition(bot, craftingTable.position.x, craftingTable.position.y, craftingTable.position.z, 3);
+        await sleep(100);  // let movement settle before opening crafting window
+    }
     const before = getInventoryCounts(bot)[itemName] || 0;
     try { await bot.craft(recipes[0], Math.min(num, 64), craftingTable); }
-    catch (err) { log(bot, \`Crafting \${itemName} failed: \${err.message}\`); if (placedTable) await collectBlock(bot, 'crafting_table', 1); return false; }
+    catch (err) { log(bot, \`FAILED: Crafting \${itemName} threw: \${err.message}\`); if (placedTable) await collectBlock(bot, 'crafting_table', 1); return false; }
     const after = getInventoryCounts(bot)[itemName] || 0;
     if (placedTable) await collectBlock(bot, 'crafting_table', 1);
     if (after > before) { log(bot, \`Crafted \${itemName}, now have \${after}.\`); return true; }
-    log(bot, \`Crafting \${itemName} produced no items.\`); return false;
+    log(bot, \`FAILED: Crafting \${itemName} produced no items.\`); return false;
 }`,
-        deps: ['placeBlock', 'collectBlock'],
+        deps: ['placeBlock', 'collectBlock', 'ensureCraftingTable'],
     },
     {
         name: 'attackNearest',

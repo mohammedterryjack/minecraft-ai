@@ -2112,7 +2112,7 @@ export async function tillAndSow(bot, x, y, z, seedType=null) {
         bot.pathfinder.setMovements(new pf.Movements(bot));
         await goToGoal(bot, new pf.goals.GoalNear(pos.x, pos.y, pos.z, 3));
     }
-    if (!bot.canSeeBlock(targetBlock) || bot.entity.position.distanceTo(targetBlock.position) > 4) await _reachBlock(bot, targetBlock);
+    if (!bot.canSeeBlock(block) || bot.entity.position.distanceTo(block.position) > 4) await _reachBlock(bot, block);
     if (block.name !== 'farmland') {
         let hoe = bot.inventory.items().find(item => item.name.includes('hoe'));
         let to_equip = hoe?.name || 'diamond_hoe';
@@ -2158,7 +2158,7 @@ export async function activateNearestBlock(bot, type) {
         bot.pathfinder.setMovements(new pf.Movements(bot));
         await goToGoal(bot, new pf.goals.GoalNear(pos.x, pos.y, pos.z, 3));
     }
-    if (!bot.canSeeBlock(targetBlock) || bot.entity.position.distanceTo(targetBlock.position) > 4) await _reachBlock(bot, targetBlock);
+    if (!bot.canSeeBlock(block) || bot.entity.position.distanceTo(block.position) > 4) await _reachBlock(bot, block);
     await bot.activateBlock(block);
     log(bot, `Activated ${type} at x:${block.position.x.toFixed(1)}, y:${block.position.y.toFixed(1)}, z:${block.position.z.toFixed(1)}.`);
     return true;
