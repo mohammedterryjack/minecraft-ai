@@ -701,6 +701,7 @@ export class Voyager {
     static _tracedSkillNamesForInstrument(voyager, closureSet, over = {}) {
         if (!(closureSet instanceof Set)) throw new Error('[voyager] _tracedSkillNamesForInstrument: closureSet must be a Set');
         const nodes = [...closureSet].filter(n => typeof n === 'string');
+        const builtIns = new Set();
         /** @type {Map<string, Set<string>>} */
         const edges = new Map();
         const inDeg = new Map();
@@ -727,6 +728,9 @@ export class Voyager {
                     else if (c?.type === 'MemberExpression' && !c.computed && c.object?.type === 'Identifier' && (c.object.name === 'skills' || c.object.name === 'world') && c.property?.type === 'Identifier') {
                         calleeName = c.property.name;
                     }
+                    // fix68: async built-in actions the closure calls are traced by name (goToPosition, goToGoal...); this
+                    // used to happen only when saveSkill had put built-ins into a skill's deps, which _relink strips on restart
+                    if (calleeName && !closureSet.has(calleeName) && Voyager._isAsyncBuiltIn(calleeName)) builtIns.add(calleeName);
                     if (calleeName && closureSet.has(calleeName) && calleeName !== name) {
                         const set = edges.get(name);
                         if (!set.has(calleeName)) {
@@ -759,9 +763,16 @@ export class Voyager {
         }
         if (out.length !== nodes.length) {
             console.warn('[voyager] _tracedSkillNamesForInstrument: cycle in call graph; using sorted closure order');
-            return nodes.slice().sort();
+            return [...nodes.slice().sort(), ...[...builtIns].sort()];
         }
-        return out;
+        return [...out, ...[...builtIns].sort()];
+    }
+    /** fix68: a built-in that acts (returns a promise) is traced; a sync built-in is a query (getInventoryCounts, blockAt
+     *  lookups) and is not: the harness reads state with them, and tracing every query would fill the trace. Decided by
+     *  the function itself, not a name list. */
+    static _isAsyncBuiltIn(name) {
+        const f = Object.prototype.hasOwnProperty.call(skills, name) ? skills[name] : Object.prototype.hasOwnProperty.call(world, name) ? world[name] : null;
+        return typeof f === 'function' && f.constructor.name === 'AsyncFunction';
     }
 
     // fix33: seed primitives into the skill library so they are blamable/repairable (learned path, not hard-coded)
@@ -1395,36 +1406,62 @@ Use only c; no other globals.`;
     // trial candidates, the learner writes which candidates are in flight; a clean end removes the journal. On the next
     // start a journal still on disk means the process died inside that run.
     get _trialJournalFile() { return `${this.dir}/trials_inflight.json`; }
-    _openTrialJournal(names, root, task) {
-        const inFlight = names.filter(n => this.skills.find(s => s.name === n)?.candidate);
-        if (!inFlight.length) return () => {};
-        writeAtomic(this._trialJournalFile, JSON.stringify({ pid: process.pid, root, task, candidates: inFlight, startedAt: Date.now() }));
+    // fix68: every replay/trial run is journalled with the library skills it runs and the version of each (candidate or
+    // incumbent code hash), not only runs with a candidate in flight. fix65 journalled candidate runs only, so the 14:02:52Z
+    // kill (no candidate on the stack) could not be counted against anything, and a just-promoted skill was never counted.
+    _openTrialJournal(names, root, task, closure) {
+        const ran = {};
+        for (const n of new Set([root, ...closure])) {
+            const e = this.skills.find(s => s.name === n);
+            if (!e) continue;
+            const cand = names.includes(n) && e.candidate;   // the candidate code is what runs (staged by _replayOverrides)
+            ran[n] = cand ? { as: 'candidate', hash: this._skillHash({ code: e.candidate.code }) } : { as: 'incumbent', hash: this._skillHash(e) };
+        }
+        writeAtomic(this._trialJournalFile, JSON.stringify({ pid: process.pid, root, task, ran, candidates: Object.keys(ran).filter(n => ran[n].as === 'candidate'), startedAt: Date.now() }));
         return () => unlinkSync(this._trialJournalFile);
     }
     // Reads the journal left by a process that died mid-run, with the watchdog's evidence (main_thread_watchdog.js), and
-    // counts the hang as a failed trial of the deepest in-flight candidate on the blocked call stack.
+    // counts the hang against the deepest library skill on the blocked call stack, in the version that ran: a trial
+    // candidate's trial fails, an incumbent (a just-promoted one too) records a failed run. Harness bookkeeping
+    // ("<stack> <- (psn trace)") is nobody's skill: loud, not counted.
     _settleDeadTrials(evidencePath) {
         if (!existsSync(this._trialJournalFile)) return;
         const j = JSON.parse(readFileSync(this._trialJournalFile, 'utf8'));
         unlinkSync(this._trialJournalFile);
         const ev = existsSync(evidencePath) ? JSON.parse(readFileSync(evidencePath, 'utf8')) : null;
+        const ranNames = Object.keys(j.ran);
         if (!ev || ev.pid !== j.pid) {
-            console.error(`!!! [gate] LOUD: process ${j.pid} died during "${j.task}" (root ${j.root}) with trial candidate(s) ${j.candidates.join(', ')} in flight and left no watchdog evidence for that pid; the outcome cannot be attributed to one of them`);
+            console.error(`!!! [gate] LOUD: process ${j.pid} died during "${j.task}" (root ${j.root}; ran ${ranNames.join(', ')}) and left no watchdog evidence for that pid; the outcome cannot be attributed to one of them`);
             return;
         }
         const frames = String(ev.stack).split(' <- ');
-        const culprit = [...frames].reverse().find(n => j.candidates.includes(n));
+        if (frames[frames.length - 1] === '(psn trace)') {
+            console.error(`!!! [gate] LOUD: process ${j.pid} was SIGKILLed while the PSN trace harness itself was running (stack ${ev.stack}, phase ${ev.phases.join(' <- ')}); a harness fault, not counted against any skill`);
+            return;
+        }
+        const culprit = [...frames].reverse().find(n => ranNames.includes(n));
         if (!culprit) {
-            console.error(`!!! [gate] LOUD: process ${j.pid} was SIGKILLed by the watchdog during "${j.task}" blocked in "${ev.stack}", which runs none of the in-flight candidates (${j.candidates.join(', ')}); not counted against them`);
+            console.error(`!!! [gate] LOUD: process ${j.pid} was SIGKILLed by the watchdog during "${j.task}" blocked in "${ev.stack}", which names none of the library skills that ran (${ranNames.join(', ')}); not counted`);
             return;
         }
         const e = this.skills.find(s => s.name === culprit);
-        if (!e?.candidate) {
-            console.error(`!!! [gate] LOUD: ${culprit} hung process ${j.pid} as a trial candidate, but it no longer has a candidate (resolved since); nothing to count`);
+        const v = j.ran[culprit];
+        const how = `HUNG - watchdog SIGKILLed pid ${j.pid} after ${ev.silentMs}ms without a main-loop turn (stack ${ev.stack}, phase ${ev.phases.join(' <- ')})`;
+        if (v.as === 'candidate') {
+            if (!e?.candidate || this._skillHash({ code: e.candidate.code }) !== v.hash) {
+                console.error(`!!! [gate] LOUD: ${culprit} hung process ${j.pid} as a trial candidate, but that candidate is gone or changed since; nothing to count`);
+                return;
+            }
+            gateLog(`trial run of candidate ${culprit} inside ${j.root}: ${how}; counted as a failed trial`);
+            this._recordRun(e, j.task, false, true);
             return;
         }
-        gateLog(`trial run of candidate ${culprit} inside ${j.root}: HUNG - watchdog SIGKILLed pid ${j.pid} after ${ev.silentMs}ms without a main-loop turn (stack ${ev.stack}, phase ${ev.phases.join(' <- ')}); counted as a failed trial`);
-        this._recordRun(e, j.task, false, true);
+        if (!e || this._skillHash(e) !== v.hash) {
+            console.error(`!!! [gate] LOUD: ${culprit} hung process ${j.pid}, but its code changed since that run; nothing to count`);
+            return;
+        }
+        gateLog(`run of ${culprit} inside ${j.root}: ${how}; counted as a failed run of the current version (saved ${e.saved})`);
+        this._recordRun(e, j.task, false, false);
     }
     _diedInRun() { const d = this.agent.lastDeath; return d && d.t >= (this._runStart || Infinity) ? d : null; }
     _interruptReason(output = '') {
@@ -1901,7 +1938,7 @@ Use only c; no other globals.`;
         if (lint) { console.error(`[voyager] replay ${r.name}: lint failed before run: ${lint}`); return { ok: false, name: r.name, output: '', reason: `lint failed before run: ${lint}` }; }
         if (!staged) return { ok: false };
         this._runStart = Date.now();
-        const closeJournal = this._openTrialJournal(Object.keys(over), r.name, task);
+        const closeJournal = this._openTrialJournal(Object.keys(over), r.name, task, replayClosure);
         let res;
         try {
             res = await this._run(`voyager:replay:${task}`, async () => {
@@ -2609,7 +2646,7 @@ Use only c; no other globals.`;
         if (lint) { gateLog(`regression ${entry.name}: lint failed`); return false; }
         if (!staged) return false;
         this._runStart = Date.now();
-        const closeJournal = this._openTrialJournal([entry.name], entry.name, past);
+        const closeJournal = this._openTrialJournal([entry.name], entry.name, past, regClosure);
         let res;
         try {
             res = await this._run(`voyager:gate:${entry.name}`, async () => {
@@ -3468,7 +3505,10 @@ current_health: ${Math.round(bot.health)}/${vmax.health}\ncurrent_food: ${bot.fo
         // so missingCalls doesn't reject repairs that call getNearestBlock, getInventoryCounts, etc.
         const bareAPI = getBareAPI();
         const names = new Set([...this.skills.map(s => s.name), ...bareAPI.names]);
-        let deps = depsOf(code, name, names);
+        // fix68: deps are LIBRARY skills only, as _relink computes them on every start. fix26 (89b03dd) widened the name set
+        // for missingCalls and deps with it, so a saved/promoted skill carried built-ins (getInventoryCounts...) in its deps
+        // until the next restart; those entered replay closures and were traced (see skill_graph instrumentSrc fix68)
+        let deps = depsOf(code, name, new Set(this.skills.map(s => s.name)));
         const missing = missingCalls(code, name, names);
         if (missing.length) { gateLog(`REJECT ${name}: calls unknown skills ${missing.join(', ')}`); return false; }
         // fix39: seeded primitives must not depend on learned skills (prevents cycles like

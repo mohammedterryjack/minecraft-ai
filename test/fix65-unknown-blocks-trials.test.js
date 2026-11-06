@@ -161,7 +161,7 @@ describe('fix65: trial candidates are retired by the learner', () => {
         const ev = watchdogEvidencePath(BOT_DIR);
         for (let k = 1; k <= 2; k++) {
             const v = liveVoyager();
-            v._openTrialJournal(Object.keys(v._replayOverrides('mineOneIronOre', false)), 'mineOneIronOre', 'Mine 1 iron_ore');   // never closed: the process "died"
+            v._openTrialJournal(Object.keys(v._replayOverrides('mineOneIronOre', false)), 'mineOneIronOre', 'Mine 1 iron_ore', v._closure('mineOneIronOre'));   // never closed: the process "died"
             writeFileSync(ev, JSON.stringify({ pid: process.pid, silentMs: 22545, limitMs: 22545, phases: ['action:voyager:replay:Mine 1 iron_ore'], skill: 'collectBlock', stack: 'mineOneIronOre <- mineIronOreBlock <- collectBlock' }));
             const next = liveVoyager();
             if (k === 2) next.skills.find(s => s.name === 'collectBlock').candidate.stats = { success: 0, fail: 1, streakFail: 1, tasks: [] };
@@ -176,7 +176,7 @@ describe('fix65: trial candidates are retired by the learner', () => {
 
     it('no watchdog evidence for the dead pid: loud, not counted against anyone', () => {
         const v = liveVoyager();
-        v._openTrialJournal(['collectBlock'], 'mineOneIronOre', 'Mine 1 iron_ore');
+        v._openTrialJournal(['collectBlock'], 'mineOneIronOre', 'Mine 1 iron_ore', v._closure('mineOneIronOre'));
         const ev = watchdogEvidencePath(BOT_DIR);
         writeFileSync(ev, JSON.stringify({ pid: -1, silentMs: 1, phases: [], skill: 'x', stack: 'collectBlock' }));
         const next = liveVoyager();
@@ -186,7 +186,7 @@ describe('fix65: trial candidates are retired by the learner', () => {
 
     it('a clean run removes its journal', () => {
         const v = liveVoyager();
-        const close = v._openTrialJournal(['collectBlock'], 'mineOneIronOre', 'Mine 1 iron_ore');
+        const close = v._openTrialJournal(['collectBlock'], 'mineOneIronOre', 'Mine 1 iron_ore', v._closure('mineOneIronOre'));
         assert.ok(existsSync(`${v.dir}/trials_inflight.json`));
         close();
         assert.ok(!existsSync(`${v.dir}/trials_inflight.json`));
@@ -198,7 +198,9 @@ describe('fix65: trial candidates are retired by the learner', () => {
         const v = liveVoyager();
         const child = spawn(process.execPath, [fileURLToPath(new URL('./fixtures/fix64-watchdog-child.mjs', import.meta.url)), 'spin', '200', ev, 'mineOneIronOre <- mineIronOreBlock <- collectBlock'], { stdio: ['ignore', 'pipe', 'pipe'] });
         // the journal is written by the process that runs the trial; here the child stands in for it
-        writeFileSync(`${v.dir}/trials_inflight.json`, JSON.stringify({ pid: child.pid, root: 'mineOneIronOre', task: 'Mine 1 iron_ore', candidates: ['collectBlock', 'mineIronOreBlock'], startedAt: Date.now() }));
+        v._openTrialJournal(['collectBlock', 'mineIronOreBlock'], 'mineOneIronOre', 'Mine 1 iron_ore', v._closure('mineOneIronOre'));   // fix68: same journal format
+        const j = JSON.parse(readFileSync(`${v.dir}/trials_inflight.json`, 'utf8')); j.pid = child.pid;
+        writeFileSync(`${v.dir}/trials_inflight.json`, JSON.stringify(j));
         const signal = await new Promise(r => child.on('exit', (c, s) => r(s)));
         assert.strictEqual(signal, 'SIGKILL');
         const evidence = JSON.parse(readFileSync(ev, 'utf8'));

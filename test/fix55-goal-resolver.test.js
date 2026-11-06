@@ -126,6 +126,7 @@ function replayHarness(skills, rootRecord) {
     };
     v.observe = () => state;
     v._run = async (label, fn) => { await fn(); return { success: true, message: '' }; };
+    v._openTrialJournal = () => () => {};   // fix68: every run is journalled; this rig has no bot dir
     v._diedInRun = () => null; v._stalledInRun = () => null;
     v._precheck = () => ({ ok: true });
     v.recorded = [];

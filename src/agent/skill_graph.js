@@ -213,28 +213,54 @@ export function instrumentSrc(names) {
     //        parent that then blocked showed no stack in the watchdog's evidence)
     // fix49/fix51: __have() = getInventoryCounts (slots 5+ already include armor, held hotbar slot and off-hand: counting eq again double-counts)
     //        waitForTicks(1) before post snapshot (one server tick, not magic timers)
-    const wrap = `const __T = bot.__psnTrace = []; const __als = bot.__psnALS; if (!__als) throw new Error('PSN trace: bot.__psnALS (AsyncLocalStorage) missing'); const __inv = () => getInventoryCounts(bot);
+    // fix68: three faults made the 14:02:29Z replay of mineOneIronOre block the main thread for 22.7 s (SIGKILL):
+    //   1. the harness read inventory through the BARE binding getInventoryCounts, which this same prelude rebinds to a
+    //      traced wrapper whenever getInventoryCounts is in the traced names (it was: the promoted mineIronOreBlock carried
+    //      built-in deps from saveSkill). Every traced call's pre-snapshot then re-entered the wrapper, whose own
+    //      pre-snapshot re-entered it again, synchronously (no await before the snapshot at the root, par = -1; the 1500-record
+    //      cap never tripped because the push comes after the snapshot). Each tower ran to a stack overflow, the rejected
+    //      promise was dropped, and the parent started the next tower from its state snapshot: unbounded synchronous work.
+    //      The harness now captures the functions it needs before any rebinding and never traces its own calls.
+    //   2. the wrapper was async, so a traced SYNC function (getInventoryCounts, a learned sync helper such as
+    //      isSafeTarget) returned a Promise to its caller: `counts.raw_iron` was undefined, `if (isSafeTarget(b))` always
+    //      true. A sync function is now traced synchronously and returns its own value; only a returned thenable is awaited.
+    //   (fix68b) nothing in the harness turns an error into a value. The towers' RangeErrors were dropped at the async
+    //      wrapper boundary: `async function (...a)` turns a throw before its first await into a rejected promise, and the
+    //      harness stored that promise unawaited in the snapshot (`pre: __have()`, `inv: __inv()`), so the caller simply
+    //      went on to its next snapshot and the next tower. And fix51 (#42) changed fix10's `catch (e) { ...; throw e; }`
+    //      to `return false`, so every exception inside traced code became a plain failed return. A traced call that throws
+    //      now records the failure, writes one FAILED line (where it was thrown) and rethrows to its caller.
+    //   3. the watchdog saw stack "getInventoryCounts": the harness's own bookkeeping, outside any skill, was shown as a
+    //      skill. While the harness snapshots state the published stack says so: "<stack> <- (psn trace)".
+    const wrap = `const __T = bot.__psnTrace = []; const __als = bot.__psnALS; if (!__als) throw new Error('PSN trace: bot.__psnALS (AsyncLocalStorage) missing');
+const __rawInventoryCounts = getInventoryCounts;
+const __inv = () => __rawInventoryCounts(bot);
 const __eq = () => { const s = bot.inventory.slots; return { heldItem: s[bot.quickBarSlot + 36]?.name || null, offHand: s[45]?.name || null, helmet: s[5]?.name || null, chestplate: s[6]?.name || null, leggings: s[7]?.name || null, boots: s[8]?.name || null }; };
 const __have = () => __inv();
 const __st = () => { const p = bot.entity.position, b = bot.blockAt(p.floored().offset(0, 1, 0)); return { pos: { x: p.x, y: p.y, z: p.z }, hp: bot.health, food: bot.food, oxygen: bot.oxygenLevel, sky: b ? b.skyLight : null, alive: bot.health > 0, dim: String(bot.game?.dimension || ''), inv: __inv(), free: bot.inventory.emptySlotCount(), eq: __eq() }; };
-const __wrap = (n, f) => async function (...a) {
-    if (__T.length >= 1500) return await f.apply(this, a);
+let __inHarness = false;
+const __reported = new WeakSet();   // an error is reported once, by the traced call it was thrown in; callers see it rethrown
+const __harness = (stackStr, fn) => { const was = bot.__psnStackStr; bot.__psnStackStr = stackStr + ' <- (psn trace)'; __inHarness = true; try { return fn(); } finally { __inHarness = false; bot.__psnStackStr = was; } };
+const __wrap = (n, f) => function (...a) {
+    if (__inHarness || __T.length >= 1500) return f.apply(this, a);
     const par = __als.getStore() ?? -1;
     const __stackParts = []; for (let __i = par; __i >= 0 && __i < __T.length; __i = __T[__i].parent) __stackParts.push(__T[__i].name); const __stackStr = [...__stackParts.reverse(), n].join(' <- ');
-    bot.__psnRunningSkill = n; bot.__psnStackStr = __stackStr;
-    const rec = { name: n, args: (() => { const s = a.slice(1); return JSON.stringify(s).slice(0, 120); })(), parent: par, depth: par < 0 ? 0 : __T[par].depth + 1, o0: (bot.output || '').length, t0: Date.now(), pre: __have(), argv: a.slice(1).map(x => x === null || typeof x !== 'object' ? x : null) };
-    if (!n.startsWith('skills.')) rec.s0 = __st();
+    bot.__psnRunningSkill = n;
+    const rec = __harness(__stackStr, () => { const r0 = { name: n, args: JSON.stringify(a.slice(1)).slice(0, 120), parent: par, depth: par < 0 ? 0 : __T[par].depth + 1, o0: (bot.output || '').length, t0: Date.now(), pre: __have(), argv: a.slice(1).map(x => x === null || typeof x !== 'object' ? x : null) }; if (!n.startsWith('skills.')) r0.s0 = __st(); return r0; });
+    bot.__psnStackStr = __stackStr;
     const id = __T.push(rec) - 1;
-    try { const r = await __als.run(id, () => f.apply(this, a)); rec.ret = r === undefined ? 'undefined' : String(JSON.stringify(r)).slice(0, 60); rec.rv = r === null || typeof r !== 'object' ? r : null; rec.fail = r === false || r === null || r === 0; return r; }
-    catch (e) {
-        rec.fail = true;
-        const msg = String(e?.message || e);
-        rec.err = msg;
-        bot.output = bot.output + '\\nFAILED: ' + n + ' threw ' + msg + '\\n';
-        rec.rv = false;
-        return false;
-    }
-    finally { await bot.waitForTicks(1); rec.t1 = Date.now(); if (!n.startsWith('skills.')) rec.s1 = __st(); rec.o1 = (bot.output || '').length; bot.__psnOut = bot.output; const post = __have(); rec.delta = {}; for (const k of new Set([...Object.keys(rec.pre), ...Object.keys(post)])) { const d = (post[k] || 0) - (rec.pre[k] || 0); if (d) rec.delta[k] = d; } delete rec.pre; rec.intr = !!bot.interrupt_code; bot.__psnRunningSkill = par >= 0 ? __T[par].name : null; bot.__psnStackStr = __stackParts.join(' <- '); }
+    const settle = (r) => { rec.ret = r === undefined ? 'undefined' : String(JSON.stringify(r)).slice(0, 60); rec.rv = r === null || typeof r !== 'object' ? r : null; rec.fail = r === false || r === null || r === 0; return r; };
+    const threw = (e) => { rec.fail = true; const msg = e instanceof Error ? e.message : String(e); rec.err = msg; rec.rv = false; if (!__reported.has(e)) { if (e !== null && typeof e === 'object') __reported.add(e); bot.output = bot.output + '\\nFAILED: ' + n + ' threw ' + msg + '\\n'; } };
+    const finish = () => { __harness(__stackStr, () => { rec.t1 = Date.now(); if (!n.startsWith('skills.')) rec.s1 = __st(); rec.o1 = (bot.output || '').length; bot.__psnOut = bot.output; const post = __have(); rec.delta = {}; for (const k of new Set([...Object.keys(rec.pre), ...Object.keys(post)])) { const d = (post[k] || 0) - (rec.pre[k] || 0); if (d) rec.delta[k] = d; } delete rec.pre; rec.intr = !!bot.interrupt_code; }); bot.__psnRunningSkill = par >= 0 ? __T[par].name : null; bot.__psnStackStr = __stackParts.join(' <- '); };
+    let r;
+    try { r = __als.run(id, () => f.apply(this, a)); }
+    catch (e) { threw(e); finish(); throw e; }
+    if (r === null || typeof r !== 'object' || typeof r.then !== 'function') { settle(r); finish(); return r; }
+    return (async () => {
+        try { return settle(await r); }
+        catch (e) { threw(e); throw e; }
+        finally { await bot.waitForTicks(1); finish(); }
+    })();
 };`;
     // fix40: bare-name API - builtins and learned skills both use bare names
     // Wrap all provided names (both built-in and learned) for tracing
