@@ -72,9 +72,17 @@ function patternNames(p) {
     throw new Error(`[skill_graph] patternNames: unexpected binding pattern ${p.type}`);
 }
 // topLevelStatements: every top-level statement of `code`, by kind and declared name (AST; comments are not statements).
+// fix83: parsed as a SCRIPT: there, two top-level declarations of one function are legal syntax, so a reply that pastes a library
+//        skill next to its own function of the same name has a shape this rule can name. As a module it does not parse at all
+//        ("Identifier 'craftSticks' has already been declared (47:15)", live 19:07:36 GMT), and fix82's rule never saw it: the
+//        model was told only the parse error. Whether the code is valid module code is the lint's question (_parseError), not this.
+export function parsesAsScript(code) {
+    try { acorn.parse(String(code), { ecmaVersion: 'latest', sourceType: 'script', allowAwaitOutsideFunction: true }); return true; }
+    catch (e) { return false; }
+}
 export function topLevelStatements(code) {
     let ast;
-    try { ast = acorn.parse(String(code), { ecmaVersion: 'latest', sourceType: 'module', allowAwaitOutsideFunction: true }); }
+    try { ast = acorn.parse(String(code), { ecmaVersion: 'latest', sourceType: 'script', allowAwaitOutsideFunction: true }); }
     catch (e) { throw new Error(`[skill_graph] topLevelStatements: parse failed: ${e.message}`); }
     return ast.body.map(n => {
         if (n.type === 'FunctionDeclaration' || n.type === 'ClassDeclaration') return { node: n, kind: n.type, names: [n.id.name] };
@@ -115,9 +123,19 @@ export function splitGeneratedCode(code, own) {
     return { skillSource, violations: skillSourceViolations(skillSource, own) };
 }
 // fix82: lint feedback for the model when its code breaks the one-function rule
-export function oneFunctionFeedback(own, violations) {
+export function oneFunctionFeedback(own, violations, pasted) {
     if (!Array.isArray(violations) || !violations.length) throw new Error('oneFunctionFeedback: violations required');
-    return `A learned skill is ONE top-level function: \`async function ${own}(bot, ...)\` (optionally followed by one call of it). Helper functions and constants go INSIDE ${own}, so they are not globals of other skills' code. Your code has: ${violations.join('; ')}`;
+    if (!Array.isArray(pasted)) throw new Error('oneFunctionFeedback: pasted (library skill names the code declares) required');
+    const lib = pasted.length ? ` ${pasted.join(', ')} ${pasted.length === 1 ? 'is a learned skill' : 'are learned skills'} already defined for your code: call ${pasted.length === 1 ? 'it' : 'them'} by name, do not paste ${pasted.length === 1 ? 'its' : 'their'} source.` : '';
+    return `A learned skill is ONE top-level function: \`async function ${own}(bot, ...)\` (optionally followed by one call of it). Helper functions and constants go INSIDE ${own}, so they are not globals of other skills' code. Your code has: ${violations.join('; ')}.${lib}`;
+}
+// fix83: library skills a reply declares at top level besides its own function, or its own name declared more than once: the
+//        reply pasted their source (the prompt shows the top related skills in full)
+export function pastedLibrarySkills(code, own, libraryNames) {
+    if (!(libraryNames instanceof Set)) throw new Error('pastedLibrarySkills: libraryNames Set required');
+    const counts = new Map();
+    for (const t of topLevelStatements(code)) if (t.kind === 'FunctionDeclaration') counts.set(t.names[0], (counts.has(t.names[0]) ? counts.get(t.names[0]) : 0) + 1);
+    return [...counts].filter(([n, k]) => libraryNames.has(n) && (n !== own || k > 1)).map(([n]) => n);
 }
 // fix70: names this code declares itself (function declarations, const/let/var). A name the code declares is its own
 // definition, even when a library skill has the same name: it is not a call into the library.
@@ -331,6 +349,9 @@ const __have = () => __inv();
 const __st = () => { const p = bot.entity.position, b = bot.blockAt(p.floored().offset(0, 1, 0)); return { pos: { x: p.x, y: p.y, z: p.z }, hp: bot.health, food: bot.food, oxygen: bot.oxygenLevel, sky: b ? b.skyLight : null, alive: bot.health > 0, dim: String(bot.game?.dimension || ''), inv: __inv(), free: bot.inventory.emptySlotCount(), eq: __eq() }; };
 let __inHarness = false;
 let __syncParent = -1;
+// fix83: argument text of a traced call; JSON renders NaN/Infinity as null and drops undefined, so the live trace showed
+//        craftSticks(null) for the craftSticks(NaN) call its contract refused (19:03:57 GMT)
+const __argText = xs => '[' + xs.map(x => typeof x === 'number' || x === undefined ? String(x) : JSON.stringify(x)).join(',') + ']';
 const __reported = new WeakSet();
 const __harness = (stackStr, fn) => { const was = bot.__psnStackStr; bot.__psnStackStr = stackStr + ' <- (psn trace)'; __inHarness = true; try { return fn(); } finally { __inHarness = false; bot.__psnStackStr = was; } };
 const __wrap = (n, f) => function (...a) {
@@ -338,7 +359,7 @@ const __wrap = (n, f) => function (...a) {
     const par = __syncParent;
     const __stackParts = []; for (let __i = par; __i >= 0 && __i < __T.length; __i = __T[__i].parent) __stackParts.push(__T[__i].name); const __stackStr = [...__stackParts.reverse(), n].join(' <- ');
     bot.__psnRunningSkill = n;
-    const rec = __harness(__stackStr, () => { const r0 = { name: n, args: JSON.stringify(a.slice(1)).slice(0, 120), parent: par, depth: par < 0 ? 0 : __T[par].depth + 1, o0: (bot.output || '').length, t0: Date.now(), pre: __have(), argv: a.slice(1).map(x => x === null || typeof x !== 'object' ? x : null) }; if (!n.startsWith('skills.')) r0.s0 = __st(); return r0; });
+    const rec = __harness(__stackStr, () => { const r0 = { name: n, args: __argText(a.slice(1)).slice(0, 120), parent: par, depth: par < 0 ? 0 : __T[par].depth + 1, o0: (bot.output || '').length, t0: Date.now(), pre: __have(), argv: a.slice(1).map(x => x === null || typeof x !== 'object' ? x : null) }; if (!n.startsWith('skills.')) r0.s0 = __st(); return r0; });
     bot.__psnStackStr = __stackStr;
     const id = __T.push(rec) - 1;
     const settle = (r) => { rec.ret = r === undefined ? 'undefined' : String(JSON.stringify(r)).slice(0, 60); rec.rv = r === null || typeof r !== 'object' ? r : null; rec.fail = r === false || r === null || r === 0; return r; };

@@ -1,0 +1,275 @@
+{
+  "version": 1,
+  "bot": "icefox2000",
+  "inventory": "fix83 PR: learned contracts that enumerate names in a hand-written list (an allowlist), refused by fix83 _validContract. Found by scanning every contract.pre/post of the live index (iMac, 19:25 GMT) for string-literal arrays of 2+ names: these 11 (obtainItem post lists equipment SLOT names, not game values, and is left; fix83 would refuse it on its next relearn). All were learned by the code model with no list check; collectLogs/mineOre/collectSurface/smeltWithFuel/craftToolSet in the 12-skill backfill of 2026-11-05 18:58-18:59:15 GMT by the FREE fallback qwen2.5-coder:7b (mindcraft.log.3 110165-110182). Deleting the contract (and contractTried) lets _backfillContracts relearn it on the next step under the fix83 rule (membership from c.game or the observed state). Apply with the fix83 deploy (stop at a step boundary, dry-run, apply, start).",
+  "files": {
+    "index": "skills/index.json",
+    "progress": "skills/progress.json"
+  },
+  "records": [
+    {
+      "id": "craftToolSet.contractAllowlist",
+      "file": "index",
+      "skill": "craftToolSet",
+      "cause": {
+        "fix": "fix83",
+        "name": "learned contract enumerates names: golden, diamond, netherite tiers refused"
+      },
+      "evidence": "contract backfill 2026-11-05T18:58:00.711Z; lists: ['wooden', 'stone', 'iron']",
+      "expect": {
+        "contract": {
+          "pre": "c => c.args.length === 1 || (c.args.length === 2 && ['wooden', 'stone', 'iron'].includes(c.args[1]))",
+          "post": "c => c.ret",
+          "text": "Crafts a set of tools (pickaxe, axe, sword) of a specified material.",
+          "learned": "2026-11-05T18:58:00.711Z",
+          "why": "backfill"
+        }
+      },
+      "set": {},
+      "delete": [
+        "contract",
+        "contractTried"
+      ]
+    },
+    {
+      "id": "equipToolOrCraft.contractAllowlist",
+      "file": "index",
+      "skill": "equipToolOrCraft",
+      "cause": {
+        "fix": "fix83",
+        "name": "learned contract enumerates names: enumerated tool kinds (plus a pickaxe default)"
+      },
+      "evidence": "contract contract repair 2026-11-06T01:54:50.624Z; lists: ['pickaxe','axe','sword','shovel','hoe']",
+      "expect": {
+        "contract": {
+          "pre": "c => { const toolType = String(c.args[0] ?? 'pickaxe').toLowerCase(); return ['pickaxe','axe','sword','shovel','hoe'].includes(toolType) && c.pre.alive; }",
+          "post": "c => !c.ret || (typeof c.ret === 'string' && c.post.alive && c.ret.toLowerCase().endsWith('_' + String(c.args[0] ?? 'pickaxe').toLowerCase()) && [c.post.eq.heldItem, c.post.eq.offHand, c.post.eq.helmet, c.post.eq.chestplate, c.post.eq.leggings, c.post.eq.boots].some(n => n && String(n).toLowerCase() === c.ret.toLowerCase()))",
+          "text": "When alive with a valid tool type, success returns that tool type's name and the same item is on an equipment slot; failure returns null.",
+          "learned": "2026-11-06T01:54:50.624Z",
+          "why": "contract repair"
+        }
+      },
+      "set": {},
+      "delete": [
+        "contract",
+        "contractTried"
+      ]
+    },
+    {
+      "id": "collectLogs.contractAllowlist",
+      "file": "index",
+      "skill": "collectLogs",
+      "cause": {
+        "fix": "fix83",
+        "name": "learned contract enumerates names: oak_log, mangrove_log, cherry_log (and every stripped/wood variant) refused; collectLogs(2|4, \"oak_log\") VIOLATED x36 in violated_contracts.jsonl, incl. 19:05:36 and 19:06:14 GMT (mindcraft.log 267897, 267998)"
+      },
+      "evidence": "contract backfill 2026-11-05T18:59:15.560Z; lists: ['birch_log', 'acacia_log', 'spruce_log', 'jungle_log', 'dark_oak_log', 'crimson_stem', 'warped_stem']",
+      "expect": {
+        "contract": {
+          "pre": "c => c.args.length === 2 && Number.isInteger(c.args[0]) && c.args[0] >= 0 && ['birch_log', 'acacia_log', 'spruce_log', 'jungle_log', 'dark_oak_log', 'crimson_stem', 'warped_stem'].includes(c.args[1])",
+          "post": "c => c.ret && c.ret <= c.args[0]",
+          "text": "Chops count logs of the nearest tree type (or logType if given) and picks up drops.",
+          "learned": "2026-11-05T18:59:15.560Z",
+          "why": "backfill"
+        }
+      },
+      "set": {},
+      "delete": [
+        "contract",
+        "contractTried"
+      ]
+    },
+    {
+      "id": "mineOre.contractAllowlist",
+      "file": "index",
+      "skill": "mineOre",
+      "cause": {
+        "fix": "fix83",
+        "name": "learned contract enumerates names: deepslate_*_ore, nether_gold_ore, nether_quartz_ore, ancient_debris and every other stone variant refused"
+      },
+      "evidence": "contract backfill 2026-11-05T18:59:15.563Z; lists: ['stone', 'cobblestone', 'coal_ore', 'copper_ore', 'iron_ore', 'lapis_ore', 'gold_ore', 'redstone_ore', 'diamond_ore', 'emerald_ore']",
+      "expect": {
+        "contract": {
+          "pre": "c => c.args.length === 2 && Number.isInteger(c.args[1]) && c.args[1] >= 0 && ['stone', 'cobblestone', 'coal_ore', 'copper_ore', 'iron_ore', 'lapis_ore', 'gold_ore', 'redstone_ore', 'diamond_ore', 'emerald_ore'].includes(c.args[0])",
+          "post": "c => c.ret && c.ret <= c.args[1]",
+          "text": "Mines count of an ore or stone with the right tool.",
+          "learned": "2026-11-05T18:59:15.563Z",
+          "why": "backfill"
+        }
+      },
+      "set": {},
+      "delete": [
+        "contract",
+        "contractTried"
+      ]
+    },
+    {
+      "id": "collectSurface.contractAllowlist",
+      "file": "index",
+      "skill": "collectSurface",
+      "cause": {
+        "fix": "fix83",
+        "name": "learned contract enumerates names: \"flowers\" is no block; red_sand, mud, snow_block etc. refused"
+      },
+      "evidence": "contract backfill 2026-11-05T18:59:15.563Z; lists: ['dirt', 'sand', 'gravel', 'clay', 'sugar_cane', 'cactus', 'bamboo', 'pumpkin', 'melon', 'flowers']",
+      "expect": {
+        "contract": {
+          "pre": "c => c.args.length === 2 && Number.isInteger(c.args[1]) && c.args[1] >= 0 && ['dirt', 'sand', 'gravel', 'clay', 'sugar_cane', 'cactus', 'bamboo', 'pumpkin', 'melon', 'flowers'].includes(c.args[0])",
+          "post": "c => c.ret && c.ret <= c.args[1]",
+          "text": "Collects count of a surface block with the right tool.",
+          "learned": "2026-11-05T18:59:15.563Z",
+          "why": "backfill"
+        }
+      },
+      "set": {},
+      "delete": [
+        "contract",
+        "contractTried"
+      ]
+    },
+    {
+      "id": "smeltWithFuel.contractAllowlist",
+      "file": "index",
+      "skill": "smeltWithFuel",
+      "cause": {
+        "fix": "fix83",
+        "name": "learned contract enumerates names: every other smeltable input (raw food, logs, kelp, ores...) refused"
+      },
+      "evidence": "contract backfill 2026-11-05T18:59:15.563Z; lists: ['raw_iron', 'raw_copper', 'raw_gold', 'sand', 'cactus', 'cobblestone']",
+      "expect": {
+        "contract": {
+          "pre": "c => c.args.length === 2 && Number.isInteger(c.args[1]) && c.args[1] >= 0 && ['raw_iron', 'raw_copper', 'raw_gold', 'sand', 'cactus', 'cobblestone'].includes(c.args[0])",
+          "post": "c => c.ret",
+          "text": "Smelts count of inputName using a furnace and finding fuel if needed.",
+          "learned": "2026-11-05T18:59:15.563Z",
+          "why": "backfill"
+        }
+      },
+      "set": {},
+      "delete": [
+        "contract",
+        "contractTried"
+      ]
+    },
+    {
+      "id": "cookFood.contractAllowlist",
+      "file": "index",
+      "skill": "cookFood",
+      "cause": {
+        "fix": "fix83",
+        "name": "learned contract enumerates names: kelp and every other cookable refused"
+      },
+      "evidence": "contract backfill 2026-11-05T19:37:17.739Z; lists: ['beef','porkchop','mutton','chicken','rabbit','cod','salmon','potato'] ['cooked_beef','cooked_porkchop','cooked_mutton','cooked_chicken','cooked_rabbit','cooked_cod','cooked_salmon','baked_potato']",
+      "expect": {
+        "contract": {
+          "pre": "c => ['beef','porkchop','mutton','chicken','rabbit','cod','salmon','potato'].some(r => (c.pre.inv[r]||0) > 0)",
+          "post": "c => !c.ret || ['cooked_beef','cooked_porkchop','cooked_mutton','cooked_chicken','cooked_rabbit','cooked_cod','cooked_salmon','baked_potato'].some(k => (c.delta[k]||0) > 0)",
+          "text": "If raw meat/fish/potato is in inventory, smelts up to count; success means at least one cooked item gained.",
+          "learned": "2026-11-05T19:37:17.739Z",
+          "why": "backfill"
+        }
+      },
+      "set": {},
+      "delete": [
+        "contract",
+        "contractTried"
+      ]
+    },
+    {
+      "id": "fillBucket.contractAllowlist",
+      "file": "index",
+      "skill": "fillBucket",
+      "cause": {
+        "fix": "fix83",
+        "name": "learned contract enumerates names: enumerated fluids"
+      },
+      "evidence": "contract backfill 2026-11-05T19:37:47.246Z; lists: ['water','lava','milk']",
+      "expect": {
+        "contract": {
+          "pre": "c => c.pre.alive && ['water','lava','milk'].includes(c.args[0]||'water') && ((c.pre.inv.bucket||0) >= 1 || (c.pre.inv.iron_ingot||0) >= 3)",
+          "post": "c => c.ret !== true || (c.post.alive && ((c.args[0]||'water') === 'milk' ? (c.post.inv.milk_bucket||0) > (c.pre.inv.milk_bucket||0) : (c.post.inv[(c.args[0]||'water')+'_bucket']||0) > (c.pre.inv[(c.args[0]||'water')+'_bucket']||0)))",
+          "text": "If alive with a bucket or 3 iron, fill water/lava/milk within 16 blocks and gain one matching filled bucket on success.",
+          "learned": "2026-11-05T19:37:47.246Z",
+          "why": "backfill"
+        }
+      },
+      "set": {},
+      "delete": [
+        "contract",
+        "contractTried"
+      ]
+    },
+    {
+      "id": "tossClutterForIron.contractAllowlist",
+      "file": "index",
+      "skill": "tossClutterForIron",
+      "cause": {
+        "fix": "fix83",
+        "name": "learned contract enumerates names: a fixed clutter list (birch_log among it) instead of the learned surplus"
+      },
+      "evidence": "contract saved 2026-11-05T19:35:50.137Z; lists: ['pink_petals','sweet_berries','raw_copper','diorite','andesite','oak_sapling','gravel','birch_log','granite']",
+      "expect": {
+        "contract": {
+          "pre": "c => c.pre.alive && ((c.pre.inv.cobblestone ?? 0) > 128 || ['pink_petals','sweet_berries','raw_copper','diorite','andesite','oak_sapling','gravel','birch_log','granite'].some(n => (c.pre.inv[n] ?? 0) > 0))",
+          "post": "c => c.ret === false || c.ret === null || (c.post.alive && (c.delta.raw_iron ?? 0) >= 0 && ((c.pre.inv.cobblestone ?? 0) <= 128 || (c.post.inv.cobblestone ?? 0) <= 128) && Object.values(c.delta).reduce((s, d) => s + (d < 0 ? -d : 0), 0) >= (c.args[0] ?? 4) * 64)",
+          "text": "While alive, toss surplus clutter stacks then excess cobblestone (keep ≤128), stepping away after drops, until at least four slots are free without reducing raw iron.",
+          "learned": "2026-11-05T19:35:50.137Z",
+          "why": "saved"
+        }
+      },
+      "set": {},
+      "delete": [
+        "contract",
+        "contractTried"
+      ]
+    },
+    {
+      "id": "equipBestAxeAndPickaxe.contractAllowlist",
+      "file": "index",
+      "skill": "equipBestAxeAndPickaxe",
+      "cause": {
+        "fix": "fix83",
+        "name": "learned contract enumerates names: enumerated material tiers"
+      },
+      "evidence": "contract saved 2026-11-05T22:37:09.803Z; lists: ['netherite','diamond','iron','golden','stone','wooden']",
+      "expect": {
+        "contract": {
+          "pre": "c => c.pre.alive",
+          "post": "c => { if (!c.post.alive) return true; const inv = c.pre.inv; const n = i => inv[i] || 0; const tiers = ['netherite','diamond','iron','golden','stone','wooden']; const best = s => tiers.find(t => { const id = t + '_' + s; return n(id) > 0 || c.pre.eq.heldItem === id; }); const bp = best('pickaxe'); const ba = best('axe'); if (bp) return c.post.eq.heldItem === bp; if (ba) return c.post.eq.heldItem === ba; return true; }",
+          "text": "If alive, on success main hand holds the best pickaxe in inventory when any pickaxe exists, else the best axe when any axe exists, otherwise unchanged (checked via equipment, not inventory delta).",
+          "learned": "2026-11-05T22:37:09.803Z",
+          "why": "saved"
+        }
+      },
+      "set": {},
+      "delete": [
+        "contract",
+        "contractTried"
+      ]
+    },
+    {
+      "id": "equipBestPickaxeForMining.contractAllowlist",
+      "file": "index",
+      "skill": "equipBestPickaxeForMining",
+      "cause": {
+        "fix": "fix83",
+        "name": "learned contract enumerates names: diamond, netherite and golden pickaxes refused (tiers list)"
+      },
+      "evidence": "contract contract repair 2026-11-06T10:59:56.314Z; lists: ['iron_pickaxe', 'stone_pickaxe', 'wooden_pickaxe'] ['iron_pickaxe', 'stone_pickaxe', 'wooden_pickaxe']",
+      "expect": {
+        "contract": {
+          "pre": "c => { if (!c.pre.alive) return false; const tiers = ['iron_pickaxe', 'stone_pickaxe', 'wooden_pickaxe']; const norm = id => id && tiers.find(t => id === t || id.endsWith(':' + t)); const hasTier = t => (c.pre.inv[t] || 0) > 0 || norm(c.pre.eq.heldItem) === t || norm(c.pre.eq.offHand) === t || Object.entries(c.pre.inv || {}).some(([k, n]) => n > 0 && norm(k) === t); return tiers.some(hasTier); }",
+          "post": "c => { if (c.ret == null || c.ret === false) return true; const tiers = ['iron_pickaxe', 'stone_pickaxe', 'wooden_pickaxe']; const norm = id => id && tiers.find(t => id === t || id.endsWith(':' + t)); const hasTier = t => (c.pre.inv[t] || 0) > 0 || norm(c.pre.eq.heldItem) === t || norm(c.pre.eq.offHand) === t || Object.entries(c.pre.inv || {}).some(([k, n]) => n > 0 && norm(k) === t); const best = tiers.find(hasTier); return c.post.alive && best != null && norm(c.post.eq.heldItem) === best && c.ret === best; }",
+          "text": "When alive and any iron/stone/wooden pickaxe exists (inventory or hands, namespaced or not), success equips the best tier in main hand and returns that tier.",
+          "learned": "2026-11-06T10:59:56.314Z",
+          "why": "contract repair"
+        }
+      },
+      "set": {},
+      "delete": [
+        "contract",
+        "contractTried"
+      ]
+    }
+  ]
+}

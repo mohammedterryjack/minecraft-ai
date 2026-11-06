@@ -27,7 +27,7 @@ import minecraftData from 'minecraft-data';
 import { Ollama } from '../models/ollama.js';
 import { setCallDurationStore } from '../models/call_durations.js';
 import { setMovementStore, learnedKinds, recordStep, recordCut, stepBound, noteUnbounded } from '../utils/movement_model.js';
-import { signatureOf, depsOf, missingCalls, reservedNamesUsed, findCycle, findAllCycles, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf, thrownIn, declaredNames, skillSourceViolations, splitGeneratedCode, oneFunctionFeedback } from './skill_graph.js';
+import { signatureOf, depsOf, missingCalls, reservedNamesUsed, findCycle, findAllCycles, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf, thrownIn, declaredNames, skillSourceViolations, splitGeneratedCode, oneFunctionFeedback, parsesAsScript, pastedLibrarySkills } from './skill_graph.js';
 import { getBareAPI, collectBareApiUsedInSource, PRECONDITION_UNMET_BINDING } from './coder.js';   // fix40: unified bare-name API helper
 import { withStallPhase } from '../utils/event_loop_guard.js';
 import { watchdogEvidencePath } from '../utils/main_thread_watchdog.js';
@@ -222,6 +222,18 @@ function ensureGoal(task) {
     const md = minecraftData(VERSION);
     if (!md.itemsByName[item] && !md.blocksByName[item]) return null;
     return { count: 1, item, items: [item], verb: 'ensure' };
+}
+
+// fix83: "reach <block>" - a source block the bot needs is not within reach (collectBlock found none); verified by the block
+//        being observed nearby (observe().nearby_blocks), like an ensure goal, but it is FOUND, not placed: its failure needs
+//        are not "place it" (that would chain reach -> place -> collect -> reach)
+function reachGoal(task) {
+    const m = task.match(/^reach\s+([a-z_]+)$/i);
+    if (!m) return null;
+    if (!VERSION) throw new Error('[fix83] LOUD FAIL: reachGoal called but VERSION is null - bot version must be set before parsing goals');
+    const item = m[1].toLowerCase();
+    if (!minecraftData(VERSION).blocksByName[item]) return null;
+    return { count: 1, item, items: [item], verb: 'reach' };
 }
 
 // "Smelt 6 raw_iron into 6 iron_ingot" -> verify by output gained
@@ -1059,6 +1071,8 @@ export class Voyager {
   c.pre / c.post = bot state before / after the call: { pos:{x,y,z}, hp (0-${skills.VITALS_MAX.health}), food (0-${skills.VITALS_MAX.food}), sky (sky light 0-15 at head height; 0 = underground or enclosed), alive (bool), dim (dimension string), inv:{item:count}, free (empty inventory slots), eq:{heldItem,offHand,helmet,chestplate,leggings,boots} }
   c.delta = inventory change {item: +n/-n}
   c.dist(a, b) = euclidean distance between two {x,y,z}
+  c.game.item(name) / c.game.block(name) = true when name is an item / a block in the game data; c.game.drops(block) = names of the items that block drops
+NEVER enumerate item, block or kind names in a list (e.g. ['birch_log', 'spruce_log'].includes(c.args[1])): a hand-written list leaves out real values (oak_log) and every call with one of them is refused. Derive membership from c.game (game data) or from the observed state (c.pre / c.post).
 pre: what must hold before the call for it to be able to succeed (use "c => true" if nothing).
 post: what the call promises afterwards when it reports success (state the observable effect: arrived near target, item gained, still alive, not stranded underground, etc.). If the call returns false/null it already reported failure, so post may return true in that case.
 IMPORTANT for equip skills: postconditions should check c.post.eq (equipment state) rather than c.delta for idempotency - already-equipped items should satisfy the postcondition without requiring an inventory change.
@@ -1080,15 +1094,50 @@ Use only c; no other globals.`;
         this._contractEndowments = endowments;
         return endowments;
     }
+    // fix83: game data for contracts (c.game), read from the live registry when a contract asks
+    _contractGame() {
+        const reg = () => this.agent.bot.registry;
+        return {
+            item: n => typeof n === 'string' && Object.hasOwn(reg().itemsByName, n),
+            block: n => typeof n === 'string' && Object.hasOwn(reg().blocksByName, n),
+            drops: n => {
+                if (typeof n !== 'string' || !Object.hasOwn(reg().blocksByName, n)) return [];
+                return reg().blocksByName[n].drops.map(d => reg().items[typeof d === 'number' ? d : d.drop.id].name);
+            },
+        };
+    }
+    _contractCtx(fields) { return { ...fields, dist: (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z), game: this._contractGame() }; }
     _compileContract(src) { const f = makeCompartment(this._getContractEndowments()).evaluate(`(${src})`); if (typeof f !== 'function') throw new Error('not a function'); return f; }
     _validContract(ct) {
         if (!ct || typeof ct.post !== 'string' || typeof ct.pre !== 'string') return 'missing pre/post string';
         // fix43: include eq (equipment state) in test state for contract validation
         const eq = { heldItem: null, offHand: null, helmet: null, chestplate: null, leggings: null, boots: null };
         const s = { pos: { x: 0, y: 64, z: 0 }, hp: skills.VITALS_MAX.health, food: skills.VITALS_MAX.food, sky: 15, alive: true, dim: 'overworld', inv: {}, free: 0, eq };   // fix59: max from VITALS_MAX
-        const c = { args: [0, 64, 0, 'x', 1], ret: true, pre: s, post: s, delta: {}, dist: (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z) };
+        // fix83: an enumerated list of names is not a contract (live collectLogs, learned by the free fallback model 2026-11-05
+        //        18:59:15 GMT: ['birch_log', ..., 'warped_stem'].includes(c.args[1]) refused collectLogs(2, 'oak_log') x36)
+        for (const k of ['pre', 'post']) { const lists = Voyager.contractNameLists(ct[k]); if (lists.length) return `${k} enumerates names ${lists.join(', ')}; derive membership from c.game (game data) or the observed state, never a list`; }
+        const c = this._contractCtx({ args: [0, 64, 0, 'x', 1], ret: true, pre: s, post: s, delta: {} });
         try { for (const k of ['pre', 'post']) { const r = this._compileContract(ct[k])(c); if (typeof r !== 'boolean') return `${k} returned ${typeof r}, not boolean`; } } catch (e) { return `throws: ${e.message}`; }
         return null;
+    }
+    // fix83: what a violated contract was given, for the model's feedback: the call with its real arguments (NaN, not JSON's
+    //        null) and every argument that is a number but not a finite one (arithmetic on a missing value, e.g. an item count the
+    //        inventory does not list). Facts only; the code is not rewritten.
+    static contractCallFacts(name, argv, k, src) {
+        const txt = argv.map(x => typeof x === 'number' || x === undefined ? String(x) : JSON.stringify(x)).join(', ');
+        const bad = argv.map((x, i) => [x, i]).filter(([x]) => typeof x === 'number' && !Number.isFinite(x)).map(([x, i]) => `argument ${i + 1} is ${x} (a number computed from a missing value: check what it was computed from)`);
+        return `${name}(${txt}) does not satisfy its ${k}condition ${src}${bad.length ? `; ${bad.join('; ')}` : ''}`;
+    }
+    // fix83: the string-literal arrays (2+ names) in a contract source: an enumerated allowlist, e.g. ['birch_log', 'spruce_log']
+    static contractNameLists(src) {
+        const ast = acorn.parse(`(${String(src)})`, { ecmaVersion: 'latest' }), out = [];
+        const walk = n => {
+            if (!n || typeof n.type !== 'string') return;
+            if (n.type === 'ArrayExpression' && n.elements.length >= 2 && n.elements.every(e => e !== null && e.type === 'Literal' && typeof e.value === 'string')) out.push(`[${n.elements.map(e => `'${e.value}'`).join(', ')}]`);
+            for (const v of Object.values(n)) { if (Array.isArray(v)) v.forEach(walk); else if (v && typeof v === 'object' && typeof v.type === 'string') walk(v); }
+        };
+        walk(ast);
+        return out;
     }
     // fix51: parse a contract with acorn; returns { root, param, src } where root is the contract function node
     _parseContract(contractSrc) {
@@ -1447,7 +1496,7 @@ Use only c; no other globals.`;
             if (r.intr || !r.s0 || !r.s1) continue;
             const e = this.skills.find(s => s.name === r.name);
             if (!e?.contract) continue;
-            const c = { args: r.argv, ret: r.rv, pre: r.s0, post: r.s1, delta: r.delta, dist };
+            const c = this._contractCtx({ args: r.argv, ret: r.rv, pre: r.s0, post: r.s1, delta: r.delta });
             for (const k of ['pre', 'post']) {
                 // fix51: when skill explicitly returns false, skip postcondition checking
                 // The skill already signaled failure; evaluating post would just mark VIOLATED for expected failure
@@ -1481,7 +1530,7 @@ Use only c; no other globals.`;
                 }
                 r.ok = false; r.fail = true; if (k === 'pre') r.preFail = true;
                 if (k === 'pre') this._contractNeed(e, c, r);   // fix81: which inventory item the violated precondition lacks
-                r.ownFail = [...(r.ownFail || []), `${k === 'pre' ? 'PRECONDITION' : 'POSTCONDITION'} violated: ${e.contract.text || e.contract[k]} (post pos ${r.s1.pos ? [r.s1.pos.x, r.s1.pos.y, r.s1.pos.z].map(Math.round).join(',') : '?'}, sky ${r.s1.sky}, alive ${r.s1.alive})`];
+                r.ownFail = [...(r.ownFail || []), `${k === 'pre' ? 'PRECONDITION' : 'POSTCONDITION'} violated: ${Voyager.contractCallFacts(e.name, r.argv, k, e.contract[k])}${e.contract.text ? ` (${e.contract.text})` : ''} (post pos ${r.s1.pos ? [r.s1.pos.x, r.s1.pos.y, r.s1.pos.z].map(Math.round).join(',') : '?'}, sky ${r.s1.sky}, alive ${r.s1.alive})`];
                 // fix51: enhanced VIOLATED logging with exact context for debugging
                 const stateInfo = `pre.inv=${JSON.stringify(r.s0.inv)}, post.inv=${JSON.stringify(r.s1.inv)}, delta=${JSON.stringify(r.delta)}`;
                 // fix51: analyze why the contract failed by evaluating sub-expressions
@@ -2325,6 +2374,7 @@ Use only c; no other globals.`;
         else if (r.at) { const p = this.agent.bot.entity.position; ok = Math.hypot(p.x - r.at.x, p.z - r.at.z) <= 8; }
         else if (g.kind === 'item') ok = gainedFor(goal, before, after) >= goal.count;
         else if (g.kind === 'ensure') { ok = this._ensureHolds(g, after); console.log(`[psn] fix55 ensure goal ${g.item}: placed nearby -> ${ok}`); }
+        else if (g.kind === 'reach') { ok = this._reachHolds(g, after); console.log(`[psn] fix83 reach goal ${g.item}: observed nearby -> ${ok}`); }
         else if (g.kind === 'skill') {
             // a different skill run on a skill goal cannot show that the named skill succeeded
             if (r.name !== g.skill.name) { ok = false; console.log(`[psn] LOUD: skill goal "${task}" was run by ${r.name}, not ${g.skill.name}; NOT satisfied`); }
@@ -2480,11 +2530,13 @@ Use only c; no other globals.`;
         if (smelt) return { kind: 'item', ...smelt };
         const ensure = ensureGoal(t);  // fix49: before countGoal
         if (ensure) return { kind: 'ensure', ...ensure };
+        const reach = reachGoal(t);   // fix83
+        if (reach) return { kind: 'reach', ...reach };
         const count = countGoal(t);
         if (count) return { kind: 'item', ...count };
         if (!isBareIdentifier(t)) return { kind: 'open' };
         const e = this.skills.find(s => s.name === t);
-        if (!e) return { kind: 'invalid', why: `"${t}" is neither an item goal ("<verb> N <item>", "Smelt N <raw> into N <out>", "ensure <block>") nor the name of a known skill` };
+        if (!e) return { kind: 'invalid', why: `"${t}" is neither an item goal ("<verb> N <item>", "Smelt N <raw> into N <out>", "ensure <block>", "reach <block>") nor the name of a known skill` };
         // fix70: a demoted skill with a repair candidate is still a valid goal: the candidate's trial runs are the learner's only way
         // back for it (a promotion clears demoted). fix55 (#48) made every demoted skill goal invalid, so _gateTrial's dedicated
         // trial of the eatCookedMutton candidate was refused ("not replaying ... skill eatCookedMutton is demoted") every 5 min
@@ -2507,6 +2559,12 @@ Use only c; no other globals.`;
             return blocks.some(b => b === goal.item);
         }
         throw new Error(`[fix55] _ensureHolds called for a non-ensure goal (${goal.verb})`);
+    }
+    // fix83: a "reach" goal holds when the block is observed nearby (exact block name in observe().nearby_blocks)
+    _reachHolds(goal, state) {
+        if (goal.verb !== 'reach') throw new Error(`[fix83] _reachHolds called for a non-reach goal (${goal.verb})`);
+        if (!Array.isArray(state.nearby_blocks)) throw new Error('[fix83] state.nearby_blocks (array) required for reach goals');
+        return state.nearby_blocks.includes(goal.item);
     }
     // fix81: the items being sought by the subgoal entry's ancestors (root first); a fresh task has none
     _prereqChain(entry) {
@@ -2536,9 +2594,14 @@ Use only c; no other globals.`;
     // fix81: the goal key a subgoal chain is seeking: an item goal seeks the item, an ensure goal the block PLACED nearby
     _goalKey(goal) {
         if (goal.kind === 'ensure') return `placed ${goal.item}`;
+        if (goal.kind === 'reach') return `reach ${goal.item}`;   // fix83
         return goal.item;
     }
-    _needKey(need) { return need.reason === 'proximity' ? `placed ${need.item}` : need.item; }
+    _needKey(need) {
+        if (need.reason === 'proximity') return `placed ${need.item}`;
+        if (need.reason === 'reach') return `reach ${need.item}`;   // fix83
+        return need.item;
+    }
     // fix81: every failure that is not a library fault says what it lacks, as structured facts { item | anyOf, count, reason }:
     //   1. reported by the code that failed (markPreconditionUnmet(bot, { need }): seeded craftRecipe "ingredients",
     //      collectBlock "tool", tossClutter "proximity", ensureCraftingTable "ingredients")
@@ -2558,6 +2621,8 @@ Use only c; no other globals.`;
             if (Object.hasOwn(inv, goal.item) && inv[goal.item] > 0) return null;
             return [this._checkNeed({ item: goal.item, count: 1, reason: 'place' }, 'game data')];
         }
+        // fix83: nothing in the game data says where a block is: a reach goal that fails is decomposed / written by the model
+        if (goal.kind === 'reach') return null;
         // smelt goals ("Smelt N <raw> into N <out>") are furnace work the crafting recipes do not describe
         if (goal.kind !== 'item' || Object.hasOwn(goal, 'input')) return null;
         const pre = this._obtainPlanner(state).prerequisites(goal.item, goal.count, state.inventory);
@@ -2587,7 +2652,7 @@ Use only c; no other globals.`;
                 item = ch.item;
             }
             const need = { item, count: n.count, reason: n.reason, source: n.source };
-            if (goal.kind === 'item' && item === goal.item && n.reason !== 'proximity') {
+            if (goal.kind === 'item' && item === goal.item && n.reason !== 'proximity' && n.reason !== 'reach') {
                 // the goal's own item could not be made: what it lacks is its own game-data prerequisites
                 const own = this._failureNeeds(task, null, null, state);
                 if (own === null) { console.log(`[backchain] "${task}": ${item} reported missing, but the game data shows nothing it lacks`); continue; }
@@ -2603,10 +2668,11 @@ Use only c; no other globals.`;
             this._recordGoalOutcome(task, false, `prerequisite still missing: ${desc}`);
             return true;
         }
-        const below = goal.kind === 'item' || goal.kind === 'ensure' ? [...chain, this._goalKey(goal)] : chain;
+        const below = goal.kind === 'item' || goal.kind === 'ensure' || goal.kind === 'reach' ? [...chain, this._goalKey(goal)] : chain;
         for (const n of resolved) if (below.includes(this._needKey(n))) throw new Error(`[fix81] LOUD: subgoal cycle ${[...below, this._needKey(n)].join(' -> ')} (need of "${task}")`);
         const subs = resolved.map(n => {
             if (n.reason === 'proximity') return { task: `ensure ${n.item}`, need: n, edge: null };
+            if (n.reason === 'reach') return { task: `reach ${n.item}`, need: n, edge: null };   // fix83: no source within reach
             // a learned producer first (its learned task); else the game's recipe/loot data, an UNTRIED edge until a run proves it
             const learned = this._subgoalToObtainItem(n.item, n.count, inv, new Set());
             if (learned !== null) return { task: learned, need: n, edge: null };
@@ -2617,10 +2683,30 @@ Use only c; no other globals.`;
         const d = (this.progress.decomposed ||= {}), q = (this.progress.subgoals ||= []);
         const depth = cur === null ? 0 : cur.depth;
         d[task] = { subs: subs.map(sb => sb.task), skills: [], at: Date.now(), reason: `needs: ${desc}` };
-        q.unshift(...subs.map(sb => ({ task: sb.task, parent: task, depth: depth + 1, chain: below, edge: sb.edge })), { task, retry: true, prereq: true, depth, chain });
-        // fix47's curriculum blockers, now from the structured needs (was the "Cannot break X" critic text)
+        // fix83: a need's count is a SHORTFALL (how many more), the subgoal's task names that delta ("Collect 1 oak_planks") and
+        //        its run is verified by the gain (gainedFor >= 1), but the pre-run check read it as an absolute count: with 1 of the 2
+        //        oak_planks "Craft 3 sticks" needs held, "Collect 1 oak_planks" was "already satisfied (1/1)" and never ran (live
+        //        19:01-19:05 GMT, twice). The entry carries what the parent needs HELD (held now + shortfall); the pre-run check of
+        //        that entry and the blocker use it, so the delta and the absolute target cannot disagree.
+        const target = (n, sbTask) => {
+            const g = this._resolveGoal(sbTask);
+            if (g.kind !== 'item' || g.item !== n.item) return null;   // a learned task for another item is verified by its own goal
+            const held = Object.hasOwn(inv, n.item) ? inv[n.item] : 0;
+            return { item: n.item, count: held + n.count };
+        };
+        q.unshift(...subs.map(sb => {
+            const entry = { task: sb.task, parent: task, depth: depth + 1, chain: below, edge: sb.edge };
+            const t = target(sb.need, sb.task);
+            if (t !== null) entry.atLeast = t;
+            return entry;
+        }), { task, retry: true, prereq: true, depth, chain });
+        // fix47's curriculum blockers, now from the structured needs (was the "Cannot break X" critic text); fix83: resolved once
+        //        the bot HOLDS what the goal needs (held at the failure + shortfall), not once it holds the shortfall
         this.progress.blockers = this.progress.blockers.filter(b => b.task !== task);
-        for (const n of resolved) this.progress.blockers.push({ item: n.item, count: n.count, reason: n.reason, task, at: Date.now() });
+        for (const n of resolved) {
+            const held = Object.hasOwn(inv, n.item) ? inv[n.item] : 0;
+            this.progress.blockers.push({ item: n.item, count: n.reason === 'proximity' || n.reason === 'reach' ? n.count : held + n.count, reason: n.reason, task, at: Date.now() });
+        }
         this._saveProgress();
         console.log(`[psn] DECOMPOSE (needs) "${task}" -> ${subs.map(sb => sb.task).join(', ')}; lacks ${desc}`);
         return true;
@@ -2727,7 +2813,7 @@ Use only c; no other globals.`;
         const r = tr.find(t => t.name === e.name && (t.parent ?? -1) < 0);
         const why = !r ? 'no root call in the trace' : r.intr ? 'interrupted' : !r.s0 || !r.s1 ? 'no pre/post state snapshot' : r.fail ? 'the call failed' : r.rv === false || r.rv === null ? `it returned ${r.rv}` : null;
         if (why) { console.log(`[psn] post of ${e.name}: ${why} -> does not hold`); return false; }
-        try { return this._compileContract(e.contract.post)({ args: r.argv, ret: r.rv, pre: r.s0, post: r.s1, delta: r.delta, dist: (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z) }) === true; }
+        try { return this._compileContract(e.contract.post)(this._contractCtx({ args: r.argv, ret: r.rv, pre: r.s0, post: r.s1, delta: r.delta })) === true; }
         catch (err) { console.log(`!!! [contract] ${e.name}.post THREW: ${err.message}; does not hold, queued contract repair`); this._queueContractFix(e, `post threw: ${err.message}`); return false; }
     }
 
@@ -2746,8 +2832,8 @@ Use only c; no other globals.`;
         if (!['ret', 'delta', 'post'].some(k => reads.has(k))) return { ok: false, why: `post reads only [${[...reads].join(', ')}], nothing the run produced (ret, delta, post state)` };
         const r = this.agent.bot.__psnTrace.find(t => t.name === e.name && (t.parent ?? -1) < 0);
         const f = this._compileContract(src), dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
-        if (f({ args: r.argv, ret: undefined, pre: r.s0, post: r.s0, delta: {}, dist }) === true) return { ok: false, why: 'post also holds for a run that did nothing (ret undefined, no state change)' };
-        if (!r.rv && f({ args: r.argv, ret: r.rv, pre: r.s0, post: r.s0, delta: {}, dist }) === true) return { ok: false, why: `ret was ${JSON.stringify(r.rv)} and the post holds from ret alone (vacuous guard), not from what the run changed` };
+        if (f(this._contractCtx({ args: r.argv, ret: undefined, pre: r.s0, post: r.s0, delta: {} })) === true) return { ok: false, why: 'post also holds for a run that did nothing (ret undefined, no state change)' };
+        if (!r.rv && f(this._contractCtx({ args: r.argv, ret: r.rv, pre: r.s0, post: r.s0, delta: {} })) === true) return { ok: false, why: `ret was ${JSON.stringify(r.rv)} and the post holds from ret alone (vacuous guard), not from what the run changed` };
         return { ok: true };
     }
 
@@ -2825,7 +2911,21 @@ Use only c; no other globals.`;
             return { satisfied: false, reason: `${goal.item} not found nearby (need to place it)`, goal };
         }
 
+        // fix83: "reach <block>" holds when the block is observed nearby (the same observation an ensure goal reads)
+        if (goal.kind === 'reach') {
+            if (this._reachHolds(goal, state)) return { satisfied: true, reason: `${goal.item} is within reach (observed nearby)` };
+            return { satisfied: false, reason: `${goal.item} not observed nearby (need to find it)`, goal };
+        }
+
         const inv = state.inventory;
+        // fix83: a need subgoal (_chainNeeds) is satisfied when the bot holds what its parent needs, not the delta its task names
+        const cur = this._curSub !== null && this._curSub !== undefined && this._curSub.task === task && Object.hasOwn(this._curSub, 'atLeast') ? this._curSub : null;
+        if (cur !== null) {
+            if (cur.atLeast.item !== goal.item) throw new Error(`[fix83] LOUD: subgoal "${task}" targets ${cur.atLeast.item} but its goal is ${goal.item}`);
+            const held = Object.hasOwn(inv, goal.item) ? inv[goal.item] : 0;
+            if (held >= cur.atLeast.count) return { satisfied: true, reason: `already hold ${held}/${cur.atLeast.count} ${goal.item} (what "${cur.parent}" needs)` };
+            return { satisfied: false, reason: `hold ${held} ${goal.item}; "${cur.parent}" needs ${cur.atLeast.count} (this subgoal gains ${goal.count})`, goal };
+        }
         // fix51: inventory counts already include held/worn/off-hand slots; exact item name only (no double count)
         const haveExact = inv[goal.item] || 0;
         const shortfallInfo = this._computeShortfall(goal, inv);
@@ -4441,11 +4541,15 @@ IMPORTANT: All functions use bare names. Do NOT write skills.goToPosition - writ
                 //        18:27:59Z the craftItem repair read `bot.recipes.find(...)` (mineflayer has recipesFor/recipesAll, no
                 //        bot.recipes), was HELD as a candidate, and both trials threw "Cannot read properties of undefined
                 //        (reading 'find')" at the table (-125,43,61) inside obtainItem and craftIronPickaxe
-                const gate = this.agent.coder.userGeneratedCodeLintBlockers(code, this.skills.map(s => s.name));
-                const split = gate ? null : splitGeneratedCode(code, e.name);
-                body = split ? split.skillSource : null;
-                if (gate) err = `lint: ${gate}`;
-                else if (split.violations.length) err = `lint: ${oneFunctionFeedback(e.name, split.violations)}`;
+                // fix83: the shape first, from a script parse (as writeCode): a repair that pastes a library skill beside its own
+                //        function of the same name gets the one-function feedback, not only the module parse error
+                const split = parsesAsScript(code) ? splitGeneratedCode(code, e.name) : null;
+                const shape = split !== null && split.violations.length ? oneFunctionFeedback(e.name, split.violations, pastedLibrarySkills(code, e.name, new Set(this.skills.map(s => s.name)))) : null;
+                const gate = shape === null ? this.agent.coder.userGeneratedCodeLintBlockers(code, this.skills.map(s => s.name)) : null;
+                if (shape === null && gate === null && split === null) throw new Error('[fix83] repaired code lints as a module but does not parse as a script');
+                body = split !== null ? split.skillSource : null;
+                if (shape !== null) err = `lint: ${shape}`;
+                else if (gate !== null) err = `lint: ${gate}`;
                 else {
                     // fix49: check for dependency cycles BEFORE lint (feedback tells model which deps to avoid)
                     const cycleErr = this._cycleLint(e.name, body);
@@ -5000,7 +5104,7 @@ Interrupts: the bot may be interrupted at any time (danger, getting stuck, a pla
             const currentState = this.observe();
             const compactStateText = this._compactState(currentState);
             const user = `Task: ${task}\nHint: ${proposal.context || ''}\n${recipeFacts(task)}\n--- state (compact) ---\n${compactStateText}
---- learned skills you can call ---\n${ctx || '(none)'}
+--- learned skills you can call (already defined for your code: call them by name, never paste their source) ---\n${ctx || '(none)'}
 ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- feedback from last attempt ---\n${feedback}\n` : ''}${dupeEscalation}Attempt ${i}/${MAX_ATTEMPTS}. Write the code block:`;
             // fix47: per-prompt breakdown logging
             if (i === 1) {
@@ -5061,11 +5165,14 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             const traced = Voyager._tracedSkillNamesForInstrument(this, stageNameSet, over);
             const execBundle = libSrc + (libSrc ? '\n\n' : '') + instrumentSrc(traced) + '\n\n' + code;
             console.log(`[staging] voyager:writeCode task="${task}" attempt=${i} bundle=${execBundle.length} chars closure_skills=${stageNameSet.size}`);
-            let lint = this.agent.coder.userGeneratedCodeLintBlockers(code, this.skills.map(s => s.name));
             // fix82: one top-level function (+ its call) before staging: a second top-level declaration is saved with the skill
             //        and becomes a hidden global of every later bundle (live 18:23:44Z checkIronPickaxe, see skill_graph)
-            const split = lint ? null : splitGeneratedCode(code, own);
-            if (split && split.violations.length) lint = oneFunctionFeedback(own, split.violations);
+            // fix83: the shape is read FIRST, from a script parse: a reply with a library skill pasted beside its own function of
+            //        the same name is not module code, so the lint's parse error came first and this rule never ran (live 19:07:36)
+            const split = parsesAsScript(code) ? splitGeneratedCode(code, own) : null;
+            let lint = split !== null && split.violations.length ? oneFunctionFeedback(own, split.violations, pastedLibrarySkills(code, own, libraryNames)) : null;
+            if (lint === null) lint = this.agent.coder.userGeneratedCodeLintBlockers(code, this.skills.map(s => s.name));
+            if (lint === null && split === null) throw new Error('[fix83] generated code lints as a module but does not parse as a script');
             let staged = null;
             if (!lint) {
                 const { lint: lint2, staged: st } = await this._stageLintExecTraced(libSrc + (libSrc ? '\n\n' : '') + code, execBundle, stageNameSet, `voyager:writeCode:${task}:att${i}`);
@@ -5099,7 +5206,11 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             const after = this.observe();
             const goal = countGoal(task);
             const gained = goal ? gainedFor(goal, before, after) : 0;
+            const reachG = this._resolveGoal(task);   // fix83: a reach goal is verified by observation, never by the critic alone
+            const reached = reachG.kind === 'reach' ? this._reachHolds(reachG, after) : null;
             const verdict = cut ? { success: false, critique: `the attempt was ${cut}; it did not finish`, reasoning: 'cut off (critic skipped)' }   // fix23: a cut-off run is already a failure
+                : reached === true ? { success: true, critique: '', reasoning: `${reachG.item} observed nearby` }
+                : reached === false ? await this.critique(task, before, after, output, false)
                 : (goal && gained >= goal.count)
                 ? { success: true, critique: '', reasoning: `inventory +${gained} ${goal.item}` }
                 : await this.critique(task, before, after, output, goal ? false : undefined);   // count goal not met by inventory -> ground truth false
@@ -5298,6 +5409,10 @@ Voyager.SEEDED_PRIMITIVES = [
         if (!block) {
             if (excluded.size) log(bot, \`FAILED: no reachable \${blockType} nearby (\${excluded.size} unreachable block(s) excluded)\`);
             else log(bot, collected ? \`No more \${blockType} nearby.\` : \`No \${blockType} nearby.\`);
+            // fix83: no source within reach is a structured need (as tossClutter's chest proximity): the learner chains "reach <block>"
+            const sources = types.filter(t => Object.hasOwn(bot.registry.blocksByName, t));
+            if (sources.length === 0) throw new Error(\`collectBlock: \${blockType} names no block in the game data (searched \${types.join(', ')})\`);
+            __mcPreconditionUnmet__(bot, { need: sources.length === 1 ? { item: sources[0], count: num - collected, reason: 'reach' } : { anyOf: sources, count: num - collected, reason: 'reach' } });
             break;
         }
         await equipToolForBlock(bot, block);   // fix62: cheapest tool that works on this block (was mineflayer-tool equipForBlock: fastest dig = top tier)
