@@ -1440,6 +1440,9 @@ Use only c; no other globals.`;
     // incumbent code hash), not only runs with a candidate in flight. fix65 journalled candidate runs only, so the 14:02:52Z
     // kill (no candidate on the stack) could not be counted against anything, and a just-promoted skill was never counted.
     _openTrialJournal(names, root, task, closure) {
+        // fix78: fix68 (19c0ecc) added `closure` but the generated-code call site (fix65, dfd90ec) kept passing 3 args, so every
+        //        code-model attempt died here with "closure is not iterable"; a missing closure is a caller bug, say so
+        if (!(closure instanceof Set)) throw new Error(`_openTrialJournal(${JSON.stringify(root)}, task ${JSON.stringify(task)}): closure must be the Set of library skills the run can execute, got ${closure === null ? 'null' : typeof closure}`);
         const ran = {};
         for (const n of new Set([root, ...closure])) {
             const e = this.skills.find(s => s.name === n);
@@ -4666,7 +4669,9 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             //        replay/backchain, every code-model call (with idle practice running beside it) and the earlier attempts
             const runBefore = this.observe();
             this._runStart = Date.now();
-            const closeJournal = this._openTrialJournal(Object.keys(over).filter(n => stageNameSet.has(n)), own, task);
+            // fix78: the journal records every library skill this run can execute; for generated code that is exactly the staged
+            //        closure (own + what it calls + their closures), the same set staging and tracing use above
+            const closeJournal = this._openTrialJournal(Object.keys(over).filter(n => stageNameSet.has(n)), own, task, stageNameSet);
             let res;
             try {
                 res = await this._run(`voyager:${task}`, async () => {
