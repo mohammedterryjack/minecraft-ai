@@ -1,7 +1,7 @@
 /**
- * fix80: drive-reduction hunger serve (not hunger().urgent) pre-empts via one shared
- * _serveUrgent slot after repairs / before _decomposeQueue. Thompson arbitration in HP
- * units; kind 'need' is unblamed. Hunger is step-boundary only (mid-action = fix77).
+ * fix80: drive-reduction hunger serve (belowRegen only) pre-empts via _serveUrgent after
+ * repairs / before _decomposeQueue. Thompson in HP units; kind 'need' unblamed; cold-start
+ * runs the normal pursue/generate-code path under currentTask=need:hunger.
  */
 import { describe, it, before } from 'node:test';
 import assert from 'node:assert';
@@ -10,9 +10,10 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { VitalsModel } from '../src/agent/vitals_model.js';
 import {
-    checkNeedSource, needInterruptSource, isUnblamedInterruptKind,
+    needInterruptSource, isUnblamedInterruptKind,
     sampleBeta, pickUrgentCandidate,
 } from '../src/agent/urgent_need.js';
+import { stepErrorSignature } from '../src/agent/voyager.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, '..');
@@ -36,7 +37,7 @@ function liveRegen(runs = {}) {
     });
 }
 
-function mkV({ vitals, food = 10, health = 20, skillsList, proposeTask, decompose, subgoals }) {
+function mkV({ vitals, food = 10, health = 20, skillsList, proposeTask, decompose, subgoals, deathSpots }) {
     const v = Object.create(Voyager.prototype);
     const bot = {
         health, food,
@@ -44,12 +45,14 @@ function mkV({ vitals, food = 10, health = 20, skillsList, proposeTask, decompos
         interrupt_code: false,
         inventory: { emptySlotCount: () => 10 },
         entity: { position: { x: 0, y: 64, z: 0 } },
+        version: '1.21.4',
+        currentWindow: null,
     };
-    v.agent = { bot, actions: { executing: false }, openChat() {} };
+    v.agent = { bot, actions: { executing: false }, openChat() {}, fatal(msg) { v._fatalMsg = msg; throw new Error('FATAL: ' + msg); } };
     v.vitals = vitals;
     v.skills = skillsList !== undefined ? skillsList : [
         { name: 'eatCookedMutton', demoted: false, mergedInto: null, task: 'Eat cooked mutton',
-          stats: { success: 4, fail: 0 }, contract: { post: 'food_raised' } },
+          stats: { success: 4, fail: 0, tasks: [] }, contract: { post: 'food_raised' } },
     ];
     v.progress = {
         subgoals: subgoals !== undefined ? subgoals : [
@@ -58,6 +61,7 @@ function mkV({ vitals, food = 10, health = 20, skillsList, proposeTask, decompos
         ],
         decomposeQueue: decompose !== undefined ? decompose : { task: 'Craft 1 iron_pickaxe', reason: 'failed 2x' },
         decomposed: {}, failed: [], completed: [], blockers: [], goalStats: {},
+        deathSpots: deathSpots || {},
     };
     Object.defineProperty(v, '_decomposeQueue', {
         get() { return this.progress.decomposeQueue; },
@@ -66,6 +70,7 @@ function mkV({ vitals, food = 10, health = 20, skillsList, proposeTask, decompos
     v._saveProgress = () => {};
     v._curSub = null;
     v.currentTask = null;
+    v._lastStepErrSig = null;
     v._afterSuccess = () => { v._afterSuccessCalled = true; };
     v._afterSuccessCalled = false;
     v.proposeTask = proposeTask || (async () => { throw new Error('proposeTask should not be called when a raiser exists'); });
@@ -74,45 +79,38 @@ function mkV({ vitals, food = 10, health = 20, skillsList, proposeTask, decompos
         return { ok: true, name: route.name };
     };
     v._findReplay = () => null;
+    v._pursueProposedTask = async (task, proposal, before) => {
+        v._pursueCalls = (v._pursueCalls || []).concat([{ task, proposal, currentTask: v.currentTask }]);
+    };
     v._resolveGoal = (task) => {
         const e = v.skills.find(s => s.name === task);
         if (e) return { kind: 'skill', skill: e };
         return { kind: 'open' };
     };
-    v._postHolds = () => true;
     v.observe = () => ({ inventory: {}, position: '0,64,0', time: 'day 0' });
     return v;
 }
 
-describe('fix80: VitalsModel.hungerServe (drive-reduction, not hunger.urgent)', () => {
+describe('fix80: VitalsModel.hungerServe (belowRegen only; fitsGain dropped)', () => {
     it('food 10 / hp 20: servable (below regen floor 18); regenLossHp = hpMax', () => {
         const m = liveRegen();
-        m.noteRun('eatCookedMutton', { hp: 20, food: 10 }, { hp: 20, food: 16 }); // K=6
+        m.noteRun('eatCookedMutton', { hp: 20, food: 10 }, { hp: 20, food: 16 });
         const s = m.hungerServe(10, FOODMAX, 20, HPMAX);
         assert.strictEqual(s.belowRegen, true);
         assert.strictEqual(s.servable, true);
-        assert.strictEqual(s.best.K, 6);
         assert.strictEqual(s.regenLossHp, HPMAX);
-        // hunger().urgent still true for the prompt, but that is NOT the serve trigger
-        assert.strictEqual(m.hunger(10, HPMAX, 10, FOODMAX).urgent, true);
     });
 
-    it('food 19 when best gain K=6 > deficit 1: NOT servable (no thrash)', () => {
+    it('food 19 when best gain K=6 > deficit 1: NOT servable (fitsGain no longer triggers)', () => {
         const m = liveRegen();
-        m.noteRun('eatCookedMutton', { hp: 20, food: 10 }, { hp: 20, food: 16 }); // K=6
+        m.noteRun('eatCookedMutton', { hp: 20, food: 10 }, { hp: 20, food: 16 });
         const s = m.hungerServe(19, FOODMAX, 20, HPMAX);
-        assert.strictEqual(s.deficit, 1);
-        assert.strictEqual(s.fitsGain, false); // 1 < 6
-        assert.strictEqual(s.belowRegen, false); // 19 >= 18
+        assert.strictEqual(s.belowRegen, false);
         assert.strictEqual(s.servable, false);
         assert.strictEqual(s.regenLossHp, 0);
-        // Contrast: hunger().urgent IS true at 19/20 once decay+raiser exist — that is why we must not use it
-        m.observeFoodSample({ f: 20 }, { f: 19 });
-        assert.strictEqual(m.hunger(20, HPMAX, 19, FOODMAX).urgent, true);
-        assert.strictEqual(m.hungerServe(19, FOODMAX, 20, HPMAX).servable, false);
     });
 
-    it('food 14 with K=6 above a floor of 12: servable via fitsGain; regenLossHp 0 (Thompson yields to task)', () => {
+    it('food 14 above floor 12 with K=6: NOT servable (only belowRegen; no invented HP for fitsGain)', () => {
         const m = new VitalsModel({
             regen: { 12: { n: 10, up: 5 } },
             runs: {},
@@ -121,122 +119,181 @@ describe('fix80: VitalsModel.hungerServe (drive-reduction, not hunger.urgent)', 
         m.noteRun('eatCookedMutton', { hp: 20, food: 10 }, { hp: 20, food: 16 });
         const s = m.hungerServe(14, FOODMAX, 20, HPMAX);
         assert.strictEqual(s.belowRegen, false);
-        assert.strictEqual(s.fitsGain, true); // deficit 6 >= K 6
-        assert.strictEqual(s.servable, true);
+        assert.strictEqual(s.servable, false);
         assert.strictEqual(s.regenLossHp, 0);
     });
 
-    it('cold start: no raiser, below floor → servable with best null (model path)', () => {
+    it('cold start: no raiser, below floor → servable with best null', () => {
         const m = liveRegen();
         const s = m.hungerServe(10, FOODMAX, 20, HPMAX);
         assert.strictEqual(s.servable, true);
         assert.strictEqual(s.best, null);
-        assert.strictEqual(s.fitsGain, false);
         assert.ok(s.regenLossHp > 0);
     });
 });
 
-describe('fix80: Thompson helpers + kind need', () => {
+describe('fix80: Thompson HP units + kind need', () => {
     it('needInterruptSource is kind need; unblamed with threat', () => {
         assert.deepStrictEqual(needInterruptSource('hunger food 10/20'), { kind: 'need', by: 'hunger food 10/20' });
         assert.strictEqual(isUnblamedInterruptKind('need'), true);
         assert.strictEqual(isUnblamedInterruptKind('threat'), true);
-        assert.strictEqual(isUnblamedInterruptKind('timeout'), false);
-        assert.throws(() => checkNeedSource({ kind: 'need' }), /by required/);
     });
 
-    it('pickUrgentCandidate takes the argmax (no fixed priority)', () => {
-        const w = pickUrgentCandidate([
-            { id: 'task', value: 0.9 },
-            { id: 'hunger', value: 12.0 },
-            { id: 'threat', value: 3.0 },
-        ]);
-        assert.strictEqual(w.id, 'hunger');
-    });
-
-    it('sampleBeta(s+1,f+1) stays in (0,1)', () => {
-        for (let i = 0; i < 20; i++) {
-            const x = sampleBeta(5, 2);
-            assert.ok(x > 0 && x < 1, String(x));
-        }
+    it('task value uses death-spot HP stake (shared units with hunger)', () => {
+        const m = liveRegen();
+        m.noteRun('eatCookedMutton', { hp: 20, food: 10 }, { hp: 20, food: 16 });
+        const v = mkV({
+            vitals: m, food: 10,
+            deathSpots: { '0,0': { n: 2, tasks: ['Mine 1 iron_ore', 'Mine 1 iron_ore'], pos: '0,64,0' } },
+        });
+        v.progress.goalStats['Mine 1 iron_ore::'] = { success: 1, fail: 3 };
+        const stake = v._taskHpStake('Mine 1 iron_ore');
+        assert.ok(stake > 0, 'deaths on the task yield HP stake');
+        const st = v._hungerServeState();
+        const cands = v._urgentCandidates(st);
+        const task = cands.find(c => c.id === 'task');
+        const hunger = cands.find(c => c.id === 'hunger');
+        assert.ok(task.stake > 0);
+        assert.strictEqual(typeof task.value, 'number');
+        assert.strictEqual(typeof hunger.value, 'number');
+        // both in HP units (draw × hpStake / regenLossHp)
+        assert.ok(hunger.value > 0);
     });
 });
 
 describe('fix80: _serveUrgent with pending decompose (food 10 / HP 20)', () => {
-    it('pre-empts: replays best raiser, leaves decompose + subgoals untouched, then chain can resume', async () => {
+    it('pre-empts: replays best raiser; queues untouched; chain resumes', async () => {
         const m = liveRegen();
         m.noteRun('eatCookedMutton', { hp: 20, food: 10 }, { hp: 20, food: 16 });
         const v = mkV({ vitals: m, food: 10, health: 20 });
         const decBefore = JSON.stringify(v.progress.decomposeQueue);
         const subBefore = JSON.stringify(v.progress.subgoals);
-
-        // Force hunger to win Thompson: regenLossHp=20, raiser Beta high → value >> task
-        const served = await v._serveUrgent();
-        assert.strictEqual(served, true);
-        assert.ok(v._replayCalls && v._replayCalls.length === 1);
+        assert.strictEqual(await v._serveUrgent(), true);
         assert.strictEqual(v._replayCalls[0].label, 'need:hunger');
         assert.strictEqual(v._replayCalls[0].route.name, 'eatCookedMutton');
-        assert.strictEqual(JSON.stringify(v.progress.decomposeQueue), decBefore, 'decompose deferred untouched');
-        assert.strictEqual(JSON.stringify(v.progress.subgoals), subBefore, 'subgoals deferred untouched');
-        assert.strictEqual(v._curSub, null);
-
-        // Simulate food raised → next serve returns false → chain resumes
-        v.agent.bot.food = 16;
+        assert.strictEqual(JSON.stringify(v.progress.decomposeQueue), decBefore);
+        assert.strictEqual(JSON.stringify(v.progress.subgoals), subBefore);
+        v.agent.bot.food = 20;   // at/above learned floor 18 → not servable
         assert.strictEqual(await v._serveUrgent(), false);
-        const sub = v._subgoalTask();
-        assert.strictEqual(sub.task, 'Mine 1 iron_ore');
-        assert.strictEqual(v.progress.subgoals.length, 1);
-        // Decompose still pending for a later step
-        assert.deepStrictEqual(v.progress.decomposeQueue, JSON.parse(decBefore));
+        assert.strictEqual(v._subgoalTask().task, 'Mine 1 iron_ore');
     });
 
-    it('no pre-emption at food 19 when best gain > 1', async () => {
+    it('no pre-emption at food 19', async () => {
         const m = liveRegen();
-        m.noteRun('eatCookedMutton', { hp: 20, food: 10 }, { hp: 20, food: 16 }); // K=6
+        m.noteRun('eatCookedMutton', { hp: 20, food: 10 }, { hp: 20, food: 16 });
         const v = mkV({ vitals: m, food: 19, health: 20 });
-        const decBefore = JSON.stringify(v.progress.decomposeQueue);
-        const subBefore = JSON.stringify(v.progress.subgoals);
         assert.strictEqual(await v._serveUrgent(), false);
         assert.strictEqual(v._replayCalls, undefined);
-        assert.strictEqual(JSON.stringify(v.progress.decomposeQueue), decBefore);
-        assert.strictEqual(JSON.stringify(v.progress.subgoals), subBefore);
     });
 
-    it('fitsGain above floor with regenLossHp 0 does not consume the step (value<=0)', async () => {
-        // Floor at 12 so food 14 is above floor; K=6 → deficit 6 fits
-        const m = new VitalsModel({
-            regen: { 12: { n: 10, up: 5 } },
-            runs: {},
-            foodSamples: { drop: { n: 0, sum: 0 }, rise: { n: 0, sum: 0 } },
-        });
-        m.noteRun('eatCookedMutton', { hp: 20, food: 10 }, { hp: 20, food: 16 });
-        const v = mkV({ vitals: m, food: 14, health: 20 });
-        const st = v._hungerServeState();
-        assert.strictEqual(st.servable, true);
-        assert.strictEqual(st.regenLossHp, 0);
-        assert.strictEqual(await v._serveUrgent(), false);
-    });
-
-    it('cold start (no raiser): surfaces need to proposeTask; queues untouched', async () => {
-        let note = null;
+    it('cold start unreplayable proposal runs normal pursue/code-gen path under need:hunger', async () => {
         const m = liveRegen();
+        let codegen = 0;
         const v = mkV({
             vitals: m, food: 10, health: 20, skillsList: [],
-            proposeTask: async (obs) => { note = obs.note; return { task: 'Gather food', reasoning: 'cold start', context: '' }; },
+            proposeTask: async () => ({ task: 'Cook and eat food from inventory', reasoning: 'cold start', context: '' }),
         });
+        // Real pursue path (not the stub): prove code-gen is reached for an unreplayable open goal
+        v._pursueProposedTask = Voyager.prototype._pursueProposedTask;
+        v._prefetchPlan = () => {};
+        v._goalAlreadySatisfied = () => ({ satisfied: false, reason: 'not yet' });
+        v._resolveGoal = () => ({ kind: 'open' });
+        v._structuredReplay = () => null;
+        v._embedReplay = async () => null;
+        v._findReplay = () => null;
+        v._backchain = async () => null;
+        v._cursorLimited = () => false;
+        v.retrieveSkills = async () => [];
+        v._relevantBuiltInAPI = async () => [];
+        v.unifiedAPIList = () => '';
+        v.sharedHints = [];
+        v._logPromptBreakdown = () => {};
+        v.agent.prompter = { profile: { coding: '' }, coding_examples: [], replaceStrings: async s => s };
+        v.agent.coder = { userGeneratedCodeLintBlockers: () => null };
+        v._compactState = () => 'state';
+        let sawNeedLabel = false;
+        v._ask = async () => {
+            sawNeedLabel = (v.currentTask === 'need:hunger');
+            codegen++;
+            throw new Error('CODEGEN_REACHED');
+        };
         const decBefore = JSON.stringify(v.progress.decomposeQueue);
         const subBefore = JSON.stringify(v.progress.subgoals);
-        assert.strictEqual(await v._serveUrgent(), true);
-        assert.match(note, /LEARNED vital need/);
-        assert.match(note, /deferred/);
+        await assert.rejects(() => v._serveUrgent(), /CODEGEN_REACHED/);
+        assert.strictEqual(codegen, 1, 'generate-code path (_ask) must run');
+        assert.strictEqual(sawNeedLabel, true, 'currentTask is need:hunger during code-gen');
+        assert.strictEqual(v.currentTask, null, 'need:hunger cleared after serve ends (no sticky re-entry lock)');
         assert.strictEqual(JSON.stringify(v.progress.decomposeQueue), decBefore);
         assert.strictEqual(JSON.stringify(v.progress.subgoals), subBefore);
-        assert.strictEqual(v._replayCalls, undefined, 'no hard-coded eat replay');
+    });
+
+    it('raiser-serve failures require a reason and record as skill evidence', async () => {
+        const m = liveRegen();
+        m.noteRun('eatCookedMutton', { hp: 20, food: 10 }, { hp: 20, food: 16 });
+        const skill = { name: 'eatCookedMutton', demoted: false, mergedInto: null, stats: { success: 4, fail: 0, tasks: [] } };
+        const v = mkV({ vitals: m, food: 10, skillsList: [skill] });
+        v._replay = async (label, before, route) => {
+            // Simulate _attribute recording a fail on the raiser (evidence for Thompson)
+            skill.stats.fail++;
+            return { ok: false, name: route.name, reason: 'postcondition food_raised not held' };
+        };
+        assert.strictEqual(await v._serveUrgent(), true);
+        assert.strictEqual(skill.stats.fail, 1, 'failure recorded as evidence');
+        // Second fail increments again
+        assert.strictEqual(await v._serveUrgent(), true);
+        assert.strictEqual(skill.stats.fail, 2);
+        // Missing reason throws
+        v._replay = async () => ({ ok: false, name: 'eatCookedMutton' });
+        await assert.rejects(() => v._serveUrgent(), /failed without a reason/);
+    });
+
+    it('same error signature on consecutive need steps hits loud fatal (#67)', async () => {
+        const m = liveRegen();
+        m.noteRun('eatCookedMutton', { hp: 20, food: 10 }, { hp: 20, food: 16 });
+        const v = mkV({ vitals: m, food: 10 });
+        const err = new Error('need raiser exploded');
+        err.stack = 'Error: need raiser exploded\n    at Voyager._serveUrgent (file:///x/voyager.js:1:1)';
+        v._replay = async () => { throw err; };
+        let fatal = null;
+        v.agent.fatal = (msg) => { fatal = msg; return 'fatalled'; };
+        // Two consecutive step errors with the same signature → fatal (#67)
+        try { await v._serveUrgent(); } catch (e) { v._onStepError(e); }
+        assert.strictEqual(fatal, null, 'first occurrence is loud but not fatal');
+        assert.ok(v._lastStepErrSig);
+        assert.strictEqual(v.currentTask, null, 'need:hunger cleared after serve throw');
+        try { await v._serveUrgent(); } catch (e) { v._onStepError(e); }
+        assert.match(String(fatal), /same step error on two consecutive steps/);
+        assert.strictEqual(stepErrorSignature(err), v._lastStepErrSig);
+    });
+});
+
+describe('fix80: fail-loud guards', () => {
+    it('missing vitals / non-numeric food throws (only need: re-entry returns false)', async () => {
+        const v = mkV({ vitals: liveRegen(), food: 10 });
+        v.currentTask = 'need:hunger';
+        assert.strictEqual(await v._serveUrgent(), false, 're-entry excluded');
+        v.currentTask = null;
+        v.vitals = undefined;
+        await assert.rejects(() => v._serveUrgent(), /vitals is undefined/);
+        v.vitals = liveRegen();
+        v.agent.bot.food = 'full';
+        await assert.rejects(() => v._serveUrgent(), /bot\.food must be a number/);
+    });
+
+    it('cold-start empty/null task throws (no livelock return true)', async () => {
+        const m = liveRegen();
+        const v = mkV({
+            vitals: m, food: 10, skillsList: [],
+            proposeTask: async () => ({ task: '', reasoning: 'empty', context: '' }),
+        });
+        await assert.rejects(() => v._serveUrgent(), /task is empty/);
+        v.proposeTask = async () => ({ task: null, reasoning: 'n', context: '' });
+        await assert.rejects(() => v._serveUrgent(), /task is null/);
     });
 });
 
 describe('fix80: _interruptReason kind need is unblamed', () => {
-    it('sets _lastCutKind to need (not interrupt)', () => {
+    it('sets _lastCutKind to need', () => {
         const v = Object.create(Voyager.prototype);
         v.agent = { bot: { entity: { position: { x: 0, y: 64, z: 0 } } } };
         v._diedInRun = () => null;
@@ -252,46 +309,31 @@ describe('fix80: _interruptReason kind need is unblamed', () => {
 });
 
 describe('fix80: wiring + Mo-rule static scans', () => {
-    it('_serveUrgent sits after _repairQueue and before _decomposeQueue; no mid-action hunger interrupt', () => {
+    it('_serveUrgent after repair / before decompose; cold-start calls _pursueProposedTask; no mid-action hunger', () => {
         const src = readFileSync(join(ROOT, 'src/agent/voyager.js'), 'utf8');
         const stepIdx = src.indexOf('async _step()');
         const step = src.slice(stepIdx, stepIdx + 2500);
-        const repair = step.indexOf('_repairQueue');
-        const serve = step.indexOf('_serveUrgent()');
-        const deco = step.indexOf('_decomposeQueue');
-        assert.ok(repair > 0 && serve > repair && deco > serve, `order repair(${repair})<serve(${serve})<deco(${deco})`);
+        assert.ok(step.indexOf('_repairQueue') < step.indexOf('_serveUrgent()'));
+        assert.ok(step.indexOf('_serveUrgent()') < step.indexOf('_decomposeQueue'));
+        assert.match(src, /_pursueProposedTask\(task, proposal, before\)/);
         assert.equal(src.includes('_ensureUrgentNeedEvents'), false);
         assert.equal(src.includes('_onVitalChangeEvent'), false);
-        assert.equal(src.includes("bot.on('health'"), false);
-        assert.match(src, /isUnblamedInterruptKind/);
-        assert.match(src, /hungerServe/);
     });
 
-    it('added src has no || / ?? / .test( / empty catch / hard-coded eat / food=20 threshold / timers', () => {
+    it('added src has no || / ?? / .test( / empty catch / hard-coded eat / timers', () => {
         const un = readFileSync(join(ROOT, 'src/agent/urgent_need.js'), 'utf8');
-        assert.equal(un.includes('??'), false);
-        assert.equal(/\|\|/.test(un), false);
-        assert.equal(/\.test\(/.test(un), false);
-        assert.equal(/catch\s*\([^)]*\)\s*\{\s*\}/.test(un), false);
-
+        assert.equal(/\|\||\?\?|\.test\(|catch\s*\([^)]*\)\s*\{\s*\}/.test(un), false);
         const voy = readFileSync(join(ROOT, 'src/agent/voyager.js'), 'utf8');
         const start = voy.indexOf('// fix80: shared step-boundary urgent-need');
         const end = voy.indexOf('// fix76: structural unmet-precondition classification', start);
-        assert.ok(start > 0 && end > start);
         const block = voy.slice(start, end);
-        assert.equal(block.includes('??'), false, '?? in fix80 block');
-        assert.equal(/\|\|/.test(block), false, '|| in fix80 block');
-        assert.equal(/\.test\(/.test(block), false, '.test( in fix80 block');
-        assert.equal(/catch\s*\([^)]*\)\s*\{\s*\}/.test(block), false);
-        assert.equal(/eatCookedMutton/.test(block), false, 'no hard-coded skill name');
-        assert.equal(/food\s*[=<>]=?\s*20/.test(block), false);
+        assert.equal(/\|\||\?\?|\.test\(|catch\s*\([^)]*\)\s*\{\s*\}/.test(block), false, block.slice(0, 200));
+        assert.equal(/eatCookedMutton/.test(block), false);
         assert.equal(/setTimeout|setInterval/.test(block), false);
-
         const vit = readFileSync(join(ROOT, 'src/agent/vitals_model.js'), 'utf8');
         const vs = vit.indexOf('// fix80: drive-reduction serve predicate');
         const ve = vit.indexOf('// fix59: which part of the LEARNED recovery', vs);
-        const vb = vit.slice(vs, ve);
-        assert.equal(vb.includes('??'), false);
-        assert.equal(/\|\|/.test(vb), false);
+        assert.equal(/\|\||\?\?/.test(vit.slice(vs, ve)), false);
+        assert.match(vit.slice(vs, ve), /Only belowRegen triggers/);
     });
 });

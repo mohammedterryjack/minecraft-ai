@@ -1,3 +1,4 @@
+import { VitalsModel } from '../src/agent/vitals_model.js';
 /**
  * fix56 (live iMac 10:58-11:01):
  * 1) open goal "Explore for iron ore deposit" routed to ensureFurnaceInRange by lexical overlap and "verified" by a vacuous post
@@ -119,7 +120,8 @@ describe('fix56 open goals are never routed by lexical overlap', () => {
         const v = mk([FURNACE]);
         for (const m of ['_checkHomeGround', '_watchWindows', '_watchDimension', '_oneshot', '_requeueDeferred', '_prefetchPlan']) v[m] = () => {};
         for (const m of ['_queueApiLintRepairs', '_gateTrial', '_backfillContracts', '_refactor', '_prune', '_generalise', '_split', '_retention', '_idlePractice']) v[m] = async () => false;
-        v.agent = { bot: { currentWindow: null, version: '1.21.4' } };
+        v.agent = { bot: { currentWindow: null, version: '1.21.4', food: 20, health: 20, game: { maxHealth: 20, maxFood: 20 } } };
+        v.vitals = new VitalsModel({ regen: {}, runs: {}, foodSamples: { drop: { n: 0, sum: 0 }, rise: { n: 0, sum: 0 } } });
         v.observe = () => ({ inventory: {}, equipment: eq });
         v._subgoalTask = () => null;
         v._takePlan = async () => ({ task: 'Explore for iron ore deposit', reasoning: 'r' });

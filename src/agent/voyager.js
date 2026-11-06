@@ -1223,27 +1223,48 @@ Use only c; no other globals.`;
     _hungerServeState() {
         const bot = this.agent.bot, m = skills.getVitalsMax(bot);
         const raw = this.vitals.hungerServe(bot.food, m.food, bot.health, m.health);
-        // Re-evaluate fitsGain against the best PLAYABLE raiser (demoted/merged skipped).
         const playable = this._playableFoodRaisers();
         const best = playable.length > 0 ? playable[0] : null;
         const K = best !== null ? best.raiser.food : null;
-        const fitsGain = best !== null && raw.deficit >= K;
-        const servable = raw.belowRegen ? true : fitsGain;
+        // Only belowRegen is servable (fitsGain dropped: no HP-harm evidence above the floor in VitalsModel).
         return {
-            servable, belowRegen: raw.belowRegen, fitsGain, deficit: raw.deficit,
+            servable: raw.servable, belowRegen: raw.belowRegen, deficit: raw.deficit,
             best, K, regenLossHp: raw.regenLossHp, firstRise: raw.firstRise,
             food: bot.food, foodMax: m.food, hp: bot.health, hpMax: m.health,
         };
     }
     _hungerServeBy(st) {
         const floor = st.firstRise !== null ? `learned regen food floor ${st.firstRise.f}` : 'no regen food floor learned yet';
-        const why = st.belowRegen
-            ? `food ${st.food}/${st.foodMax} below ${floor}`
-            : `deficit ${st.deficit} fits best raiser gain ${st.K}`;
+        const why = `food ${st.food}/${st.foodMax} below ${floor}`;
         const raiser = st.best !== null ? `${st.best.entry.name} +${st.K.toFixed(1)} food/run` : 'none playable';
         return `hunger ${why}; raiser ${raiser}; regenLossHp ${st.regenLossHp}`;
     }
-    // Thompson candidates in HP units. Hunger: raiser success posterior × regenLossHp. Task: goal backoff posterior.
+    // Learned HP at stake if we continue `taskName`, from death evidence on that task (deathSpots.tasks).
+    // Each death = full observed hpMax lost. No death evidence → 0 (task protects no HP in the data).
+    _taskHpStake(taskName) {
+        if (typeof taskName !== 'string') throw new Error(`[fix80] _taskHpStake needs a task string, got ${JSON.stringify(taskName)}`);
+        if (taskName.length === 0) throw new Error('[fix80] _taskHpStake: empty task');
+        const spots = this.progress.deathSpots;
+        let deaths = 0;
+        if (spots !== null && spots !== undefined && typeof spots === 'object') {
+            for (const c of Object.values(spots)) {
+                if (c === null) continue;
+                if (c === undefined) continue;
+                if (!Array.isArray(c.tasks)) continue;
+                for (const t of c.tasks) {
+                    if (t === taskName) deaths++;
+                }
+            }
+        }
+        if (deaths === 0) return 0;
+        const hpMax = skills.getVitalsMax(this.agent.bot).health;
+        const { s, f } = this._goalOutcomes(taskName);
+        const outcomes = s + f;
+        // Death rate among observed outcomes (deaths count even if not yet folded into goalStats).
+        const denom = outcomes > deaths ? outcomes : deaths;
+        return hpMax * (deaths / denom);
+    }
+    // Thompson candidates in HP units. Hunger: raiser success × regenLossHp. Task: success posterior × learned death-HP stake.
     // Threat seam (fix77): push { id:'threat', value: hitChance * learnedDamage, ... }. No fixed priority order.
     _urgentCandidates(st) {
         const candidates = [];
@@ -1261,7 +1282,6 @@ Use only c; no other globals.`;
                 draw, st, by: this._hungerServeBy(st),
             });
         }
-        // Pending work peek (do NOT shift subgoals or clear _decomposeQueue — BT re-tick semantics).
         let taskName = null;
         if (Array.isArray(this.progress.subgoals) && this.progress.subgoals.length > 0) {
             taskName = this.progress.subgoals[0].task;
@@ -1271,9 +1291,10 @@ Use only c; no other globals.`;
         if (taskName !== null && taskName !== undefined) {
             const { s, f } = this._goalOutcomes(taskName);
             const draw = sampleBeta(s + 1, f + 1);
-            candidates.push({ id: 'task', kind: 'task', value: draw, draw, taskName });
+            const stake = this._taskHpStake(taskName);
+            candidates.push({ id: 'task', kind: 'task', value: draw * stake, draw, stake, taskName });
         } else {
-            candidates.push({ id: 'task', kind: 'task', value: 0, draw: 0, taskName: null });
+            candidates.push({ id: 'task', kind: 'task', value: 0, draw: 0, stake: 0, taskName: null });
         }
         // fix77: ThreatModel candidates append here, same value units (expected HP loss).
         return candidates;
@@ -1282,16 +1303,26 @@ Use only c; no other globals.`;
     async _serveUrgent() {
         // A need:* label is excluded from pre-emption (Mindcraft mode.active analogue).
         if (typeof this.currentTask === 'string' && this.currentTask.startsWith('need:')) return false;
-        // No learned vitals store / no numeric food+health yet → nothing drive-reduction can serve (unit-test stubs, boot).
-        if (this.vitals === null) return false;
-        if (this.vitals === undefined) return false;
-        if (this.agent === null) return false;
-        if (this.agent === undefined) return false;
+        try {
+            return await this._serveUrgentBody();
+        } finally {
+            // Clear the need label when the serve finishes (success, fail, or throw) so the next step can serve again.
+            // Leaving need:hunger stuck would skip every later _serveUrgent (re-entry check) — a livelock.
+            if (this.currentTask === 'need:hunger') this.currentTask = null;
+        }
+    }
+    async _serveUrgentBody() {
+        // Fail loud: voyager with a live bot must have vitals + numeric food/health. Unit stubs must wire them.
+        if (this.vitals === null) throw new Error('[fix80] _serveUrgent: vitals is null');
+        if (this.vitals === undefined) throw new Error('[fix80] _serveUrgent: vitals is undefined');
+        if (this.agent === null) throw new Error('[fix80] _serveUrgent: agent is null');
+        if (this.agent === undefined) throw new Error('[fix80] _serveUrgent: agent is undefined');
         const bot = this.agent.bot;
-        if (bot === null) return false;
-        if (bot === undefined) return false;
-        if (typeof bot.food !== 'number') return false;
-        if (typeof bot.health !== 'number') return false;
+        if (bot === null) throw new Error('[fix80] _serveUrgent: agent.bot is null');
+        if (bot === undefined) throw new Error('[fix80] _serveUrgent: agent.bot is undefined');
+        if (typeof bot.food !== 'number') throw new Error(`[fix80] _serveUrgent: bot.food must be a number, got ${JSON.stringify(bot.food)}`);
+        if (typeof bot.health !== 'number') throw new Error(`[fix80] _serveUrgent: bot.health must be a number, got ${JSON.stringify(bot.health)}`);
+
         const st = this._hungerServeState();
         if (!st.servable) return false;
         const candidates = this._urgentCandidates(st);
@@ -1311,55 +1342,41 @@ Use only c; no other globals.`;
         if (st.best !== null) {
             const route = { name: st.best.entry.name, call: `await ${st.best.entry.name}(bot);` };
             const rp = await this._replay(label, before, route);
-            // Do not _recordGoalOutcome for the deferred subgoal/curriculum task; kind 'need' is unblamed.
-            if (rp && rp.ok) {
+            if (rp === null) throw new Error('[fix80] _replay returned nothing for a need raiser serve');
+            if (rp === undefined) throw new Error('[fix80] _replay returned nothing for a need raiser serve');
+            if (rp.ok) {
                 console.log(`[urgent-need] served via learned raiser ${st.best.entry.name}`);
                 this._afterSuccess();
-            } else {
-                const why = rp && rp.reason ? rp.reason : (rp && rp.unmetPrecondition ? rp.unmetPrecondition : 'serve failed');
-                console.log(`[urgent-need] raiser serve failed: ${why}; queues remain deferred`);
+                return true;
             }
-            // Queues intentionally untouched.
-            return true;
+            // Failure is evidence: _replay → _attribute → skill stats. Reason is required (no silent 'serve failed').
+            if (typeof rp.reason === 'string' && rp.reason.length > 0) {
+                console.log(`[urgent-need] raiser serve failed: ${rp.reason}; queues remain deferred`);
+                return true;
+            }
+            if (typeof rp.unmetPrecondition === 'string' && rp.unmetPrecondition.length > 0) {
+                console.log(`[urgent-need] raiser serve unmet precondition: ${rp.unmetPrecondition}; queues remain deferred`);
+                return true;
+            }
+            throw new Error(`[fix80] need raiser serve failed without a reason: ${JSON.stringify(rp)}`);
         }
 
-        // Cold start: no playable raiser observed — surface the need to the model (no hard-coded eat).
+        // Cold start: no playable raiser — propose, then run the NORMAL pursue path (replay then generate-code).
+        // currentTask stays need:hunger so we do not re-enter; queues stay deferred.
         const hun = this._hunger();
         const hunText = this.vitals.hungerText(hun);
         const fact = hunText !== null ? hunText : winner.by;
         const note = `LEARNED vital need (pre-empts decompose/subgoal queues; they are deferred, not dropped): ${fact}. Propose ONE task that raises food using what the bot has.`;
         const proposal = await this.proposeTask({ ...before, note });
-        if (proposal === null) {
-            throw new Error('[fix80] proposeTask returned nothing for a cold-start vital need');
-        }
-        if (proposal === undefined) {
-            throw new Error('[fix80] proposeTask returned nothing for a cold-start vital need');
-        }
-        if (typeof proposal !== 'object') {
-            throw new Error('[fix80] proposeTask returned nothing for a cold-start vital need');
-        }
-        console.log(`[urgent-need] cold-start model proposal: ${proposal.task} (${proposal.reasoning})`);
-        // Try a replay if the model named a known skill; otherwise the proposal is logged and the next step resumes the chain.
-        let taskRaw = proposal.task;
-        if (taskRaw === undefined) taskRaw = '';
-        if (taskRaw === null) taskRaw = '';
-        const task = String(taskRaw).trim();
-        if (task.length > 0) {
-            const g = this._resolveGoal(task);
-            if (g.kind === 'skill') {
-                const route = { name: g.skill.name, call: `await ${g.skill.name}(bot);` };
-                const rp = await this._replay(label, before, route);
-                if (rp && rp.ok) this._afterSuccess();
-            } else {
-                const route = this._findReplay(task);
-                if (route) {
-                    const rp = await this._replay(label, before, route);
-                    if (rp && rp.ok) this._afterSuccess();
-                } else {
-                    console.log(`[urgent-need] cold-start proposal "${task}" has no replay route this step; queues remain deferred for resume`);
-                }
-            }
-        }
+        if (proposal === null) throw new Error('[fix80] proposeTask returned nothing for a cold-start vital need');
+        if (proposal === undefined) throw new Error('[fix80] proposeTask returned nothing for a cold-start vital need');
+        if (typeof proposal !== 'object') throw new Error('[fix80] proposeTask returned nothing for a cold-start vital need');
+        if (proposal.task === null) throw new Error('[fix80] cold-start proposeTask.task is null');
+        if (proposal.task === undefined) throw new Error('[fix80] cold-start proposeTask.task is undefined');
+        const task = String(proposal.task).trim();
+        if (task.length === 0) throw new Error('[fix80] cold-start proposeTask.task is empty');
+        console.log(`[urgent-need] cold-start model proposal: ${task} (${proposal.reasoning}); pursuing via normal path under ${label}`);
+        await this._pursueProposedTask(task, proposal, before);
         return true;
     }
 
@@ -4732,46 +4749,9 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
         const now = Date.now(); console.log(`[timing] ${new Date().toISOString().slice(11,19)}Z step start (gap since last step end ${this._stepEnd ? now - this._stepEnd : 0}ms)`);   // fix27
         try { return await this._step(); } finally { this._flushSkills(); this._stepEnd = Date.now(); console.log(`[timing] ${new Date().toISOString().slice(11,19)}Z step end (took ${this._stepEnd - now}ms)`); }
     }
-    async _step() {
-        this._checkHomeGround();   // fix27: perception upkeep (was called from the removed milestone planner)
-        this._watchWindows();
-        this._watchDimension();
-        if (this.agent.bot.currentWindow) { const w = this.agent.bot.currentWindow; if (/CHOICE/.test(JSON.stringify(w.title))) { if (!this._choiceNoted) { this._choiceNoted = 1; console.log("[window] datapack dialog CHOICE (A Breach Happened multi_action dialog via ViaProxy) left open; not answering"); } } else console.log(`[window] STRAY ${w.type} id=${w.id} still open at step start (opened ${Math.round((Date.now() - (this._winOpenedAt || 0)) / 1000)}s ago); closing`); if (!/CHOICE/.test(JSON.stringify(w.title))) try { this.agent.bot.closeWindow(w); } catch (e) { console.log('[window] close failed: ' + e.message); } }
-        this._oneshot();
-        // fix18: no hard-coded survival/housekeeping policy; the curriculum proposes it and the PSN learns it
-        this._requeueDeferred();   // fix26
-        if (this._apiLinted !== this._apiSignature()) { this._apiLinted = this._apiSignature(); await this._queueApiLintRepairs(); }   // fix67
-        if (this._repairQueue?.length) { await this._repair(); return; }
-        // fix80: one shared pre-emption slot (hunger now; fix77 threat later). After repairs, BEFORE decompose/subgoals
-        // so a fresh decomposition cannot starve the need for a whole LLM call. Queues stay untouched (BT re-tick).
-        if (await this._serveUrgent()) return;
-        if (this._decomposeQueue) { const dq = this._decomposeQueue; this._decomposeQueue = null; await this._decompose(dq.task, dq.reason); return; }
-        if (!this.progress.fix25) this._fix25Migrate();
-        if (await this._gateTrial()) return;   // fix28
-        if (await this._backfillContracts()) return;   // fix22
-        if (await this._refactor()) return;
-        if (await this._prune()) return;   // fix34
-        if (await this._generalise()) return;   // fix34
-        if (await this._split()) return;   // fix34
-        if (await this._retention()) return;   // fix32
-        // SkillWeaver-style: idle practice when no pending work (gated: idle, no repairs, no subgoals)
-        if (await this._idlePractice()) return;
-        const before = this.observe();
-        this._curSub = null;
-        const sub = this._subgoalTask(), ms = null, fromCurr = !sub && !ms;
-        let proposal = sub || ms || await this._takePlan(before);
-        let task = String(proposal.task || '').trim();
-        let invalid = this._rejectTask(task, fromCurr);   // fix55: invalid goals and learned backoff go back to the planner
-        if (invalid) {
-            console.log(`[voyager] rejected task "${task}": ${invalid}`);
-            this.progress.failed.push(`${task} (invalid: ${invalid})`);
-            proposal = await this.proposeTask({ ...before, note: `Your last proposal "${task}" was rejected: ${invalid}` });
-            task = String(proposal.task || '').trim();
-            invalid = this._rejectTask(task, true);
-            if (invalid) { console.log(`[voyager] rejected again "${task}": ${invalid}; skipping`); this._saveProgress(); return; }
-        }
-        console.log(`[voyager] new task: ${task} (${proposal.reasoning})`);
-        this.currentTask = task;
+    // fix80: shared pursue path used by _step and by cold-start _serveUrgent (replay then generate-code).
+    // Does not set currentTask — caller sets it (need:hunger for a need serve; the task string otherwise).
+    async _pursueProposedTask(task, proposal, before) {
         this._prefetchPlan(task, before);   // fix28 (C): the next proposal is planned while this task runs
         VERSION = this.agent.bot.version;
 
@@ -5062,6 +5042,49 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
         const fails = this.progress.failed.slice(-20).filter(t => t === task).length;
         if (fails >= 2 || anyCut || this._decomposeQueue?.task === task) { if (this._decomposeQueue?.task === task) this._decomposeQueue = null; await this._decompose(task, anyCut || `failed ${fails}x; last critic: ${String(feedback).slice(-300)}${invFullReason}`); }
         else if (this._curSub?.parent) console.log(`[psn] subgoal "${task}" failed; moving on`);
+    }
+
+    async _step() {
+        this._checkHomeGround();   // fix27: perception upkeep (was called from the removed milestone planner)
+        this._watchWindows();
+        this._watchDimension();
+        if (this.agent.bot.currentWindow) { const w = this.agent.bot.currentWindow; if (/CHOICE/.test(JSON.stringify(w.title))) { if (!this._choiceNoted) { this._choiceNoted = 1; console.log("[window] datapack dialog CHOICE (A Breach Happened multi_action dialog via ViaProxy) left open; not answering"); } } else console.log(`[window] STRAY ${w.type} id=${w.id} still open at step start (opened ${Math.round((Date.now() - (this._winOpenedAt || 0)) / 1000)}s ago); closing`); if (!/CHOICE/.test(JSON.stringify(w.title))) try { this.agent.bot.closeWindow(w); } catch (e) { console.log('[window] close failed: ' + e.message); } }
+        this._oneshot();
+        // fix18: no hard-coded survival/housekeeping policy; the curriculum proposes it and the PSN learns it
+        this._requeueDeferred();   // fix26
+        if (this._apiLinted !== this._apiSignature()) { this._apiLinted = this._apiSignature(); await this._queueApiLintRepairs(); }   // fix67
+        if (this._repairQueue?.length) { await this._repair(); return; }
+        // fix80: one shared pre-emption slot (hunger now; fix77 threat later). After repairs, BEFORE decompose/subgoals
+        // so a fresh decomposition cannot starve the need for a whole LLM call. Queues stay untouched (BT re-tick).
+        if (await this._serveUrgent()) return;
+        if (this._decomposeQueue) { const dq = this._decomposeQueue; this._decomposeQueue = null; await this._decompose(dq.task, dq.reason); return; }
+        if (!this.progress.fix25) this._fix25Migrate();
+        if (await this._gateTrial()) return;   // fix28
+        if (await this._backfillContracts()) return;   // fix22
+        if (await this._refactor()) return;
+        if (await this._prune()) return;   // fix34
+        if (await this._generalise()) return;   // fix34
+        if (await this._split()) return;   // fix34
+        if (await this._retention()) return;   // fix32
+        // SkillWeaver-style: idle practice when no pending work (gated: idle, no repairs, no subgoals)
+        if (await this._idlePractice()) return;
+        const before = this.observe();
+        this._curSub = null;
+        const sub = this._subgoalTask(), ms = null, fromCurr = !sub && !ms;
+        let proposal = sub || ms || await this._takePlan(before);
+        let task = String(proposal.task || '').trim();
+        let invalid = this._rejectTask(task, fromCurr);   // fix55: invalid goals and learned backoff go back to the planner
+        if (invalid) {
+            console.log(`[voyager] rejected task "${task}": ${invalid}`);
+            this.progress.failed.push(`${task} (invalid: ${invalid})`);
+            proposal = await this.proposeTask({ ...before, note: `Your last proposal "${task}" was rejected: ${invalid}` });
+            task = String(proposal.task || '').trim();
+            invalid = this._rejectTask(task, true);
+            if (invalid) { console.log(`[voyager] rejected again "${task}": ${invalid}; skipping`); this._saveProgress(); return; }
+        }
+        console.log(`[voyager] new task: ${task} (${proposal.reasoning})`);
+        this.currentTask = task;
+        await this._pursueProposedTask(task, proposal, before);
     }
 }
 
