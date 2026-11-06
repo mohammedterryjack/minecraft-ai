@@ -38,22 +38,22 @@ function cellBot(cells, at = new Vec3(-122.3, 33, 58.7)) {
 }
 
 describe('fix65: unloaded is unknown, never air', () => {
-    it('getBlockAtPosition returns null for an unloaded chunk and the block for a loaded relative offset', () => {
+    it('the relative lookup returns null for an unloaded chunk and the block for a loaded offset (fix67: one Vec3 offset)', () => {
         const bot = cellBot({ '-123,32,58': 'deepslate' });
-        assert.strictEqual(world.getBlockAtPosition(bot, 0, -1, 0).name, 'deepslate');
-        assert.strictEqual(world.getBlockAtPosition(bot, 0, 1, 0), null, 'unloaded -> null, not {name: "air"}');
-        assert.strictEqual(world.getBlockAtPosition(bot, 2, -1, 0), null);   // ensureFurnace-style offset: allowed
+        assert.strictEqual(world.getBlockAtOffset(bot, new Vec3(0, -1, 0)).name, 'deepslate');
+        assert.strictEqual(world.getBlockAtOffset(bot, new Vec3(0, 1, 0)), null, 'unloaded -> null, not {name: "air"}');
+        assert.strictEqual(world.getBlockAtOffset(bot, new Vec3(2, -1, 0)), null);   // ensureFurnace-style offset
     });
 
-    it('absolute coordinates passed as offsets throw and name the absolute API (the live candidate passed block.position)', () => {
+    it('absolute positions have their own lookup (fix67 replaced the fix65 inference)', () => {
         const bot = cellBot({ '-124,33,57': 'iron_ore' });
-        assert.throws(() => world.getBlockAtPosition(bot, -124, 33, 57), /absolute coordinates .*RELATIVE.*bot\.blockAt\(new Vec3\(-124, 33, 57\)\)/);
+        assert.strictEqual(world.getBlockAtAbsolute(bot, new Vec3(-124, 33, 57)).name, 'iron_ore');
     });
 
     it('reports print UNLOADED for unknown cells; getFirstBlockAboveHead stops at the first unknown cell', () => {
         const bot = cellBot({ '-123,32,58': 'stone', '-123,33,58': 'air', '-123,35,58': 'air', '-123,36,58': 'air' });
         assert.deepStrictEqual(world.getSurroundingBlocks(bot), ['Block Below: stone', 'Block at Legs: air', `Block at Head: ${world.UNLOADED}`]);
-        assert.strictEqual(world.reportBlockAtOffset(bot, 0, 1, 0), world.UNLOADED);
+        assert.strictEqual(world.reportBlockAtOffset(bot, new Vec3(0, 1, 0)), world.UNLOADED);
         assert.strictEqual(world.getFirstBlockAboveHead(bot, null, 32), `${world.UNLOADED} (2 blocks up)`);
         const sky = cellBot(Object.fromEntries(Array.from({ length: 4 }, (_, i) => [`-123,${35 + i},58`, 'air'])));
         assert.strictEqual(world.getFirstBlockAboveHead(sky, null, 4), 'none');
@@ -66,7 +66,7 @@ describe('fix65: unloaded is unknown, never air', () => {
         }
     });
 
-    it('the live collectBlock candidate now fails loudly on its first lookup instead of excluding every ore', async () => {
+    it('the live collectBlock candidate now fails loudly on its first lookup instead of excluding every ore (fix67: the three-number lookup no longer exists)', async () => {
         const cand = LIVE.find(s => s.name === 'collectBlock').candidate.code.replace('getNearestBlocks(bot, types, 64, 10000)', 'getNearestBlocksWhere(bot, types, 64, 10000)');
         const coder = new Coder({ name: NAME });
         while (!coder.code_lint_template || !coder.code_template) await new Promise(r => setImmediate(r));
@@ -74,7 +74,7 @@ describe('fix65: unloaded is unknown, never air', () => {
         const ores = new Map(Array.from({ length: 40 }, (_, k) => { const p = new Vec3(-124 + k, 33, 57); return [p.toString(), { name: 'iron_ore', position: p }]; }));
         const bot = { output: '', interrupt_code: false, scans: 0, entity: { position: new Vec3(-122.3, 33, 58.7) },
             findBlocks() { bot.scans++; return [...ores.values()].map(b => b.position); }, blockAt: p => ores.get(p.floored().toString()) ?? null };
-        await assert.rejects(staged.func.main(bot), /absolute coordinates/);
+        await assert.rejects(staged.func.main(bot), /getBlockAtPosition is not (defined|a function)/);
         assert.strictEqual(bot.scans, 1, 'one scan, then a loud error (it used to rescan once per ore)');
     });
 });

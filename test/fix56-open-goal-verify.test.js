@@ -117,7 +117,7 @@ describe('fix56 open goals are never routed by lexical overlap', () => {
     it('_step routes an open goal via the embedding match, not _lexicalReplay', async () => {
         const v = mk([FURNACE]);
         for (const m of ['_checkHomeGround', '_watchWindows', '_watchDimension', '_oneshot', '_requeueDeferred', '_prefetchPlan']) v[m] = () => {};
-        for (const m of ['_gateTrial', '_backfillContracts', '_refactor', '_prune', '_generalise', '_split', '_retention', '_idlePractice']) v[m] = async () => false;
+        for (const m of ['_queueApiLintRepairs', '_gateTrial', '_backfillContracts', '_refactor', '_prune', '_generalise', '_split', '_retention', '_idlePractice']) v[m] = async () => false;
         v.agent = { bot: { currentWindow: null, version: '1.21.4' } };
         v.observe = () => ({ inventory: {}, equipment: eq });
         v._subgoalTask = () => null;
