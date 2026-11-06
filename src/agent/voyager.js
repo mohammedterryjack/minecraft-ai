@@ -177,7 +177,14 @@ function countGoal(task) {
     }
     return { count: countParsed, item, items, verb };
 }
-let VERSION = null;
+// fix52: registry version known at module load from settings.minecraft_version (the version the bot connects as),
+// so goals parsed before spawn (_polyMerge -> _findReplay -> countGoal in the constructor) have a registry.
+// bot.version overwrites it after spawn. Fail loud if settings names a version minecraft-data does not know.
+function registryVersion(v) {
+    if (!minecraftData(v)) throw new Error(`[fix52] LOUD FAIL: settings.minecraft_version "${v}" has no minecraft-data registry`);
+    return v;
+}
+let VERSION = registryVersion(settings.minecraft_version);
 // fix46: test-only setter for VERSION (parseVerboseGoal requires VERSION to be set)
 export function _setVersionForTest(v) { VERSION = v; }
 
@@ -824,8 +831,7 @@ export class Voyager {
             const tgt = r && this.skills.find(x => x.name === r.name);
             if (!tgt || tgt.name === s.name || !(tgt.handwritten || tgt.primitive)) continue;
             // only pure variants: a real item id, and no extra behaviour in the name (e.g. craftAndPlaceChestInHut stays its own skill)
-            // fix49: countGoal throws if VERSION is null (fail loud) - catch to allow batch to continue
-            let g = null; try { g = countGoal(s.task); } catch (e) { if (e.message?.includes('VERSION is null')) continue; throw e; }
+            const g = countGoal(s.task);  // fix52: VERSION set at load, no catch-and-continue
             // fix49: fail loud if VERSION not set (no fallback) - countGoal already threw if null
             let valid = true; if (g) { const md = minecraftData(VERSION); valid = !!md.itemsByName[g.item] || !!md.blocksByName[g.item]; }
             const extra = s.name.split(/(?=[A-Z])/).map(w => w.toLowerCase()).filter(w => !['craft','mine','get','obtain','collect','gather','smelt','one','two','three','four','five','six','seven','eight'].includes(w) && !(g?.item || '').split('_').some(p => p.startsWith(w) || w.startsWith(p)));
