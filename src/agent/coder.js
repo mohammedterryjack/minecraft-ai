@@ -47,6 +47,43 @@ function _trimLineAt(code, line1) {
 // Exported for voyager.js to build the unified signature list for prompts
 // fix41: Object.keys registration for every exported function even when extractSig regex misses
 let _bareAPICache = null;
+// fix83: getInventoryCounts(bot) lists only the items the bot holds, so `getInventoryCounts(bot).stick` is undefined when it holds
+//        none and arithmetic on it is NaN. Live 19:03:50 GMT: the generated ensureSticks did `const currentSticks =
+//        getInventoryCounts(bot).stick; const neededSticks = 2 - currentSticks; await craftSticks(bot, neededSticks)` with no
+//        sticks, and craftSticks' precondition refused craftSticks(NaN) (traced as craftSticks(null)). Lint feedback for the
+//        model (the code is not rewritten): every arithmetic operand that is an item count read straight from
+//        getInventoryCounts(...), directly, through a variable holding the counts, or through a variable holding one count.
+const ARITH_OPS = new Set(['+', '-', '*', '/', '%', '**']);
+export function missingCountArithmetic(code) {
+    let ast;
+    try { ast = acorn.parse(code, { ecmaVersion: 'latest', sourceType: 'module', allowAwaitOutsideFunction: true }); }
+    catch (e) { throw new Error(`[fix83] missingCountArithmetic: called on code that does not parse (${e.message}); userGeneratedCodeLintBlockers reports parse errors first`); }
+    const isCountsCall = n => n.type === 'CallExpression' && n.callee.type === 'Identifier' && n.callee.name === 'getInventoryCounts';
+    const countsVars = new Set(), countVars = new Map();
+    const isCountRead = n => n.type === 'MemberExpression' && (isCountsCall(n.object) || (n.object.type === 'Identifier' && countsVars.has(n.object.name)));
+    const visit = (n, f) => {
+        if (!n || typeof n.type !== 'string') return;
+        f(n);
+        for (const v of Object.values(n)) { if (Array.isArray(v)) for (const x of v) visit(x, f); else if (v && typeof v === 'object' && typeof v.type === 'string') visit(v, f); }
+    };
+    visit(ast, n => {
+        if (n.type !== 'VariableDeclarator' || n.id.type !== 'Identifier' || n.init === null) return;
+        if (isCountsCall(n.init)) countsVars.add(n.id.name);
+    });
+    visit(ast, n => {
+        if (n.type !== 'VariableDeclarator' || n.id.type !== 'Identifier' || n.init === null) return;
+        if (isCountRead(n.init)) countVars.set(n.id.name, code.slice(n.init.start, n.init.end));
+    });
+    const out = [];
+    visit(ast, n => {
+        if (n.type !== 'BinaryExpression' || !ARITH_OPS.has(n.operator)) return;
+        for (const side of [n.left, n.right]) {
+            const read = isCountRead(side) ? code.slice(side.start, side.end) : side.type === 'Identifier' && countVars.has(side.name) ? `${side.name} (= ${countVars.get(side.name)})` : null;
+            if (read !== null) out.push(`\`${code.slice(n.start, n.end)}\`: ${read} is undefined when the bot holds none of that item (getInventoryCounts lists only held items), so this is NaN. Read the count with a check that the item is listed.`);
+        }
+    });
+    return out;
+}
 // fix74: internal sandbox binding of markPreconditionUnmet (see _stageCode endowments); seeded primitives call it by this name
 export const PRECONDITION_UNMET_BINDING = '__mcPreconditionUnmet__';
 export function getBareAPI() {
@@ -310,6 +347,8 @@ export class Coder {
         if (timerLint.length > 0) {
             return 'setTimeout/setInterval are not available in the sandbox; use `await sleep(ms)`';
         }
+        const missingCounts = missingCountArithmetic(code);   // fix83
+        if (missingCounts.length) return missingCounts.join('\n');
         return this._apiGate(code, knownNames);
     }
 

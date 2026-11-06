@@ -60,7 +60,7 @@ describe('fix82 (1): the 18:23:44Z "checkIronPickaxe has already been declared"'
         assert.strictEqual(own, 'checkForIronPickaxe');
         const { violations } = splitGeneratedCode(REPLY_1750, own);
         assert.deepStrictEqual(violations, ['top-level function checkIronPickaxe besides checkForIronPickaxe', 'top-level call checkIronPickaxe(...) (runs whenever the skill is staged)']);
-        assert.match(oneFunctionFeedback(own, violations), /ONE top-level function: `async function checkForIronPickaxe\(bot, \.\.\.\)`.*INSIDE checkForIronPickaxe/);
+        assert.match(oneFunctionFeedback(own, violations, []), /ONE top-level function: `async function checkForIronPickaxe\(bot, \.\.\.\)`.*INSIDE checkForIronPickaxe/);
     });
     it('the call is cut by AST position, arguments or not (the old regex kept `await tossClutterForIron(bot, 4);`)', () => {
         const old = c => c.replace(/\n\s*await\s+\w+\(bot\);\s*$/, '').trim();
@@ -75,7 +75,8 @@ describe('fix82 (1): the 18:23:44Z "checkIronPickaxe has already been declared"'
     it('every top-level binding form is reported; nested helpers are fine', () => {
         assert.deepStrictEqual(skillSourceViolations('const LIMIT = 3, { x, y: [z] } = o;\nasync function f(bot) {}', 'f'), ['top-level variable LIMIT, x, z besides f']);
         assert.deepStrictEqual(skillSourceViolations('class K {}\nasync function f(bot) {}', 'f'), ['top-level class K besides f']);
-        assert.throws(() => skillSourceViolations('async function f(bot) {}\nasync function f(bot) {}', 'f'), /Identifier 'f' has already been declared/);   // a module cannot hold two
+        // fix83: read as a script, two declarations are a shape the rule names (as a module it only threw, and the model saw the parse error)
+        assert.deepStrictEqual(skillSourceViolations('async function f(bot) {}\nasync function f(bot) {}', 'f'), ['2 top-level declarations of function f (exactly 1 required)']);
         assert.deepStrictEqual(skillSourceViolations('async function g(bot) {}', 'f'), ['top-level function g besides f', '0 top-level declarations of function f (exactly 1 required)']);
         assert.deepStrictEqual(skillSourceViolations('// c\nasync function f(bot) {\n    const h = () => 1;\n    function inner() { return h(); }\n    return inner();\n}', 'f'), []);
         assert.throws(() => skillSourceViolations('async function f(bot) {', 'f'), /topLevelStatements: parse failed/);
@@ -212,10 +213,11 @@ describe('fix82 (2): craftItem "Cannot read properties of undefined (reading \'f
     });
     it('writeCode and the repair loop run the same gate; saveSkill runs it for every other path', () => {
         const src = readFileSync(new URL('../src/agent/voyager.js', import.meta.url), 'utf8');
-        assert.match(src, /const gate = this\.agent\.coder\.userGeneratedCodeLintBlockers\(code, this\.skills\.map\(s => s\.name\)\);/);
+        assert.match(src, /const gate = shape === null \? this\.agent\.coder\.userGeneratedCodeLintBlockers\(code, this\.skills\.map\(s => s\.name\)\) : null;/);
         assert.match(src, /const apiErr = this\.agent\.coder\._apiGate\(code, \[\.\.\.names\]\);/);
         // writeCode: the shape lint runs before staging, and what is saved is the AST-cut source
-        assert.match(src, /const split = lint \? null : splitGeneratedCode\(code, own\);\n\s*if \(split && split\.violations\.length\) lint = oneFunctionFeedback\(own, split\.violations\);\n\s*let staged = null;\n\s*if \(!lint\) \{/);
+        // fix83: the shape is read first (script parse), then the lint
+        assert.match(src, /const split = parsesAsScript\(code\) \? splitGeneratedCode\(code, own\) : null;\n\s*let lint = split !== null && split\.violations\.length \? oneFunctionFeedback\(own, split\.violations, pastedLibrarySkills\(code, own, libraryNames\)\) : null;\n\s*if \(lint === null\) lint = this\.agent\.coder\.userGeneratedCodeLintBlockers\(code, this\.skills\.map\(s => s\.name\)\);/);
         assert.match(src, /await this\.saveSkill\(own, desc\.trim\(\), split\.skillSource, task\);/);
         assert.doesNotMatch(src.split('\n').filter(l => !l.trimStart().startsWith('//')).join('\n'), /code\.replace\(\/\\n\\s\*await\\s\+\\w\+\\\(bot/);
     });
