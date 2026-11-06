@@ -1,12 +1,15 @@
 // fix74: nits carried from fix58/fix70/fix76 review, each required-or-throw with no default.
-import { describe, it } from 'node:test';
+import { describe, it, after } from 'node:test';
 import assert from 'node:assert';
 import { readFileSync, mkdtempSync, cpSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { VitalsModel } from '../src/agent/vitals_model.js';
 import { loadManifest, applyManifest, checkRecord } from '../scripts/reset_bug_poisoned.js';
-import { markPreconditionUnmet } from '../src/agent/library/skills.js';
+import * as skillsLib from '../src/agent/library/skills.js';
+import { Coder, getBareAPI, PRECONDITION_UNMET_BINDING } from '../src/agent/coder.js';
+import { missingCalls, reservedNamesUsed } from '../src/agent/skill_graph.js';
+import { Voyager } from '../src/agent/voyager.js';
 import { peekPreconditionUnmet } from '../src/agent/precondition.js';
 
 const src = f => readFileSync(new URL(`../${f}`, import.meta.url), 'utf8');
@@ -29,13 +32,48 @@ describe('fix74: hungerText / recoveryText list every learned food-raiser', () =
     });
 });
 
-describe('fix74: the precondition marker has one writer', () => {
-    it('seeded primitives call markPreconditionUnmet (a bare API function); no bare marker writes remain', () => {
+describe('fix74: the precondition marker has one writer, and generated code cannot reach it', () => {
+    const NAME = '__fix74_nits__';
+    after(() => rmSync(`./bots/${NAME}`, { recursive: true, force: true }));
+    const stubBot = () => ({ registry: { itemsByName: {}, blocksByName: {}, entitiesByName: {} } });
+    it('seeded primitives call the internal binding; no bare marker writes remain', () => {
         const v = src('src/agent/voyager.js');
         assert.strictEqual(v.includes('bot.__unmetPrecondition ='), false);
-        assert.strictEqual((v.match(/markPreconditionUnmet\(bot\);/g) || []).length, 3);
-        const bot = {};
-        markPreconditionUnmet(bot);
+        assert.strictEqual((v.match(new RegExp(`${PRECONDITION_UNMET_BINDING}\\(bot\\);`, 'g')) || []).length, 3);
+    });
+    it('it is not on the model-visible API: not a skills.js export, not in getBareAPI (prompts, lint sandbox)', () => {
+        assert.strictEqual(Object.hasOwn(skillsLib, 'markPreconditionUnmet'), false);
+        const api = getBareAPI();
+        assert.strictEqual(api.names.has('markPreconditionUnmet'), false);
+        assert.strictEqual(api.names.has(PRECONDITION_UNMET_BINDING), false);
+        assert.strictEqual(api.sigs.some(x => x.includes('PreconditionUnmet')), false);
+    });
+    it('generated code that calls it, by either name, is rejected by the writeCode gate', () => {
+        const coder = new Coder({ name: NAME, bot: stubBot() });
+        for (const fn of ['markPreconditionUnmet', PRECONDITION_UNMET_BINDING]) {
+            const r = coder.userGeneratedCodeLintBlockers(`async function eatSomething(bot) {\n    ${fn}(bot);\n    return false;\n}\nawait eatSomething(bot);`, []);
+            assert.ok(r, `${fn} passed the gate`);
+            assert.match(r, new RegExp(fn));
+        }
+    });
+    it('a saved or repaired skill that names it is rejected by saveSkill', async () => {
+        // missingCalls sees camelCase calls only: markPreconditionUnmet is unknown there; the __ binding is caught by the reserved check
+        const names = new Set(['eatSomething', ...getBareAPI().names]);
+        assert.deepStrictEqual(missingCalls('async function eatSomething(bot) { markPreconditionUnmet(bot); return false; }', 'eatSomething', names), ['markPreconditionUnmet']);
+        assert.deepStrictEqual(reservedNamesUsed(`async function eatSomething(bot) { ${PRECONDITION_UNMET_BINDING}(bot); return false; }`, [PRECONDITION_UNMET_BINDING]), [PRECONDITION_UNMET_BINDING]);
+        assert.deepStrictEqual(reservedNamesUsed(`// ${PRECONDITION_UNMET_BINDING}(bot)\nasync function f(bot) {}`, [PRECONDITION_UNMET_BINDING]), [], 'comments do not count');
+        const v = Object.create(Voyager.prototype);
+        Object.assign(v, { skills: [], _lastEffects: [], agent: {} });
+        const saved = await v.saveSkill('eatSomething', 'd', `async function eatSomething(bot) {\n    ${PRECONDITION_UNMET_BINDING}(bot);\n    return false;\n}`, 'Eat 1 cooked_mutton', { repair: true });
+        assert.strictEqual(saved, false);
+        assert.deepStrictEqual(v.skills, []);
+    });
+    it('staged seeded code reaches it through the sandbox binding and sets the typed marker', async () => {
+        const coder = new Coder({ name: NAME, bot: stubBot() });
+        while (!coder.code_lint_template || !coder.code_template) await new Promise(r => setImmediate(r));
+        const st = await coder._stageCode(`${PRECONDITION_UNMET_BINDING}(bot);`, {});
+        const bot = { interrupt_code: false, output: '' };
+        await st.func.main(bot);
         assert.deepStrictEqual(peekPreconditionUnmet(bot), { kind: 'precondition' });
     });
 });

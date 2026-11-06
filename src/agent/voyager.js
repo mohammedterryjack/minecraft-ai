@@ -25,8 +25,8 @@ import minecraftData from 'minecraft-data';
 import { Ollama } from '../models/ollama.js';
 import { setCallDurationStore } from '../models/call_durations.js';
 import { setMovementStore, learnedKinds, recordStep, recordCut, stepBound, noteUnbounded } from '../utils/movement_model.js';
-import { signatureOf, depsOf, missingCalls, findCycle, findAllCycles, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf, thrownIn, declaredNames } from './skill_graph.js';
-import { getBareAPI, collectBareApiUsedInSource } from './coder.js';   // fix40: unified bare-name API helper
+import { signatureOf, depsOf, missingCalls, reservedNamesUsed, findCycle, findAllCycles, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf, thrownIn, declaredNames } from './skill_graph.js';
+import { getBareAPI, collectBareApiUsedInSource, PRECONDITION_UNMET_BINDING } from './coder.js';   // fix40: unified bare-name API helper
 import { withStallPhase } from '../utils/event_loop_guard.js';
 import { watchdogEvidencePath } from '../utils/main_thread_watchdog.js';
 import { wrapBotForApiTiming } from '../utils/bot_api_timing.js';
@@ -1206,7 +1206,7 @@ Use only c; no other globals.`;
     // fix76: learned hunger outlook (food vs regen floor / decay), including at full HP
     _hunger() { const bot = this.agent.bot, m = skills.getVitalsMax(bot); return this.vitals.hunger(bot.health, m.health, bot.food, m.food); }
     // fix76: structural unmet-precondition classification (no message-text matching).
-    // (1) seeded code called markPreconditionUnmet(bot) -> kind === 'precondition'
+    // (1) seeded code called markPreconditionUnmet(bot) (sandbox binding __mcPreconditionUnmet__, fix74) -> kind === 'precondition'
     // (2) skill's learned vitals effect raises food, and food was already at the observed food cap
     _foodRaiseSaturated(skillName, foodAtStart) {
         if (typeof skillName !== 'string') throw new Error('[fix76] _foodRaiseSaturated: skillName required');
@@ -3724,6 +3724,10 @@ current_health: ${Math.round(bot.health)}/${vmax.health}\ncurrent_food: ${bot.fo
         let deps = depsOf(code, name, new Set(this.skills.map(s => s.name)));
         const missing = missingCalls(code, name, names);
         if (missing.length) { gateLog(`REJECT ${name}: calls unknown skills ${missing.join(', ')}`); return false; }
+        // fix74: the unmet-precondition marker is for repo-owned seeded primitives only (it voids a run's stats, fix76); model
+        //        code (new, repaired, refactored) that names it is rejected. missingCalls cannot see it (camelCase calls only).
+        const reserved = reservedNamesUsed(code, [PRECONDITION_UNMET_BINDING]);
+        if (reserved.length) { gateLog(`REJECT ${name}: uses ${reserved.join(', ')}, reserved for seeded primitives (marks a failure as an unmet precondition)`); return false; }
         // fix39: seeded primitives must not depend on learned skills (prevents cycles like
         // ensureCraftingTable -> depositToChest -> ensureChest -> ensureCraftingTable)
         // If a repair tries to add learned deps to a seeded skill, strip them and warn
@@ -5261,7 +5265,7 @@ Voyager.SEEDED_PRIMITIVES = [
         const chest = getNearestBlock(bot, b => /chest|barrel|shulker/.test(b.name), 32);
         if (!chest) {
             if (depositList.length || (bot.inventory.emptySlotCount() < 2 && uncertainList.length)) {
-                markPreconditionUnmet(bot);
+                __mcPreconditionUnmet__(bot);
                 log(bot, \`PREREQUISITE FAILED: tossClutter needs chest within 32 blocks to deposit items (have \${depositList.length} deposit candidates, \${uncertainList.length} uncertain items). Place or find a chest first.\`);
                 return false;
             }
@@ -5392,7 +5396,7 @@ Voyager.SEEDED_PRIMITIVES = [
                 if (!crafted && shortfall > 0) {
                     // fix51: fail loud with structured prerequisite info for decomposition/needs-produces
                     bot.__prereqFail = { item: ingItem.name, need: shortfall + (inv[ingItem.name] || 0), have: inv[ingItem.name] || 0 };
-                    markPreconditionUnmet(bot);
+                    __mcPreconditionUnmet__(bot);
                     log(bot, \`PREREQUISITE FAILED: ensureCraftingTable needs \${shortfall} more \${ingItem.name} but cannot craft it (no 2x2 recipe or missing sub-ingredients). Decompose to obtain \${ingItem.name} first.\`);
                     return false;
                 }
@@ -5430,7 +5434,7 @@ Voyager.SEEDED_PRIMITIVES = [
                     }
                 }
             }
-            markPreconditionUnmet(bot);
+            __mcPreconditionUnmet__(bot);
             log(bot, \`PREREQUISITE FAILED: ensureCraftingTable cannot craft - missing: \${missingIngredients.join(', ')}. Decompose to obtain prerequisites.\`);
             return false;
         }

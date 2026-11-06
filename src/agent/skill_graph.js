@@ -43,6 +43,12 @@ export function signatureOf(code, name) {
     throw new Error(`[skill_graph] signatureOf: no function declaration or assignment for "${name}" in skill source`);
 }
 function stripComments(code) { return String(code).replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, ''); }
+// fix74: which of the host-reserved sandbox bindings (repo-owned code only) this code names outside comments
+export function reservedNamesUsed(code, reserved) {
+    if (!Array.isArray(reserved)) throw new Error('reservedNamesUsed: reserved must be an array of binding names');
+    const src = stripComments(code);
+    return reserved.filter(n => src.includes(n));
+}
 // fix51: strip string literals so names inside strings aren't counted as dependencies
 function stripStrings(code) {
     return String(code)
