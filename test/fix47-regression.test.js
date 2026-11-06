@@ -132,7 +132,8 @@ describe('fix47: number word parsing', () => {
     });
 
     it('should parse "Mine five iron ore" goal correctly', async () => {
-        const { parseVerboseGoal } = await import('../src/agent/voyager.js');
+        const { parseVerboseGoal, _setVersionForTest } = await import('../src/agent/voyager.js');
+        _setVersionForTest('1.20.4');  // fix49: VERSION must be set for countGoal
         const result = parseVerboseGoal('Mine five iron ore');
         
         assert.ok(result, 'Should parse the goal');

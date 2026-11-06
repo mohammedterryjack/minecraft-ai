@@ -157,18 +157,39 @@ function countGoal(task) {
     if (countParsed === null) return null;  // not a valid number
     let item = m[3].toLowerCase();
     // plural item names from the curriculum ("torches", "sticks") -> registry id
+    // fix49: fail loud if VERSION is not set (no fallback) - throw like ensureGoal does
+    if (!VERSION) throw new Error(`[fix49] LOUD FAIL: countGoal called but VERSION is null - bot version must be set before parsing goals`);
+    const md = minecraftData(VERSION);
     { const irr = { torches: 'torch' }; if (irr[item]) item = irr[item];
-      else { try { const md = minecraftData(VERSION || '1.20.4'); if (!md.itemsByName[item] && item.endsWith('s') && md.itemsByName[item.slice(0, -1)]) item = item.slice(0, -1); } catch (e) {} } }
+      else if (!md.itemsByName[item] && item.endsWith('s') && md.itemsByName[item.slice(0, -1)]) item = item.slice(0, -1); }
     // mining a block counts its loot drops too (iron_ore -> raw_iron, coal_ore -> coal, stone -> cobblestone)
     let items = [item];
     if (['mine', 'collect', 'gather', 'chop', 'get', 'obtain'].includes(verb)) {
-        try { const md = minecraftData(VERSION || '1.20.4'); for (const d of (md.blockLoot?.[item]?.drops || [])) if (!items.includes(d.item)) items.push(d.item); } catch (e) {}
+        for (const d of (md.blockLoot?.[item]?.drops || [])) if (!items.includes(d.item)) items.push(d.item);
     }
     return { count: countParsed, item, items, verb };
 }
 let VERSION = null;
 // fix46: test-only setter for VERSION (parseVerboseGoal requires VERSION to be set)
 export function _setVersionForTest(v) { VERSION = v; }
+
+// fix49: parse "ensure X" goals - places a block/item nearby (furnace, crafting_table, chest, etc.)
+// The goal item must be placed, not just in inventory - so satisfaction requires the item to exist as a block nearby
+// Uses observed state (findBlock) to check satisfaction, not skill name patterns
+function ensureGoal(task) {
+    const m = task.match(/^ensure\s+([a-z_]+)\b/i);
+    if (!m) return null;
+    const item = m[1].toLowerCase().replace(/ /g, '_');
+    // fix49: fail loud if VERSION not set - no fallback
+    if (!VERSION) {
+        throw new Error(`[fix49] LOUD FAIL: ensureGoal called but VERSION is null - bot version must be set before parsing goals`);
+    }
+    // validate item exists in registry (no hard-coded list)
+    const md = minecraftData(VERSION);
+    if (!md.itemsByName[item] && !md.blocksByName[item]) return null;
+    return { count: 1, item, items: [item], verb: 'ensure' };
+}
+
 // "Smelt 6 raw_iron into 6 iron_ingot" -> verify by output gained
 function smeltGoal(task) {
     const m = task.match(/^(?:smelt|cook)\s+(\d+)\s+([a-z_]+)\s+into\s+(\d+)\s+([a-z_]+)/i);
@@ -280,8 +301,16 @@ export class Voyager {
         this.indexFile = `${this.dir}/index.json`;
         this.progressFile = `${this.dir}/progress.json`;
         this.skills = existsSync(this.indexFile) ? JSON.parse(readFileSync(this.indexFile, 'utf8')) : [];
+        // fix49: ensure every skill has effects/consumes/stats (older skill files may not have them)
+        for (const s of this.skills) {
+            if (!s.effects) s.effects = [];
+            if (!s.consumes) s.consumes = {};
+            if (!s.stats) s.stats = newStats();
+        }
         this.progress = existsSync(this.progressFile) ? JSON.parse(readFileSync(this.progressFile, 'utf8'))
-            : { completed: [], failed: [], enabled: true };
+            : { completed: [], failed: [], enabled: true, goalStats: {} };
+        // fix49: ensure goalStats exists (older progress files may not have it)
+        if (!this.progress.goalStats) this.progress.goalStats = {};
         this.running = false;
         this.abort = false;
         this.lastPlayerMsg = 0;
@@ -644,6 +673,8 @@ export class Voyager {
                 deps: prim.deps,
                 seeded: true,
                 stats: newStats(),
+                effects: [],  // fix49: initialize effects
+                consumes: {},  // fix49: initialize consumes
                 saved: new Date().toISOString(),
             };
             // fix45: copy seeded contract if present
@@ -723,8 +754,10 @@ export class Voyager {
             const tgt = r && this.skills.find(x => x.name === r.name);
             if (!tgt || tgt.name === s.name || !(tgt.handwritten || tgt.primitive)) continue;
             // only pure variants: a real item id, and no extra behaviour in the name (e.g. craftAndPlaceChestInHut stays its own skill)
-            const g = countGoal(s.task);
-            let valid = true; try { valid = !g || !!minecraftData(VERSION || '1.20.4').itemsByName[g.item] || !!minecraftData(VERSION || '1.20.4').blocksByName[g.item]; } catch (e) {}
+            // fix49: countGoal throws if VERSION is null (fail loud) - catch to allow batch to continue
+            let g = null; try { g = countGoal(s.task); } catch (e) { if (e.message?.includes('VERSION is null')) continue; throw e; }
+            // fix49: fail loud if VERSION not set (no fallback) - countGoal already threw if null
+            let valid = true; if (g) { const md = minecraftData(VERSION); valid = !!md.itemsByName[g.item] || !!md.blocksByName[g.item]; }
             const extra = s.name.split(/(?=[A-Z])/).map(w => w.toLowerCase()).filter(w => !['craft','mine','get','obtain','collect','gather','smelt','one','two','three','four','five','six','seven','eight'].includes(w) && !(g?.item || '').split('_').some(p => p.startsWith(w) || w.startsWith(p)));
             if (!valid || extra.length) continue;
             s.mergedInto = tgt.name; s.variantCall = r.call; n++;
@@ -1290,12 +1323,14 @@ Use only c; no other globals.`;
         }
     }
     // Skill-V-style applicability precheck: is the route even runnable from the current state?
+    // fix49: VERSION must be set (fail loud, no fallback)
     _precheck(r) {
         const c = this._contract(r); if (!c) return { ok: true };
+        if (!VERSION) throw new Error(`[fix49] LOUD FAIL: _precheck called but VERSION is null`);
         const bot = this.agent.bot, inv = this.observe().inventory;
         try {
             if (c.pre === 'recipe') {
-                const md = minecraftData(VERSION || '1.20.4'); const it = md.itemsByName[c.item];
+                const md = minecraftData(VERSION); const it = md.itemsByName[c.item];
                 if (!it) return { ok: false, why: `unknown item ${c.item}` };
                 const table = bot.findBlock({ matching: md.blocksByName.crafting_table.id, maxDistance: 32 });
                 const can = bot.recipesFor(it.id, null, 1, table).length > 0;
@@ -1303,7 +1338,7 @@ Use only c; no other globals.`;
             }
             if (c.pre === 'block') {
                 if (c.item.startsWith('any')) return { ok: true };
-                const md = minecraftData(VERSION || '1.20.4'); const b = md.blocksByName[c.item];
+                const md = minecraftData(VERSION); const b = md.blocksByName[c.item];
                 if (!b) return { ok: false, why: `unknown block ${c.item}` };
                 const ids = [b.id, md.blocksByName['deepslate_' + c.item]?.id].filter(x => x !== undefined);
                 return bot.findBlock({ matching: ids, maxDistance: 64 }) ? { ok: true } : { ok: false, why: `no ${c.item} within 64 blocks` };
@@ -1389,6 +1424,16 @@ Use only c; no other globals.`;
     // library source with optional per-name code overrides (candidates under test)
     _libSrc(over = {}) { return this.skills.map(s => over[s.name] ?? s.code).join('\n\n'); }
     _graph(exclude) { const g = {}; for (const s of this.skills) if (s.name !== exclude) g[s.name] = s.deps || []; return g; }
+    
+    // fix49: check if code would create a dependency cycle - returns error message or null
+    // This is for lint feedback so the model knows which deps to avoid BEFORE the gate rejects
+    _cycleLint(skillName, code) {
+        const allNames = new Set(this.skills.map(s => s.name));
+        const deps = depsOf(code, skillName, allNames);
+        const cyc = findCycle(skillName, deps, this._graph(skillName));
+        if (!cyc) return null;
+        return `DEPENDENCY CYCLE would be created: ${cyc.join(' -> ')}\nThe skill "${skillName}" cannot call ${deps.filter(d => cyc.includes(d)).join(', ')} because they transitively depend on "${skillName}".`;
+    }
 
     // fix32: learned effects / consumption of a skill from its successful runs (union, capped) - feeds backward chaining
     // fix44: goalItems hint FILTERS which observed ups count as effects - does NOT fabricate
@@ -1485,11 +1530,26 @@ Use only c; no other globals.`;
     // fix25: prefer smeltGoal so "Smelt X into Y" checks Y (product), not X (ingredient)
     // fix45: use parseVerboseGoal as fallback for verbose goals like "craftItem: Craft 1 iron_pickaxe..."
     // fix47: enhanced to compute producible items and shortfall
+    // fix49: added ensureGoal for "ensure X" tasks - checks observed state, not skill names
     _goalAlreadySatisfied(task, state) {
-        const goal = smeltGoal(task) || countGoal(task) || parseVerboseGoal(task);  // fix45: verbose fallback
+        const goal = smeltGoal(task) || ensureGoal(task) || countGoal(task) || parseVerboseGoal(task);  // fix49: ensureGoal before countGoal
         if (!goal) return { satisfied: false, reason: 'goal not parseable as count/smelt/verbose', noLearnedCheck: true };
 
         const inv = state.inventory || {};
+        
+        // fix49: for "ensure" goals, check observed state directly (is the block nearby?)
+        // Exact block-name match only - no substring matching
+        if (goal.verb === 'ensure') {
+            if (!state.nearby) throw new Error('[fix49] state.nearby required for ensure goals');
+            const blocks = state.nearby.blocks;
+            if (!Array.isArray(blocks)) throw new Error('[fix49] state.nearby.blocks must be an array');
+            // exact match only - no includes()
+            const found = blocks.some(b => b === goal.item);
+            if (found) {
+                return { satisfied: true, reason: `${goal.item} is already placed nearby (observed state)` };
+            }
+            return { satisfied: false, reason: `${goal.item} not found nearby (need to place it)`, goal };
+        }
         
         // fix47: compute what we have + can produce (no fallback - producible is the single source)
         const shortfallInfo = this._computeShortfall(goal, inv);
@@ -1938,64 +1998,71 @@ Use only c; no other globals.`;
         // recompute shared hints if needed
         if (did.length) console.log(`[overlap] CPU maintenance overlapped with code-model: ${did.join(', ')} (${Date.now() - t0}ms)`);
     }
-    // fix37: idle practice during code-model waits - runs learned skills without requiring 30s of true idle
-    // Skills to practise are selected from the learned skill library (not hard-coded); eligibility is context-dependent
-    // Fail-loud: failures are logged, consecutive failures trigger backoff (no silent infinite loops)
+    // fix37/fix49: idle practice during code-model waits - runs learned skills without requiring 30s of true idle
+    // Skills ranked by learning value (low rate, streakFail, few trials) and plan relevance
+    // fix49: logs [idle] model_call_ms=… practice_ms=… idle_ms=… for before/after measurement
+    // fix49: empty state delta doesn't count as practice
     async _startIdlePractice(callNum) {
         if (this._idlePracticeActive) return;
         this._idlePracticeActive = true;
         this._idlePracticeAbort = false;
         const t0 = Date.now();
-        console.log(`[idle-practice] starting during code-model call #${callNum} (no 30s idle required)`);
+        let practiceMs = 0;  // fix49: track actual practice time
+        console.log(`[idle-practice] starting during code-model call #${callNum}`);
         const practice = async () => {
             let consecutiveSkips = 0;
             let practiceCount = 0;
             const MAX_CONSECUTIVE_SKIPS = 3;
             while (this._idlePracticeActive && !this._idlePracticeAbort) {
-                // select a learned skill to practice (from skill library, not hard-coded)
+                // select a learned skill to practice (ranked by learning value)
                 const skill = this._selectPracticeSkill();
                 if (!skill) {
                     console.log(`[idle-practice] no eligible skill to practice; pausing 5s`);
                     await new Promise(r => setTimeout(r, 5000));
                     consecutiveSkips++;
                     if (consecutiveSkips >= MAX_CONSECUTIVE_SKIPS) {
-                        console.log(`[idle-practice] no eligible skills after ${MAX_CONSECUTIVE_SKIPS} attempts; stopping practice loop`);
+                        console.log(`[idle-practice] no eligible skills after ${MAX_CONSECUTIVE_SKIPS} attempts; stopping`);
                         break;
                     }
                     continue;
                 }
                 consecutiveSkips = 0;
-                // run the skill in a safe, interruptible way
+                // run the skill and track time
+                const runStart = Date.now();
                 const ok = await this._runPracticeSkill(skill);
-                if (ok && ok.message) {
-                    console.log(`[idle-practice] SUCCESS ${skill.name}: ${ok.message}`);
+                const runMs = Date.now() - runStart;
+                if (ok && ok.message && ok.deltaChanged) {
+                    // fix49: only count as practice if state delta is non-empty
+                    console.log(`[idle-practice] SUCCESS ${skill.name}: ${ok.message} (practice: ${runMs}ms)`);
+                    practiceMs += runMs;
                     practiceCount++;
+                } else if (ok && ok.message) {
+                    // ran but no state change - doesn't count as practice
+                    console.log(`[idle-practice] ${skill.name}: no state delta (not counted as practice)`);
                 } else if (ok === null) {
-                    // aborted or interrupted (already logged in _runPracticeSkill)
                     break;
                 } else {
-                    // context-dependent fail logged in _runPracticeSkill; skill stays eligible
                     consecutiveSkips++;
                     if (consecutiveSkips >= MAX_CONSECUTIVE_SKIPS) {
-                        console.log(`[idle-practice] ${MAX_CONSECUTIVE_SKIPS} consecutive skips/failures; pausing practice loop`);
+                        console.log(`[idle-practice] ${MAX_CONSECUTIVE_SKIPS} consecutive skips/failures; pausing`);
                         await new Promise(r => setTimeout(r, 5000));
                         consecutiveSkips = 0;
                     }
                 }
-                // brief pause between practice attempts
                 if (this._idlePracticeActive && !this._idlePracticeAbort) {
                     await new Promise(r => setTimeout(r, 2000));
                 }
             }
-            return practiceCount;
+            return { practiceCount, practiceMs };
         };
-        this._idlePracticePromise = practice().then(count => {
-            console.log(`[idle-practice] completed ${count} practice run(s) during code-model call #${callNum}`);
+        this._idlePracticePromise = practice().then(({ practiceCount, practiceMs: pm }) => {
+            const modelCallMs = Date.now() - t0;
+            const idleMs = modelCallMs - pm;
+            // fix49: log format for before/after measurement
+            console.log(`[idle] model_call_ms=${modelCallMs} practice_ms=${pm} idle_ms=${idleMs} runs=${practiceCount}`);
         }).catch(e => {
             console.error(`[idle-practice] ERROR: ${e.message}; stopping practice`);
         }).finally(() => {
-            const elapsed = Date.now() - t0;
-            console.log(`[idle-practice] stopped after ${elapsed}ms`);
             this._idlePracticeActive = false;
         });
         return this._idlePracticePromise;
@@ -2005,43 +2072,56 @@ Use only c; no other globals.`;
         this._idlePracticeAbort = true;
         console.log(`[idle-practice] stopping (code-model call completed)`);
     }
-    // fix37: select a learned skill to practice - skills must be from the library (not hard-coded)
-    // fix42: skip skills whose postcondition is already met OR would consume scarce inputs needed elsewhere
-    // Uses maturity and recency to pick skills that benefit from practice
+    // fix37/fix49: select a learned skill to practice - ranked by learning value
+    // Learning value: low success rate, high streakFail, few trials
+    // Plan relevance: shares needs/produces with pending goal
     _selectPracticeSkill() {
-        // filter to learned, non-demoted, non-primitive skills that are safe to run as practice
-        const inv = this.observe().inventory || {};
-        const pending = this._getPendingGoalItems();  // fix42: items needed by pending/failed tasks
+        const inv = this.observe().inventory;
+        const pending = this._getPendingGoalItems();  // items needed by pending/failed tasks
         const candidates = this.skills.filter(s =>
             !s.primitive && !s.handwritten && !s.demoted && !s.mergedInto && !s.candidate &&
             s.code && s.name && s.stats &&
-            // parameterless skills only (can be called without arguments)
             /async\s+function\s+\w+\s*\(\s*bot\s*(?:,\s*\w+\s*=\s*[^,)]+)*\)/.test(s.code)
         );
         if (!candidates.length) return null;
-        // fix42: filter out skills that shouldn't be practiced right now (postcondition met or scarce inputs)
         const filtered = candidates.filter(s => {
             const skip = this._shouldSkipPractice(s, inv, pending);
             if (skip) console.log(`[idle-practice] filtering out ${s.name}: ${skip}`);
             return !skip;
         });
         if (!filtered.length) {
-            console.log(`[idle-practice] all ${candidates.length} candidate(s) filtered out by postcondition/scarce-input checks`);
+            console.log(`[idle-practice] all ${candidates.length} candidate(s) filtered out`);
             return null;
         }
-        // score by: low maturity + long since last run (skills needing practice)
-        const now = Date.now();
+        // fix49: rank by Beta-posterior uncertainty * (1 + plan_relevance)
+        // Uncertainty = (s+1)(f+1) / ((n+2)^2 * (n+3)) where s=successes, f=failures, n=s+f
+        // Skills with n=0 get max variance naturally. No hand weights or recency constants.
+        // Note: filter above ensures s.stats exists (via `s.stats &&`)
+        const pendingSize = pending.size;
         const scored = filtered.map(s => {
-            const m = this._maturity(s);
-            const lastRun = s.stats?.lastRun || 0;
-            const sinceRun = now - lastRun;
-            // prefer low-V skills that haven't run recently (need practice)
-            const score = (1 - m.V) * 0.6 + Math.min(1, sinceRun / (60 * 60 * 1000)) * 0.4;
-            return { s, score };
+            const successes = s.stats.success;
+            const failures = s.stats.fail;
+            const n = successes + failures;
+            
+            // Beta-posterior variance: (s+1)(f+1) / ((n+2)^2 * (n+3))
+            const uncertainty = ((successes + 1) * (failures + 1)) / (Math.pow(n + 2, 2) * (n + 3));
+            
+            // plan relevance = |effects ∩ pending needs| / |pending needs|
+            // effects may be empty array but never undefined (initialized at save time)
+            const effects = s.effects;
+            const intersection = effects.filter(eff => pending.has(eff)).length;
+            const planRelevance = pendingSize > 0 ? intersection / pendingSize : 0;
+            
+            // final score: uncertainty * (1 + plan_relevance)
+            const score = uncertainty * (1 + planRelevance);
+            return { s, score, reason: `n=${n} unc=${uncertainty.toFixed(4)} rel=${planRelevance.toFixed(2)}` };
         }).sort((a, b) => b.score - a.score);
-        // pick from top candidates with some randomization
-        const top = scored.slice(0, Math.min(5, scored.length));
-        return top[Math.floor(Math.random() * top.length)]?.s || null;
+        
+        if (scored.length > 0) {
+            console.log(`[idle-practice] top candidate: ${scored[0].s.name} (${scored[0].reason})`);
+        }
+        // pick the highest-scoring skill (no randomization - uncertainty is the tiebreaker)
+        return scored[0]?.s || null;
     }
     // fix42: get items needed by pending/failed tasks (from learned needs/produces, not hard-coded)
     // fix25: prefer smeltGoal so "Smelt X into Y" prioritizes Y (product), ingredients come from consumes
@@ -2064,22 +2144,23 @@ Use only c; no other globals.`;
     }
     // fix42: check if a practice skill should be skipped (postcondition already met or would consume scarce inputs)
     // Returns a skip reason string, or null if practice is allowed
+    // fix49: effects/consumes/stats initialized at load time - read directly
     _shouldSkipPractice(skill, inv, pendingItems) {
         // 1) Check if postcondition is already satisfied (learned path: check effects + inventory)
-        const effects = skill.effects || [];
+        const effects = skill.effects;
         if (effects.length > 0) {
-            const produced = effects.filter(eff => (inv[eff] || 0) > 0);
+            const produced = effects.filter(eff => inv[eff] > 0);
             // if all effects are already in inventory, postcondition is likely met
             if (produced.length === effects.length) {
                 return `postcondition already met (has all of: ${effects.join(', ')})`;
             }
         }
         // 2) Check if skill would consume scarce inputs needed by pending goals
-        const consumes = Object.keys(skill.consumes || {});
+        const consumes = Object.keys(skill.consumes);
         if (consumes.length > 0) {
             for (const item of consumes) {
-                const have = inv[item] || 0;
-                const need = skill.consumes[item] || 0;
+                const have = inv[item] || 0;  // inventory lookup: missing item = 0
+                const need = skill.consumes[item];
                 // if pending items include this consumable and we don't have much
                 if (pendingItems.has(item) && have < need * 3) {
                     return `would consume scarce ${item} (have ${have}, need ${need}, pending goal needs it)`;
@@ -2200,11 +2281,9 @@ Use only c; no other globals.`;
         this.agent.bot.__depositCandidates = lists.deposit;
         this.agent.bot.__uncertainItems = lists.uncertain || [];
     }
-    // fix37: run a practice skill safely - returns { message } on success, false on context-fail, null on abort
+    // fix37/fix49: run a practice skill safely - returns { message, deltaChanged } on success, false on context-fail, null on abort
+    // fix49: tracks state delta - empty delta means the run doesn't count as practice
     // Fail-loud: all skips and failures are logged clearly
-    // fix45: removed hard-coded health/food thresholds (bot.health < 10, bot.food < 8) per owner rule
-    // "nothing hard-coded" - low vitals must not stop the bot from acting; risks are expressed as
-    // learned facts (e.g. skill failure rates when vitals are low), not fixed numbers
     async _runPracticeSkill(skill) {
         if (this._idlePracticeAbort) return null;
         const bot = this.agent.bot;
@@ -2213,12 +2292,16 @@ Use only c; no other globals.`;
             console.log(`[idle-practice] SKIPPED ${skill.name}: bot is not idle`);
             return false;
         }
-        // fix45: threats are a real-time danger (learned from environment), keep this gate
+        // threats are a real-time danger (learned from environment), keep this gate
         const threats = this._threats();
         if (threats !== 'none') {
             console.log(`[idle-practice] SKIPPED ${skill.name}: threats nearby (${threats})`);
             return false;
         }
+        // fix49: capture state before to compute delta
+        const stateBefore = this.observe();
+        const invBefore = { ...stateBefore.inventory };
+        
         // stage and run the skill (fail-loud: log errors, rethrow critical ones)
         const call = `await ${skill.name}(bot);`;
         const full = this._libSrc() + `\n\nasync function __practice(bot) {\n    try { ${call} } catch (e) { log(bot, 'PRACTICE FAILED: ' + e.message); throw e; }\n}\nawait __practice(bot);`;
@@ -2257,6 +2340,17 @@ Use only c; no other globals.`;
             await new Promise(r => setTimeout(r, 200));
         }
         try { await runPromise; } catch (e) { /* already logged above */ }
+        
+        // fix49: compute state delta - empty delta means no practice value
+        const stateAfter = this.observe();
+        const invAfter = stateAfter.inventory || {};
+        const delta = {};
+        for (const k of new Set([...Object.keys(invBefore), ...Object.keys(invAfter)])) {
+            const diff = (invAfter[k] || 0) - (invBefore[k] || 0);
+            if (diff !== 0) delta[k] = diff;
+        }
+        const deltaChanged = Object.keys(delta).length > 0;
+        
         // record the practice run (updates stats)
         if (skill.stats) {
             skill.stats.lastRun = Date.now();
@@ -2266,7 +2360,7 @@ Use only c; no other globals.`;
         if (practiceError) {
             return false;
         }
-        return { message: `completed in ${Date.now() - practiceStart}ms` };
+        return { message: `completed in ${Date.now() - practiceStart}ms`, deltaChanged, delta };
     }
 
     // fix47: compute cheapest tool to break a block by recursing through recipes
@@ -2505,6 +2599,56 @@ Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
         console.log(`[plan] overlapped proposal "${r?.task}" is stale (${why}); re-planning`);
         return this.proposeTask(before);
     }
+    // fix49: get edible items in inventory using minecraft-data foods (game data, not a list)
+    // Returns array of { item, count, foodPoints, saturation } for items in inventory that are food
+    _getEdibleInventory(inv) {
+        if (!VERSION) throw new Error('[fix49] VERSION must be set to get edible inventory');
+        const md = minecraftData(VERSION);
+        const edible = [];
+        // md.foods is keyed by item ID; check each inventory item against it
+        for (const [itemName, count] of Object.entries(inv)) {
+            if (count <= 0) continue;
+            const item = md.itemsByName[itemName];
+            if (!item) continue;
+            const food = md.foods[item.id];
+            if (food) {
+                edible.push({
+                    item: itemName,
+                    count,
+                    foodPoints: food.foodPoints,
+                    saturation: food.saturation
+                });
+            }
+        }
+        // sort by effective quality (foodPoints + saturation)
+        return edible.sort((a, b) => (b.foodPoints + b.saturation) - (a.foodPoints + a.saturation));
+    }
+    
+    // fix49: goal backoff multiplier = posterior mean success (s+1)/(n+2) per goal+reason
+    // Decay comes only from new evidence (new successes/failures), no time constants
+    _goalBackoffMultiplier(task, reason) {
+        const key = `${task}::${reason || ''}`;
+        const stats = this.progress.goalStats[key];
+        if (!stats) return 1;  // no evidence = no backoff
+        const s = stats.success;
+        const n = stats.success + stats.fail;
+        // posterior mean: (s+1)/(n+2) - Bayesian with uniform prior
+        return (s + 1) / (n + 2);
+    }
+    
+    // fix49: record goal outcome for backoff learning (keyed by goal + failure reason)
+    // goalStats initialized at load time, entry created here on first outcome
+    _recordGoalOutcome(task, success, reason) {
+        const key = `${task}::${reason || ''}`;
+        if (!this.progress.goalStats[key]) {
+            this.progress.goalStats[key] = { success: 0, fail: 0 };
+        }
+        const entry = this.progress.goalStats[key];
+        if (success) entry.success++;
+        else entry.fail++;
+        this._saveProgress();
+    }
+    
     async proposeTask(state) {
         const system = `You are the automatic curriculum for a Minecraft bot named ${this.agent.name} (Voyager-style).
 Goal: discover as many diverse things as possible and grow a small town of its own, progressing wood -> stone -> iron -> diamond tech.
@@ -2534,10 +2678,15 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "task": "...", "contex
         const blockerHint = blockers.length > 0 
             ? `\nBLOCKERS (prioritize these - failures need tools): ${blockers.map(b => `need ${b.tool} to break ${b.block}`).join('; ')}`
             : '';
+        // fix49: pass edible inventory (from minecraft-data foods) to curriculum - let the model rank
+        const edible = VERSION ? this._getEdibleInventory(inv) : [];
+        const edibleHint = edible.length > 0 
+            ? `\nedible_inventory: ${edible.map(e => `${e.item}(${e.count}, food=${e.foodPoints})`).join(', ')}`
+            : '';
         const user = `known_skills: ${JSON.stringify(knownSkillsFacts)}
 replayable_tasks (cheap, no new code needed): ${JSON.stringify(replayableTasks)} plus any "Mine N <block or ore>", "Collect N <log>", "Get N <item>", "Smelt N <raw> into N <out>", "Kill N <mob>", "Harvest N <crop>"
 completed_tasks: ${JSON.stringify(this.progress.completed.slice(-30))}
-failed_tasks: ${JSON.stringify(this.progress.failed.slice(-15))}${blockerHint}
+failed_tasks: ${JSON.stringify(this.progress.failed.slice(-15))}${blockerHint}${edibleHint}
 --- state (compact) ---
 ${compactStateText}
 current_health: ${Math.round(bot.health)}/20\ncurrent_food: ${bot.food}/20 (20/20 = full)${this._cursorLimited() ? '\nIMPORTANT: the code-writing model is unavailable right now, so ONLY propose a task from replayable_tasks or "Mine N <block>".' : ''}${workflowHints ? '\n' + workflowHints : ''}`;   // fix31: slow-changing lists first so Ollama reuses the cached prompt prefix
@@ -2989,9 +3138,14 @@ IMPORTANT: All functions use bare names. Do NOT write skills.goToPosition - writ
             else {
                 desc = ((code.match(/\/\/\s*DESCRIPTION:\s*(.+)/) || [])[1] || e.description).trim();
                 body = code.replace(/\n\s*await\s+\w+\(bot[^)]*\);\s*$/, '').trim();
-                const staged = await this.agent.coder._stageCode(this._libSrc({ [e.name]: body }) + '\n\nawait Promise.resolve();');   // fix19: lint needs an await in main (library-only source always failed lint)
-                const lint = staged ? await this.agent.coder._lintCode(staged.src_lint_copy) : 'staging failed';
-                if (lint) err = `lint: ${String(lint).slice(0, 600)}`;
+                // fix49: check for dependency cycles BEFORE lint (feedback tells model which deps to avoid)
+                const cycleErr = this._cycleLint(e.name, body);
+                if (cycleErr) err = cycleErr;
+                else {
+                    const staged = await this.agent.coder._stageCode(this._libSrc({ [e.name]: body }) + '\n\nawait Promise.resolve();');   // fix19: lint needs an await in main (library-only source always failed lint)
+                    const lint = staged ? await this.agent.coder._lintCode(staged.src_lint_copy) : 'staging failed';
+                    if (lint) err = `lint: ${String(lint).slice(0, 600)}`;
+                }
             }
             if (!err) break;
             console.log(`[psn] repair attempt ${att} FAILED for ${e.name}: ${err.slice(0, 300)}${att < 2 ? '; retrying with the error fed back' : ''}`);
@@ -3443,6 +3597,7 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
             this.progress.failed = this.progress.failed.filter(t => t !== task);
             // fix47: clear blockers for this task when it passes
             this.progress.blockers = (this.progress.blockers || []).filter(b => b.task !== task);
+            this._recordGoalOutcome(task, true, null);  // fix49: backoff tracking
             this._saveProgress();
             this.agent.openChat?.(`Done: ${task} (already satisfied: ${alreadySatisfied.reason}).`);
             this._afterSuccess();
@@ -3460,13 +3615,17 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
             this.progress.completed.push(task); this.progress.failed = this.progress.failed.filter(t => t !== task);
             // fix47: clear blockers for this task when it passes
             this.progress.blockers = (this.progress.blockers || []).filter(b => b.task !== task);
+            this._recordGoalOutcome(task, true, null);  // fix49: backoff tracking
             this._saveProgress();
             this._subgoalDone(rp.name);
             this.agent.openChat?.(`Done: ${task} (replayed ${rp.name}).`);
             this._afterSuccess();
             return;
         }
-        if (rp && !rp.ok && !rp.interrupted) { this.progress.failed.push(task); this._saveProgress(); this._windowCheck(false); }
+        if (rp && !rp.ok && !rp.interrupted) { 
+            this._recordGoalOutcome(task, false, rp.reason || 'replay failed');  // fix49: backoff tracking
+            this.progress.failed.push(task); this._saveProgress(); this._windowCheck(false); 
+        }
         if (this._cursorLimited()) { console.log(`[voyager] skipped "${task}": needs new code but Cursor is at its limit (replay-only mode)`); return; }
         this.agent.openChat?.(`New goal: ${task}`);
         // fix28 (B): the prompt carries only the skills nomic-embed-text ranks relevant, plus their dependency closures (all skills stay defined in scope)
@@ -3611,6 +3770,7 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
                 this.progress.failed = this.progress.failed.filter(t => t !== task);
                 // fix47: clear blockers for this task when it passes
                 this.progress.blockers = (this.progress.blockers || []).filter(b => b.task !== task);
+                this._recordGoalOutcome(task, true, null);  // fix49: backoff tracking
                 this._saveProgress();
                 this._subgoalDone(fn[1]);
                 // fix44: pass goal items to filter learned effects and produces (denoise)
@@ -3638,6 +3798,7 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             lastCode = code;
             if (lastTry) { if (i < MAX_ATTEMPTS) console.log(`[voyager] stopping after attempt ${i}: ${same ? 'critique unchanged from the previous attempt' : `${cut} (travel/death cut-off)`}`); break; }
         }
+        this._recordGoalOutcome(task, false, anyCut || `failed ${MAX_ATTEMPTS}x`);  // fix49: backoff tracking
         this.progress.failed.push(task);
         this._saveProgress(); this._windowCheck(false);
         console.log(`[voyager] task failed after ${MAX_ATTEMPTS} attempts: ${task}`);
@@ -3663,6 +3824,7 @@ Voyager.SEEDED_PRIMITIVES = [
         name: 'travelTo',
         description: 'Travel long distances (hundreds of blocks) in short hops of up to 32 blocks, so chunks load and paths stay short. Returns true once within 4 blocks (horizontally) of the target.',
         task: 'travel to a distant location',
+        // fix49: use GoalNearXZ (pathfinder goal with heuristic method), not Vec3 which lacks goal interface
         code: `async function travelTo(bot, x, y, z, maxHops = 120) {
     let fails = 0;
     for (let hop = 0; hop < maxHops; hop++) {
@@ -3674,7 +3836,7 @@ Voyager.SEEDED_PRIMITIVES = [
         const step = Math.min(32, d);
         const side = fails ? (fails % 2 ? 1 : -1) * 10 * fails : 0;
         const tx = Math.round(p.x + dx / d * step - dz / d * side), tz = Math.round(p.z + dz / d * step + dx / d * side);
-        try { await goToGoal(bot, new Vec3(tx, p.y, tz), 3); fails = 0; }
+        try { await goToGoal(bot, new GoalNearXZ(tx, tz, 3)); fails = 0; }
         catch (err) {
             if (bot.interrupt_code) return false;
             if (++fails >= 6) { log(bot, \`travelTo gave up at \${p.floored()} after 6 failed hops: \${err?.message}\`); return false; }
@@ -3779,6 +3941,9 @@ Voyager.SEEDED_PRIMITIVES = [
     log(bot, \`Crafting \${itemName} produced no items.\`); return false;
 }`,
         deps: ['placeBlock', 'collectBlock'],
+        // fix49: no seeded contract - the delta-based check in _checkContracts handles this correctly
+        // The fix45 deltaGained check is the root-cause fix: when delta shows gain, the skill succeeded
+        // Adding a seeded contract with || 0 fallbacks would violate the "no fallbacks" rule
     },
     {
         name: 'attackNearest',
@@ -3848,27 +4013,39 @@ Voyager.SEEDED_PRIMITIVES = [
     },
     {
         name: 'breakBlockAt',
-        description: 'Break the block at the given position. Equips the right tool and moves within range if needed.',
+        description: 'Break the block at the given position. Equips the best available tool from inventory (no crafting) and moves within range if needed.',
         task: 'break a block',
+        // fix49: uses equipBestTool (inventory only, no crafting) to avoid dep cycle
+        // Obtaining a missing tool is the planner's job via harvestTools decompose
         code: `async function breakBlockAt(bot, x, y, z) {
     if (x == null || y == null || z == null) { log(bot, 'breakBlockAt: invalid coordinates'); return false; }
     const block = bot.blockAt(new Vec3(x, y, z));
-    if (!block || block.name === 'air' || block.name === 'water' || block.name === 'lava') {
+    if (!block) { log(bot, \`breakBlockAt: blockAt(\${x}, \${y}, \${z}) returned null (unloaded chunk?)\`); return false; }
+    if (block.name === 'air' || block.name === 'water' || block.name === 'lava') {
         log(bot, \`No solid block at \${x}, \${y}, \${z}.\`); return false;
     }
     if (bot.entity.position.distanceTo(block.position) > 4.5) {
         await goToPosition(bot, block.position.x, block.position.y, block.position.z, 4);
     }
     if (bot.game.gameMode !== 'creative') {
-        await bot.tool.equipForBlock(block);
+        // fix49: equip from inventory only (no crafting) - use equipBestTool for type needed
+        // mineflayer-tool's equipForBlock can craft, creating dep cycles
+        const harvestTools = block.harvestTools;
+        if (harvestTools) {
+            const toolTypes = ['pickaxe', 'axe', 'shovel', 'hoe'];
+            for (const tt of toolTypes) {
+                const equipped = await equipBestTool(bot, tt);
+                if (equipped && block.canHarvest(bot.heldItem?.type)) break;
+            }
+        }
         const itemId = bot.heldItem ? bot.heldItem.type : null;
-        if (!block.canHarvest(itemId)) { log(bot, \`Don't have right tools to break \${block.name}.\`); return false; }
+        if (!block.canHarvest(itemId)) { log(bot, \`FAILED: Don't have right tools to break \${block.name}. Need one of: \${Object.keys(harvestTools || {}).join(', ') || 'any tool'}\`); return false; }
     }
     await bot.dig(block, true);
     log(bot, \`Broke \${block.name} at \${x.toFixed(1)}, \${y.toFixed(1)}, \${z.toFixed(1)}.\`);
     return true;
 }`,
-        deps: [],
+        deps: ['equipBestTool'],
     },
     {
         name: 'pickupNearbyItems',
