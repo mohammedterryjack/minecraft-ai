@@ -41,7 +41,21 @@ export class VitalsModel {
         const firstRise = rose.length ? rose[0] : null;
         const below = hp < hpMax;
         const blocked = below && low.up === 0 && firstRise !== null && firstRise.f > food && low.n * (firstRise.up / firstRise.n) >= 1;
-        return { below, blocked, hp, hpMax, food, low, firstRise, raisers: this.foodRaisers() };
+        // fix59: regenFood = current food is at/above the lowest level hp has been seen rising at (null until a rise is observed)
+        const regenFood = firstRise === null ? null : food >= firstRise.f;
+        return { below, blocked, regenFood, hp, hpMax, food, low, firstRise, raisers: this.foodRaisers() };
+    }
+    // fix59: which part of the LEARNED recovery outlook changed between two recovery() results, or null if none did.
+    // Replaces _planStale's fixed "hp/food dropped by 6": vitals only invalidate a plan when they cross a learned boundary.
+    static outlookChange(a, b) {
+        if (!a || !b) throw new Error('[fix59] outlookChange needs two recovery() results');
+        const word = x => x ? 'blocked' : 'not blocked';
+        if (a.blocked !== b.blocked) return `learned health recovery changed (${word(a.blocked)} -> ${word(b.blocked)})`;
+        if (a.regenFood !== b.regenFood) {
+            const lvl = (b.firstRise === null ? a.firstRise : b.firstRise).f;
+            return `food crossed the learned regen level ${lvl} (${a.food} -> ${b.food})`;
+        }
+        return null;
     }
     // plain facts for the curriculum (no imperatives); null when hp is at max (nothing to recover)
     recoveryText(r) {

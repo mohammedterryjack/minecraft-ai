@@ -13,6 +13,7 @@ import { NeedsProducesGraph } from './needs_produces.js';
 import { RepairMemory } from './repair_memory.js';
 import { IdlePractice } from './idle_practice.js';
 import { VitalsModel } from './vitals_model.js';   // fix58
+import { SlotEffects } from './slot_effects.js';   // fix59
 // fix14: crash-safe writes (tmp file + rename)
 export function writeAtomic(fp, text) { const tmp = `${fp}.tmp-${process.pid}`; writeFileSync(tmp, text); renameSync(tmp, fp); }
 import * as world from './library/world.js';
@@ -367,6 +368,9 @@ export class Voyager {
         // fix58: learned vitals relations (food level -> hp regen, skill -> food/hp change), persisted with progress
         if (!this.progress.vitals) this.progress.vitals = { regen: {}, runs: {} };
         this.vitals = new VitalsModel(this.progress.vitals);
+        // fix59: learned per-skill inventory-slot effect (replaces the fix39 free-space name regex/list)
+        if (!this.progress.slots) this.progress.slots = { runs: {} };
+        this.slotEffects = new SlotEffects(this.progress.slots);
         this.running = false;
         this.abort = false;
         this.lastPlayerMsg = 0;
@@ -388,12 +392,7 @@ export class Voyager {
         this._setupChestTracking();
         if (!globalThis.__voyagerGuard) {
             globalThis.__voyagerGuard = true;
-            const onErr = (kind) => (err) => {
-                const t = this.currentTask || '(no task)';
-                console.error(`[voyager] !!! ${kind} during task "${t}" - counted as FAILED, process kept alive: ${err?.stack || err}`);
-                if (this.currentTask) { this.progress.failed.push(this.currentTask); this._saveProgress(); }
-                try { this.agent.bot.interrupt_code = true; this.agent.actions.stop?.(); } catch (e) {}
-            };
+            const onErr = (kind) => (err) => this._onProcessError(kind, err);
             process.on('uncaughtException', onErr('UNCAUGHT EXCEPTION'));
             process.on('unhandledRejection', onErr('UNHANDLED REJECTION'));
         }
@@ -992,7 +991,7 @@ export class Voyager {
     static CONTRACT_SPEC = `A contract is two JavaScript arrow functions over one argument c, each returning true when satisfied:
   c.args  = the call's arguments after bot (numbers/strings; objects are null)
   c.ret   = the call's return value (primitive, or null for objects)
-  c.pre / c.post = bot state before / after the call: { pos:{x,y,z}, hp (0-20), food (0-20), sky (sky light 0-15 at head height; 0 = underground or enclosed), alive (bool), dim (dimension string), inv:{item:count}, eq:{heldItem,offHand,helmet,chestplate,leggings,boots} }
+  c.pre / c.post = bot state before / after the call: { pos:{x,y,z}, hp (0-${skills.VITALS_MAX.health}), food (0-${skills.VITALS_MAX.food}), sky (sky light 0-15 at head height; 0 = underground or enclosed), alive (bool), dim (dimension string), inv:{item:count}, free (empty inventory slots), eq:{heldItem,offHand,helmet,chestplate,leggings,boots} }
   c.delta = inventory change {item: +n/-n}
   c.dist(a, b) = euclidean distance between two {x,y,z}
 pre: what must hold before the call for it to be able to succeed (use "c => true" if nothing).
@@ -1021,7 +1020,7 @@ Use only c; no other globals.`;
         if (!ct || typeof ct.post !== 'string' || typeof ct.pre !== 'string') return 'missing pre/post string';
         // fix43: include eq (equipment state) in test state for contract validation
         const eq = { heldItem: null, offHand: null, helmet: null, chestplate: null, leggings: null, boots: null };
-        const s = { pos: { x: 0, y: 64, z: 0 }, hp: 20, food: 20, sky: 15, alive: true, dim: 'overworld', inv: {}, eq };
+        const s = { pos: { x: 0, y: 64, z: 0 }, hp: skills.VITALS_MAX.health, food: skills.VITALS_MAX.food, sky: 15, alive: true, dim: 'overworld', inv: {}, free: 0, eq };   // fix59: max from VITALS_MAX
         const c = { args: [0, 64, 0, 'x', 1], ret: true, pre: s, post: s, delta: {}, dist: (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z) };
         try { for (const k of ['pre', 'post']) { const r = this._compileContract(ct[k])(c); if (typeof r !== 'boolean') return `${k} returned ${typeof r}, not boolean`; } } catch (e) { return `throws: ${e.message}`; }
         return null;
@@ -1157,6 +1156,10 @@ Use only c; no other globals.`;
     // fix58: every traced skill run with pre/post snapshots teaches that skill's observed food/hp change
     _learnVitalsEffects(trace) {
         for (const r of trace) { if (r.intr || !r.s0 || !r.s1 || !r.s0.alive || !r.s1.alive) continue; this.vitals.noteRun(r.name, r.s0, r.s1); }
+    }
+    // fix59: same traced runs teach each skill's observed inventory-slot effect (post.free - pre.free)
+    _learnSlotEffects(trace) {
+        for (const r of trace) { if (r.intr || !r.s0 || !r.s1 || !r.s0.alive || !r.s1.alive) continue; this.slotEffects.noteRun(r.name, r.s0, r.s1); }
     }
     _recovery() { const bot = this.agent.bot; return this.vitals.recovery(bot.health, skills.getVitalsMax(bot).health, bot.food); }
     // evaluate contracts on every traced library call; violations become contract failures in the trace
@@ -1338,6 +1341,17 @@ Use only c; no other globals.`;
         return `interrupted: ${what}${travelling ? ' while travelling' : ''}${under ? ` (underground: y=${Math.floor(p.y)}, surface y=${s})` : ''}`;
     }
 
+    // fix59: process-level uncaught error/rejection. Kept alive ONLY while a task step is running: the error is that step's
+    // (generated code), so the step is failed and stopped and the update loop keeps acting. Outside a step nothing owns the
+    // error and nothing will act on it, so it is fatal (agent.fatal: exit 1, launchd restarts) instead of a silent stall.
+    _onProcessError(kind, err) {
+        if (!this.running) return this.agent.fatal(`${kind} outside a task step`, err);
+        const t = this.currentTask;
+        console.error(`[voyager] !!! ${kind} during task step "${t}" - counted as FAILED, step stopped, process kept alive: ${err instanceof Error ? err.stack : String(err)}`);
+        if (t) { this.progress.failed.push(t); this._saveProgress(); }
+        this.agent.bot.interrupt_code = true;
+        this.agent.actions.stop();
+    }
     // a real player spoke: they take priority
     notePlayerMessage() {
         this.lastPlayerMsg = Date.now();
@@ -1351,8 +1365,12 @@ Use only c; no other globals.`;
     // fix28: 1 Hz motion/health samples so a death carries fall height and the damage that preceded it
     // fix51: also samples oxygen_level (bot.oxygenLevel) for drowning analysis
     _sample() {
-        const bot = this.agent.bot, now = Date.now(); if (!bot?.entity || now - (this._lastSample || 0) < 1000) return; this._lastSample = now;
+        // fix59: no catch-and-continue around this. update() runs only from agent.startEvents(), which runs after mineflayer's
+        // 'spawn' (emitted from the first update_health packet, whose handler sets bot.health/bot.food in the same emit), so
+        // entity/health/food exist by construction; if that ever breaks, fail loud here instead of being swallowed.
+        const bot = this.agent.bot, now = Date.now(); if (this._lastSample !== undefined && now - this._lastSample < 1000) return; this._lastSample = now;
         const p = bot.entity.position, h = bot.health, f = bot.food, o = bot.oxygenLevel, prev = (this._samples ||= []).slice(-1)[0];
+        VitalsModel._nums({ 'bot.health': h, 'bot.food': f });
         if (prev) this.vitals.observeSample(prev, { h, f }, skills.getVitalsMax(bot).health);   // fix58: learn food level -> hp regen
         const hit = prev && h < prev.h ? { t: now, dmg: +(prev.h - h).toFixed(1), near: (() => { const e = bot.nearestEntity(x => x !== bot.entity && x.type !== 'object' && x.position.distanceTo(p) < 8); return e ? `${e.name || e.username} ${e.position.distanceTo(p).toFixed(0)}m` : 'no entity within 8m'; })(), onGround: bot.entity.onGround, inLava: !!bot.entity.isInLava, inWater: !!bot.entity.isInWater } : null;
         this._samples.push({ t: now, y: p.y, h, f, o, hit }); if (this._samples.length > 30) this._samples.shift();
@@ -1388,7 +1406,7 @@ Use only c; no other globals.`;
         return `; fall height ${fall} blocks in the last 10s; damage taken: ${hits.length ? hits.join(', ') : 'none sampled'}${oxygenTrend}${itemsLost}`;
     }
     update() {
-        try { this._sample(); } catch (e) { console.log('[death] sampler error: ' + e.message); }
+        this._sample();   // fix59: fail loud (was catch-and-continue)
         if (!this.enabled || this.running) {
             this.idlePractice.markBusy();
             return;
@@ -2305,17 +2323,18 @@ Use only c; no other globals.`;
     catalogue(only) {
         return this.skills.filter(s => !s.demoted && !s.mergedInto && (!only || only.has(s.name))).map(s => `- ${signatureOf(s.code, s.name)}${s.handwritten ? ' [handwritten]' : ''}: ${s.description}`).join('\n');
     }
-    // fix39 (#18): enriched known_skills for decompose/curriculum - includes descriptions for primitives and space-freeing skills
-    // so the local model can propose free-space subgoals when inventory is full (learned path, not hard-coded rules)
+    // fix39 (#18): enriched known_skills for decompose/curriculum - descriptions for primitives and for skills that free space
+    // fix59: "frees space" is LEARNED (mean empty-slot gain over the skill's traced runs, SlotEffects), not a name regex/list
     _knownSkillsFacts() {
-        const freeSpaceKeywords = /deposit|toss|clutter|chest|discard|free.*space|store.*item/i;
-        const importantSkills = new Set(['depositToChest', 'tossClutter', 'tossItem', 'ensureChest']);
         return this.skills.filter(s => !s.demoted && !s.mergedInto).map(s => {
-            const desc = s.description || '';
-            const isFreeSpace = importantSkills.has(s.name) || freeSpaceKeywords.test(s.name) || freeSpaceKeywords.test(desc);
+            if (typeof s.description !== 'string') throw new Error(`[fix59] skill ${s.name} has no description`);
+            const desc = s.description;
+            const eff = this.slotEffects.effect(s.name);
+            const frees = eff !== null && eff.freed > 0;
             const isPrimitive = s.primitive || s.seeded;
-            if (isFreeSpace || isPrimitive) return `${s.name}: ${desc.slice(0, 120)}`;
-            return s.name;
+            if (!frees && !isPrimitive) return s.name;
+            const learned = frees ? ` (observed: frees ${eff.freed.toFixed(1)} inventory slots/run over ${eff.n} runs)` : '';
+            return `${s.name}: ${desc.slice(0, 120)}${learned}`;
         });
     }
     // fix47: retrieve relevant built-in API functions by embedding search + skill deps
@@ -3101,9 +3120,10 @@ Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
                 if (r?.context) this._prefetchRelatedEmbeds(r.context);
                 return r;
             }, e => { console.log(`[plan] prefetch failed: ${e.message}`); return null; });
-        this._plan = { p, task, basis: before, t: t0 };
+        this._plan = { p, task, basis: before, t: t0, rec: this._recovery() };   // fix59: learned recovery outlook the plan was made under
     }
-    _planStale(pl, r, now) {
+    // fix59: nowRec = learned recovery outlook now; vitals make the plan stale only when the learned outlook changed (no fixed hp/food drop)
+    _planStale(pl, r, now, nowRec) {
         if (!r?.task) return 'no proposal';
         if (Date.now() - pl.t > 20 * 60e3) return 'older than 20 min';
         const last = this.progress.failed.slice(-1)[0];
@@ -3112,16 +3132,15 @@ Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
         const P = s => s.position.split(',').map(Number), [a, b] = [P(pl.basis), P(now)];
         if (Math.hypot(a[0] - b[0], a[2] - b[2]) > 32) return 'the bot moved more than 32 blocks';
         const ph = s => s.time.split(' ')[0]; if (ph(pl.basis) !== ph(now)) return `time of day changed (${ph(pl.basis)} -> ${ph(now)})`;
-        if (parseInt(now.health) < parseInt(pl.basis.health) - 6 || parseInt(now.food) < parseInt(pl.basis.food) - 6) return 'health/food dropped';
         if ((now.threats === 'none') !== (pl.basis.threats === 'none')) return 'threat situation changed';
-        if (now.health_recovery_blocked !== pl.basis.health_recovery_blocked) return `learned health recovery changed (${pl.basis.health_recovery_blocked ? 'blocked' : 'not blocked'} -> ${now.health_recovery_blocked ? 'blocked' : 'not blocked'})`;   // fix58
+        const vit = VitalsModel.outlookChange(pl.rec, nowRec); if (vit) return vit;   // fix58/fix59
         if (now.recent_deaths !== pl.basis.recent_deaths) return 'the bot died since';
         return null;
     }
     async _takePlan(before) {
         const pl = this._plan; this._plan = null;
         if (!pl) return this.proposeTask(before);
-        const r = await pl.p, why = this._planStale(pl, r, before);
+        const r = await pl.p, why = this._planStale(pl, r, before, this._recovery());
         if (!why) { console.log(`[plan] using the overlapped proposal (planned during "${pl.task}")`); return r; }
         console.log(`[plan] overlapped proposal "${r?.task}" is stale (${why}); re-planning`);
         return this.proposeTask(before);
@@ -3235,6 +3254,7 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "task": "...", "contex
             : '';
         // fix58: learned recovery facts (food level -> hp regen, skills' observed food change) so the ranking can weigh recovery
         const rec = this._recovery(), recText = this.vitals.recoveryText(rec);
+        const vmax = skills.getVitalsMax(bot);   // fix59: one source for hp/food max (was literal /20)
         if (rec.blocked) console.log(`[vitals] ${recText}`);
         const recoveryHint = recText ? `\n${recText}` : '';
         const user = `known_skills: ${JSON.stringify(knownSkillsFacts)}
@@ -3243,7 +3263,7 @@ completed_tasks: ${JSON.stringify(this.progress.completed.slice(-30))}
 failed_tasks: ${JSON.stringify(this.progress.failed.slice(-15))}${blockerHint}${edibleHint}${recoveryHint}
 --- state (compact) ---
 ${compactStateText}
-current_health: ${Math.round(bot.health)}/20\ncurrent_food: ${bot.food}/20 (20/20 = full)${this._cursorLimited() ? '\nIMPORTANT: the code-writing model is unavailable right now, so ONLY propose a task from replayable_tasks or "Mine N <block>".' : ''}${workflowHints ? '\n' + workflowHints : ''}`;   // fix31: slow-changing lists first so Ollama reuses the cached prompt prefix
+current_health: ${Math.round(bot.health)}/${vmax.health}\ncurrent_food: ${bot.food}/${vmax.food} (${vmax.food}/${vmax.food} = full)${this._cursorLimited() ? '\nIMPORTANT: the code-writing model is unavailable right now, so ONLY propose a task from replayable_tasks or "Mine N <block>".' : ''}${workflowHints ? '\n' + workflowHints : ''}`;   // fix31: slow-changing lists first so Ollama reuses the cached prompt prefix
         const facts = recipeFacts(this.progress.failed.slice(-5).join(' '));
         const finalUser = facts ? user + '\n' + facts : user;
         // fix47: per-prompt breakdown logging for curriculum
@@ -3512,6 +3532,7 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         annotateTrace(trace, bot.__psnOut || '');
         this._checkContracts(trace, ok);   // fix22: learned pre/postconditions against real state
         this._learnVitalsEffects(trace);   // fix58
+        this._learnSlotEffects(trace);   // fix59
         // candidate children: their contract result in this run is a trial run (regression gate)
         for (const name of Object.keys(over)) {
             if (name === root) continue;

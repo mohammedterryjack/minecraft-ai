@@ -121,9 +121,11 @@ describe('fix58: wiring into voyager', () => {
         const v = Object.create(Voyager.prototype);
         v.progress = { failed: [] };
         const basis = { position: '0, 0, 0', time: 'day (1)', health: '17/20', food: '18/20', threats: 'none', recent_deaths: 'none', health_recovery_blocked: false };
-        const pl = { t: Date.now(), task: 'Mine 1 iron_ore', basis };
-        assert.strictEqual(v._planStale(pl, { task: 'Mine 1 diamond_ore' }, { ...basis }), null);
-        assert.match(v._planStale(pl, { task: 'Mine 1 diamond_ore' }, { ...basis, food: '17/20', health_recovery_blocked: true }), /learned health recovery changed/);
+        // fix59: the learned recovery outlook travels with the plan (pl.rec) and is compared with the current one
+        const m = learnedFromReal(); feed(m, REAL.stuck);
+        const pl = { t: Date.now(), task: 'Mine 1 iron_ore', basis, rec: m.recovery(17, HPMAX, 18) };
+        assert.strictEqual(v._planStale(pl, { task: 'Mine 1 diamond_ore' }, { ...basis }, m.recovery(17, HPMAX, 18)), null);
+        assert.match(v._planStale(pl, { task: 'Mine 1 diamond_ore' }, { ...basis, food: '17/20', health_recovery_blocked: true }, m.recovery(17, HPMAX, 17)), /learned health recovery changed/);
     });
     it('curriculum prompt carries the learned recovery facts in the stuck state', async () => {
         const m = learnedFromReal(); feed(m, REAL.stuck);

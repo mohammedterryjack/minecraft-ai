@@ -143,7 +143,7 @@ describe('fix56 trace snapshots read the real inventory (root cause of the mineO
         const inv = { raw_iron: 1 };
         const bot = {
             __psnALS: new AsyncLocalStorage(), output: '', health: 20, food: 20, oxygenLevel: 300, game: { dimension: 'overworld' }, quickBarSlot: 0,
-            inventory: { slots: [] }, entity: { position: { x: 0, y: 32, z: 0, floored() { return { offset: () => ({}) }; } } },
+            inventory: { slots: [], emptySlotCount: () => 35 }, entity: { position: { x: 0, y: 32, z: 0, floored() { return { offset: () => ({}) }; } } },
             blockAt: () => ({ skyLight: 0 }), waitForTicks: async () => {},
         };
         const getInventoryCounts = () => ({ ...inv });
