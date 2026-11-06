@@ -2061,9 +2061,13 @@ Use only c; no other globals.`;
     // Skill-V style regression check: rerun a candidate on one recorded past task that has a deterministic inventory check
     async _regressionRun(entry, code) {
         if (!/async\s+function\s+\w+\s*\(\s*bot\s*\)/.test(code)) return null;   // parameterised: can't rerun blindly -> trial runs instead
-        const past = (entry.stats?.tasks || []).slice().reverse().find(t => countGoal(t) || smeltGoal(t));
-        if (!past) return null;
-        const goal = smeltGoal(past) || countGoal(past);
+        // fix51: a past task is a valid regression check only if its goal items are among the skill's learned effects;
+        // callee skills (e.g. pickupNearbyItems) inherit their caller's task in stats and can't satisfy it alone
+        if (!Array.isArray(entry.effects)) { gateLog(`regression rerun of ${entry.name}: no learned effects; trial runs instead`); return null; }
+        const goalOf = t => smeltGoal(t) || countGoal(t);
+        const past = (entry.stats?.tasks || []).slice().reverse().find(t => { const g = goalOf(t); return g && g.items.some(it => entry.effects.includes(it)); });
+        if (!past) { gateLog(`regression rerun of ${entry.name}: no past task whose goal overlaps learned effects [${entry.effects.join(', ')}]; trial runs instead`); return null; }
+        const goal = goalOf(past);
         const before = this.observe();
         gateLog(`regression rerun of candidate ${entry.name} on past task "${past}"`);
         const staged = await this.agent.coder._stageCode(this._libSrc({ [entry.name]: code }) + `\n\nawait ${entry.name}(bot);`);
@@ -4195,6 +4199,7 @@ Voyager.SEEDED_PRIMITIVES = [
         code: `async function tossClutter(bot, minFree = 4) {
     const start = bot.entity.position.clone();
     let tossed = 0;
+    let depositedTotal = 0;
     // fix51: fail loud if signals not initialized (no fallback)
     if (!Array.isArray(bot.__safeToToss)) {
         log(bot, 'FAIL LOUD: bot.__safeToToss not initialized (voyager._prepareTossSignals not called before tossClutter)');
@@ -4260,6 +4265,7 @@ Voyager.SEEDED_PRIMITIVES = [
                 if (ok) deposited++;
                 else depositFailed = true;
             }
+            depositedTotal = deposited;
             if (deposited) console.log(\`[toss] deposited \${deposited} item type(s) to chest (empty slots now \${bot.inventory.emptySlotCount()})\`);
             if (bot.inventory.emptySlotCount() < minFree && !bot.interrupt_code) {
                 if (depositFailed) {
@@ -4281,7 +4287,8 @@ Voyager.SEEDED_PRIMITIVES = [
         }
         return false;  // fix51: explicit failure so postcondition isn't evaluated
     }
-    return true;  // fix51: success when emptySlotCount >= minFree
+    // fix51: return stacks removed (0 when space was already free) so a truthy ret always means inventory shrank (seeded post)
+    return tossed + depositedTotal;
 }`,
         deps: ['moveAway', 'depositToChest'],
     },

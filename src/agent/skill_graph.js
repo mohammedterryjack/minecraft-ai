@@ -91,7 +91,8 @@ export function missingCalls(code, name, names) {
         local.add(m[1]);
     }
     
-    const builtins = new Set(['if','for','while','switch','return','catch','function','await','async','Math','Promise','setTimeout','Number','String','Array','Object','Set','Map','JSON','Vec3','log','parseInt','parseFloat','isNaN','Boolean','Error','Date','require','console']);
+    // fix51: JS builtins derived from the real global object (isFinite, encodeURIComponent, ...), not a hand list
+    const builtins = new Set(Object.getOwnPropertyNames(globalThis));
     const out = new Set();
     const re = /(?<![.\w])([a-z]\w*[A-Z]\w*)\s*\(/g;   // camelCase bare calls only
     let m;

@@ -792,8 +792,8 @@ describe('fix51 issue 17b: tossClutter return value fix', async () => {
             'tossClutter should NOT return emptySlotCount on failure');
         assert.ok(section.includes('return false;'),
             'tossClutter should return false on failure');
-        assert.ok(section.includes('return true;'),
-            'tossClutter should return true on success');
+        assert.ok(section.includes('return tossed + depositedTotal;'),
+            'tossClutter should return stacks removed on success (truthy only when inventory shrank)');
     });
 
     it('tossClutter does not use magic sleep timer', async () => {
