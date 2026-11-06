@@ -76,9 +76,16 @@ function patternNames(p) {
 //        skill next to its own function of the same name has a shape this rule can name. As a module it does not parse at all
 //        ("Identifier 'craftSticks' has already been declared (47:15)", live 19:07:36 GMT), and fix82's rule never saw it: the
 //        model was told only the parse error. Whether the code is valid module code is the lint's question (_parseError), not this.
+// true when `code` parses as a script; otherwise the parse error text (callers must check === true: the text is not a boolean)
 export function parsesAsScript(code) {
-    try { acorn.parse(String(code), { ecmaVersion: 'latest', sourceType: 'script', allowAwaitOutsideFunction: true }); return true; }
-    catch (e) { return false; }
+    try {
+        acorn.parse(String(code), { ecmaVersion: 'latest', sourceType: 'script', allowAwaitOutsideFunction: true });
+        return true;
+    } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (!msg) throw new Error('[skill_graph] parsesAsScript: parse failed with no message');
+        return msg;
+    }
 }
 export function topLevelStatements(code) {
     let ast;

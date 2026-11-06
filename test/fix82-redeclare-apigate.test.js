@@ -217,7 +217,7 @@ describe('fix82 (2): craftItem "Cannot read properties of undefined (reading \'f
         assert.match(src, /const apiErr = this\.agent\.coder\._apiGate\(code, \[\.\.\.names\]\);/);
         // writeCode: the shape lint runs before staging, and what is saved is the AST-cut source
         // fix83: the shape is read first (script parse), then the lint
-        assert.match(src, /const split = parsesAsScript\(code\) \? splitGeneratedCode\(code, own\) : null;\n\s*let lint = split !== null && split\.violations\.length \? oneFunctionFeedback\(own, split\.violations, pastedLibrarySkills\(code, own, libraryNames\)\) : null;\n\s*if \(lint === null\) lint = this\.agent\.coder\.userGeneratedCodeLintBlockers\(code, this\.skills\.map\(s => s\.name\)\);/);
+        assert.match(src, /const scriptParse = parsesAsScript\(code\);\n\s*const split = scriptParse === true \? splitGeneratedCode\(code, own\) : null;\n\s*let lint = scriptParse !== true \? `does not parse as a script: \$\{scriptParse\}` : \(split\.violations\.length \? oneFunctionFeedback\(own, split\.violations, pastedLibrarySkills\(code, own, libraryNames\)\) : null\);\n\s*if \(lint === null\) lint = this\.agent\.coder\.userGeneratedCodeLintBlockers\(code, this\.skills\.map\(s => s\.name\)\);/);
         assert.match(src, /await this\.saveSkill\(own, desc\.trim\(\), split\.skillSource, task\);/);
         assert.doesNotMatch(src.split('\n').filter(l => !l.trimStart().startsWith('//')).join('\n'), /code\.replace\(\/\\n\\s\*await\\s\+\\w\+\\\(bot/);
     });

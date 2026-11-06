@@ -14,6 +14,7 @@ import { EventEmitter } from 'node:events';
 import { createRequire } from 'node:module';
 import Registry from 'prismarine-registry';
 import { _setVersionForTest } from '../src/utils/mcdata.js';
+import { PLAYER_WINDOW } from '../src/utils/carried.js';
 
 const require = createRequire(import.meta.url);
 const injectInventory = require('mineflayer/lib/plugins/inventory.js');
@@ -78,7 +79,7 @@ function skillBot(over = {}) {
         interrupt_code: false,
         currentWindow: null,
         game: { gameMode: 'survival' },
-        inventory: { slots: new Array(46).fill(null), items() { return this.slots.filter(Boolean); }, emptySlotCount: () => 30,
+        inventory: { slots: new Array(PLAYER_WINDOW.size).fill(null), inventoryStart: PLAYER_WINDOW.mainStart, inventoryEnd: PLAYER_WINDOW.offHand, items() { return this.slots.filter(Boolean); }, emptySlotCount: () => 30,
             findInventoryItem(name) { return this.slots.find(s => s && s.name === name); } },
         closed: [],
         async closeWindow(w) { if (w == null) throw new TypeError("Cannot read properties of null (reading 'id')"); this.closed.push(w); this.currentWindow = null; },
@@ -160,7 +161,7 @@ describe('fix69: equip / consume window cleanup in finally', () => {
 });
 
 describe('fix69: pickupNearbyItems uses goToGoal\'s result instead of catching', () => {
-    const item = { name: 'item', isValid: true, position: { x: 3, y: 64, z: 0 } };
+    const item = { name: 'item', isValid: true, position: { x: 3, y: 64, z: 0 }, getDroppedItem() { return { name: 'oak_log', count: 1 }; } };
 
     it('an interrupt (goToGoal -> false) ends the pickup with false instead of retrying', async () => {
         const { pickupNearbyItems } = await import('../src/agent/library/skills.js');

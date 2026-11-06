@@ -16,6 +16,7 @@ import { checkNeedSource, needInterruptSource, isUnblamedInterruptKind, sampleBe
 import { peekPreconditionUnmet, clearPreconditionUnmet, checkNeed } from './precondition.js';   // fix76; fix81: structured needs (markPreconditionUnmet is called by seeded code)
 import { SlotEffects } from './slot_effects.js';   // fix59
 import { obtainPlanner } from './recipe_plan.js';   // fix81
+import { stackableCounts, emptySlotsToFit, bestSlotFreeingCraft, surplusFromConsumption, slotsFreedBy } from './slot_room.js';   // fix84
 // fix14: crash-safe writes (tmp file + rename)
 export function writeAtomic(fp, text) { const tmp = `${fp}.tmp-${process.pid}`; writeFileSync(tmp, text); renameSync(tmp, fp); }
 import * as world from './library/world.js';
@@ -1071,8 +1072,9 @@ export class Voyager {
   c.pre / c.post = bot state before / after the call: { pos:{x,y,z}, hp (0-${skills.VITALS_MAX.health}), food (0-${skills.VITALS_MAX.food}), sky (sky light 0-15 at head height; 0 = underground or enclosed), alive (bool), dim (dimension string), inv:{item:count}, free (empty inventory slots), eq:{heldItem,offHand,helmet,chestplate,leggings,boots} }
   c.delta = inventory change {item: +n/-n}
   c.dist(a, b) = euclidean distance between two {x,y,z}
-  c.game.item(name) / c.game.block(name) = true when name is an item / a block in the game data; c.game.drops(block) = names of the items that block drops
+  c.game.item(name) / c.game.block(name) = true when name is an item / a block in the game data; c.game.drops(block) = names of the items that block drops; c.game.harvestTools(block) = the tools that block drops with, or null when the game data lists none
 NEVER enumerate item, block or kind names in a list (e.g. ['birch_log', 'spruce_log'].includes(c.args[1])): a hand-written list leaves out real values (oak_log) and every call with one of them is refused. Derive membership from c.game (game data) or from the observed state (c.pre / c.post).
+A postcondition must not require a held or returned item that a named block's harvestTools omit.
 pre: what must hold before the call for it to be able to succeed (use "c => true" if nothing).
 post: what the call promises afterwards when it reports success (state the observable effect: arrived near target, item gained, still alive, not stranded underground, etc.). If the call returns false/null it already reported failure, so post may return true in that case.
 IMPORTANT for equip skills: postconditions should check c.post.eq (equipment state) rather than c.delta for idempotency - already-equipped items should satisfy the postcondition without requiring an inventory change.
@@ -1104,6 +1106,17 @@ Use only c; no other globals.`;
                 if (typeof n !== 'string' || !Object.hasOwn(reg().blocksByName, n)) return [];
                 return reg().blocksByName[n].drops.map(d => reg().items[typeof d === 'number' ? d : d.drop.id].name);
             },
+            // fix84: null when the block is unknown or the game data gives it no tool list (it drops by hand)
+            harvestTools: n => {
+                if (typeof n !== 'string' || !Object.hasOwn(reg().blocksByName, n)) return null;
+                const ht = reg().blocksByName[n].harvestTools;
+                if (!ht) return null;
+                return Object.keys(ht).map(id => {
+                    const it = reg().items[id];
+                    if (!it) throw new Error(`[fix84] harvestTools id ${id} of ${n} is not an item`);
+                    return it.name;
+                });
+            },
         };
     }
     _contractCtx(fields) { return { ...fields, dist: (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z), game: this._contractGame() }; }
@@ -1116,6 +1129,12 @@ Use only c; no other globals.`;
         // fix83: an enumerated list of names is not a contract (live collectLogs, learned by the free fallback model 2026-11-05
         //        18:59:15 GMT: ['birch_log', ..., 'warped_stem'].includes(c.args[1]) refused collectLogs(2, 'oak_log') x36)
         for (const k of ['pre', 'post']) { const lists = Voyager.contractNameLists(ct[k]); if (lists.length) return `${k} enumerates names ${lists.join(', ')}; derive membership from c.game (game data) or the observed state, never a list`; }
+        // fix84: a single name is not a list, so fix83 accepts `heldItem === 'iron_shovel'` for iron_ore. harvestTools does not.
+        //        The game data is the version's (the same source countGoal uses); a contract is checked before a bot exists.
+        const reg = minecraftData(VERSION);
+        if (!reg || !reg.blocksByName || !reg.items) throw new Error(`[fix84] _validContract: no game data for version ${JSON.stringify(VERSION)}`);
+        const tools = Voyager.contractToolMismatches([ct.pre, ct.post], reg);
+        if (tools !== null) return tools;
         const c = this._contractCtx({ args: [0, 64, 0, 'x', 1], ret: true, pre: s, post: s, delta: {} });
         try { for (const k of ['pre', 'post']) { const r = this._compileContract(ct[k])(c); if (typeof r !== 'boolean') return `${k} returned ${typeof r}, not boolean`; } } catch (e) { return `throws: ${e.message}`; }
         return null;
@@ -1138,6 +1157,59 @@ Use only c; no other globals.`;
         };
         walk(ast);
         return out;
+    }
+    // fix84: a postcondition that requires a held or returned item the named block's harvestTools omit
+    // (equipBestToolForIronOre: heldItem === 'iron_shovel' while iron_ore drops only with a pickaxe). A single
+    // string is not an enumerated list, so fix83's contractNameLists does not see it.
+    static contractToolMismatches(sources, registry) {
+        if (!Array.isArray(sources)) throw new Error('[fix84] contractToolMismatches: sources required');
+        if (!registry || !registry.blocksByName || !registry.items) throw new Error('[fix84] contractToolMismatches: registry required');
+        const blocks = new Set(), tools = new Set();
+        const eq = (a, b) => a.length === b.length && a.every((x, i) => x === b[i]);
+        const pathOf = (node, param) => {
+            if (param === null) return null;
+            const keys = [];
+            let n = node;
+            while (n && n.type === 'MemberExpression') {
+                if (!n.computed) keys.unshift(n.property.name);
+                else if (n.property.type === 'Literal') keys.unshift(String(n.property.value));
+                else keys.unshift('*');
+                n = n.object;
+            }
+            if (!n || n.type !== 'Identifier' || n.name !== param) return null;
+            return keys;
+        };
+        for (const src of sources) {
+            const ast = acorn.parse(`(${String(src)})`, { ecmaVersion: 'latest' });
+            const root = ast.body[0].expression;
+            const param = root.params && root.params[0] && root.params[0].type === 'Identifier' ? root.params[0].name : null;
+            const walk = n => {
+                if (!n || typeof n.type !== 'string') return;
+                if (n.type === 'Literal' && typeof n.value === 'string' && Object.hasOwn(registry.blocksByName, n.value) && registry.blocksByName[n.value].harvestTools) blocks.add(n.value);
+                if ((n.type === 'BinaryExpression' && (n.operator === '===' || n.operator === '=='))) {
+                    const sides = [[n.left, n.right], [n.right, n.left]];
+                    for (const [lit, other] of sides) {
+                        if (lit.type !== 'Literal' || typeof lit.value !== 'string') continue;
+                        const p = pathOf(other, param);
+                        if (p !== null && (eq(p, ['post', 'eq', 'heldItem']) || eq(p, ['ret']))) tools.add(lit.value);
+                    }
+                }
+                for (const v of Object.values(n)) { if (Array.isArray(v)) v.forEach(walk); else if (v && typeof v === 'object' && typeof v.type === 'string') walk(v); }
+            };
+            walk(ast);
+        }
+        const msgs = [];
+        for (const tool of [...tools].sort()) {
+            for (const block of [...blocks].sort()) {
+                const names = Object.keys(registry.blocksByName[block].harvestTools).map(id => {
+                    const it = registry.items[id];
+                    if (!it) throw new Error(`[fix84] harvestTools id ${id} of ${block} is not an item`);
+                    return it.name;
+                });
+                if (!names.includes(tool)) msgs.push(`post expects '${tool}' for block '${block}', whose harvestTools are ${names.join(', ')}`);
+            }
+        }
+        return msgs.length ? msgs.join('; ') : null;
     }
     // fix51: parse a contract with acorn; returns { root, param, src } where root is the contract function node
     _parseContract(contractSrc) {
@@ -2595,11 +2667,13 @@ Use only c; no other globals.`;
     _goalKey(goal) {
         if (goal.kind === 'ensure') return `placed ${goal.item}`;
         if (goal.kind === 'reach') return `reach ${goal.item}`;   // fix83
+        if (goal.kind === 'skill') return `skill ${goal.skill.name}`;   // fix84
         return goal.item;
     }
     _needKey(need) {
         if (need.reason === 'proximity') return `placed ${need.item}`;
         if (need.reason === 'reach') return `reach ${need.item}`;   // fix83
+        if (need.reason === 'slot') return 'slot';   // fix84: any full-inventory need is the same missing slot
         return need.item;
     }
     // fix81: every failure that is not a library fault says what it lacks, as structured facts { item | anyOf, count, reason }:
@@ -2652,7 +2726,9 @@ Use only c; no other globals.`;
                 item = ch.item;
             }
             const need = { item, count: n.count, reason: n.reason, source: n.source };
-            if (goal.kind === 'item' && item === goal.item && n.reason !== 'proximity' && n.reason !== 'reach') {
+            // fix84: a slot need names the drop that will not fit. That item IS the collect goal, and expanding it
+            //        into the goal's own prerequisites would ask for the same item again instead of a free slot.
+            if (goal.kind === 'item' && item === goal.item && n.reason !== 'proximity' && n.reason !== 'reach' && n.reason !== 'slot') {
                 // the goal's own item could not be made: what it lacks is its own game-data prerequisites
                 const own = this._failureNeeds(task, null, null, state);
                 if (own === null) { console.log(`[backchain] "${task}": ${item} reported missing, but the game data shows nothing it lacks`); continue; }
@@ -2668,16 +2744,20 @@ Use only c; no other globals.`;
             this._recordGoalOutcome(task, false, `prerequisite still missing: ${desc}`);
             return true;
         }
-        const below = goal.kind === 'item' || goal.kind === 'ensure' || goal.kind === 'reach' ? [...chain, this._goalKey(goal)] : chain;
-        for (const n of resolved) if (below.includes(this._needKey(n))) throw new Error(`[fix81] LOUD: subgoal cycle ${[...below, this._needKey(n)].join(' -> ')} (need of "${task}")`);
-        const subs = resolved.map(n => {
-            if (n.reason === 'proximity') return { task: `ensure ${n.item}`, need: n, edge: null };
-            if (n.reason === 'reach') return { task: `reach ${n.item}`, need: n, edge: null };   // fix83: no source within reach
-            // a learned producer first (its learned task); else the game's recipe/loot data, an UNTRIED edge until a run proves it
-            const learned = this._subgoalToObtainItem(n.item, n.count, inv, new Set());
-            if (learned !== null) return { task: learned, need: n, edge: null };
-            return { task: this._obtainPlanner(state).prerequisites(n.item, n.count, inv).task, need: n, edge: n.item };
-        });
+        const keyed = goal.kind === 'item' || goal.kind === 'ensure' || goal.kind === 'reach' || goal.kind === 'skill';
+        const below = keyed ? [...chain, this._goalKey(goal)] : chain;
+        const subs = [];
+        for (const n of resolved) {
+            const key = this._needKey(n);
+            // fix84: a slot need whose key is already on the chain is the chest→logs→slot loop. A craft whose net
+            //        slot change (stack sizes) is negative breaks it; otherwise it is a real cycle and throws.
+            if (below.includes(key)) {
+                if (n.reason !== 'slot') throw new Error(`[fix81] LOUD: subgoal cycle ${[...below, key].join(' -> ')} (need of "${task}")`);
+                subs.push(this._breakSlotCycle(task, below, n));
+                continue;
+            }
+            subs.push(this._subgoalForNeed(n, state));
+        }
         const edges = this.progress.recipeEdges;
         for (const sb of subs) if (sb.edge !== null && !Object.hasOwn(edges, sb.edge)) edges[sb.edge] = { task: sb.task, status: 'untried', runs: 0, fails: 0 };
         const d = (this.progress.decomposed ||= {}), q = (this.progress.subgoals ||= []);
@@ -2695,17 +2775,21 @@ Use only c; no other globals.`;
             return { item: n.item, count: held + n.count };
         };
         q.unshift(...subs.map(sb => {
-            const entry = { task: sb.task, parent: task, depth: depth + 1, chain: below, edge: sb.edge };
+            // fix84: descendants of a slot need see 'slot' on the chain, so the logs a chest needs notice the loop
+            const entryChain = sb.need.reason === 'slot' ? [...below, 'slot'] : below;
+            const entry = { task: sb.task, parent: task, depth: depth + 1, chain: entryChain, edge: sb.edge };
             const t = target(sb.need, sb.task);
             if (t !== null) entry.atLeast = t;
             return entry;
         }), { task, retry: true, prereq: true, depth, chain });
         // fix47's curriculum blockers, now from the structured needs (was the "Cannot break X" critic text); fix83: resolved once
-        //        the bot HOLDS what the goal needs (held at the failure + shortfall), not once it holds the shortfall
+        //        the bot HOLDS what the goal needs (held at the failure + shortfall), not once it holds the shortfall.
+        //        fix84: a slot's count is how many more will not fit, not an absolute stack to hold.
         this.progress.blockers = this.progress.blockers.filter(b => b.task !== task);
+        const shortfallOnly = new Set(['proximity', 'reach', 'slot']);
         for (const n of resolved) {
             const held = Object.hasOwn(inv, n.item) ? inv[n.item] : 0;
-            this.progress.blockers.push({ item: n.item, count: n.reason === 'proximity' || n.reason === 'reach' ? n.count : held + n.count, reason: n.reason, task, at: Date.now() });
+            this.progress.blockers.push({ item: n.item, count: shortfallOnly.has(n.reason) ? n.count : held + n.count, reason: n.reason, task, at: Date.now() });
         }
         this._saveProgress();
         console.log(`[psn] DECOMPOSE (needs) "${task}" -> ${subs.map(sb => sb.task).join(', ')}; lacks ${desc}`);
@@ -2754,6 +2838,75 @@ Use only c; no other globals.`;
         }
         if (skill.task) return skill.task;
         return null;
+    }
+    // fix84: one need, one subgoal. proximity and reach are placement/search; a slot is a learned skill that has freed
+    //        slots (or an open task the code model writes). Anything else is a learned producer, else the game data.
+    _subgoalForNeed(n, state) {
+        if (n.reason === 'proximity') return { task: `ensure ${n.item}`, need: n, edge: null };
+        if (n.reason === 'reach') return { task: `reach ${n.item}`, need: n, edge: null };
+        if (n.reason === 'slot') return this._slotSubgoal(n);
+        const learned = this._subgoalToObtainItem(n.item, n.count, state.inventory, new Set());
+        if (learned !== null) return { task: learned, need: n, edge: null };
+        return { task: this._obtainPlanner(state).prerequisites(n.item, n.count, state.inventory).task, need: n, edge: n.item };
+    }
+    // fix84: the learned skill whose traced runs freed the most slots (then the name). null when none has.
+    _slotFreeingSkill() {
+        if (!this.slotEffects) throw new Error('[fix84] slotEffects required to choose a slot-freeing skill');
+        const fits = [];
+        for (const s of this.skills) {
+            if (s.demoted) continue;
+            if (s.mergedInto) continue;
+            if (s.candidate) continue;
+            if (!s.contract || typeof s.contract.post !== 'string') continue;
+            if (requiredArgs(s).length) continue;
+            const eff = this.slotEffects.effect(s.name);
+            if (eff === null) continue;
+            if (typeof eff.freed !== 'number') throw new Error(`[fix84] slot effect of ${s.name} has no freed number`);
+            if (eff.freed > 0) fits.push({ s, freed: eff.freed });
+        }
+        fits.sort((a, b) => (b.freed - a.freed) || (a.s.name < b.s.name ? -1 : a.s.name > b.s.name ? 1 : 0));
+        return fits.length ? fits[0].s : null;
+    }
+    _slotSubgoal(n) {
+        const skill = this._slotFreeingSkill();
+        if (skill !== null) {
+            this._armSlotsNeeded(n);
+            return { task: skill.name, need: n, edge: null };
+        }
+        return { task: `free a slot for ${n.item}`, need: n, edge: null };
+    }
+    _armSlotsNeeded(n) {
+        const bot = this.agent.bot;
+        bot.__slotsNeeded = emptySlotsToFit(bot.registry, stackableCounts(bot), n.item, n.count);
+    }
+    // fix84: 'slot' is already on the ancestor chain (a chest needs logs, the logs need a free slot). A craft that
+    //        leaves fewer stacks than it started from, counted by stackSize, breaks it. Else the seeded toss of
+    //        learned surplus. Else the cycle is real: name it and throw.
+    _breakSlotCycle(task, below, n) {
+        const bot = this.agent.bot;
+        const counts = stackableCounts(bot);
+        const registry = bot.registry;
+        if (typeof bot.recipesAll !== 'function') throw new Error('[fix84] bot.recipesAll required to resolve a slot cycle');
+        const named = [...below, 'slot'].join(' -> ');
+        const craft = bestSlotFreeingCraft(registry, id => bot.recipesAll(id, null, true), counts);
+        if (craft !== null && !below.includes(craft.item)) {
+            console.log(`[fix84] slot cycle ${named} (need of "${task}") broken by ${craft.task} (frees ${craft.freed} slot(s) by stack size)`);
+            return { task: craft.task, need: n, edge: craft.item };
+        }
+        const surplus = surplusFromConsumption(this.skills, counts);
+        const freed = surplus.length ? slotsFreedBy(registry, counts, surplus) : 0;
+        if (freed > 0) {
+            const toss = this.skills.find(s => s.name === 'tossClutter');
+            if (!toss) throw new Error(`[fix84] LOUD: subgoal cycle ${named} (need of "${task}"); learned surplus would free ${freed} slot(s) but tossClutter is not in the library`);
+            if (!toss.contract || typeof toss.contract.post !== 'string') throw new Error(`[fix84] LOUD: subgoal cycle ${named} (need of "${task}"); learned surplus would free ${freed} slot(s) but tossClutter has no post-contract, so a toss cannot be verified`);
+            if (requiredArgs(toss).length) throw new Error(`[fix84] LOUD: subgoal cycle ${named} (need of "${task}"); tossClutter requires arguments (${requiredArgs(toss).join(', ')})`);
+            if (below.includes(toss.name)) throw new Error(`[fix84] LOUD: subgoal cycle ${named} (need of "${task}"); tossClutter is already on the chain and did not free a slot`);
+            this._armSlotsNeeded(n);
+            console.log(`[fix84] slot cycle ${named} (need of "${task}") broken by tossClutter (learned surplus frees ${freed} slot(s))`);
+            return { task: toss.name, need: n, edge: null };
+        }
+        const why = craft === null ? 'no slot-freeing craft (net slot change from stack sizes)' : `the only slot-freeing craft is ${craft.item}, which is already on the chain`;
+        throw new Error(`[fix84] LOUD: subgoal cycle ${named} (need of "${task}"); ${why} and no learned surplus toss frees a slot`);
     }
     // fix74: how long a skill has been seen to run before returning on its own, from the trace of every traced run (replay,
     //        writeCode, practice): skill.runMs = { n, max }. A call that was interrupted (rec.intr) or never returned (no t1)
@@ -3567,110 +3720,15 @@ Use only c; no other globals.`;
         }
         return null;
     }
-    // fix43: compute safe-to-toss and deposit-candidate items based on POSITIVE learned signals only
-    // INVERTED POLARITY: absence from needs/produces does NOT imply disposable
-    // Items are safe to toss ONLY if:
-    // 1. We have a POSITIVE learned producer signal for them (skill.effects or NeedsProducesGraph confirms we can get more)
-    // 2. NOT consumed by pending goal items
-    // 3. In surplus (count > max(64, learned consume amount × 3))
-    // Unknown/unlinked items → NOT auto-tossed, returned to model/planning as 'uncertain'
-    // Returns { toss: [item names], deposit: [item names], uncertain: [items with no learned signal] }
+    // fix84: surplus is what verified consumption says is above the most any skill has been seen to spend.
+    //        An item with no consumption evidence is not surplus. No name list, no stack-count threshold.
+    //        Returns { toss: [item names], deposit: [], uncertain: [], surplus: [{ item, count, keep }] }.
     _computeTossAndDepositLists() {
-        const inv = this.observe().inventory || {};
-        const pendingItems = this._getPendingGoalItems();
-        
-        // Collect all items that are consumed by any skill
-        const consumedBySkills = new Set();
-        const maxConsumed = {};  // track max consumption per item for surplus threshold
-        for (const s of this.skills) {
-            if (s.demoted || s.mergedInto) continue;
-            for (const [item, amt] of Object.entries(s.consumes || {})) {
-                consumedBySkills.add(item);
-                maxConsumed[item] = Math.max(maxConsumed[item] || 0, amt);
-            }
-        }
-        
-        // Collect items that we have POSITIVE learned producer signals for (we can get more)
-        const hasLearnedProducer = new Set();
-        for (const s of this.skills) {
-            if (s.demoted || s.mergedInto || s.candidate) continue;
-            for (const eff of s.effects) {
-                hasLearnedProducer.add(eff);
-            }
-        }
-        // Also check the NeedsProducesGraph for confirmed producers
-        if (this.npGraph) {
-            const confirmed = this.npGraph.getConfirmedLinks();
-            for (const [key, links] of Object.entries(confirmed)) {
-                for (const prod of (links.produces || [])) {
-                    hasLearnedProducer.add(prod);
-                }
-            }
-        }
-        
-        // Essential tools/armor - always keep (minimal: equipped gear only, no food/torch lists)
-        const essential = /pickaxe|axe|sword|shovel|hoe|helmet|chestplate|leggings|boots|shield|bow|crossbow|trident|elytra|crafting_table|furnace/;
-        
-        const tossItems = [];
-        const depositItems = [];
-        const uncertainItems = [];
-        
-        for (const [item, count] of Object.entries(inv)) {
-            if (count <= 0) continue;
-            if (essential.test(item)) continue;  // never toss/deposit essential gear
-            
-            // Skip if this is needed for pending goals
-            if (pendingItems.has(item)) continue;
-            
-            // Skip if consumed by any known skill (valuable for future crafting)
-            if (consumedBySkills.has(item)) {
-                // Large stacks (>64) of consumed items are deposit candidates only
-                if (count > 64) {
-                    depositItems.push({ item, count, score: count });
-                }
-                continue;
-            }
-            
-            // fix43: ONLY toss if we have a POSITIVE learned producer signal (we can get more)
-            // Unknown items (no learned producer) → NOT auto-tossed, marked uncertain
-            if (!hasLearnedProducer.has(item)) {
-                uncertainItems.push({ item, count });
-                // Large stacks of uncertain items can still be deposit candidates (safer than toss)
-                if (count > 64) {
-                    depositItems.push({ item, count, score: count });
-                }
-                continue;
-            }
-            
-            // Has learned producer AND not consumed AND not pending → safe to toss surplus
-            // Surplus threshold: max(64, learned consume × 3) - learned, not hard-coded per-item
-            const surplusThreshold = Math.max(64, (maxConsumed[item] || 0) * 3);
-            if (count > surplusThreshold) {
-                const surplus = count - surplusThreshold;
-                tossItems.push({ item, count, surplus, score: surplus });
-            }
-            
-            // Large stacks are also deposit candidates (backup if toss fails)
-            if (count > 64) {
-                depositItems.push({ item, count, score: count });
-            }
-        }
-        
-        // Sort by surplus/score (highest surplus first)
-        tossItems.sort((a, b) => b.score - a.score);
-        depositItems.sort((a, b) => b.score - a.score);
-        
-        console.log(`[toss] computed ${tossItems.length} safe-to-toss item(s) (POSITIVE learned producer + surplus): ${tossItems.slice(0, 5).map(x => `${x.item}(${x.surplus}/${x.count})`).join(', ')}${tossItems.length > 5 ? '...' : ''}`);
-        console.log(`[toss] computed ${depositItems.length} deposit candidate(s): ${depositItems.slice(0, 5).map(x => `${x.item}(${x.count})`).join(', ')}${depositItems.length > 5 ? '...' : ''}`);
-        if (uncertainItems.length) {
-            console.log(`[toss] ${uncertainItems.length} item(s) have NO learned producer (not auto-tossed, returned to model/planning): ${uncertainItems.slice(0, 5).map(x => `${x.item}(${x.count})`).join(', ')}${uncertainItems.length > 5 ? '...' : ''}`);
-        }
-        
-        return {
-            toss: tossItems.map(x => x.item),
-            deposit: depositItems.map(x => x.item),
-            uncertain: uncertainItems.map(x => x.item)
-        };
+        const counts = stackableCounts(this.agent.bot);
+        const surplus = surplusFromConsumption(this.skills, counts);
+        const text = surplus.map(s => `${s.item}(${s.count} above ${s.keep})`).join(', ');
+        console.log(`[toss] learned surplus from verified consumption: ${surplus.length} item(s)${surplus.length ? `: ${text}` : ''}`);
+        return { toss: surplus.map(s => s.item), deposit: [], uncertain: [], surplus };
     }
     // fix43: populate bot.__safeToToss, __depositCandidates, and __uncertainItems before running tossClutter/freeInventory
     // fix51: also populate __knownChests from chestMemory (deposit uses ONLY learned chests)
@@ -3678,7 +3736,8 @@ Use only c; no other globals.`;
         const lists = this._computeTossAndDepositLists();
         this.agent.bot.__safeToToss = lists.toss;
         this.agent.bot.__depositCandidates = lists.deposit;
-        this.agent.bot.__uncertainItems = lists.uncertain || [];
+        this.agent.bot.__uncertainItems = lists.uncertain;
+        this.agent.bot.__surplus = lists.surplus;
         this.agent.bot.__knownChests = this.chestMemory;
     }
     // fix37/fix49/fix74: run one practice skill. Returns null when the code-model call completed (abort: no verdict),
@@ -4543,10 +4602,11 @@ IMPORTANT: All functions use bare names. Do NOT write skills.goToPosition - writ
                 //        (reading 'find')" at the table (-125,43,61) inside obtainItem and craftIronPickaxe
                 // fix83: the shape first, from a script parse (as writeCode): a repair that pastes a library skill beside its own
                 //        function of the same name gets the one-function feedback, not only the module parse error
-                const split = parsesAsScript(code) ? splitGeneratedCode(code, e.name) : null;
-                const shape = split !== null && split.violations.length ? oneFunctionFeedback(e.name, split.violations, pastedLibrarySkills(code, e.name, new Set(this.skills.map(s => s.name)))) : null;
+                // fix84: a failed script parse returns its error text (it used to return false and the text was thrown away)
+                const scriptParse = parsesAsScript(code);
+                const split = scriptParse === true ? splitGeneratedCode(code, e.name) : null;
+                const shape = scriptParse !== true ? `does not parse as a script: ${scriptParse}` : (split.violations.length ? oneFunctionFeedback(e.name, split.violations, pastedLibrarySkills(code, e.name, new Set(this.skills.map(s => s.name)))) : null);
                 const gate = shape === null ? this.agent.coder.userGeneratedCodeLintBlockers(code, this.skills.map(s => s.name)) : null;
-                if (shape === null && gate === null && split === null) throw new Error('[fix83] repaired code lints as a module but does not parse as a script');
                 body = split !== null ? split.skillSource : null;
                 if (shape !== null) err = `lint: ${shape}`;
                 else if (gate !== null) err = `lint: ${gate}`;
@@ -5169,10 +5229,11 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             //        and becomes a hidden global of every later bundle (live 18:23:44Z checkIronPickaxe, see skill_graph)
             // fix83: the shape is read FIRST, from a script parse: a reply with a library skill pasted beside its own function of
             //        the same name is not module code, so the lint's parse error came first and this rule never ran (live 19:07:36)
-            const split = parsesAsScript(code) ? splitGeneratedCode(code, own) : null;
-            let lint = split !== null && split.violations.length ? oneFunctionFeedback(own, split.violations, pastedLibrarySkills(code, own, libraryNames)) : null;
+            // fix84: a failed script parse is the lint the model sees, text and all (it used to be swallowed as false)
+            const scriptParse = parsesAsScript(code);
+            const split = scriptParse === true ? splitGeneratedCode(code, own) : null;
+            let lint = scriptParse !== true ? `does not parse as a script: ${scriptParse}` : (split.violations.length ? oneFunctionFeedback(own, split.violations, pastedLibrarySkills(code, own, libraryNames)) : null);
             if (lint === null) lint = this.agent.coder.userGeneratedCodeLintBlockers(code, this.skills.map(s => s.name));
-            if (lint === null && split === null) throw new Error('[fix83] generated code lints as a module but does not parse as a script');
             let staged = null;
             if (!lint) {
                 const { lint: lint2, staged: st } = await this._stageLintExecTraced(libSrc + (libSrc ? '\n\n' : '') + code, execBundle, stageNameSet, `voyager:writeCode:${task}:att${i}`);
@@ -5418,6 +5479,20 @@ Voyager.SEEDED_PRIMITIVES = [
         await equipToolForBlock(bot, block);   // fix62: cheapest tool that works on this block (was mineflayer-tool equipForBlock: fastest dig = top tier)
         const itemId = bot.heldItem ? bot.heldItem.type : null;
         if (!block.canHarvest(itemId)) { __mcPreconditionUnmet__(bot, { need: { anyOf: Object.keys(block.harvestTools).map(id => bot.registry.items[id].name), count: 1, reason: 'tool' } }); log(bot, \`Don't have right tools to harvest \${blockType}.\`); return false; }
+        // fix84: no free slot is the same kind of structured need as the reach marker above (a chest then chains through planks to logs)
+        const drops = bot.registry.blocksByName[block.name].drops;
+        if (!Array.isArray(drops)) throw new Error(\`collectBlock: \${block.name} has no drops list in the game data\`);
+        if (drops.length) {
+            const dropId = drops[0];
+            const id = typeof dropId === 'number' ? dropId : dropId.drop.id;
+            const dropItem = bot.registry.items[id];
+            if (!dropItem) throw new Error(\`collectBlock: drop \${id} of \${block.name} is not an item\`);
+            if (roomForItem(bot, dropItem.name) < 1) {
+                __mcPreconditionUnmet__(bot, { need: { item: dropItem.name, count: num - collected, reason: 'slot' } });
+                log(bot, \`PREREQUISITE FAILED: no free slot for \${dropItem.name}.\`);
+                return false;
+            }
+        }
         const before = getInventoryCounts(bot);
         const startPos = bot.entity.position.clone();
         const targetDist = startPos.distanceTo(block.position);
@@ -5610,6 +5685,15 @@ Voyager.SEEDED_PRIMITIVES = [
     let nearestItem = getNearestItem();
     let pickedUp = 0;
     for (let tries = 0; nearestItem && tries < 12; tries++) {
+        // fix84: the drop names its item (prismarine-entity getDroppedItem); no room is a slot need, same marker as collectBlock
+        if (typeof nearestItem.getDroppedItem !== 'function') throw new Error('pickupNearbyItems: dropped item entity has no getDroppedItem()');
+        const dropped = nearestItem.getDroppedItem();
+        if (dropped === null || typeof dropped !== 'object' || typeof dropped.name !== 'string' || !Number.isInteger(dropped.count) || dropped.count < 1) throw new Error('pickupNearbyItems: dropped entity has no item');
+        if (roomForItem(bot, dropped.name) < 1) {
+            __mcPreconditionUnmet__(bot, { need: { item: dropped.name, count: dropped.count, reason: 'slot' } });
+            log(bot, \`PREREQUISITE FAILED: no free slot for \${dropped.count} \${dropped.name}.\`);
+            return false;
+        }
         try { await goToPosition(bot, nearestItem.position.x, nearestItem.position.y, nearestItem.position.z, 0.5); }
         catch (e) { log(bot, \`Failed to reach item: \${e.message}\`); throw e; }
         await sleep(500);
@@ -5640,6 +5724,9 @@ Voyager.SEEDED_PRIMITIVES = [
     const toDeposit = Math.min(count, item.count);
     const chestKeys = Object.keys(bot.__knownChests);
     if (chestKeys.length === 0) {
+        const chestBlock = bot.registry.blocksByName.chest;
+        if (!chestBlock) throw new Error('depositToChest: the game data has no chest block');
+        __mcPreconditionUnmet__(bot, { need: { item: chestBlock.name, count: 1, reason: 'proximity' } });
         log(bot, \`[deposit] reject all chests: chestMemory empty (0 known positions); have \${toDeposit} \${itemName} to deposit\`);
         return false;
     }
@@ -5702,7 +5789,10 @@ Voyager.SEEDED_PRIMITIVES = [
         description: 'Toss surplus/low-value items to free inventory space using LEARNED signals (needs/produces, not hard-coded lists). If toss is insufficient, calls depositToChest. Fails loud if nothing is safe to toss/deposit or if chest prerequisite missing.',
         task: 'toss clutter to free inventory space',
         code: `async function tossClutter(bot, minFree = 4) {
-    const start = bot.entity.position.clone();
+    // the argument is the caller's empty-slot target; a slot-need chain sets __slotsNeeded from stack sizes instead
+    if (!Number.isInteger(minFree) || minFree < 1) throw new Error('tossClutter: minFree must be a positive integer, got ' + JSON.stringify(minFree));
+    const need = Number.isInteger(bot.__slotsNeeded) && bot.__slotsNeeded > 0 ? bot.__slotsNeeded : minFree;
+    if (bot.inventory.emptySlotCount() >= need) return 0;
     let tossed = 0;
     let depositedTotal = 0;
     // fix51: fail loud if signals not initialized (no fallback)
@@ -5718,84 +5808,57 @@ Voyager.SEEDED_PRIMITIVES = [
         log(bot, 'FAIL LOUD: bot.__uncertainItems not initialized');
         return false;
     }
-    const safeList = bot.__safeToToss;
+    if (!Array.isArray(bot.__surplus)) {
+        log(bot, 'FAIL LOUD: bot.__surplus not initialized (voyager._prepareTossSignals not called before tossClutter)');
+        return false;
+    }
     const depositList = bot.__depositCandidates;
-    const uncertainList = bot.__uncertainItems;
-    
-    // Phase 1: toss safe items (items with POSITIVE learned producer signal + surplus)
-    if (safeList.length) {
-        const inv = getInventoryCounts(bot);
-        for (let i = 0; i < 40 && bot.inventory.emptySlotCount() < minFree; i++) {
-            if (bot.interrupt_code) break;
-            const pick = safeList.find(n => (inv[n] || 0) > 0);
-            if (!pick) break;
-            const it = bot.inventory.items().find(x => x.name === pick);
-            if (!it) { inv[pick] = 0; continue; }
-            if (bot.currentWindow) {
-                const win = bot.currentWindow;
-                bot.closeWindow(win);
-                await new Promise(resolve => {
-                    const onClose = (w) => { if (!w || w === win) { bot.off('windowClose', onClose); resolve(); } };
-                    bot.on('windowClose', onClose);
-                });
-            }
-            await bot.tossStack(it);
-            inv[pick] = Math.max(0, (inv[pick] || 0) - it.count);
-            tossed++;
-            console.log(\`[toss] tossed \${it.count} \${pick} (empty slots now \${bot.inventory.emptySlotCount()})\`);
+    // fix84: toss the learned surplus counts (verified consumption), not whole stacks and not a name list
+    for (const s of bot.__surplus) {
+        if (bot.interrupt_code) return false;
+        if (bot.inventory.emptySlotCount() >= need) break;
+        if (typeof s.item !== 'string' || !Number.isInteger(s.count) || s.count < 1) throw new Error('tossClutter: surplus entry ' + JSON.stringify(s) + ' is not { item, count }');
+        const it = bot.inventory.items().find(x => x.name === s.item);
+        if (!it) throw new Error('tossClutter: learned surplus ' + s.item + ' is not in the inventory');
+        if (bot.currentWindow) {
+            const win = bot.currentWindow;
+            bot.closeWindow(win);
+            await new Promise(resolve => {
+                const onClose = (w) => { if (!w || w === win) { bot.off('windowClose', onClose); resolve(); } };
+                bot.on('windowClose', onClose);
+            });
         }
-        if (tossed && !bot.interrupt_code) {
-            await moveAway(bot, 6);
-            console.log(\`[toss] moved away from \${tossed} dropped stack(s) to avoid re-pickup\`);
+        const n = s.count < it.count ? s.count : it.count;
+        await bot.toss(it.type, null, n);
+        tossed++;
+        console.log(\`[toss] tossed \${n} \${s.item} (empty slots now \${bot.inventory.emptySlotCount()})\`);
+    }
+    if (tossed && !bot.interrupt_code) {
+        await moveAway(bot, 6);
+        console.log(\`[toss] moved away from \${tossed} dropped stack(s) to avoid re-pickup\`);
+    }
+    if (bot.inventory.emptySlotCount() >= need) return tossed + depositedTotal;
+    // fix84: the storage block is the game data's chest, and a missing one is a proximity need (same marker as before)
+    const chestBlock = bot.registry.blocksByName.chest;
+    if (!chestBlock) throw new Error('tossClutter: the game data has no chest block');
+    const chest = getNearestBlock(bot, chestBlock.name);
+    if (!chest) {
+        __mcPreconditionUnmet__(bot, { need: { item: chestBlock.name, count: 1, reason: 'proximity' } });
+        log(bot, \`PREREQUISITE FAILED: tossClutter needs a chest within reach to deposit (learned surplus did not free a slot). Place or find a chest first.\`);
+        return false;
+    }
+    if (depositList.length) {
+        console.log(\`[toss] still \${bot.inventory.emptySlotCount()} empty after tossing \${tossed}; depositing \${depositList.length} candidate(s) to chest at \${chest.position}\`);
+        for (const itemName of depositList) {
+            if (bot.interrupt_code) return false;
+            if (bot.inventory.emptySlotCount() >= need) break;
+            const ok = await depositToChest(bot, itemName);
+            if (ok) depositedTotal++;
         }
     }
-    
-    // Phase 2: if still low on space, try depositToChest
-    if (bot.inventory.emptySlotCount() < minFree && !bot.interrupt_code) {
-        // fix43: check for chest FIRST and fail loud with PREREQUISITE if missing
-        const isStore = b => /chest|barrel|shulker/.test(b.name);
-        const chest = getNearestBlock(bot, isStore, 32);
-        if (!chest) {
-            if (depositList.length || (bot.inventory.emptySlotCount() < 2 && uncertainList.length)) {
-                __mcPreconditionUnmet__(bot, { need: { anyOf: bot.registry.blocksArray.filter(isStore).map(b => b.name), count: 1, reason: 'proximity' } });
-                log(bot, \`PREREQUISITE FAILED: tossClutter needs chest within 32 blocks to deposit items (have \${depositList.length} deposit candidates, \${uncertainList.length} uncertain items). Place or find a chest first.\`);
-                return false;
-            }
-        } else if (depositList.length) {
-            console.log(\`[toss] still only \${bot.inventory.emptySlotCount()} empty after tossing \${tossed} stacks; depositing \${depositList.length} candidate(s) to chest at \${chest.position}\`);
-            let deposited = 0;
-            let depositFailed = false;
-            for (const itemName of depositList) {
-                if (bot.interrupt_code) break;
-                if (bot.inventory.emptySlotCount() >= minFree) break;
-                const ok = await depositToChest(bot, itemName);
-                if (ok) deposited++;
-                else depositFailed = true;
-            }
-            depositedTotal = deposited;
-            if (deposited) console.log(\`[toss] deposited \${deposited} item type(s) to chest (empty slots now \${bot.inventory.emptySlotCount()})\`);
-            if (bot.inventory.emptySlotCount() < minFree && !bot.interrupt_code) {
-                if (depositFailed) {
-                    log(bot, \`FAILED tossClutter: deposit to chest failed - chest may be full or inaccessible.\`);
-                } else {
-                    log(bot, \`FAILED tossClutter: still only \${bot.inventory.emptySlotCount()} empty after tossing \${tossed} + depositing \${deposited} items\`);
-                }
-            }
-        }
-    }
-    
-    // fix43: if we couldn't free space and have uncertain items, surface this for model/planning
-    // fix51: return false when failing to meet minFree, so postcondition skip (r.rv === false) works
-    if (bot.inventory.emptySlotCount() < minFree && !bot.interrupt_code) {
-        if (uncertainList.length && !safeList.length) {
-            log(bot, \`FAILED tossClutter: \${uncertainList.length} item(s) have NO learned producer signal (\${uncertainList.slice(0,3).join(', ')}\${uncertainList.length > 3 ? '...' : ''}) - cannot auto-toss unknown items. Return decision to model/planning.\`);
-        } else if (!safeList.length && !depositList.length) {
-            log(bot, 'FAILED tossClutter: no learned signal indicates what is safe to toss/deposit');
-        }
-        return false;  // fix51: explicit failure so postcondition isn't evaluated
-    }
-    // fix51: return stacks removed (0 when space was already free) so a truthy ret always means inventory shrank (seeded post)
-    return tossed + depositedTotal;
+    if (bot.inventory.emptySlotCount() >= need) return tossed + depositedTotal;
+    log(bot, \`FAILED tossClutter: still \${bot.inventory.emptySlotCount()} empty after tossing \${tossed} and depositing \${depositedTotal}\`);
+    return false;
 }`,
         deps: ['moveAway', 'depositToChest'],
     },
