@@ -124,6 +124,25 @@ describe('fix51 issue 3: parseVerboseGoal handles live shapes', async () => {
         assert.ok(result !== null);
         assert.strictEqual(result.item, 'iron_helmet');
     });
+
+    it('parses camelCase skill names like craftIronHelmet', () => {
+        // fix51: skill names like "craftIronHelmet" should parse to {item: iron_helmet, count: 1}
+        const result = parseVerboseGoal('craftIronHelmet');
+        assert.ok(result !== null, 'craftIronHelmet should parse');
+        assert.strictEqual(result.item, 'iron_helmet');
+        assert.strictEqual(result.count, 1);
+    });
+
+    it('parses camelCase skill names with various prefixes', () => {
+        // Test different verb prefixes
+        const tasks = ['craftIronPickaxe', 'mineIronOre', 'getOakLog', 'obtainDiamond'];
+        const expected = ['iron_pickaxe', 'iron_ore', 'oak_log', 'diamond'];
+        for (let i = 0; i < tasks.length; i++) {
+            const result = parseVerboseGoal(tasks[i]);
+            assert.ok(result !== null, `${tasks[i]} should parse`);
+            assert.strictEqual(result.item, expected[i]);
+        }
+    });
 });
 
 // Issue 4: Oxygen level in samples - observed trend, no classification threshold

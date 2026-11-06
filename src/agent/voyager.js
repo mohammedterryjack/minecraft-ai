@@ -244,6 +244,27 @@ export function parseVerboseGoal(task) {
         }
     }
     
+    // fix51: try camelCase skill names like "craftIronHelmet" -> iron_helmet (count defaults to 1)
+    // Split on uppercase letters, join with underscore, check against registry
+    if (candidates.length === 0) {
+        const camelParts = task.match(/[A-Z]?[a-z0-9]+/g);
+        if (camelParts && camelParts.length >= 2) {
+            // Skip verb prefix (craft, mine, get, make, smelt, etc.)
+            const verbPrefixes = ['craft', 'mine', 'get', 'make', 'smelt', 'cook', 'obtain', 'collect', 'gather'];
+            const startIdx = verbPrefixes.includes(camelParts[0].toLowerCase()) ? 1 : 0;
+            // Try progressively longer suffixes: "IronHelmet" -> "iron_helmet", then "iron", etc.
+            for (let len = camelParts.length - startIdx; len > 0; len--) {
+                const itemParts = camelParts.slice(startIdx, startIdx + len);
+                const itemName = itemParts.map(p => p.toLowerCase()).join('_');
+                const resolved = resolveItem(itemName);
+                if (resolved) {
+                    console.log(`[fix51] parsed camelCase skill "${task}" -> ${resolved} (count 1)`);
+                    return { count: 1, item: resolved, items: [resolved] };
+                }
+            }
+        }
+    }
+    
     if (candidates.length === 0) {
         console.log(`[fix46] LOUD: parseVerboseGoal failed for "${task.slice(0, 100)}": no valid item name found in registry`);
         return null;
