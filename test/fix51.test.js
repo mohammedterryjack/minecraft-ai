@@ -1063,7 +1063,8 @@ describe('fix51 issue 22: idle practice requires real effect change', async () =
         const Voyager = mod.Voyager;
         const mockBot = { version: '1.21.4', chat: () => {}, on: () => {}, off: () => {}, once: () => {}, removeListener: () => {} };
         const v = new Voyager({ bot: mockBot, agent: { prompter: { task: () => {} }, npc: { constructs: {} } } });
-        const skill = { name: 'craftOneIronPickaxe', effects: ['iron_pickaxe'] };
+        // fix74: effects judge a practice run only when verified by run evidence
+        const skill = { name: 'craftOneIronPickaxe', effects: ['iron_pickaxe'], effectEvidence: { runs: 1, items: { iron_pickaxe: { runs: 1, gained: 1 } } } };
         const inv = { iron_ingot: 36, stick: 6 };
         const before = { inventory: { ...inv }, equipment: {} };
         const after = { inventory: { ...inv }, equipment: {} };
@@ -1074,7 +1075,7 @@ describe('fix51 issue 22: idle practice requires real effect change', async () =
     it('_runPracticeSkill logs NOT SUCCESS when delta empty (source check)', () => {
         const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
         assert.ok(voyagerSrc.includes('_practiceRunChanged'), 'voyager should define _practiceRunChanged');
-        assert.ok(voyagerSrc.includes('[idle-practice] NOT SUCCESS'),
+        assert.ok(voyagerSrc.includes("'NOT SUCCESS'"),
             'idle practice should not count empty delta as SUCCESS');
     });
 });

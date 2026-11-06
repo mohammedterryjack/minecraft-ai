@@ -81,18 +81,20 @@ describe('fix70: effects are measured over the skill\'s own run', () => {
         const bot = { interrupt_code: false };
         const v = Object.create(Voyager.prototype);
         Object.assign(v, {
-            agent: { bot, isIdle: () => true }, _threats: () => 'none', observe: () => ({ inventory: {} }), _libSrcSubset: () => '', _closure: () => [],
-            _timedBotForSkillRun: () => bot, _idlePracticeAbort: false,
-            _stageLintExec: async () => ({ lint: null, staged: { func: { main: async b => {
+            // fix74: the stop is agent.requestInterrupt() (it also stops the pathfinder), the abort is a signal, the run is traced
+            agent: { bot, isIdle: () => true, requestInterrupt: () => { bot.interrupt_code = true; } }, _threats: () => 'none', observe: () => ({ inventory: {} }), _libSrcSubset: () => '', _closure: () => [],
+            _timedBotForSkillRun: () => bot, skills: [], _saveSkills: () => {}, _idlePracticeActive: true,
+            _stageLintExecTraced: async () => ({ lint: null, staged: { func: { main: async b => {
                 running = true;
                 while (!b.interrupt_code) await new Promise(r => setTimeout(r, 20));
                 await new Promise(r => setTimeout(r, 300));   // the skill's own wind-down after it sees the interrupt
                 finished = true;
             } } } }),
         });
+        v._armPracticeAbort();
         const p = v._runPracticeSkill({ name: 'pickupNearbyItems', stats: {} });
         while (!running) await new Promise(r => setTimeout(r, 10));
-        v._idlePracticeAbort = true;
+        v._stopIdlePractice();
         assert.strictEqual(await p, null);
         assert.strictEqual(finished, true, 'the skill finished before the slot was given back');
         assert.strictEqual(bot.interrupt_code, false, 'the interrupt that ended it is not left on the bot');

@@ -284,8 +284,10 @@ test('fix49: idle practice uses Beta-posterior uncertainty', async (t) => {
     await t.test('empty delta should not count as practice', async () => {
         const fs = await import('fs');
         const voyagerCode = fs.readFileSync('./src/agent/voyager.js', 'utf8');
-        assert.ok(voyagerCode.includes('deltaChanged'),
-            'should track deltaChanged for practice runs');
+        // fix74: an inventory delta alone is not a practice success (no "any delta" path); a run is judged by the skill's
+        //        learned post-contract or its evidence-verified effects (_practiceRunChanged)
+        assert.ok(!voyagerCode.includes('inv delta includes'), 'an arbitrary inventory delta must not count as a practice success');
+        assert.ok(voyagerCode.includes("'no learned post-contract and no verified effects to judge it by'"), 'a run nothing can judge is no verdict');
     });
 
     await t.test('should log [idle] timing format', async () => {
