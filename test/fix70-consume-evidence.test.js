@@ -100,6 +100,6 @@ describe('fix70: effects are measured over the skill\'s own run', () => {
         assert.strictEqual(bot.interrupt_code, false, 'the interrupt that ended it is not left on the bot');
     });
     it('_ask waits for the practice it started before returning the model reply', () => {
-        assert.match(SRC, /this\._stopIdlePractice\(\);\n\s+await practicePromise;/);
+        assert.match(SRC, /this\._stopIdlePractice\(\);\n(?:\s*\/\/[^\n]*\n)?\s+try \{ await practicePromise; \}/);   // fix79: awaited in try/finally (the queue is released when practice rejects)
     });
 });
