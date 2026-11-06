@@ -187,19 +187,21 @@ test('fix49: breakBlockAt dep cycle prevention', async (t) => {
         const { Voyager } = await import('../src/agent/voyager.js');
         const breakBlockAt = Voyager.SEEDED_PRIMITIVES.find(p => p.name === 'breakBlockAt');
         assert.ok(breakBlockAt, 'breakBlockAt should exist');
-        assert.ok(breakBlockAt.code.includes('equipBestTool'),
-            'breakBlockAt should use equipBestTool (inventory only)');
+        // fix62: per-block choice moved to equipToolForBlock (still inventory only, deps [])
+        assert.ok(breakBlockAt.code.includes('equipToolForBlock'),
+            'breakBlockAt should use equipToolForBlock (inventory only)');
         // Check there's no actual call to equipForBlock (await bot.tool.equipForBlock)
         // Comments mentioning it are OK
         assert.ok(!breakBlockAt.code.includes('await bot.tool.equipForBlock'),
             'breakBlockAt should NOT call bot.tool.equipForBlock (can craft, creating cycle)');
     });
 
-    await t.test('breakBlockAt deps should be equipBestTool only', async () => {
+    await t.test('breakBlockAt deps should be equipToolForBlock only (fix62; was equipBestTool)', async () => {
         const { Voyager } = await import('../src/agent/voyager.js');
         const breakBlockAt = Voyager.SEEDED_PRIMITIVES.find(p => p.name === 'breakBlockAt');
-        assert.deepEqual(breakBlockAt.deps, ['equipBestTool'], 
-            'breakBlockAt deps should be [equipBestTool] - no crafting deps');
+        assert.deepEqual(breakBlockAt.deps, ['equipToolForBlock'],
+            'breakBlockAt deps should be [equipToolForBlock] - no crafting deps');
+        assert.deepEqual(Voyager.SEEDED_PRIMITIVES.find(p => p.name === 'equipToolForBlock').deps, [], 'equipToolForBlock has no deps (cannot form a cycle)');
     });
 
     await t.test('findCycle should detect the exact cycle from the bug', async () => {
