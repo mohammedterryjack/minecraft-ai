@@ -1,0 +1,126 @@
+{
+  "version": 1,
+  "bot": "icefox2000",
+  "inventory": "/workspace/fix76-poison-inventory.md",
+  "files": {
+    "index": "skills/index.json",
+    "progress": "skills/progress.json"
+  },
+  "records": [
+    {
+      "id": "eatCookedMutton.demotion",
+      "file": "index",
+      "skill": "eatCookedMutton",
+      "cause": { "fix": "#65", "commit": "5d378f9", "name": "fix70 off-hand/slot consume + prune on poisoned V" },
+      "expect": { "demoted": true, "prunedAt": 1793973522204 },
+      "set": { "demoted": false },
+      "delete": ["prunedAt"]
+    },
+    {
+      "id": "eatCookedMutton.stats.fails",
+      "file": "index",
+      "skill": "eatCookedMutton",
+      "cause": { "fix": "#65", "commit": "5d378f9", "name": "consume-bug fails counted against incumbent" },
+      "expect": { "stats.success": 1, "stats.fail": 2, "stats.streakFail": 2 },
+      "set": { "stats.fail": 0, "stats.streakFail": 0 }
+    },
+    {
+      "id": "eatCookedMutton.consumes",
+      "file": "index",
+      "skill": "eatCookedMutton",
+      "cause": { "fix": "#65", "commit": "5d378f9", "name": "fix70c dirt-effect task-window consumes" },
+      "expect": { "consumes": { "cobblestone": 7, "dirt": 2, "andesite": 4, "raw_copper": 5 } },
+      "set": { "consumes": {} }
+    },
+    {
+      "id": "eatCookedMutton.candidate.note",
+      "file": "index",
+      "skill": "eatCookedMutton",
+      "cause": { "fix": "fix76", "commit": null, "name": "Food-is-full REJECT deleted candidate; do not invent code" },
+      "expect": { "candidate": null },
+      "set": {},
+      "delete": ["candidate"],
+      "note": "candidate already null; undemote restores learner path"
+    },
+    {
+      "id": "vitals.runs.eatCookedMutton",
+      "file": "progress",
+      "path": ["vitals", "runs", "eatCookedMutton"],
+      "cause": { "fix": "#65", "commit": "5d378f9", "name": "zero-gain vitals from full-food/failed consume runs" },
+      "expect": { "n": 8, "food": 0, "hp": 0 },
+      "delete_path": true
+    },
+    {
+      "id": "vitals.runs.checkInventoryForCookedMutton",
+      "file": "progress",
+      "path": ["vitals", "runs", "checkInventoryForCookedMutton"],
+      "cause": { "fix": "#65", "commit": "5d378f9", "name": "zero-gain vitals sibling of eat runs" },
+      "expect": { "n": 8, "food": 0, "hp": 0 },
+      "delete_path": true
+    },
+    {
+      "id": "goalStats.eatCookedMutton.replay_failed",
+      "file": "progress",
+      "path": ["goalStats", "eatCookedMutton::replay failed"],
+      "cause": { "fix": "#65", "commit": "5d378f9", "name": "eat posterior poison" },
+      "expect": { "success": 0, "fail": 3 },
+      "delete_path": true
+    },
+    {
+      "id": "goalStats.Eat_1_cooked_mutton.failed_4x",
+      "file": "progress",
+      "path": ["goalStats", "Eat 1 cooked_mutton::failed 4x"],
+      "cause": { "fix": "#65", "commit": "5d378f9", "name": "eat posterior poison" },
+      "expect": { "success": 0, "fail": 1 },
+      "delete_path": true
+    },
+    {
+      "id": "travelWestAvoidDeathHotspot.consumes",
+      "file": "index",
+      "skill": "travelWestAvoidDeathHotspot",
+      "cause": { "fix": "#65", "commit": "5d378f9", "name": "fix70c dirt-effect fake consumes on travel skill" },
+      "expect": { "consumes": { "stone_pickaxe": 1, "oak_log": 1, "iron_pickaxe": 1 } },
+      "set": { "consumes": {} }
+    },
+    {
+      "id": "travelWestAvoidDeathHotspot.effects",
+      "file": "index",
+      "skill": "travelWestAvoidDeathHotspot",
+      "cause": { "fix": "#65", "commit": "5d378f9", "name": "fix70c dirt-effect fake effects on travel skill" },
+      "expect": { "effects": ["crafting_table", "cobblestone"] },
+      "set": { "effects": [] }
+    },
+    {
+      "id": "scanForIronOreBlocks.demotion",
+      "file": "index",
+      "skill": "scanForIronOreBlocks",
+      "cause": { "fix": "#66", "commit": "fceac94", "name": "__rawInventoryCounts missing after #64 until fix73" },
+      "expect": { "demoted": true },
+      "set": { "demoted": false }
+    },
+    {
+      "id": "scanForIronOreBlocks.stats.fails",
+      "file": "index",
+      "skill": "scanForIronOreBlocks",
+      "cause": { "fix": "#66", "commit": "fceac94", "name": "__rawInventoryCounts TypeError fail storm" },
+      "expect": { "stats.success": 1, "stats.fail": 75, "stats.streakFail": 75 },
+      "set": { "stats.fail": 0, "stats.streakFail": 0 }
+    },
+    {
+      "id": "goalStats.Craft_1_iron_pickaxe.replay_failed",
+      "file": "progress",
+      "path": ["goalStats", "Craft 1 iron_pickaxe::replay failed"],
+      "cause": { "fix": "#67", "commit": "ae731ed", "name": "infra/interrupt/timeout fails inflating iron_pickaxe posterior (also #61 watchdog era)" },
+      "expect": { "success": 0, "fail": 25 },
+      "delete_path": true
+    },
+    {
+      "id": "goalStats.Craft_1_iron_pickaxe.failed_4x",
+      "file": "progress",
+      "path": ["goalStats", "Craft 1 iron_pickaxe::failed 4x"],
+      "cause": { "fix": "#67", "commit": "ae731ed", "name": "infra fails inflating iron_pickaxe posterior" },
+      "expect": { "success": 0, "fail": 19 },
+      "delete_path": true
+    }
+  ]
+}

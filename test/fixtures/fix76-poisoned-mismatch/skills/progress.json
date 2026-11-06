@@ -1,0 +1,56 @@
+{
+  "vitals": {
+    "regen": {
+      "18": {
+        "n": 4,
+        "up": 4
+      }
+    },
+    "runs": {
+      "eatCookedMutton": {
+        "n": 8,
+        "food": 0,
+        "hp": 0
+      },
+      "checkInventoryForCookedMutton": {
+        "n": 8,
+        "food": 0,
+        "hp": 0
+      },
+      "mineOneIronOre": {
+        "n": 36,
+        "food": -8,
+        "hp": -10
+      }
+    }
+  },
+  "goalStats": {
+    "eatCookedMutton::replay failed": {
+      "success": 0,
+      "fail": 3
+    },
+    "Eat 1 cooked_mutton::failed 4x": {
+      "success": 0,
+      "fail": 1
+    },
+    "Craft 1 iron_pickaxe::": {
+      "success": 14,
+      "fail": 0
+    },
+    "Craft 1 iron_pickaxe::replay failed": {
+      "success": 0,
+      "fail": 25
+    },
+    "Craft 1 iron_pickaxe::failed 4x": {
+      "success": 0,
+      "fail": 19
+    },
+    "Mine 1 iron_ore::replay failed": {
+      "success": 0,
+      "fail": 8
+    }
+  },
+  "completed": [
+    "keep-me"
+  ]
+}

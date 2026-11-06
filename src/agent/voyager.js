@@ -12,6 +12,7 @@ import { NeedsProducesGraph } from './needs_produces.js';
 import { RepairMemory } from './repair_memory.js';
 import { IdlePractice } from './idle_practice.js';
 import { VitalsModel } from './vitals_model.js';   // fix58
+import { markPreconditionUnmet, peekPreconditionUnmet, clearPreconditionUnmet } from './precondition.js';   // fix76
 import { SlotEffects } from './slot_effects.js';   // fix59
 // fix14: crash-safe writes (tmp file + rename)
 export function writeAtomic(fp, text) { const tmp = `${fp}.tmp-${process.pid}`; writeFileSync(tmp, text); renameSync(tmp, fp); }
@@ -384,7 +385,8 @@ export class Voyager {
         // fix49: ensure goalStats exists (older progress files may not have it)
         if (!this.progress.goalStats) this.progress.goalStats = {};
         // fix58: learned vitals relations (food level -> hp regen, skill -> food/hp change), persisted with progress
-        if (!this.progress.vitals) this.progress.vitals = { regen: {}, runs: {} };
+        if (!this.progress.vitals) this.progress.vitals = { regen: {}, runs: {}, foodSamples: { drop: { n: 0, sum: 0 }, rise: { n: 0, sum: 0 } } };
+        if (!this.progress.vitals.foodSamples) this.progress.vitals.foodSamples = { drop: { n: 0, sum: 0 }, rise: { n: 0, sum: 0 } };
         this.vitals = new VitalsModel(this.progress.vitals);
         // fix59: learned per-skill inventory-slot effect (replaces the fix39 free-space name regex/list)
         if (!this.progress.slots) this.progress.slots = { runs: {} };
@@ -1198,6 +1200,35 @@ Use only c; no other globals.`;
         for (const r of trace) { if (r.intr || !r.s0 || !r.s1 || !r.s0.alive || !r.s1.alive) continue; this.slotEffects.noteRun(r.name, r.s0, r.s1); }
     }
     _recovery() { const bot = this.agent.bot; return this.vitals.recovery(bot.health, skills.getVitalsMax(bot).health, bot.food); }
+    // fix76: learned hunger outlook (food vs regen floor / decay), including at full HP
+    _hunger() { const bot = this.agent.bot, m = skills.getVitalsMax(bot); return this.vitals.hunger(bot.health, m.health, bot.food, m.food); }
+    // fix76: structural unmet-precondition classification (no message-text matching).
+    // (1) seeded code called markPreconditionUnmet(bot) -> kind === 'precondition'
+    // (2) skill's learned vitals effect raises food, and food was already at the observed food cap
+    _foodRaiseSaturated(skillName, foodAtStart) {
+        if (typeof skillName !== 'string') throw new Error('[fix76] _foodRaiseSaturated: skillName required');
+        if (!skillName) throw new Error('[fix76] _foodRaiseSaturated: skillName required');
+        if (!this.vitals) return null;   // no vitals store yet → no learned food-raiser
+        const e = this.vitals.s.runs[skillName];
+        if (!e) return null;
+        if (e.n < 1) return null;
+        if (!(e.food / e.n > 0)) return null;
+        // foodAtStart is required only once this skill is a learned food-raiser
+        if (typeof foodAtStart !== 'number') throw new Error(`[fix76] foodAtStart required to test saturation of food-raiser ${skillName}, got ${foodAtStart}`);
+        if (Number.isNaN(foodAtStart)) throw new Error(`[fix76] foodAtStart required to test saturation of food-raiser ${skillName}, got ${foodAtStart}`);
+        const cap = skills.getVitalsMax(this.agent.bot).food;
+        if (foodAtStart >= cap) return 'food_saturated';
+        return null;
+    }
+    _classifyUnmetPrecondition(skillName, foodAtStart) {
+        const bot = this.agent.bot;
+        const marked = peekPreconditionUnmet(bot);
+        if (marked) {
+            clearPreconditionUnmet(bot);
+            return 'precondition';
+        }
+        return this._foodRaiseSaturated(skillName, foodAtStart);
+    }
     // evaluate contracts on every traced library call; violations become contract failures in the trace
     _checkContracts(trace, taskOk) {
         const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
@@ -1656,6 +1687,9 @@ Use only c; no other globals.`;
             health_max: skills.VITALS_MAX.health,
             // fix58: learned: hp below max and not recovering at the current food level (from the bot's own vitals history)
             health_recovery_blocked: this._recovery().blocked,
+            // fix76: learned hunger (food vs regen floor / decay) — fires at full HP; not a hard-coded eat threshold
+            hunger_urgent: this._hunger().urgent,
+            food_below_regen_floor: this._hunger().belowRegen,
             // fix51: oxygen level as protocol value (300 = full breath, decreases when submerged, 0 = drowning damage)
             oxygen_level: bot.oxygenLevel,
             inventory: world.getInventoryCounts(bot),  // fix41: host code uses world. prefix
@@ -1981,6 +2015,14 @@ Use only c; no other globals.`;
         // ran the 09:37Z collectBlock candidate, its 0/0 record never moved, and every repair of collectBlock was deferred
         // "a candidate is already under trial" and DROPPED. A child candidate is exercised by the root's real calls for this
         // task, so it is trialled in place whenever it is in the closure (fix10's rule).
+        // fix76: learned food-raiser already at observed food cap — do not run (would raise a saturated vital); not evidence
+        {
+            const sat = this._foodRaiseSaturated(r.name, this.agent.bot.food);
+            if (sat) {
+                console.log(`!!! [blame] UNMET PRECONDITION (${sat}): skip replay of ${r.name} — not counted against stats or gate`);
+                return { ok: false, name: r.name, output: '', unmetPrecondition: sat, unverified: true };
+            }
+        }
         const replayClosure = new Set([r.name, ...this._closure(r.name)]);
         const over = this._replayOverrides(r.name, trial);
         const tracedNames = Voyager._tracedSkillNamesForInstrument(this, replayClosure, over);
@@ -2038,14 +2080,17 @@ Use only c; no other globals.`;
             }
         }
         if (!ok) this._tryDecomposePrerequisiteFailure(task);
-        else delete this.agent.bot.__prereqFail;
+        else { delete this.agent.bot.__prereqFail; clearPreconditionUnmet(this.agent.bot); }
         // fix44: pass goal items to filter learned effects and produces (denoise)
         const goalItems = goal?.items || (goal?.item ? [goal.item] : null);
         if (entry && ok && !trial) this._learnEffects(entry, runBefore, after, goalItems);
         // fix56: an unverified open goal is neither a pass nor a failure of the skill: no run stats, no blame of the root for the goal
         // fix70: a run whose error was raised in library code is that code's fault, not a run of the learned skill
+        // fix76: structural unmet preconditions (typed marker or learned food-raiser at food cap) are not skill/candidate evidence
         const libFault = !ok && this._libraryFault(this.agent.bot.__psnTrace, r.name);
-        if (entry && !unverified && !libFault) this._recordRun(entry, task, ok, trial);
+        const unmet = !ok && !libFault && this._classifyUnmetPrecondition(r.name, runBefore.food_value);
+        if (unmet) console.log(`!!! [blame] UNMET PRECONDITION (${unmet}): ${r.name} — not counted against stats or gate`);
+        if (entry && !unverified && !libFault && !unmet) this._recordRun(entry, task, ok, trial);
         // ADAM-style: record inventory delta for needs/produces learning
         if (ok) this.npGraph.recordDelta(r.name, runBefore.inventory, after.inventory, goalItems);   // fix70: this run only
         this._attribute(r.name, task, unverified ? true : ok, over);   // fix10: per-call trace -> contract results -> blame -> targeted repair
@@ -2199,6 +2244,7 @@ Use only c; no other globals.`;
         const inv = this.observe().inventory;
         const sub = this._subgoalToObtainItem(item, shortfall, inv, new Set());
         if (!sub) {
+            markPreconditionUnmet(this.agent.bot, { item });
             console.log(`[psn] PREREQUISITE FAILED for ${item} but no learned producer subgoal (needs/produces + skill library)`);
             return false;
         }
@@ -2972,6 +3018,12 @@ Use only c; no other globals.`;
                 }
             }
         }
+        // fix76: learned food-raiser at observed food cap — practice would be an unmet eat precondition
+        // (needs a live bot; unit tests that call _shouldSkipPractice without agent.bot only exercise consumes/effects gates)
+        if (this.agent && this.agent.bot) {
+            const sat = this._foodRaiseSaturated(skill.name, this.agent.bot.food);
+            if (sat) return `${sat}: ${skill.name} is a learned food-raiser at the observed food cap`;
+        }
         return null;
     }
     // fix43: compute safe-to-toss and deposit-candidate items based on POSITIVE learned signals only
@@ -3526,14 +3578,18 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "task": "...", "contex
             ? `\nedible_inventory: ${edible.map(e => `${e.item}(${e.count}, food=${e.foodPoints})`).join(', ')}`
             : '';
         // fix58: learned recovery facts (food level -> hp regen, skills' observed food change) so the ranking can weigh recovery
+        // fix76: hunger facts even when hp is full (recoveryText is null at max HP)
         const rec = this._recovery(), recText = this.vitals.recoveryText(rec);
+        const hun = this._hunger(), hunText = this.vitals.hungerText(hun);
         const vmax = skills.getVitalsMax(bot);   // fix59: one source for hp/food max (was literal /20)
         if (rec.blocked) console.log(`[vitals] ${recText}`);
+        if (hunText) console.log(`[vitals] ${hunText}`);
         const recoveryHint = recText ? `\n${recText}` : '';
+        const hungerHint = hunText ? `\n${hunText}` : '';
         const user = `known_skills: ${JSON.stringify(knownSkillsFacts)}
 replayable_tasks (cheap, no new code needed): ${JSON.stringify(replayableTasks)} plus any "Mine N <block or ore>", "Collect N <log>", "Get N <item>", "Smelt N <raw> into N <out>", "Kill N <mob>", "Harvest N <crop>"
 completed_tasks: ${JSON.stringify(this.progress.completed.slice(-30))}
-failed_tasks: ${JSON.stringify(this.progress.failed.slice(-15))}${blockerHint}${edibleHint}${recoveryHint}
+failed_tasks: ${JSON.stringify(this.progress.failed.slice(-15))}${blockerHint}${edibleHint}${recoveryHint}${hungerHint}
 --- state (compact) ---
 ${compactStateText}
 current_health: ${Math.round(bot.health)}/${vmax.health}\ncurrent_food: ${bot.food}/${vmax.food} (${vmax.food}/${vmax.food} = full)${this._cursorLimited() ? '\nIMPORTANT: the code-writing model is unavailable right now, so ONLY propose a task from replayable_tasks or "Mine N <block>".' : ''}${workflowHints ? '\n' + workflowHints : ''}`;   // fix31: slow-changing lists first so Ollama reuses the cached prompt prefix
@@ -3856,7 +3912,17 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
             if (name === root) continue;
             const rec = trace.find(t => t.name === name);
             const e = this.skills.find(s => s.name === name);
-            if (rec && e?.candidate && !rec.intr && !(!rec.ok && this._libraryFault(trace, name))) { gateLog(`trial run of candidate ${name} inside ${root}: contract ${rec.ok ? 'ok' : 'FAILED'}`); this._recordRun(e, task, rec.ok, true); }   // fix70: not on a library fault
+            if (rec && e && e.candidate && !rec.intr) {
+                const libF = !rec.ok && this._libraryFault(trace, name);
+                let unmetC = null;
+                if (!rec.ok && !libF) {
+                    if (peekPreconditionUnmet(this.agent.bot)) unmetC = 'precondition';
+                    else if (rec.s0 && typeof rec.s0.food === 'number') unmetC = this._foodRaiseSaturated(name, rec.s0.food);
+                    // no s0 (hung/crash before snapshot): cannot claim food_saturated; count as a normal trial fail
+                }
+                if (unmetC) gateLog(`candidate ${name} unmet precondition (${unmetC}): not a trial fail`);
+                else if (!libF) { gateLog(`trial run of candidate ${name} inside ${root}: contract ${rec.ok ? 'ok' : 'FAILED'}`); this._recordRun(e, task, rec.ok, true); }   // fix70: not on a library fault; fix76: not on unmet precondition
+            }
         }
         // fix27: no hotspot filter; deaths stay traced failures (above) and blame/repair learns avoidance
         // fix19 (5): an explicit FAILED line from a skill is a contract failure even if the task check passed (e.g. ensureChest inside a storage task)
@@ -4534,7 +4600,7 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
             this._afterSuccess();
             return;
         }
-        if (rp && !rp.ok && !rp.interrupted) { 
+        if (rp && !rp.ok && !rp.interrupted && !rp.unmetPrecondition) { 
             this._recordGoalOutcome(task, false, rp.reason || 'replay failed');  // fix49: backoff tracking
             this.progress.failed.push(task); this._saveProgress(); this._windowCheck(false); 
         }
@@ -5152,6 +5218,7 @@ Voyager.SEEDED_PRIMITIVES = [
         const chest = getNearestBlock(bot, b => /chest|barrel|shulker/.test(b.name), 32);
         if (!chest) {
             if (depositList.length || (bot.inventory.emptySlotCount() < 2 && uncertainList.length)) {
+                bot.__unmetPrecondition = { kind: 'precondition' };
                 log(bot, \`PREREQUISITE FAILED: tossClutter needs chest within 32 blocks to deposit items (have \${depositList.length} deposit candidates, \${uncertainList.length} uncertain items). Place or find a chest first.\`);
                 return false;
             }
@@ -5282,6 +5349,7 @@ Voyager.SEEDED_PRIMITIVES = [
                 if (!crafted && shortfall > 0) {
                     // fix51: fail loud with structured prerequisite info for decomposition/needs-produces
                     bot.__prereqFail = { item: ingItem.name, need: shortfall + (inv[ingItem.name] || 0), have: inv[ingItem.name] || 0 };
+                    bot.__unmetPrecondition = { kind: 'precondition' };
                     log(bot, \`PREREQUISITE FAILED: ensureCraftingTable needs \${shortfall} more \${ingItem.name} but cannot craft it (no 2x2 recipe or missing sub-ingredients). Decompose to obtain \${ingItem.name} first.\`);
                     return false;
                 }
@@ -5319,6 +5387,7 @@ Voyager.SEEDED_PRIMITIVES = [
                     }
                 }
             }
+            bot.__unmetPrecondition = { kind: 'precondition' };
             log(bot, \`PREREQUISITE FAILED: ensureCraftingTable cannot craft - missing: \${missingIngredients.join(', ')}. Decompose to obtain prerequisites.\`);
             return false;
         }
