@@ -181,6 +181,43 @@ describe('fix81: respawn without tools — the failure chains iron_ore -> stone_
     });
 });
 
+describe('fix81: the live inventory (56 iron_ingot, 410 cobblestone, 0 wood) chains iron_pickaxe -> stick -> planks -> logs', () => {
+    it('drives Mine 1 iron_ore to iron_pickaxe (deterministic, no random choice), each failure chained on what it lacks', async () => {
+        const inv = { ...LIVE_INV };
+        const v = mkV({ inv, nearby: [...SURFACE] });
+        const logs = [], orig = console.log;
+        console.log = (...a) => { logs.push(a.join(' ')); };
+        try { await drive(v, 'Mine 1 iron_ore'); } finally { console.log = orig; }
+        assert.deepStrictEqual(v.ran, [
+            'Mine 1 iron_ore', 'Craft 1 iron_pickaxe', 'Craft 2 stick', 'Craft 2 oak_planks', 'Collect 1 oak_log',
+            'Craft 2 oak_planks', 'Craft 2 stick', 'Craft 1 iron_pickaxe', 'Mine 1 iron_ore',
+        ]);
+        assert.strictEqual(has(inv, 'iron_pickaxe'), 1);
+        assert.strictEqual(has(inv, 'iron_ingot'), 53);
+        // with 410 cobblestone held, stone_pickaxe and iron_pickaxe cost the same (both ingredients held, 2 sticks each):
+        // the tie is broken by name (no proven edges yet) and logged
+        assert.ok(logs.some(l => l.startsWith('[backchain] cost tie broken (proven edges, then name): one of ') && l.includes('"iron_pickaxe" (4 untried) over') && l.includes('"stone_pickaxe" (4 untried)')), logs.filter(l => l.includes('tie')).join('\n'));
+    });
+    it('without cobblestone (56 iron_ingot, 0 wood) iron_pickaxe is STRICTLY cheaper: stone_pickaxe costs its cobblestone\'s harvest tool, recursively', () => {
+        const v = mkV({ inv: {}, nearby: [...SURFACE] });
+        const p = v._obtainPlanner(v.observe());
+        const iron = p.prerequisites('iron_pickaxe', 1, { iron_ingot: 56 }), stone = p.prerequisites('stone_pickaxe', 1, { iron_ingot: 56 });
+        assert.deepStrictEqual(iron.plan, ['Collect 1 oak_log', 'Craft 2 oak_planks', 'Craft 2 stick', 'Craft 1 iron_pickaxe']);
+        assert.ok(stone.plan.includes('Collect 3 cobblestone') && stone.plan.indexOf('Craft 1 iron_pickaxe') < stone.plan.indexOf('Collect 3 cobblestone'), `cobblestone needs a pickaxe first: ${stone.plan.join(' > ')}`);
+        const less = (a, b) => { for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return a[i] < b[i]; return false; };
+        assert.ok(less(iron.cost, stone.cost), `${iron.cost} < ${stone.cost}`);
+        const ch = p.cheapest(['stone_pickaxe', 'iron_pickaxe', 'wooden_pickaxe', 'diamond_pickaxe', 'netherite_pickaxe'], 1, { iron_ingot: 56 });
+        assert.deepStrictEqual(ch, { item: 'iron_pickaxe', ties: [] }, 'no tie: strictly by cost');
+    });
+    it('a cost tie goes to the option with fewer untried edges (a run-proven stone_pickaxe edge beats the untried iron one)', () => {
+        const v = mkV({ inv: {}, nearby: [...SURFACE] });
+        v.progress.recipeEdges = { stone_pickaxe: { task: 'Craft 1 stone_pickaxe', status: 'proven', runs: 1, fails: 0 } };
+        const ch = v._obtainPlanner(v.observe()).cheapest(['iron_pickaxe', 'stone_pickaxe'], 1, { ...LIVE_INV });
+        assert.strictEqual(ch.item, 'stone_pickaxe');
+        assert.match(ch.ties[0], /"stone_pickaxe" \(3 untried\) over "iron_pickaxe" \(4 untried\)/);
+    });
+});
+
 describe('fix81: a non-tool failure chains the same way (no chest nearby)', () => {
     it('"needs a chest within 32 blocks" -> ensure chest -> craft chest -> planks -> logs, then the goal passes', async () => {
         const inv = { cobblestone: 410, raw_iron: 114 };
@@ -244,7 +281,7 @@ describe('fix81: structured needs are validated and reach the curriculum', () =>
 describe('fix81: obtainPlanner (game data only)', () => {
     const planner = (nearby, learned = () => false) => obtainPlanner({
         registry, recipesOf: id => Recipe.find(id),
-        known: (item, src) => src.some(b => nearby.includes(b)) || learned(item), choose: t => t[0],
+        known: (item, src) => src.some(b => nearby.includes(b)) || learned(item), proven: () => false,
     });
     it('cheapest harvest tool for stone from nothing is the wooden pickaxe (fix47 case, structural)', () => {
         const pre = planner(['oak_log']).prerequisites('stone', 3, {});
@@ -277,7 +314,7 @@ describe('fix81: obtainPlanner (game data only)', () => {
             blocksByName: {}, blockLoot: {},
         };
         const rec = { 1: [{ result: { count: 1 }, delta: [{ id: 2, count: -1 }, { id: 1, count: 1 }] }], 2: [{ result: { count: 1 }, delta: [{ id: 1, count: -1 }, { id: 2, count: 1 }] }] };
-        const pre = obtainPlanner({ registry: reg, recipesOf: id => rec[id], known: () => false, choose: t => t[0] }).prerequisites('a_item', 1, {});
+        const pre = obtainPlanner({ registry: reg, recipesOf: id => rec[id], known: () => false, proven: () => false }).prerequisites('a_item', 1, {});
         assert.deepStrictEqual(pre.cycles, ['a_item -> b_item -> a_item']);
         assert.strictEqual(pre.task, 'Craft 1 a_item');
         assert.deepStrictEqual(pre.steps.map(st => st.task), ['Obtain 1 b_item']);
@@ -289,7 +326,7 @@ describe('fix81: obtainPlanner (game data only)', () => {
             blocksByName: { x_item: { name: 'x_item', harvestTools: { 1: true } } },
             blockLoot: { x_item: { drops: [{ item: 'x_item' }] } },
         };
-        const p = obtainPlanner({ registry: reg, recipesOf: () => [], known: () => false, choose: t => t[0] });
+        const p = obtainPlanner({ registry: reg, recipesOf: () => [], known: () => false, proven: () => false });
         assert.throws(() => p.prerequisites('x_item', 1, {}), /no acyclic way to obtain 1 x_item .*cycles: x_item -> x_item.*unobtainable: x_item from x_item/);
     });
 });

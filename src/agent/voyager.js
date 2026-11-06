@@ -2516,7 +2516,7 @@ Use only c; no other globals.`;
                 if (!memo.has(item)) memo.set(item, src.some(b => near.has(b)) || this._producers(item).length > 0);
                 return memo.get(item);
             },
-            choose: tied => tied[Math.floor(Math.random() * tied.length)],
+            proven: item => Object.hasOwn(this.progress.recipeEdges, item) && this.progress.recipeEdges[item].status === 'proven',
         });
     }
     // fix81: the goal key a subgoal chain is seeking: an item goal seeks the item, an ensure goal the block PLACED nearby
@@ -2547,6 +2547,7 @@ Use only c; no other globals.`;
         // smelt goals ("Smelt N <raw> into N <out>") are furnace work the crafting recipes do not describe
         if (goal.kind !== 'item' || Object.hasOwn(goal, 'input')) return null;
         const pre = this._obtainPlanner(state).prerequisites(goal.item, goal.count, state.inventory);
+        for (const t of pre.ties) console.log(`[backchain] cost tie broken (proven edges, then name) planning ${goal.item}: ${t}`);
         if (pre.cycles.length) console.log(`[backchain] LOUD: ${pre.cycles.length} recipe cycle(s) in the game data excluded while planning ${goal.item}, through: ${[...new Set(pre.cycles.flatMap(c => c.split(' -> ')))].join(', ')}`);
         if (!pre.steps.length) return null;
         return pre.steps.map(st => this._checkNeed({ item: st.item, count: st.count, reason: pre.tool === null ? 'ingredients' : 'tool' }, 'game data'));
@@ -2565,7 +2566,12 @@ Use only c; no other globals.`;
         const inv = state.inventory;
         const resolved = [];
         for (const n of needs) {
-            const item = Object.hasOwn(n, 'anyOf') ? this._obtainPlanner(state).cheapest(n.anyOf, n.count, inv) : n.item;
+            let item = n.item;
+            if (Object.hasOwn(n, 'anyOf')) {
+                const ch = this._obtainPlanner(state).cheapest(n.anyOf, n.count, inv);
+                for (const t of ch.ties) console.log(`[backchain] cost tie broken (proven edges, then name): ${t}`);
+                item = ch.item;
+            }
             const need = { item, count: n.count, reason: n.reason, source: n.source };
             if (goal.kind === 'item' && item === goal.item && n.reason !== 'proximity') {
                 // the goal's own item could not be made: what it lacks is its own game-data prerequisites
@@ -5311,9 +5317,9 @@ Voyager.SEEDED_PRIMITIVES = [
     };
     let recipes = bot.recipesFor(target.id, null, 1, null);
     let craftingTable = null, placedTable = false;
-    if (!recipes || !recipes.length) {
+    if (!recipes.length) {
         recipes = bot.recipesFor(target.id, null, 1, true);
-        if (!recipes || !recipes.length) return unmakeable();
+        if (!recipes.length) return unmakeable();
         craftingTable = getNearestBlock(bot, 'crafting_table', 16);
         if (!craftingTable) {
             // fix51: call ensureCraftingTable to get/craft/place a table (fail loud if can't)
@@ -5325,7 +5331,7 @@ Voyager.SEEDED_PRIMITIVES = [
         }
         if (craftingTable) recipes = bot.recipesFor(target.id, null, 1, craftingTable);
     }
-    if (!recipes || !recipes.length) { if (placedTable) await collectBlock(bot, 'crafting_table', 1); return unmakeable(); }
+    if (!recipes.length) { if (placedTable) await collectBlock(bot, 'crafting_table', 1); return unmakeable(); }
     // fix60: walk to a spot that sees and reaches a face of the table (GoalLookAtBlock, game reach), not just near it
     if (craftingTable) {
         const reached = await goToReachBlock(bot, craftingTable);

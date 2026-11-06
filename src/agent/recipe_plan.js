@@ -10,12 +10,15 @@
 // iron_ingot) is a cycle in the game data: that recipe is excluded and the cycle is reported; nothing recurses on it.
 // Options are compared by [opaque obtains (an unknown item no recipe or block in the data yields: what it takes cannot
 // be read), units of raw resources with no known source, units of raw resources, steps]; "known" is learned or
-// observed (a source block seen nearby, or a learned producer). Exact ties go to choose(tied).
-export function obtainPlanner({ registry, recipesOf, known, choose }) {
+// observed (a source block seen nearby, or a learned producer). A raw resource's cost includes its harvest tool, planned
+// recursively from block.harvestTools (stone_pickaxe needs cobblestone, whose blocks need a pickaxe), unless a held tool
+// works. Exact cost ties are not a choice to randomise: the option with fewer untried (not run-proven) edges wins, then
+// the lexically first option name; each tie broken is reported (ties) and logged by the caller.
+export function obtainPlanner({ registry, recipesOf, known, proven }) {
     if (!registry) throw new Error('[fix81] obtainPlanner: registry required');
     if (typeof recipesOf !== 'function') throw new Error('[fix81] obtainPlanner: recipesOf(itemId) required');
     if (typeof known !== 'function') throw new Error('[fix81] obtainPlanner: known(item, sourceBlocks) required');
-    if (typeof choose !== 'function') throw new Error('[fix81] obtainPlanner: choose(tied) required');
+    if (typeof proven !== 'function') throw new Error('[fix81] obtainPlanner: proven(item) required (a run-proven producer edge)');
     if (!registry.blockLoot) throw new Error('[fix81] obtainPlanner: registry.blockLoot required');
     const itemName = id => {
         const it = registry.items[id];
@@ -60,14 +63,21 @@ export function obtainPlanner({ registry, recipesOf, known, choose }) {
     };
     const add = (a, b) => a.map((x, i) => x + b[i]);
     const less = (a, b) => { for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return a[i] < b[i]; return false; };
-    const pick = opts => {
+    // an option's name: its steps (or the item, for a choice between items); its untried edges: steps not proven by a run
+    const optName = o => (Object.hasOwn(o, 'item') ? o.item : o.steps.map(st => `${st.verb} ${st.item}`).join(' > '));
+    const untried = o => o.steps.filter(st => !proven(st.item)).length;
+    const pick = (opts, ctx, what) => {
         let best = [];
         for (const o of opts) {
             if (!best.length || less(o.cost, best[0].cost)) best = [o];
             else if (!less(best[0].cost, o.cost)) best.push(o);
         }
         if (!best.length) return null;
-        return best.length === 1 ? best[0] : choose(best);
+        if (best.length === 1) return best[0];
+        const ranked = best.map(o => ({ o, u: untried(o), n: optName(o) }))
+            .sort((a, b) => (a.u !== b.u ? a.u - b.u : (a.n < b.n ? -1 : a.n > b.n ? 1 : 0)));
+        ctx.ties.add(`${what} [cost ${ranked[0].o.cost.join(',')}]: "${ranked[0].n}" (${ranked[0].u} untried) over ${ranked.slice(1).map(r => `"${r.n}" (${r.u} untried)`).join(', ')}`);
+        return ranked[0].o;
     };
 
     function plan(item, need, inv, path, ctx, gain) {
@@ -119,7 +129,7 @@ export function obtainPlanner({ registry, recipesOf, known, choose }) {
                 opts.push(...withTool);
             }
         } else if (!crafts.length || isKnown) opts.push({ cost: [isKnown ? 0 : 1, unknown, rem, 1], inv, steps: [{ verb: 'obtain', item, count: rem }], how: 'obtain', missing: [] });
-        return pick(opts);
+        return pick(opts, ctx, item);
     }
 
     const taskFor = (how, item, count) => {
@@ -137,7 +147,7 @@ export function obtainPlanner({ registry, recipesOf, known, choose }) {
         prerequisites(item, count, inv) {
             if (!Number.isInteger(count)) throw new Error(`[fix81] prerequisites(${item}): integer count required, got ${JSON.stringify(count)}`);
             if (count < 1) throw new Error(`[fix81] prerequisites(${item}): count must be >= 1, got ${count}`);
-            const ctx = { cycles: new Set(), unobtainable: new Set() };
+            const ctx = { cycles: new Set(), unobtainable: new Set(), ties: new Set() };
             const best = plan(item, count, { ...inv }, [], ctx, true);
             const list = set => (set.size ? [...set].join('; ') : 'none');
             if (!best) throw new Error(`[fix81] LOUD: no acyclic way to obtain ${count} ${item} from the game data (cycles: ${list(ctx.cycles)}; unobtainable: ${list(ctx.unobtainable)})`);
@@ -148,21 +158,22 @@ export function obtainPlanner({ registry, recipesOf, known, choose }) {
                 steps: best.missing.map(m => ({ item: m.item, count: m.count, task: taskFor(m.how, m.item, m.count) })),
                 plan: best.steps.map(s => taskFor(s.verb, s.item, s.count)),
                 cycles: [...ctx.cycles],
+                ties: [...ctx.ties],
                 cost: best.cost,
             };
         },
         // the one of `items` that is cheapest to gain `count` of from `inv` (a need that any of several items meets:
-        // a harvest tool tier, a storage block); exact ties go to `choose`. Throws when none of them can be obtained.
+        // a harvest tool tier, a storage block); exact ties as in pick (proven edges, then name), reported in ties.
+        // Throws when none of them can be obtained.
         cheapest(items, count, inv) {
-            const opts = [];
+            const opts = [], ctx = { cycles: new Set(), unobtainable: new Set(), ties: new Set() };
             for (const item of items) {
-                const ctx = { cycles: new Set(), unobtainable: new Set() };
-                const best = plan(item, count, { ...inv }, [], ctx, true);
-                if (best) opts.push({ cost: best.cost, item });
+                const best = plan(item, count, { ...inv }, [], { cycles: new Set(), unobtainable: new Set(), ties: new Set() }, true);
+                if (best) opts.push({ cost: best.cost, item, steps: best.steps });
             }
-            const best = pick(opts);
+            const best = pick(opts, ctx, `one of ${items.join('/')}`);
             if (best === null) throw new Error(`[fix81] LOUD: none of ${items.join(', ')} can be obtained from the game data`);
-            return best.item;
+            return { item: best.item, ties: [...ctx.ties] };
         },
     };
 }

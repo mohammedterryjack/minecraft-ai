@@ -42,7 +42,7 @@ function rig(skills, rec, links = {}) {
     v._run = async (l, fn) => { await fn(); return { success: true, message: 'Code finished.' }; };
     v._diedInRun = () => null; v._stalledInRun = () => null; v._crashedInRun = () => null; v._lastRunTimedOut = false;
     v._foodRaiseSaturated = () => null; v._libraryFault = () => false; v._classifyUnmetPrecondition = () => null;
-    v._tryDecomposePrerequisiteFailure = () => {}; v._detectInventoryFullFailure = () => null;
+    v._failureNeeds = () => null; v._detectInventoryFullFailure = () => null;   // fix81: the structured-needs chain (was _tryDecomposePrerequisiteFailure) is not under test here
     v._learnRunDurations = () => {}; v._checkContracts = () => {}; v._learnVitalsEffects = () => {}; v._learnSlotEffects = () => {};
     v._prefetchBlamedEmbeds = () => {};
     v.logs = [];
