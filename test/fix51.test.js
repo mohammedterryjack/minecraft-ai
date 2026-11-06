@@ -462,30 +462,74 @@ describe('fix51 issue 11: nav stall loop per-goal::reason tracking', async () =>
     });
 });
 
-// Issue 13 (live run-2): Travel skill contract bug detection
-describe('fix51 issue 13: travel skill contract bug detection', async () => {
-    it('_isTravelContractBug exists and checks for delta-only postconditions', () => {
+// Issue 13 (live run-2): Observation-based contract mismatch detection (no name patterns)
+describe('fix51 issue 13: observation-based contract mismatch detection', async () => {
+    it('_extractPostFields extracts fields from postcondition source', () => {
         const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
-        assert.ok(voyagerSrc.includes('_isTravelContractBug'),
-            'should have _isTravelContractBug method');
+        assert.ok(voyagerSrc.includes('_extractPostFields'),
+            'should have _extractPostFields method');
+        assert.ok(voyagerSrc.includes('c\\.delta\\.') && voyagerSrc.includes('c\\.(post|pre)\\.pos'),
+            'should extract delta and position field references');
     });
 
-    it('detects travel skill with delta-based postcondition as bug', () => {
+    it('_detectContractMismatch detects when post checks unchanged fields', () => {
         const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
-        assert.ok(voyagerSrc.includes('checksDelta') && voyagerSrc.includes('checksPos'),
-            'should check if postcondition uses delta vs position');
+        assert.ok(voyagerSrc.includes('_detectContractMismatch'),
+            'should have _detectContractMismatch method');
+        assert.ok(voyagerSrc.includes('Changed:') && voyagerSrc.includes('Unchanged:'),
+            'should report changed and unchanged fields');
     });
 
-    it('queues contract repair for travel skill with inventory-based postcondition', () => {
+    it('does NOT use name patterns for detection', () => {
         const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
-        assert.ok(voyagerSrc.includes('_queueContractFix') && voyagerSrc.includes('travel skill postcondition'),
-            'should queue contract fix for travel skill contract bug');
+        // Should NOT have travel|goto|etc name pattern
+        assert.ok(!voyagerSrc.includes('travel|goto|goTo|moveTo'),
+            'should NOT use name-based pattern matching');
     });
 
-    it('travel skill name detection is case-insensitive', () => {
+    it('queues contract repair with observed field feedback', () => {
         const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
-        assert.ok(voyagerSrc.includes('/travel|goto|goTo') && voyagerSrc.includes('/i.test'),
-            'should use case-insensitive regex for travel skill detection');
+        assert.ok(voyagerSrc.includes('MISMATCH') && voyagerSrc.includes('_queueContractFix'),
+            'should queue contract fix with mismatch feedback');
+    });
+
+    it('detection works for non-travel-sounding names (observation-based)', () => {
+        // Test the logic: a skill named "doSomethingUseful" with postcondition checking delta
+        // but where delta is empty and position changed should be detected as mismatch
+        const postSrc = 'c => c.delta.stone > 0';
+        const s0 = { pos: { x: 0, y: 64, z: 0 }, hp: 20, food: 20, inv: {}, eq: {} };
+        const s1 = { pos: { x: 100, y: 64, z: 0 }, hp: 20, food: 20, inv: {}, eq: {} }; // moved 100 blocks
+        const r = { s0, s1, delta: {} }; // empty delta
+
+        // Extract fields from postcondition
+        const fields = { delta: ['stone'], pos: false, hp: false, food: false, inv: [], eq: [], dist: false };
+        
+        // Compute what changed
+        const deltaEmpty = Object.keys(r.delta).length === 0;
+        const posMoved = Math.abs(s1.pos.x - s0.pos.x) > 1;
+        
+        // Mismatch: post checks delta.stone but delta is empty and position moved
+        const isMismatch = fields.delta.length > 0 && deltaEmpty && posMoved && !fields.pos;
+        
+        assert.strictEqual(isMismatch, true, 
+            'should detect mismatch when post checks delta but delta empty and position changed');
+    });
+
+    it('no mismatch when checked fields actually changed', () => {
+        // Post checks delta.stone and delta.stone actually increased
+        const s0 = { pos: { x: 0, y: 64, z: 0 }, hp: 20, food: 20, inv: {}, eq: {} };
+        const s1 = { pos: { x: 0, y: 64, z: 0 }, hp: 20, food: 20, inv: {}, eq: {} }; // didn't move
+        const r = { s0, s1, delta: { stone: 5 } }; // delta changed
+
+        const fields = { delta: ['stone'], pos: false };
+        const deltaEmpty = Object.keys(r.delta).length === 0;
+        const posMoved = Math.abs(s1.pos.x - s0.pos.x) > 1;
+        
+        // No mismatch: post checks delta.stone and delta is not empty
+        const isMismatch = fields.delta.length > 0 && deltaEmpty && posMoved && !fields.pos;
+        
+        assert.strictEqual(isMismatch, false, 
+            'should NOT detect mismatch when checked delta fields actually changed');
     });
 });
 

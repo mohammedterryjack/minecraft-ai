@@ -752,21 +752,71 @@ Use only c; no other globals.`;
         try { for (const k of ['pre', 'post']) { const r = this._compileContract(ct[k])(c); if (typeof r !== 'boolean') return `${k} returned ${typeof r}, not boolean`; } } catch (e) { return `throws: ${e.message}`; }
         return null;
     }
-    // fix51: detect travel skill with inventory-based postcondition (contract bug)
-    // A travel skill's postcondition should check position change, not inventory delta
-    _isTravelContractBug(skillName, contract) {
-        if (!contract?.post) return false;
-        const isTravel = /travel|goto|goTo|moveTo|walk|navigate|approach|flee|escape|avoid/i.test(skillName);
-        if (!isTravel) return false;
-        const postStr = String(contract.post);
-        const checksDelta = /c\.delta|delta\[|delta\./.test(postStr);
-        const checksPos = /c\.post\.pos|c\.pre\.pos|c\.dist/.test(postStr);
-        // Bug: travel skill checks delta but not position
-        if (checksDelta && !checksPos) {
-            console.log(`[fix51] CONTRACT BUG: travel skill "${skillName}" postcondition checks delta but not position: ${postStr.slice(0, 100)}`);
-            return true;
+    // fix51: extract fields the postcondition reads from its source (AST-like extraction)
+    // Returns { delta: ['stone', 'iron_ingot'], pos: true, hp: true, ... }
+    _extractPostFields(postSrc) {
+        const src = String(postSrc);
+        const fields = { delta: [], pos: false, hp: false, food: false, inv: [], eq: [], dist: false };
+        // c.delta.item or c.delta['item'] or c.delta[var]
+        for (const m of src.matchAll(/c\.delta\.(\w+)/g)) fields.delta.push(m[1]);
+        for (const m of src.matchAll(/c\.delta\[['"](\w+)['"]\]/g)) fields.delta.push(m[1]);
+        if (/c\.delta\[/.test(src) && !/c\.delta\[['"]/.test(src)) fields.delta.push('*'); // dynamic access
+        // c.post.pos or c.pre.pos or c.dist
+        if (/c\.(post|pre)\.pos/.test(src)) fields.pos = true;
+        if (/c\.dist/.test(src)) fields.dist = true;
+        // c.post.hp or c.pre.hp
+        if (/c\.(post|pre)\.hp/.test(src)) fields.hp = true;
+        if (/c\.(post|pre)\.food/.test(src)) fields.food = true;
+        // c.post.inv.item or c.pre.inv.item
+        for (const m of src.matchAll(/c\.(post|pre)\.inv\.(\w+)/g)) fields.inv.push(m[2]);
+        // c.post.eq.slot or c.pre.eq.slot
+        for (const m of src.matchAll(/c\.(post|pre)\.eq\.(\w+)/g)) fields.eq.push(m[2]);
+        return fields;
+    }
+    // fix51: observation-based contract mismatch detection
+    // When post fails, check if post references fields that didn't change while other fields did change
+    // This detects contracts that don't match what the skill actually does, without using name patterns
+    _detectContractMismatch(e, r, postFailed) {
+        if (!postFailed || !e?.contract?.post || !r.s0 || !r.s1) return null;
+        const fields = this._extractPostFields(e.contract.post);
+        
+        // Compute what actually changed
+        const deltaEmpty = Object.keys(r.delta || {}).length === 0;
+        const posMoved = r.s0.pos && r.s1.pos && 
+            (Math.abs(r.s1.pos.x - r.s0.pos.x) > 1 || Math.abs(r.s1.pos.y - r.s0.pos.y) > 1 || Math.abs(r.s1.pos.z - r.s0.pos.z) > 1);
+        const hpChanged = r.s0.hp !== r.s1.hp;
+        const foodChanged = r.s0.food !== r.s1.food;
+        const eqChanged = JSON.stringify(r.s0.eq) !== JSON.stringify(r.s1.eq);
+        
+        // Build observed changes summary
+        const changed = [];
+        const unchanged = [];
+        if (posMoved) changed.push('position'); else unchanged.push('position');
+        if (!deltaEmpty) changed.push(`delta(${Object.keys(r.delta).join(',')})`); else unchanged.push('delta');
+        if (hpChanged) changed.push('hp');
+        if (foodChanged) changed.push('food');
+        if (eqChanged) changed.push('equipment');
+        
+        // Detect mismatch: post checks fields that didn't change, but other fields did change
+        const postChecksDelta = fields.delta.length > 0;
+        const postChecksPos = fields.pos || fields.dist;
+        
+        // Case: post checks delta but delta is empty, and position changed
+        if (postChecksDelta && deltaEmpty && posMoved && !postChecksPos) {
+            return `postcondition checks delta fields [${fields.delta.join(',')}] but delta was empty; position changed. Contract doesn't match skill behavior. Changed: ${changed.join(', ')}; Unchanged: ${unchanged.join(', ')}`;
         }
-        return false;
+        // Case: post checks position but position didn't change, and delta changed
+        if (postChecksPos && !posMoved && !deltaEmpty && !postChecksDelta) {
+            return `postcondition checks position but position didn't change; delta changed [${Object.keys(r.delta).join(',')}]. Contract doesn't match skill behavior. Changed: ${changed.join(', ')}; Unchanged: ${unchanged.join(', ')}`;
+        }
+        // Case: post checks specific delta items that aren't in actual delta, but other things changed
+        if (postChecksDelta && !fields.delta.includes('*')) {
+            const checkedButMissing = fields.delta.filter(item => !(r.delta || {})[item]);
+            if (checkedButMissing.length === fields.delta.length && changed.length > 0) {
+                return `postcondition checks delta items [${fields.delta.join(',')}] but none were in actual delta; other state changed. Changed: ${changed.join(', ')}; Unchanged: ${unchanged.join(', ')}`;
+            }
+        }
+        return null;
     }
     // evaluate contracts on every traced library call; violations become contract failures in the trace
     _checkContracts(trace, taskOk) {
@@ -775,11 +825,6 @@ Use only c; no other globals.`;
             if (r.intr || !r.s0 || !r.s1) continue;
             const e = this.skills.find(s => s.name === r.name);
             if (!e?.contract) continue;
-            // fix51: detect travel skill with inventory-based postcondition (contract bug) and queue repair
-            if (this._isTravelContractBug(e.name, e.contract)) {
-                this._queueContractFix(e, `travel skill postcondition checks delta but not position`);
-                continue;
-            }
             const c = { args: r.argv || [], ret: r.rv, pre: r.s0, post: r.s1, delta: r.delta || {}, dist };
             for (const k of ['pre', 'post']) {
                 let ok;
@@ -795,6 +840,16 @@ Use only c; no other globals.`;
                     if (deltaGained) {
                         console.log(`[contract] fix45: ${e.name} postcondition disagreed but delta shows gain for effects [${effects.join(',')}]; queuing contract repair, not skill repair`);
                         this._queueContractFix(e, `postcondition ${e.contract.post} was false but delta shows gain (effects: ${effects.join(',')})`);
+                        continue;
+                    }
+                }
+                // fix51: observation-based contract mismatch detection (no name patterns)
+                // If post checks fields that didn't change but other fields did, the contract doesn't match the skill
+                if (k === 'post') {
+                    const mismatch = this._detectContractMismatch(e, r, true);
+                    if (mismatch) {
+                        console.log(`[contract] MISMATCH ${e.name}: ${mismatch}`);
+                        this._queueContractFix(e, mismatch);
                         continue;
                     }
                 }
