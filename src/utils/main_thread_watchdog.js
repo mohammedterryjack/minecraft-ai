@@ -27,12 +27,21 @@ export const LIMIT = 1;
 /** @type {{ ctl: Int32Array, port: import('node:worker_threads').MessagePort, worker: Worker } | null} */
 let _wd = null;
 
-/** Start the worker once per process. Arming waits for the learned keep_alive gap (armMainThreadWatchdog). */
-export function startMainThreadWatchdog() {
+/** fix65: where the worker leaves its kill evidence for the next process (Voyager._settleDeadTrials reads it). */
+export function watchdogEvidencePath(botDir) {
+    return `${botDir}/watchdog_kill.json`;
+}
+
+/**
+ * Start the worker once per process. Arming waits for the learned keep_alive gap (armMainThreadWatchdog).
+ * @param {string} evidencePath file the worker writes (synchronously, before SIGKILL) for the next process to read
+ */
+export function startMainThreadWatchdog(evidencePath) {
+    if (typeof evidencePath !== 'string' || !evidencePath) throw new Error('[watchdog] startMainThreadWatchdog: evidence path required');
     if (_wd) return _wd;
     const ctl = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 2));
     const { port1, port2 } = new MessageChannel();
-    const worker = new Worker(WORKER_PATH, { workerData: { sab: ctl.buffer, port: port2, pid: process.pid }, transferList: [port2] });
+    const worker = new Worker(WORKER_PATH, { workerData: { sab: ctl.buffer, port: port2, pid: process.pid, evidencePath }, transferList: [port2] });
     worker.on('error', (e) => { throw new Error(`[watchdog] LOUD FAIL: watchdog worker crashed: ${e && e.stack ? e.stack : e}`); });
     worker.on('exit', (code) => { throw new Error(`[watchdog] LOUD FAIL: watchdog worker exited (code ${code}); the main thread is unguarded`); });
     worker.unref();

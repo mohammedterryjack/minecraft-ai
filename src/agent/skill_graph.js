@@ -209,6 +209,8 @@ export function instrumentSrc(names) {
     // fix11 (B6): parent call tracked with AsyncLocalStorage (bot.__psnALS, set by voyager.js before each run; fix12: SES compartments have their own globalThis), so parallel calls get the right parent
     // fix43: __st() now includes equipment state (eq) so equip skill contracts can be idempotent (already-equipped = success)
     // fix59: __st() also records free (empty inventory slots) so a skill's slot effect is learned, not matched by name
+    // fix65: when a traced call returns, bot.__psnRunningSkill/__psnStackStr go back to its CALLER (they were cleared, so a
+    //        parent that then blocked showed no stack in the watchdog's evidence)
     // fix49/fix51: __have() = getInventoryCounts (slots 5+ already include armor, held hotbar slot and off-hand: counting eq again double-counts)
     //        waitForTicks(1) before post snapshot (one server tick, not magic timers)
     const wrap = `const __T = bot.__psnTrace = []; const __als = bot.__psnALS; if (!__als) throw new Error('PSN trace: bot.__psnALS (AsyncLocalStorage) missing'); const __inv = () => getInventoryCounts(bot);
@@ -232,7 +234,7 @@ const __wrap = (n, f) => async function (...a) {
         rec.rv = false;
         return false;
     }
-    finally { await bot.waitForTicks(1); rec.t1 = Date.now(); if (!n.startsWith('skills.')) rec.s1 = __st(); rec.o1 = (bot.output || '').length; bot.__psnOut = bot.output; const post = __have(); rec.delta = {}; for (const k of new Set([...Object.keys(rec.pre), ...Object.keys(post)])) { const d = (post[k] || 0) - (rec.pre[k] || 0); if (d) rec.delta[k] = d; } delete rec.pre; rec.intr = !!bot.interrupt_code; bot.__psnRunningSkill = null; bot.__psnStackStr = ''; }
+    finally { await bot.waitForTicks(1); rec.t1 = Date.now(); if (!n.startsWith('skills.')) rec.s1 = __st(); rec.o1 = (bot.output || '').length; bot.__psnOut = bot.output; const post = __have(); rec.delta = {}; for (const k of new Set([...Object.keys(rec.pre), ...Object.keys(post)])) { const d = (post[k] || 0) - (rec.pre[k] || 0); if (d) rec.delta[k] = d; } delete rec.pre; rec.intr = !!bot.interrupt_code; bot.__psnRunningSkill = par >= 0 ? __T[par].name : null; bot.__psnStackStr = __stackParts.join(' <- '); }
 };`;
     // fix40: bare-name API - builtins and learned skills both use bare names
     // Wrap all provided names (both built-in and learned) for tracing

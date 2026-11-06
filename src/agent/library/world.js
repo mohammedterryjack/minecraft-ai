@@ -1,4 +1,5 @@
 import pf from 'mineflayer-pathfinder';
+import { Vec3 } from 'vec3';
 import * as mc from '../../utils/mcdata.js';
 
 
@@ -51,39 +52,62 @@ export function getNearestFreeSpace(bot, size=1, distance=8) {
 }
 
 
+/**
+ * fix65: label for a block whose chunk the client has not loaded. Not a block name: the block there is UNKNOWN, not air.
+ * Callers that report surroundings print it; callers that act on a block must check for null themselves.
+ */
+export const UNLOADED = 'unloaded (unknown, not air)';
+
 export function getBlockAtPosition(bot, x=0, y=0, z=0) {
      /**
-     * Get a block from the bot's relative position 
+     * Get the block at an offset RELATIVE to the bot's feet.
      * @param {Bot} bot - The bot to get the block for.
-     * @param {number} x - The relative x offset to serach, default 0.
-     * @param {number} y - The relative y offset to serach, default 0.
-     * @param {number} y - The relative z offset to serach, default 0. 
-     * @returns {Block} - The nearest block.
+     * @param {number} x - The relative x offset to search, default 0.
+     * @param {number} y - The relative y offset to search, default 0.
+     * @param {number} z - The relative z offset to search, default 0.
+     * @returns {Block|null} - The block, or null when its chunk is not loaded (unknown: NOT air).
+     * Throws when the arguments are an absolute position near the bot (use bot.blockAt(new Vec3(x, y, z)) for that).
      * @example
      * let blockBelow = world.getBlockAtPosition(bot, 0, -1, 0);
      * let blockAbove = world.getBlockAtPosition(bot, 0, 2, 0); since minecraft position is at the feet
      **/
-    let block = bot.blockAt(bot.entity.position.offset(x, y, z));
-    if (!block) block = {name: 'air'};
-       
-    return block;
+    // fix65: an unloaded chunk used to come back as {name: 'air'} (copied in 6a7820b from the 2024 modes.js
+    // "hacky fix when blocks are not loaded", dc520a9/b4a60cb, which only stopped a null crash). Fake air hid both unloaded
+    // chunks and absolute coordinates passed as offsets: the 09:37Z collectBlock candidate read every ore as missing.
+    const feet = bot.entity.position.floored();
+    const asOffset = new Vec3(x, y, z);
+    // Absolute coordinates of a nearby block lie closer to the bot than to the origin of offsets; a real offset does not.
+    if (asOffset.distanceTo(feet) < asOffset.distanceTo(new Vec3(0, 0, 0))) {
+        throw new Error(`getBlockAtPosition(bot, ${x}, ${y}, ${z}): these are absolute coordinates (the bot stands at ${feet}), but getBlockAtPosition takes offsets RELATIVE to the bot. For an absolute position use bot.blockAt(new Vec3(${x}, ${y}, ${z})).`);
+    }
+    return bot.blockAt(bot.entity.position.offset(x, y, z));
 }
 
+/** fix65: name of the block at a relative offset for reports, or UNLOADED; never a guessed name. */
+function _reportBlockAt(bot, x, y, z) {
+    const b = getBlockAtPosition(bot, x, y, z);
+    return b ? b.name : UNLOADED;
+}
 
 export function getSurroundingBlocks(bot) {
     /**
      * Get the surrounding blocks from the bot's environment.
      * @param {Bot} bot - The bot to get the block for.
-     * @returns {string[]} - A list of block results as strings.
+     * @returns {string[]} - A list of block results as strings (UNLOADED where the chunk is not loaded).
      * @example
      **/
     // Create a list of block position results that can be unpacked.
     let res = [];
-    res.push(`Block Below: ${getBlockAtPosition(bot, 0, -1, 0).name}`);
-    res.push(`Block at Legs: ${getBlockAtPosition(bot, 0, 0, 0).name}`);
-    res.push(`Block at Head: ${getBlockAtPosition(bot, 0, 1, 0).name}`);
+    res.push(`Block Below: ${_reportBlockAt(bot, 0, -1, 0)}`);
+    res.push(`Block at Legs: ${_reportBlockAt(bot, 0, 0, 0)}`);
+    res.push(`Block at Head: ${_reportBlockAt(bot, 0, 1, 0)}`);
 
     return res;
+}
+
+/** fix65: exported for full_state.js, which reports the same three cells */
+export function reportBlockAtOffset(bot, x, y, z) {
+    return _reportBlockAt(bot, x, y, z);
 }
 
 
@@ -93,7 +117,7 @@ export function getFirstBlockAboveHead(bot, ignore_types=null, distance=32) {
      * @param {Bot} bot - The bot to get the block for.
      * @param {string[]} ignore_types - The names of the blocks to ignore.
      * @param {number} distance - The maximum distance to search, default 32.
-     * @returns {string} - The fist block above head.
+     * @returns {string} - The first block above head, 'none', or UNLOADED with its height when the column is not loaded there.
      * @example
      * let firstBlockAboveHead = world.getFirstBlockAboveHead(bot, null, 32);
      **/
@@ -107,23 +131,14 @@ export function getFirstBlockAboveHead(bot, ignore_types=null, distance=32) {
             if (mc.getBlockId(ignore_type)) ignore_blocks.push(ignore_type);
         }
     }
-    // The block above, stops when it finds a solid block .
-    let block_above = {name: 'air'};
-    let height = 0
+    // The block above, stops when it finds a solid block (fix65: or at the first unloaded cell, which is unknown, not air)
     for (let i = 0; i < distance; i++) {
-        let block = bot.blockAt(bot.entity.position.offset(0, i+2, 0));
-        if (!block) block = {name: 'air'};
-        // Ignore and continue
+        const block = bot.blockAt(bot.entity.position.offset(0, i+2, 0));
+        if (!block) return `${UNLOADED} (${i} blocks up)`;
         if (ignore_blocks.includes(block.name)) continue;
-        // Defaults to any block
-        block_above = block;
-        height = i;
-        break;
+        return `${block.name} (${i} blocks up)`;
     }
-
-    if (ignore_blocks.includes(block_above.name)) return 'none';
-    
-    return `${block_above.name} (${height} blocks up)`;
+    return 'none';
 }
 
 

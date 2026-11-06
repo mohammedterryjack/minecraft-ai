@@ -1,0 +1,419 @@
+[
+ {
+  "name": "mineOneIronOre",
+  "description": "Paths to the nearest iron ore and mines one block, collecting the drop.",
+  "task": "Mine 1 iron_ore",
+  "code": "// DESCRIPTION: Paths to the nearest iron ore and mines one block, collecting the drop.\nasync function mineOneIronOre(bot) {\n    if (bot.interrupt_code) return;\n    await equipBestPickaxeForMining(bot);\n    if (bot.interrupt_code) return;\n    let ore = getNearestBlock(bot, 'iron_ore', 64);\n    if (bot.interrupt_code) return;\n    if (!ore) {\n        ore = getNearestBlock(bot, 'deepslate_iron_ore', 64);\n    }\n    if (bot.interrupt_code) return;\n    if (!ore) {\n        await mineBlocks(bot, 'iron_ore', 1);\n        return;\n    }\n    if (bot.interrupt_code) return;\n    const counts = getInventoryCounts(bot);\n    const startRaw = counts.raw_iron || 0;\n    await mineIronOreBlock(bot, ore, startRaw, startRaw + 1);\n}",
+  "deps": [
+   "equipBestPickaxeForMining",
+   "mineBlocks",
+   "mineIronOreBlock"
+  ],
+  "effects": [
+   "cobblestone",
+   "raw_iron",
+   "dirt",
+   "raw_copper",
+   "granite"
+  ],
+  "stats": {
+   "success": 35,
+   "fail": 1,
+   "streakFail": 0,
+   "tasks": [
+    "Mine 1 iron_ore",
+    "mineOneIronOre"
+   ]
+  },
+  "contract": {
+   "pre": "c => c.pre.alive && c.pre.dim !== 'the_nether'",
+   "post": "c => c.post.alive && ((c.post.inv.raw_iron || 0) >= (c.pre.inv.raw_iron || 0) + 1) && (c.post.pos !== c.pre.pos)",
+   "text": "If alive and not in the Nether, paths to the nearest iron or deepslate iron ore, mines exactly one ore with the best pickaxe, and on success stays alive, gains at least one raw iron in inventory, and ",
+   "learned": "2026-11-06T11:01:29.521Z",
+   "why": "contract repair"
+  },
+  "consumes": {
+   "dirt": 8,
+   "iron_pickaxe": 1,
+   "cobblestone": 12
+  }
+ },
+ {
+  "name": "mineIronOreBlock",
+  "description": "Travel to a specific iron ore block, reach it from a dry adjacent stand, and mine until raw_iron progress toward goal is made.",
+  "task": "split sp1793906841127",
+  "code": "async function mineIronOreBlock(bot, block, startRaw, goal) {\n    // DESCRIPTION: Travel to a specific iron ore block, reach it from a dry adjacent stand, and mine until raw_iron progress toward goal is made.\n    if (bot.interrupt_code) return false;\n    if (!block || !block.position) {\n        log(bot, 'FAILED: invalid iron ore block');\n        return false;\n    }\n\n    const vitalsTag = () => {\n        const m = getVitalsMax(bot);\n        const maxFood = m && m.maxFood != null ? m.maxFood : 20;\n        const maxHealth = m && m.maxHealth != null ? m.maxHealth : 20;\n        return `[food ${bot.food}/${maxFood} health ${bot.health}/${maxHealth}]`;\n    };\n\n    const oreNames = ['iron_ore', 'deepslate_iron_ore'];\n    const isOre = (b) => b && oreNames.includes(b.name);\n\n    const refreshTarget = () => {\n        const b = bot.blockAt(block.position);\n        return isOre(b) ? b : null;\n    };\n\n    let target = refreshTarget();\n    if (!target) {\n        log(bot, 'FAILED: iron ore block missing at target');\n        return false;\n    }\n\n    const botFeetDry = () => {\n        if (!bot.entity || !bot.entity.position) return false;\n        const feet = bot.blockAt(bot.entity.position.floored());\n        const head = bot.blockAt(bot.entity.position.floored().offset(0, 1, 0));\n        if (!feet) return false;\n        if (feet.name === 'water' || feet.name === 'lava') return false;\n        if (head && (head.name === 'water' || head.name === 'lava')) return false;\n        return true;\n    };\n\n    const reachDist = (b) => {\n        if (!b || !b.position || !bot.entity || !bot.entity.position) return Infinity;\n        return bot.entity.position.distanceTo(b.position.offset(0.5, 0.5, 0.5));\n    };\n\n    const safeReach = (b) => botFeetDry() && reachDist(b) <= 4.5;\n\n    const pos = target.position;\n    await travelTo(bot, pos.x, pos.y, pos.z);\n    if (bot.interrupt_code) return false;\n\n    if (!botFeetDry()) {\n        await goToSurface(bot);\n        if (bot.interrupt_code) return false;\n        await travelTo(bot, pos.x, pos.y, pos.z);\n        if (bot.interrupt_code) return false;\n    }\n\n    const approach = [\n        [0, 1, 0], [0, 0, 0], [1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1],\n        [1, 0, 1], [1, 0, -1], [-1, 0, 1], [-1, 0, -1],\n        [0, -1, 0], [2, 0, 0], [-2, 0, 0], [0, 0, 2], [0, 0, -2],\n    ];\n\n    for (let i = 0; i < approach.length; i++) {\n        if (bot.interrupt_code) return false;\n        if (safeReach(target)) break;\n\n        const [dx, dy, dz] = approach[i];\n        await goToPosition(bot, pos.x + dx, pos.y + dy, pos.z + dz, 1);\n        if (bot.interrupt_code) return false;\n\n        target = refreshTarget();\n        if (!target) {\n            log(bot, 'FAILED: iron ore block missing at target');\n            return false;\n        }\n    }\n\n    if (!safeReach(target)) {\n        log(bot, 'FAILED: iron ore block out of safe reach ' + vitalsTag());\n        return false;\n    }\n\n    const before = getInventoryCounts(bot);\n    const need = goal - ((before.raw_iron || 0) - startRaw);\n    if (need <= 0) return true;\n\n    const n = Math.max(1, Math.min(need, 5));\n    const oreName = target.name;\n\n    let gained = await collectBlock(bot, oreName, n);\n    if (bot.interrupt_code) return false;\n    await pickupNearbyItems(bot);\n    if (bot.interrupt_code) return false;\n\n    const afterCollect = getInventoryCounts(bot);\n    let delta = (afterCollect.raw_iron || 0) - (before.raw_iron || 0);\n\n    if (delta <= 0) {\n        gained = await breakBlockAt(bot, pos.x, pos.y, pos.z);\n        if (bot.interrupt_code) return false;\n        await pickupNearbyItems(bot);\n        if (bot.interrupt_code) return false;\n        const afterBreak = getInventoryCounts(bot);\n        delta = (afterBreak.raw_iron || 0) - (before.raw_iron || 0);\n    }\n\n    if (delta <= 0) {\n        target = refreshTarget();\n        if (target) {\n            log(bot, 'FAILED: iron ore block out of safe reach ' + vitalsTag());\n            return false;\n        }\n    }\n\n    return true;\n}",
+  "deps": [
+   "travelTo",
+   "collectBlock",
+   "pickupNearbyItems",
+   "breakBlockAt"
+  ],
+  "effects": [],
+  "stats": {
+   "success": 2,
+   "fail": 0,
+   "streakFail": 0,
+   "tasks": [
+    "Mine 5 iron_ore"
+   ]
+  },
+  "contract": {
+   "pre": "c => c.pre.alive && typeof c.args[1] === 'number' && typeof c.args[2] === 'number'",
+   "post": "c => c.ret === false || c.ret === null ? true : c.post.alive && (c.delta.raw_iron || 0) >= 0 && (c.post.inv.raw_iron || 0) - c.args[1] <= c.args[2] && (c.post.inv.raw_iron || 0) - c.args[1] >= (c.pre.inv.raw_iron || 0) - c.args[1]",
+   "text": "When given a valid ore block reference and raw_iron baseline/goal, move within range, mine toward the goal (up to five drops per call), pick up items, and break the target block if mining yielded noth",
+   "learned": "2026-11-05T19:28:53.526Z",
+   "why": "saved"
+  },
+  "demoted": false,
+  "consumes": {},
+  "candidate": {
+   "code": "async function mineIronOreBlock(bot, block, startRaw, goal) {\n    // DESCRIPTION: Travel to a specific iron ore block, align vertically after horizontal travelTo, stand on a dry adjacent cell, and break the ore once with pickup until raw_iron progress is made.\n    if (bot.interrupt_code) return false;\n    if (!block || !block.position) {\n        log(bot, 'FAILED: invalid iron ore block');\n        return false;\n    }\n\n    const oreNames = ['iron_ore', 'deepslate_iron_ore'];\n    const isOre = (b) => b && oreNames.includes(b.name);\n\n    const refreshTarget = () => {\n        if (bot.interrupt_code) return null;\n        const b = bot.blockAt(block.position);\n        return isOre(b) ? b : null;\n    };\n\n    let target = refreshTarget();\n    if (!target) {\n        log(bot, 'FAILED: iron ore block missing at target');\n        return false;\n    }\n\n    const pos = target.position;\n    const before = getInventoryCounts(bot);\n    const need = goal - ((before.raw_iron || 0) - startRaw);\n    if (need <= 0) return true;\n\n    const vitalsTag = () => {\n        const m = getVitalsMax(bot);\n        const maxFood = m && m.maxFood != null ? m.maxFood : 20;\n        const maxHealth = m && m.maxHealth != null ? m.maxHealth : 20;\n        return `[food ${bot.food}/${maxFood} health ${bot.health}/${maxHealth}]`;\n    };\n\n    const botFeetDry = () => {\n        if (bot.interrupt_code) return false;\n        if (!bot.entity || !bot.entity.position) return false;\n        const feetPos = bot.entity.position.floored();\n        const feet = bot.blockAt(feetPos);\n        const head = bot.blockAt(feetPos.offset(0, 1, 0));\n        if (!feet) return false;\n        if (feet.name === 'water' || feet.name === 'lava') return false;\n        if (head && (head.name === 'water' || head.name === 'lava')) return false;\n        return true;\n    };\n\n    const reachDist = (b) => {\n        if (!b || !b.position || !bot.entity || !bot.entity.position) return Infinity;\n        return bot.entity.position.distanceTo(b.position.offset(0.5, 0.5, 0.5));\n    };\n\n    const canMine = (b) => botFeetDry() && reachDist(b) <= 4.5;\n\n    const rawIronDelta = () => {\n        const inv = getInventoryCounts(bot);\n        return (inv.raw_iron || 0) - (before.raw_iron || 0);\n    };\n\n    const mineAtTarget = async (t) => {\n        if (bot.interrupt_code) return false;\n        if (!t || !t.position) return false;\n        if (!canMine(t)) return false;\n\n        const inv0 = getInventoryCounts(bot);\n        const px = t.position.x;\n        const py = t.position.y;\n        const pz = t.position.z;\n\n        const broke = await breakBlockAt(bot, px, py, pz);\n        if (bot.interrupt_code) return false;\n        await pickupNearbyItems(bot);\n        if (bot.interrupt_code) return false;\n\n        const inv1 = getInventoryCounts(bot);\n        if ((inv1.raw_iron || 0) - (inv0.raw_iron || 0) > 0) return true;\n\n        if (broke) {\n            await wait(bot, 500);\n            if (bot.interrupt_code) return false;\n            await pickupNearbyItems(bot);\n            if (bot.interrupt_code) return false;\n            if (rawIronDelta() > 0) return true;\n        }\n\n        const stillOre = refreshTarget();\n        if (!stillOre) return rawIronDelta() > 0;\n\n        return false;\n    };\n\n    await travelTo(bot, pos.x, pos.y, pos.z);\n    if (bot.interrupt_code) return false;\n\n    if (!botFeetDry()) {\n        await goToSurface(bot);\n        if (bot.interrupt_code) return false;\n        await travelTo(bot, pos.x, pos.y, pos.z);\n        if (bot.interrupt_code) return false;\n    }\n\n    if (bot.entity && bot.entity.position) {\n        const dy = Math.abs(bot.entity.position.y - pos.y);\n        if (dy > 4) {\n            await goToPosition(bot, pos.x, pos.y, pos.z, 3);\n            if (bot.interrupt_code) return false;\n        }\n    }\n\n    const approach = [\n        [1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1],\n        [1, 0, 1], [1, 0, -1], [-1, 0, 1], [-1, 0, -1],\n        [0, 1, 0], [0, -1, 0],\n        [2, 0, 0], [-2, 0, 0], [0, 0, 2], [0, 0, -2],\n    ];\n\n    target = refreshTarget();\n    if (!target) {\n        if (rawIronDelta() > 0) return true;\n        log(bot, 'FAILED: iron ore block missing at target');\n        return false;\n    }\n\n    if (await mineAtTarget(target)) {\n        if (rawIronDelta() > 0) return true;\n    }\n    if (bot.interrupt_code) return false;\n\n    for (let i = 0; i < approach.length; i++) {\n        if (bot.interrupt_code) return false;\n        if (rawIronDelta() > 0) return true;\n\n        target = refreshTarget();\n        if (!target) {\n            if (rawIronDelta() > 0) return true;\n            log(bot, 'FAILED: iron ore block missing at target');\n            return false;\n        }\n\n        if (canMine(target)) {\n            if (await mineAtTarget(target)) {\n                if (rawIronDelta() > 0) return true;\n            }\n            if (bot.interrupt_code) return false;\n            if (rawIronDelta() > 0) return true;\n        }\n\n        const [dx, dy, dz] = approach[i];\n        const standBlock = bot.blockAt(pos.offset(dx, dy, dz));\n        if (!standBlock) continue;\n\n        await goToPosition(bot, pos.x + dx, pos.y + dy, pos.z + dz, 1);\n        if (bot.interrupt_code) return false;\n    }\n\n    if (rawIronDelta() > 0) return true;\n\n    target = refreshTarget();\n    if (target && canMine(target)) {\n        if (await mineAtTarget(target) && rawIronDelta() > 0) return true;\n        if (bot.interrupt_code) return false;\n    }\n\n    if (rawIronDelta() > 0) return true;\n\n    target = refreshTarget();\n    if (target) {\n        if (!canMine(target)) {\n            log(bot, 'FAILED: iron ore block out of safe reach ' + vitalsTag());\n            return false;\n        }\n        log(bot, 'FAILED: no raw_iron after mining iron ore ' + vitalsTag());\n        return false;\n    }\n\n    log(bot, 'FAILED: iron ore block missing after mining attempt');\n    return false;\n}",
+   "description": "Travel to a specific iron ore block, align vertically after horizontal travelTo, stand on a dry adjacent cell, and break the ore once with pickup until raw_iron progress is made.",
+   "deps": [
+    "getInventoryCounts",
+    "getVitalsMax",
+    "breakBlockAt",
+    "pickupNearbyItems",
+    "wait",
+    "travelTo",
+    "goToSurface",
+    "goToPosition"
+   ],
+   "task": "repair: mineOre: Mine 5 iron_ore blocks directly from the deposit, using the equipped pickaxe and collecting raw_iron drops",
+   "effects": [],
+   "stats": {
+    "success": 1,
+    "fail": 1,
+    "streakFail": 1,
+    "tasks": [
+     "Mine 1 iron_ore"
+    ]
+   },
+   "trialAfter": 1793934162820
+  }
+ },
+ {
+  "name": "breakBlockAt",
+  "description": "Break the block at the given position. Equips the best available tool from inventory (no crafting) and moves within range if needed.",
+  "task": "break a block",
+  "code": "async function breakBlockAt(bot, x, y, z) {\n    if (x == null || y == null || z == null) { log(bot, 'breakBlockAt: invalid coordinates'); return false; }\n    const block = bot.blockAt(new Vec3(x, y, z));\n    if (!block) { log(bot, `breakBlockAt: blockAt(${x}, ${y}, ${z}) returned null (unloaded chunk?)`); return false; }\n    if (block.name === 'air' || block.name === 'water' || block.name === 'lava') {\n        log(bot, `No solid block at ${x}, ${y}, ${z}.`); return false;\n    }\n    if (bot.entity.position.distanceTo(block.position) > 4.5) {\n        await goToPosition(bot, block.position.x, block.position.y, block.position.z, 4);\n    }\n    if (bot.game.gameMode !== 'creative') {\n        await equipToolForBlock(bot, block);\n        const itemId = bot.heldItem ? bot.heldItem.type : null;\n        if (!block.canHarvest(itemId)) { log(bot, `FAILED: Don't have right tools to break ${block.name}. Need one of: ${Object.keys(block.harvestTools || {}).map(id => bot.registry.items[id].name).join(', ') || 'any tool'}`); return false; }\n    }\n    await bot.dig(block, true);\n    log(bot, `Broke ${block.name} at ${x.toFixed(1)}, ${y.toFixed(1)}, ${z.toFixed(1)}.`);\n    return true;\n}",
+  "deps": [
+   "equipToolForBlock"
+  ],
+  "seeded": true,
+  "stats": {
+   "success": 1,
+   "fail": 3,
+   "streakFail": 3,
+   "tasks": [
+    "ensureCraftingTable: Ensure a crafting table is within range by crafting one from planks if needed"
+   ]
+  },
+  "contract": {
+   "pre": "c => c.pre.alive && c.args[0] != null && c.args[1] != null && c.args[2] != null",
+   "post": "c => c.ret !== true || c.post.alive",
+   "text": "Move within range, equip a suitable tool, and break the solid block at the given coordinates on success.",
+   "learned": "2026-11-05T19:37:47.251Z",
+   "why": "backfill"
+  },
+  "demoted": true,
+  "effects": [],
+  "consumes": {},
+  "candidate": {
+   "code": "// DESCRIPTION: Reach dig range of the block at x,y,z with retried navigation, equip a harvest-capable tool, dig it, and return true only when that cell no longer holds the target block.\nasync function breakBlockAt(bot, x, y, z) {\n    if (x == null || y == null || z == null) {\n        log(bot, 'FAILED: breakBlockAt invalid coordinates');\n        return false;\n    }\n    if (bot.interrupt_code) {\n        log(bot, 'FAILED: interrupted before breakBlockAt');\n        return false;\n    }\n    if (!bot.entity || !bot.entity.position) {\n        log(bot, 'FAILED: bot entity or position missing');\n        return false;\n    }\n\n    let block = bot.blockAt(new Vec3(x, y, z));\n    if (!block || block.name === 'air' || block.name === 'water' || block.name === 'lava') {\n        log(bot, `FAILED: no solid block at ${x}, ${y}, ${z}`);\n        return false;\n    }\n    const targetName = block.name;\n    const tx = block.position.x;\n    const ty = block.position.y;\n    const tz = block.position.z;\n    const maxReach = 4.5;\n\n    let navAttempts = 0;\n    while (bot.entity.position.distanceTo(block.position) > maxReach) {\n        if (bot.interrupt_code) {\n            log(bot, 'FAILED: interrupted while navigating to block');\n            return false;\n        }\n        if (navAttempts >= 5) {\n            log(bot, 'FAILED: could not reach dig range of block');\n            return false;\n        }\n        navAttempts++;\n        const dist = bot.entity.position.distanceTo(block.position);\n        let ok = false;\n        if (dist > 40) {\n            ok = await travelTo(bot, tx, ty, tz, 120);\n        } else {\n            ok = await goToPosition(bot, tx, ty, tz, 2);\n        }\n        if (!ok) {\n            await wait(bot, 300);\n            continue;\n        }\n        block = bot.blockAt(new Vec3(x, y, z));\n        if (!block || block.name === 'air' || block.name === 'water' || block.name === 'lava') {\n            log(bot, 'FAILED: block missing or not solid after navigation');\n            return false;\n        }\n    }\n\n    if (bot.interrupt_code) {\n        log(bot, 'FAILED: interrupted before equipping tool');\n        return false;\n    }\n\n    block = bot.blockAt(new Vec3(x, y, z));\n    if (!block || block.name === 'air' || block.name === 'water' || block.name === 'lava') {\n        log(bot, `FAILED: no solid block at ${x}, ${y}, ${z}`);\n        return false;\n    }\n    if (bot.entity.position.distanceTo(block.position) > maxReach) {\n        log(bot, 'FAILED: out of dig range after navigation');\n        return false;\n    }\n\n    if (bot.game.gameMode !== 'creative') {\n        await bot.tool.equipForBlock(block);\n        const itemId = bot.heldItem ? bot.heldItem.type : null;\n        if (!block.canHarvest(itemId)) {\n            log(bot, `FAILED: cannot harvest ${block.name} with equipped tool`);\n            return false;\n        }\n    }\n\n    if (bot.interrupt_code) {\n        log(bot, 'FAILED: interrupted before dig');\n        return false;\n    }\n\n    try {\n        await bot.dig(block, true);\n    } catch (e) {\n        log(bot, `FAILED: dig failed: ${e && e.message ? e.message : e}`);\n        return false;\n    }\n\n    const after = bot.blockAt(new Vec3(x, y, z));\n    if (after && after.name === targetName) {\n        log(bot, 'FAILED: target block still present after dig');\n        return false;\n    }\n\n    log(bot, `Broke ${targetName} at ${x.toFixed(1)}, ${y.toFixed(1)}, ${z.toFixed(1)}.`);\n    return true;\n}",
+   "description": "Reach dig range of the block at x,y,z with retried navigation, equip a harvest-capable tool, dig it, and return true only when that cell no longer holds the target block.",
+   "deps": [
+    "travelTo",
+    "goToPosition",
+    "wait"
+   ],
+   "task": "repair: Mine 1 diamond_ore",
+   "effects": [],
+   "stats": {
+    "success": 1,
+    "fail": 1,
+    "streakFail": 0,
+    "tasks": [
+     "Mine 1 iron_ore"
+    ]
+   },
+   "trialAfter": 1793939279369
+  }
+ },
+ {
+  "name": "equipToolForBlock",
+  "description": "Equip the cheapest inventory tool that can harvest (or speeds up) the given block; returns the item name, or null when the hand is used.",
+  "task": "equip the cheapest tool for a block",
+  "code": "async function equipToolForBlock(bot, block) {\n    if (!block) { log(bot, 'FAILED: equipToolForBlock needs a block'); return null; }\n    const reg = bot.registry;\n    const speedsUp = (b, id) => !!(reg.materials[b.material] && reg.materials[b.material][id]);\n    const works = id => block.harvestTools ? !!block.harvestTools[id] : speedsUp(block, id);\n    const items = bot.inventory.items();\n    const cands = items.filter(it => works(it.type));\n    if (!cands.length) {\n        if (block.harvestTools) { log(bot, `FAILED: no inventory tool can harvest ${block.name}`); return null; }\n        if (bot.heldItem && reg.items[bot.heldItem.type].maxDurability) await bot.unequip('hand');\n        return null;\n    }\n    const have = {};\n    for (const it of items) have[it.type] = (have[it.type] || 0) + it.count;\n    const harvests = id => reg.blocksArray.filter(b => b.harvestTools && b.harvestTools[id]).length;\n    const speeds = id => reg.blocksArray.filter(b => speedsUp(b, id)).length;\n    const ingredientId = x => (x !== null && typeof x === 'object') ? x.id : x;\n    const replaceCost = id => {\n        const rs = reg.recipes[id];\n        if (!rs) return Infinity;\n        return Math.min(...rs.map(r => (r.inShape ? r.inShape.flat() : r.ingredients).map(ingredientId).filter(x => x !== null)\n            .reduce((sum, x) => sum + 1 / (1 + (have[x] || 0)), 0) / r.result.count));\n    };\n    const scored = cands.map(it => {\n        const max = reg.items[it.type].maxDurability;\n        if (!max) throw new Error(`equipToolForBlock: ${it.name} works on ${block.name} but has no maxDurability in the registry`);\n        return { it, key: [harvests(it.type), speeds(it.type), replaceCost(it.type) / max, max - it.durabilityUsed] };\n    });\n    scored.sort((a, b) => { for (let i = 0; i < a.key.length; i++) if (a.key[i] !== b.key[i]) return a.key[i] - b.key[i]; return 0; });\n    await bot.equip(scored[0].it, 'hand');\n    return scored[0].it.name;\n}",
+  "deps": [],
+  "seeded": true,
+  "stats": {
+   "success": 0,
+   "fail": 0,
+   "streakFail": 0,
+   "tasks": []
+  },
+  "effects": [],
+  "consumes": {},
+  "contract": {
+   "pre": "c => true",
+   "post": "c => c.ret === null || (c.post.eq ? c.post.eq.heldItem === c.ret : false)",
+   "text": "returns null (hand) or the equipped tool name matches c.post.eq.heldItem",
+   "seeded": true
+  }
+ },
+ {
+  "name": "pickupNearbyItems",
+  "description": "Pick up all nearby dropped items within 8 blocks. Waits for drops to settle first.",
+  "task": "pick up items",
+  "code": "async function pickupNearbyItems(bot) {\n    const distance = 8;\n    await sleep(400);\n    const getNearestItem = () => bot.nearestEntity(e => e.name === 'item' && bot.entity.position.distanceTo(e.position) < distance);\n    let nearestItem = getNearestItem();\n    let pickedUp = 0;\n    for (let tries = 0; nearestItem && tries < 12; tries++) {\n        try { await goToPosition(bot, nearestItem.position.x, nearestItem.position.y, nearestItem.position.z, 0.5); }\n        catch (e) { log(bot, `Failed to reach item: ${e.message}`); throw e; }\n        await sleep(500);\n        const prev = nearestItem;\n        nearestItem = getNearestItem();\n        if (prev === nearestItem && prev.isValid) break;\n        pickedUp++;\n    }\n    log(bot, `Picked up ${pickedUp} items.`);\n    return true;\n}",
+  "deps": [],
+  "seeded": true,
+  "stats": {
+   "success": 4,
+   "fail": 3,
+   "streakFail": 3,
+   "tasks": [
+    "Mine 5 iron_ore",
+    "goToBlockAndInteract: Walk to and interact with the nearest iron_ore block within range, breaking it and collecting raw_iron drops",
+    "collectDrops: After mining, walk to and pick up any nearby raw_iron drops within 8 blocks to ensure full collection"
+   ],
+   "lastRun": 1793943482796,
+   "practiceRuns": 17
+  },
+  "contract": {
+   "pre": "c => true",
+   "post": "c => c.ret !== true || c.ret === true",
+   "text": "Wait for drops to settle and path to nearby item entities within 8 blocks; reports success when the pickup loop completes.",
+   "learned": "2026-11-05T19:37:47.252Z",
+   "why": "backfill"
+  },
+  "effects": [],
+  "demoted": true,
+  "consumes": {}
+ },
+ {
+  "name": "collectBlock",
+  "description": "Collect blocks of the given type. Handles ore variants (iron->iron_ore, deepslate_iron_ore), equips proper tools, and picks up drops.",
+  "task": "collect blocks or ores",
+  "code": "async function collectBlock(bot, blockType, num = 1) {\n    if (!blockType || typeof blockType !== 'string') { log(bot, 'collectBlock: invalid blockType'); return false; }\n    let types = [blockType];\n    if (['coal','diamond','emerald','iron','gold','lapis_lazuli','redstone'].includes(blockType)) types.push(blockType + '_ore');\n    if (blockType.endsWith('ore')) types.push('deepslate_' + blockType);\n    if (blockType === 'dirt') types.push('grass_block');\n    if (blockType === 'cobblestone') types.push('stone');\n    let collected = 0;\n    const excluded = new Set();\n    const posKey = p => `${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}`;\n    for (let i = 0; i < num; i++) {\n        if (bot.interrupt_code) break;\n        const block = getNearestBlock(bot, b => types.includes(b.name) && !excluded.has(posKey(b.position)), 64);\n        if (!block) {\n            if (excluded.size) log(bot, `FAILED: no reachable ${blockType} nearby (${excluded.size} unreachable block(s) excluded)`);\n            else log(bot, collected ? `No more ${blockType} nearby.` : `No ${blockType} nearby.`);\n            break;\n        }\n        await equipToolForBlock(bot, block);   // fix62: cheapest tool that works on this block (was mineflayer-tool equipForBlock: fastest dig = top tier)\n        const itemId = bot.heldItem ? bot.heldItem.type : null;\n        if (!block.canHarvest(itemId)) { log(bot, `Don't have right tools to harvest ${blockType}.`); return false; }\n        const before = getInventoryCounts(bot);\n        const startPos = bot.entity.position.clone();\n        const targetDist = startPos.distanceTo(block.position);\n        try {\n            const reached = await goToPosition(bot, block.position.x, block.position.y, block.position.z, 4);\n            const endPos = bot.entity.position;\n            const movedToward = startPos.distanceTo(block.position) - endPos.distanceTo(block.position);\n            if (!reached || (targetDist > 8 && movedToward < 2)) {\n                excluded.add(posKey(block.position));\n                log(bot, `Cannot reach ${blockType} at ${posKey(block.position)} (moved ${movedToward.toFixed(1)} blocks toward it); trying another`);\n                continue;\n            }\n            await bot.dig(block, true);\n            await pickupNearbyItems(bot);\n        } catch (err) {\n            excluded.add(posKey(block.position));\n            log(bot, `Failed to collect ${blockType} at ${posKey(block.position)}: ${err.message}; trying another`);\n            continue;\n        }\n        const after = getInventoryCounts(bot);\n        if (Object.keys(after).some(k => (after[k] || 0) > (before[k] || 0))) collected++;\n    }\n    log(bot, `Collected ${collected} ${blockType}.`);\n    return collected > 0;\n}",
+  "deps": [
+   "pickupNearbyItems",
+   "equipToolForBlock"
+  ],
+  "seeded": true,
+  "stats": {
+   "success": 0,
+   "fail": 3,
+   "streakFail": 3,
+   "tasks": []
+  },
+  "contract": {
+   "pre": "c => c.pre.alive && typeof c.args[0] === 'string' && !!c.args[0]",
+   "post": "c => c.ret !== true || Object.values(c.delta).some(n => n > 0)",
+   "text": "Mine up to num matching blocks within 64 blocks with proper tools and net at least one inventory gain on success.",
+   "learned": "2026-11-05T19:37:47.248Z",
+   "why": "backfill"
+  },
+  "effects": [],
+  "demoted": true,
+  "refactorOf": "sp1793916039593",
+  "consumes": {},
+  "candidate": {
+   "code": "async function collectBlock(bot, blockType, num = 1) {\n    if (!blockType || typeof blockType !== 'string') { log(bot, 'FAILED: invalid blockType'); return false; }\n    let types = [blockType];\n    if (['coal', 'diamond', 'emerald', 'iron', 'gold', 'lapis_lazuli', 'redstone', 'copper'].includes(blockType)) types.push(blockType + '_ore');\n    if (blockType.endsWith('ore')) types.push('deepslate_' + blockType);\n    if (blockType === 'dirt') types.push('grass_block');\n    if (blockType === 'cobblestone') types.push('stone');\n    types = [...new Set(types)];\n    let collected = 0;\n    const excluded = new Set();\n    const posKey = (p) => `${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}`;\n    for (let i = 0; i < num; i++) {\n        if (bot.interrupt_code) { log(bot, 'FAILED: interrupted'); return false; }\n        let candidates = getNearestBlocks(bot, types, 64, 10000);\n        if (!candidates || !candidates.length) { log(bot, `FAILED: no ${blockType} in range`); return false; }\n        let block = null;\n        for (const b of candidates) {\n            if (!b || !b.position) continue;\n            if (excluded.has(posKey(b.position))) continue;\n            block = b;\n            break;\n        }\n        if (!block) { log(bot, `FAILED: only excluded or invalid ${blockType} candidates remain`); return false; }\n        const here = getBlockAtPosition(bot, Math.floor(block.position.x), Math.floor(block.position.y), Math.floor(block.position.z));\n        if (!here || !types.includes(here.name)) { excluded.add(posKey(block.position)); log(bot, `FAILED: target block missing at ${posKey(block.position)}`); i--; continue; }\n        block = here;\n        await bot.tool.equipForBlock(block);\n        const itemId = bot.heldItem ? bot.heldItem.type : null;\n        if (!block.canHarvest(itemId)) { log(bot, `FAILED: cannot harvest ${blockType}`); return false; }\n        const before = getInventoryCounts(bot);\n        const startPos = bot.entity.position.clone();\n        const distStart = startPos.distanceTo(block.position);\n        try {\n            const reached = await goToPosition(bot, block.position.x, block.position.y, block.position.z, 2);\n            if (bot.interrupt_code) { log(bot, 'FAILED: interrupted'); return false; }\n            const endPos = bot.entity.position;\n            if (!reached) { excluded.add(posKey(block.position)); log(bot, `FAILED: pathfind to ${posKey(block.position)}`); i--; continue; }\n            const movedToward = distStart - endPos.distanceTo(block.position);\n            if (distStart > 8 && movedToward < 2) { excluded.add(posKey(block.position)); log(bot, `FAILED: not approaching ${posKey(block.position)}`); i--; continue; }\n            await bot.dig(block, true);\n            await pickupNearbyItems(bot);\n        } catch (err) {\n            excluded.add(posKey(block.position));\n            log(bot, `FAILED: ${err && err.message ? err.message : err}`);\n            i--;\n            continue;\n        }\n        const after = getInventoryCounts(bot);\n        if (!Object.keys(after).some((k) => (after[k] || 0) > (before[k] || 0))) { excluded.add(posKey(block.position)); log(bot, 'FAILED: dig produced no inventory gain'); i--; continue; }\n        collected++;\n    }\n    if (collected < 1) { log(bot, `FAILED: collected 0 ${blockType}`); return false; }\n    log(bot, `Collected ${collected} ${blockType}.`);\n    return collected;\n}\n\n// DESCRIPTION: Mine and collect count blocks of blockName near the bot and return how many relevant drops were gained (e.g. raw_iron for iron_ore), or 0 on failure.",
+   "description": "Collect up to num mineable blocks of blockType by pathfinding within 64 blocks, digging, and picking up drops; returns how many were collected or false if interrupted or impossible.",
+   "deps": [
+    "getNearestBlocks",
+    "getBlockAtPosition",
+    "getInventoryCounts",
+    "goToPosition",
+    "pickupNearbyItems"
+   ],
+   "task": "repair: Mine 1 iron_ore",
+   "effects": [],
+   "stats": {
+    "success": 0,
+    "fail": 0,
+    "streakFail": 0,
+    "tasks": []
+   },
+   "refactor": "jr1793957832790"
+  }
+ },
+ {
+  "name": "travelTo",
+  "description": "Travel long distances (hundreds of blocks) in short hops of up to 32 blocks, so chunks load and paths stay short. Returns true once within 4 blocks (horizontally) of the target.",
+  "task": "Go to x, y, z",
+  "code": "async function travelTo(bot, x, y, z, maxHops = 120) {\n    let fails = 0;\n    for (let hop = 0; hop < maxHops; hop++) {\n        if (bot.interrupt_code) return false;\n        const p = bot.entity.position;\n        const dx = x - p.x, dz = z - p.z, d = Math.hypot(dx, dz);\n        if (d <= 4) { log(bot, `Arrived near ${x}, ${y}, ${z}.`); return true; }\n        if (d <= 32) { if (await goToPosition(bot, x, y, z, 3)) continue; }\n        const step = Math.min(32, d);\n        const side = fails ? (fails % 2 ? 1 : -1) * 10 * fails : 0;\n        const tx = Math.round(p.x + dx / d * step - dz / d * side), tz = Math.round(p.z + dz / d * step + dx / d * side);\n        try { await goToGoal(bot, new GoalNearXZ(tx, tz, 3)); fails = 0; }\n        catch (err) {\n            if (bot.interrupt_code) return false;\n            if (++fails >= 6) { log(bot, `travelTo gave up at ${p.floored()} after 6 failed hops: ${err?.message}`); return false; }\n        }\n    }\n    log(bot, `travelTo ran out of hops; still ${Math.round(Math.hypot(x - bot.entity.position.x, z - bot.entity.position.z))} blocks away.`);\n    return false;\n}",
+  "deps": [],
+  "stats": {
+   "success": 2,
+   "fail": 1,
+   "streakFail": 0,
+   "tasks": [
+    "travelTo: Travel 32 blocks west to -178,53,107 to avoid death hotspot at -175,44,107 while staying within safe range and biome",
+    "mineOre: Mine 5 iron_ore blocks directly from the deposit, using the equipped pickaxe and collecting raw_iron drops"
+   ]
+  },
+  "seeded": true,
+  "contract": {
+   "pre": "c => c.args.length === 3 || (c.args.length === 4 && typeof c.args[3] === 'number')",
+   "post": "c => c.ret",
+   "text": "Travels to a specified position in short hops.",
+   "learned": "2026-11-05T18:58:00.712Z",
+   "why": "backfill"
+  },
+  "effects": [],
+  "demoted": false,
+  "consumes": {},
+  "candidate": {
+   "code": "// DESCRIPTION: Travel long distances in up-to-32-block hops via goToPosition until within 4 blocks horizontally of the target.\nasync function travelTo(bot, x, y, z, maxHops = 120) {\n    let fails = 0;\n    for (let hop = 0; hop < maxHops; hop++) {\n        if (bot.interrupt_code) return false;\n        const p = bot.entity.position;\n        const dx = x - p.x, dz = z - p.z, d = Math.hypot(dx, dz);\n        if (d <= 4) { log(bot, `Arrived near ${x}, ${y}, ${z}.`); return true; }\n        if (d <= 32) { if (await goToPosition(bot, x, y, z, 3)) continue; }\n        const step = Math.min(32, d);\n        const side = fails ? (fails % 2 ? 1 : -1) * 10 * fails : 0;\n        const tx = Math.round(p.x + dx / d * step - dz / d * side), tz = Math.round(p.z + dz / d * step + dx / d * side);\n        try { await goToGoal(bot, new GoalNearXZ(tx, tz, 3)); fails = 0; }\n        catch (err) {\n            if (bot.interrupt_code) return false;\n            if (++fails >= 6) { log(bot, `travelTo gave up at ${p.floored()} after 6 failed hops: ${err?.message}`); return false; }\n        }\n    }\n    log(bot, `travelTo ran out of hops; still ${Math.round(Math.hypot(x - bot.entity.position.x, z - bot.entity.position.z))} blocks away.`);\n    return false;\n}",
+   "description": "Travel long distances in up-to-32-block hops via goToPosition until within 4 blocks horizontally of the target.",
+   "deps": [
+    "goToPosition",
+    "goToGoal"
+   ],
+   "task": "repair: mineOneIronOre",
+   "effects": [],
+   "stats": {
+    "success": 0,
+    "fail": 0,
+    "streakFail": 0,
+    "tasks": []
+   },
+   "trialAfter": 1793972025612
+  }
+ },
+ {
+  "name": "mineBlocks",
+  "description": "Mine and collect `count` blocks of a block type (e.g. iron_ore, coal_ore, stone, birch_log, copper_ore) near the bot, with pathfinding, tool choice, junk dropping when inventory is full and drop pickup; returns how many items were gained.",
+  "task": "Mine N ore or blocks and pick up the drops",
+  "code": "// DESCRIPTION: Mine and collect count blocks of blockName nearby (ores, stone, logs), picking up drops; returns items gained.\nasync function mineBlocks(bot, blockName, count = 1) {\n    const total = () => bot.inventory.items().reduce((a, i) => a + i.count, 0);\n    const start = total();\n    await collectBlock(bot, blockName, count);\n    await pickupNearbyItems(bot);\n    const gained = total() - start;\n    return gained;\n}",
+  "deps": [
+   "collectBlock",
+   "pickupNearbyItems"
+  ],
+  "stats": {
+   "success": 0,
+   "fail": 0,
+   "streakFail": 0,
+   "tasks": []
+  },
+  "contract": {
+   "pre": "c => c.args.length === 1 || (c.args.length === 2 && typeof c.args[1] === 'number')",
+   "post": "c => c.ret && c.delta[c.args[0]] > 0",
+   "text": "Mines and collects blocks of a specified type near the bot.",
+   "learned": "2026-11-05T18:58:00.709Z",
+   "why": "backfill"
+  },
+  "effects": [],
+  "consumes": {},
+  "candidate": {
+   "code": "async function mineBlocks(bot, blockName, count = 1) {\n    if (bot.interrupt_code) { log(bot, 'FAILED: interrupted'); return 0; }\n    let track = [blockName];\n    if (blockName === 'iron_ore' || blockName === 'deepslate_iron_ore') track = ['raw_iron'];\n    else if (blockName === 'copper_ore' || blockName === 'deepslate_copper_ore') track = ['raw_copper'];\n    else if (blockName === 'gold_ore' || blockName === 'deepslate_gold_ore') track = ['raw_gold'];\n    else if (blockName === 'coal_ore' || blockName === 'deepslate_coal_ore') track = ['coal'];\n    else if (blockName === 'diamond_ore' || blockName === 'deepslate_diamond_ore') track = ['diamond'];\n    else if (blockName === 'emerald_ore' || blockName === 'deepslate_emerald_ore') track = ['emerald'];\n    else if (blockName === 'lapis_ore' || blockName === 'deepslate_lapis_ore') track = ['lapis_lazuli'];\n    else if (blockName === 'redstone_ore' || blockName === 'deepslate_redstone_ore') track = ['redstone'];\n    track = [...new Set(track)];\n    const beforeInv = getInventoryCounts(bot);\n    const startSum = track.reduce((s, n) => s + (beforeInv[n] || 0), 0);\n    const collected = await collectBlock(bot, blockName, count);\n    if (bot.interrupt_code) { log(bot, 'FAILED: interrupted'); return 0; }\n    await pickupNearbyItems(bot);\n    const afterInv = getInventoryCounts(bot);\n    const endSum = track.reduce((s, n) => s + (afterInv[n] || 0), 0);\n    const gained = endSum - startSum;\n    if (!collected || gained < 1) { log(bot, `FAILED: mineBlocks ${blockName} (collected=${collected}, gained=${gained})`); return 0; }\n    return gained;\n}",
+   "description": "Mine and collect count blocks of blockName near the bot and return how many relevant drops were gained (e.g. raw_iron for iron_ore), or 0 on failure.",
+   "deps": [
+    "getInventoryCounts",
+    "collectBlock",
+    "pickupNearbyItems"
+   ],
+   "task": "repair: Mine 1 iron_ore",
+   "effects": [],
+   "stats": {
+    "success": 0,
+    "fail": 0,
+    "streakFail": 0,
+    "tasks": []
+   },
+   "refactor": "jr1793957832790",
+   "trialAfter": 1793957832894
+  }
+ },
+ {
+  "name": "equipBestPickaxeForMining",
+  "description": "Equip the best pickaxe (iron > stone > wooden) for mining iron ore.",
+  "task": "equipBestTool: Equip the best pickaxe (iron > stone > wooden) for mining iron_ore, ensuring it is held in the hand",
+  "code": "// DESCRIPTION: Equip the best pickaxe (iron > stone > wooden) for mining iron ore.\nasync function equipBestPickaxeForMining(bot) {\n    if (bot.interrupt_code) return null;\n    const equipped = await equipBestPickaxeForIronOre(bot);\n    if (bot.interrupt_code) return null;\n    return equipped;\n}",
+  "deps": [
+   "equipBestPickaxeForIronOre"
+  ],
+  "effects": [],
+  "stats": {
+   "success": 3,
+   "fail": 5,
+   "streakFail": 3,
+   "tasks": [
+    "equipBestTool: Equip the best pickaxe (iron > stone > wooden) for mining iron_ore, ensuring it is held in the hand",
+    "goToBlockAndInteract: Walk to the nearest iron_ore block within range and break it using the equipped pickaxe",
+    "verifyAndCollect: Confirm the iron_ore block was successfully mined and collected in inventory, then return success if raw_iron is present or has been added"
+   ],
+   "lastRun": 1793960998911,
+   "practiceRuns": 213
+  },
+  "contract": {
+   "pre": "c => { if (!c.pre.alive) return false; const tiers = ['iron_pickaxe', 'stone_pickaxe', 'wooden_pickaxe']; const norm = id => id && tiers.find(t => id === t || id.endsWith(':' + t)); const hasTier = t => (c.pre.inv[t] || 0) > 0 || norm(c.pre.eq.heldItem) === t || norm(c.pre.eq.offHand) === t || Object.entries(c.pre.inv || {}).some(([k, n]) => n > 0 && norm(k) === t); return tiers.some(hasTier); }",
+   "post": "c => { if (c.ret == null || c.ret === false) return true; const tiers = ['iron_pickaxe', 'stone_pickaxe', 'wooden_pickaxe']; const norm = id => id && tiers.find(t => id === t || id.endsWith(':' + t)); const hasTier = t => (c.pre.inv[t] || 0) > 0 || norm(c.pre.eq.heldItem) === t || norm(c.pre.eq.offHand) === t || Object.entries(c.pre.inv || {}).some(([k, n]) => n > 0 && norm(k) === t); const best = tiers.find(hasTier); return c.post.alive && best != null && norm(c.post.eq.heldItem) === best && c.ret === best; }",
+   "text": "When alive and any iron/stone/wooden pickaxe exists (inventory or hands, namespaced or not), success equips the best tier in main hand and returns that tier.",
+   "learned": "2026-11-06T10:59:56.314Z",
+   "why": "contract repair"
+  },
+  "consumes": {
+   "granite": 1
+  },
+  "demoted": true
+ },
+ {
+  "name": "equipBestPickaxeForIronOre",
+  "description": "Equip the best pickaxe in inventory for mining iron ore.",
+  "task": "equipBestTool: Equip the best tool (stone_pickaxe) for mining iron_ore, as it is already in inventory and necessary for breaking ore blocks",
+  "code": "// DESCRIPTION: Equip the best pickaxe in inventory for mining iron ore.\nasync function equipBestPickaxeForIronOre(bot) {\n    if (bot.interrupt_code) return;\n    const equipped = await equipBestTool(bot, 'pickaxe');\n    if (bot.interrupt_code) return;\n    return equipped;\n}",
+  "deps": [
+   "equipBestTool"
+  ],
+  "effects": [],
+  "stats": {
+   "success": 2,
+   "fail": 0,
+   "streakFail": 0,
+   "tasks": [
+    "equipBestTool: Equip the best tool (stone_pickaxe) for mining iron_ore, as it is already in inventory and necessary for breaking ore blocks",
+    "equipBestPickaxeForIronOre"
+   ],
+   "lastRun": 1793960979109,
+   "practiceRuns": 403
+  },
+  "consumes": {
+   "granite": 19,
+   "diorite": 3
+  },
+  "contract": {
+   "pre": "c => c.pre.alive",
+   "post": "c => { if (!c.ret) return true; if (!c.post.alive) return false; const t = { wooden_pickaxe: 1, stone_pickaxe: 2, iron_pickaxe: 3, golden_pickaxe: 3, diamond_pickaxe: 4, netherite_pickaxe: 5 }; let best = 0, name = null; for (const k of Object.keys(t)) { const had = (Object.prototype.hasOwnProperty.call(c.pre.inv, k) && c.pre.inv[k] > 0) || c.pre.eq.heldItem === k; if (had && t[k] >= best) { best = t[k]; name = k; } } const expected = name !== null ? name : c.ret; return c.post.eq.heldItem === expected; }",
+   "text": "When alive, success means main hand holds the best-tier pickaxe available in pre inventory or already equipped, or the pickaxe type returned when pre did not record any pickaxe.",
+   "learned": "2026-11-06T02:31:11.246Z",
+   "why": "contract repair"
+  }
+ },
+ {
+  "name": "equipBestTool",
+  "description": "Equip the best tool of toolType (pickaxe, axe, sword, shovel, hoe) in the inventory; returns the item name or null.",
+  "task": "Equip the best tool of toolType (pickaxe, axe, sword, shovel, hoe) in the inventory; returns the item name or null.",
+  "code": "async function equipBestTool(bot, toolType = 'pickaxe') {\n    const reg = bot.registry;\n    const harvests = id => reg.blocksArray.filter(b => b.harvestTools && b.harvestTools[id]).length;\n    const speed = id => Math.max(...Object.values(reg.materials).map(m => m[id] || 0));\n    const cands = bot.inventory.items().filter(it => it.name.endsWith('_' + toolType));\n    if (!cands.length) return null;\n    const key = it => [harvests(it.type), speed(it.type), reg.items[it.type].maxDurability];\n    cands.sort((a, b) => { const ka = key(a), kb = key(b); for (let i = 0; i < ka.length; i++) if (ka[i] !== kb[i]) return kb[i] - ka[i]; return 0; });\n    await bot.equip(cands[0], 'hand');\n    return cands[0].name;\n}",
+  "stats": {
+   "success": 0,
+   "fail": 2,
+   "streakFail": 2,
+   "tasks": []
+  },
+  "deps": [],
+  "contract": {
+   "pre": "c => true",
+   "post": "c => c.ret === null || (c.post.eq ? c.post.eq.heldItem === c.ret : false)",
+   "text": "returns null (no tool) or the equipped tool name matches c.post.eq.heldItem",
+   "seeded": true
+  },
+  "seeded": true,
+  "effects": [],
+  "consumes": {}
+ }
+]

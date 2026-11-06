@@ -27,6 +27,7 @@ import { setCallDurationStore } from '../models/call_durations.js';
 import { signatureOf, depsOf, missingCalls, findCycle, findAllCycles, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf } from './skill_graph.js';
 import { getBareAPI, collectBareApiUsedInSource } from './coder.js';   // fix40: unified bare-name API helper
 import { withStallPhase } from '../utils/event_loop_guard.js';
+import { watchdogEvidencePath } from '../utils/main_thread_watchdog.js';
 import { wrapBotForApiTiming } from '../utils/bot_api_timing.js';
 import { logPromptBreakdown, extractBareCalls } from './prompt_utils.js';   // fix47: shared prompt utilities
 const LOCAL = { model: 'qwen3:4b-instruct-2507-q4_K_M', url: 'http://192.168.1.215:11434', params: { format: 'json', options: { num_ctx: 8192, num_predict: 512 } } };   // fix38: raised from 150 to 512 - short JSON replies still need room for reasoning; truncation fails loudly (fix31)
@@ -406,6 +407,7 @@ export class Voyager {
         this._relink();
         this._polyMerge();
         this._extractShared();
+        this._settleDeadTrials(watchdogEvidencePath(`./bots/${agent.name}`));   // fix65: a run that killed the previous process counts
         // fix50: assert no prefixed calls in prompt sources (fail loud at load time)
         if (this.agent?.prompter?.profile) {
             Voyager.assertNoPromptPrefixes(this.agent.prompter.profile, this.repairMemory);
@@ -1323,6 +1325,50 @@ Use only c; no other globals.`;
         try { const r = await this.agent.actions.runAction(label, fn, { timeout }); this._lastRunMsg = String(r?.message || ''); return r; } finally { clearInterval(iv); }
     }
     _stalledInRun() { const s = this._stall; return s && s.t >= (this._runStart || Infinity) ? s : null; }
+    /** fix65: candidate code staged in place for a replay of `root`; `rootTrial` = the goal-overlap gate's verdict on root's own candidate */
+    _replayOverrides(root, rootTrial) {
+        const closure = this._closure(root);
+        const over = {};
+        for (const s of this.skills) if (s.candidate && (s.name === root ? rootTrial : closure.has(s.name))) over[s.name] = s.candidate.code;
+        return over;
+    }
+    _crashedInRun() { const c = this._crash; return c && c.t >= (this._runStart || Infinity) ? c : null; }
+    // fix65: a run that kills the process (watchdog SIGKILL on a blocked main loop) never reaches _attribute, so its trial
+    // outcome was lost: the 12:43Z hang in the collectBlock candidate left its record at 0/0. Before every run that carries
+    // trial candidates, the learner writes which candidates are in flight; a clean end removes the journal. On the next
+    // start a journal still on disk means the process died inside that run.
+    get _trialJournalFile() { return `${this.dir}/trials_inflight.json`; }
+    _openTrialJournal(names, root, task) {
+        const inFlight = names.filter(n => this.skills.find(s => s.name === n)?.candidate);
+        if (!inFlight.length) return () => {};
+        writeAtomic(this._trialJournalFile, JSON.stringify({ pid: process.pid, root, task, candidates: inFlight, startedAt: Date.now() }));
+        return () => unlinkSync(this._trialJournalFile);
+    }
+    // Reads the journal left by a process that died mid-run, with the watchdog's evidence (main_thread_watchdog.js), and
+    // counts the hang as a failed trial of the deepest in-flight candidate on the blocked call stack.
+    _settleDeadTrials(evidencePath) {
+        if (!existsSync(this._trialJournalFile)) return;
+        const j = JSON.parse(readFileSync(this._trialJournalFile, 'utf8'));
+        unlinkSync(this._trialJournalFile);
+        const ev = existsSync(evidencePath) ? JSON.parse(readFileSync(evidencePath, 'utf8')) : null;
+        if (!ev || ev.pid !== j.pid) {
+            console.error(`!!! [gate] LOUD: process ${j.pid} died during "${j.task}" (root ${j.root}) with trial candidate(s) ${j.candidates.join(', ')} in flight and left no watchdog evidence for that pid; the outcome cannot be attributed to one of them`);
+            return;
+        }
+        const frames = String(ev.stack).split(' <- ');
+        const culprit = [...frames].reverse().find(n => j.candidates.includes(n));
+        if (!culprit) {
+            console.error(`!!! [gate] LOUD: process ${j.pid} was SIGKILLed by the watchdog during "${j.task}" blocked in "${ev.stack}", which runs none of the in-flight candidates (${j.candidates.join(', ')}); not counted against them`);
+            return;
+        }
+        const e = this.skills.find(s => s.name === culprit);
+        if (!e?.candidate) {
+            console.error(`!!! [gate] LOUD: ${culprit} hung process ${j.pid} as a trial candidate, but it no longer has a candidate (resolved since); nothing to count`);
+            return;
+        }
+        gateLog(`trial run of candidate ${culprit} inside ${j.root}: HUNG - watchdog SIGKILLed pid ${j.pid} after ${ev.silentMs}ms without a main-loop turn (stack ${ev.stack}, phase ${ev.phases.join(' <- ')}); counted as a failed trial`);
+        this._recordRun(e, j.task, false, true);
+    }
     _diedInRun() { const d = this.agent.lastDeath; return d && d.t >= (this._runStart || Infinity) ? d : null; }
     _interruptReason(output = '') {
         const died = this._diedInRun();
@@ -1351,6 +1397,7 @@ Use only c; no other globals.`;
     _onProcessError(kind, err) {
         if (!this.running) return this.agent.fatal(`${kind} outside a task step`, err);
         const t = this.currentTask;
+        this._crash = { t: Date.now(), kind, message: err instanceof Error ? err.message : String(err) };   // fix65: attributed in _attribute
         console.error(`[voyager] !!! ${kind} during task step "${t}" - counted as FAILED, step stopped, process kept alive: ${err instanceof Error ? err.stack : String(err)}`);
         if (t) { this.progress.failed.push(t); this._saveProgress(); }
         this.agent.bot.interrupt_code = true;
@@ -1782,8 +1829,13 @@ Use only c; no other globals.`;
                 gateLog(`SKIP trial of candidate ${r.name}: effects [${candidateEffects.join(', ')}] do not overlap goal [${goalItems.join(', ')}]`);
             }
         }
-        const over = {}; for (const s of this.skills) if (s.candidate && trial && (s.name === r.name || this._closure(r.name).has(s.name))) over[s.name] = s.candidate.code;   // fix10: candidates of children are trialled in place too (only if trial enabled)
+        // fix65: the goal-overlap gate above (#30) decides the ROOT's own candidate only. #30 also AND-ed it into the children,
+        // so a child candidate ran only when the replayed root had a candidate of its own: replays (the common path) never
+        // ran the 09:37Z collectBlock candidate, its 0/0 record never moved, and every repair of collectBlock was deferred
+        // "a candidate is already under trial" and DROPPED. A child candidate is exercised by the root's real calls for this
+        // task, so it is trialled in place whenever it is in the closure (fix10's rule).
         const replayClosure = new Set([r.name, ...this._closure(r.name)]);
+        const over = this._replayOverrides(r.name, trial);
         const tracedNames = Voyager._tracedSkillNamesForInstrument(this, replayClosure, over);
         const libPart = this._libSrcSubset(replayClosure, over);
         const call = '\n\nasync function __replay(bot) {\n    try { ' + r.call + ' } finally { bot.__psnOut = bot.output; }\n}\nawait __replay(bot);';
@@ -1792,11 +1844,15 @@ Use only c; no other globals.`;
         if (lint) { console.error(`[voyager] replay ${r.name}: lint failed before run: ${lint}`); return { ok: false, name: r.name, output: '', reason: `lint failed before run: ${lint}` }; }
         if (!staged) return { ok: false };
         this._runStart = Date.now();
-        const res = await this._run(`voyager:replay:${task}`, async () => {
-            const bot = this._timedBotForSkillRun();
-            bot.__psnALS = globalThis.__psnALS;
-            await staged.func.main(bot);
-        }, 5);
+        const closeJournal = this._openTrialJournal(Object.keys(over), r.name, task);
+        let res;
+        try {
+            res = await this._run(`voyager:replay:${task}`, async () => {
+                const bot = this._timedBotForSkillRun();
+                bot.__psnALS = globalThis.__psnALS;
+                await staged.func.main(bot);
+            }, 5);
+        } finally { closeJournal(); }
         if (this.abort) return { ok: false, interrupted: true };
         const after = this.observe();
         let ok, unverified = false;
@@ -2496,11 +2552,15 @@ Use only c; no other globals.`;
         if (lint) { gateLog(`regression ${entry.name}: lint failed`); return false; }
         if (!staged) return false;
         this._runStart = Date.now();
-        const res = await this._run(`voyager:gate:${entry.name}`, async () => {
-            const bot = this._timedBotForSkillRun();
-            bot.__psnALS = globalThis.__psnALS;
-            await staged.func.main(bot);
-        }, 4);   // fix28: stall watchdog on gate runs
+        const closeJournal = this._openTrialJournal([entry.name], entry.name, past);
+        let res;
+        try {
+            res = await this._run(`voyager:gate:${entry.name}`, async () => {
+                const bot = this._timedBotForSkillRun();
+                bot.__psnALS = globalThis.__psnALS;
+                await staged.func.main(bot);
+            }, 4);   // fix28: stall watchdog on gate runs
+        } finally { closeJournal(); }
         if (this._stalledInRun()) { gateLog(`regression rerun of ${entry.name} stalled; counted as a failed rerun`); return false; }
         if (res.interrupted || this.abort) return null;
         return gainedFor(goal, before, this.observe()) >= goal.count;
@@ -3543,13 +3603,6 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         this._checkContracts(trace, ok);   // fix22: learned pre/postconditions against real state
         this._learnVitalsEffects(trace);   // fix58
         this._learnSlotEffects(trace);   // fix59
-        // candidate children: their contract result in this run is a trial run (regression gate)
-        for (const name of Object.keys(over)) {
-            if (name === root) continue;
-            const rec = trace.find(t => t.name === name);
-            const e = this.skills.find(s => s.name === name);
-            if (rec && e?.candidate && !rec.intr) { gateLog(`trial run of candidate ${name} inside ${root}: contract ${rec.ok ? 'ok' : 'FAILED'}`); this._recordRun(e, task, rec.ok, true); }
-        }
         // re-validation of parents marked after a child repair
         let revalFail = null;
         for (const e of this.skills.filter(s => s.revalidate)) {
@@ -3573,6 +3626,20 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
             if (i < 0) i = trace.length - 1; while (i >= 0 && trace[i].name.startsWith('skills.') && trace[i].parent >= 0) i = trace[i].parent;
             console.log(`[psn] timeout attributed to the call running at the cut: ${trace[i].name} (depth ${trace[i].depth})`);
             trace[i].ownFail = [`FAILED: TIMED OUT while running (${String(trace[i].ownFail?.join(' | '))})`]; for (; i >= 0; i = trace[i].parent) { trace[i].intr = false; trace[i].ok = false; trace[i].fail = true; } ok = false;
+        }
+        // fix65: a crash (uncaught exception/rejection) during the step is a failure of the call running when it was thrown,
+        // like a death or a stall; before, the step was stopped and every open call stayed `intr`, so nothing was counted
+        const crashed = !died && !stalled && !timedOut && this._crashedInRun();
+        if (crashed) { let i = -1; for (let k = 0; k < trace.length; k++) if ((trace[k].t0 || 0) <= crashed.t && (trace[k].t1 ?? Infinity) >= crashed.t && (i < 0 || trace[k].depth >= trace[i].depth)) i = k; if (i < 0) i = trace.length - 1; console.log(`[psn] crash attributed to the call running when it was thrown: ${trace[i].name} (depth ${trace[i].depth})`); trace[i].ownFail = [`FAILED: CRASHED: ${crashed.kind}: ${crashed.message}`]; for (; i >= 0; i = trace[i].parent) { trace[i].intr = false; trace[i].ok = false; trace[i].fail = true; } ok = false; }
+        // candidate children: their contract result in this run is a trial run (regression gate).
+        // fix65: read AFTER the death/stall/timeout/crash attribution above. Those cuts leave every open call `intr` until they
+        // are attributed, and this loop used to run first and skip `intr` records, so a candidate that stalled, timed out or
+        // crashed was never counted against.
+        for (const name of Object.keys(over)) {
+            if (name === root) continue;
+            const rec = trace.find(t => t.name === name);
+            const e = this.skills.find(s => s.name === name);
+            if (rec && e?.candidate && !rec.intr) { gateLog(`trial run of candidate ${name} inside ${root}: contract ${rec.ok ? 'ok' : 'FAILED'}`); this._recordRun(e, task, rec.ok, true); }
         }
         // fix27: no hotspot filter; deaths stay traced failures (above) and blame/repair learns avoidance
         // fix19 (5): an explicit FAILED line from a skill is a contract failure even if the task check passed (e.g. ensureChest inside a storage task)
@@ -4356,11 +4423,15 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             if (lint) { console.log('[voyager] lint failed: ' + String(lint)); feedback = 'Lint error:\n' + lint; lastCode = code; continue; }
 
             this._runStart = Date.now();
-            const res = await this._run(`voyager:${task}`, async () => {
-                const bot = this._timedBotForSkillRun();
-                bot.__psnALS = globalThis.__psnALS;
-                await staged.func.main(bot);
-            }, 5);
+            const closeJournal = this._openTrialJournal(Object.keys(over).filter(n => stageNameSet.has(n)), own, task);
+            let res;
+            try {
+                res = await this._run(`voyager:${task}`, async () => {
+                    const bot = this._timedBotForSkillRun();
+                    bot.__psnALS = globalThis.__psnALS;
+                    await staged.func.main(bot);
+                }, 5);
+            } finally { closeJournal(); }
             console.log(`[timing] game action attempt ${i} took ${Date.now() - this._runStart}ms`);   // fix23: measurement
             if (this.abort) { console.log('[voyager] task interrupted'); return; }
             const cut = res.interrupted || this._diedInRun() || this._stalledInRun() ? this._interruptReason(res.message) : '';   // fix14: cut-off code counts as a failed attempt

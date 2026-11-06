@@ -7,14 +7,14 @@ import { startEventLoopStallGuard, pushStallPhase, stallPollIntervalMsForThresho
 const mode = process.argv[2];
 const gapMs = Number(process.argv[3]);
 const bot = { _client: new EventEmitter() };
-startMainThreadWatchdog();
+startMainThreadWatchdog(process.argv[4]);   // fix65: evidence file for the next process
 startEventLoopStallGuard(bot);
 bot._client.emit('keep_alive');
 setTimeout(() => {
     bot._client.emit('keep_alive');   // second packet: the guard learns the gap and arms the watchdog
     pushStallPhase('fixture:voyager:exec');
     bot.__psnRunningSkill = 'spinForever';
-    bot.__psnStackStr = 'mineIron > collectBlock';
+    bot.__psnStackStr = process.argv[5];
     if (mode === 'spin') {
         setImmediate(function spinForever() { for (;;) { /* never yields */ } });
     } else {
