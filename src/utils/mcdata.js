@@ -6,7 +6,6 @@ import prismarine_items from 'prismarine-item';
 import { pathfinder } from 'mineflayer-pathfinder';
 import { plugin as pvp } from 'mineflayer-pvp';
 import { plugin as collectblock } from 'mineflayer-collectblock';
-import { plugin as autoEat } from 'mineflayer-auto-eat';
 import plugin from 'mineflayer-armor-manager';
 const armorManager = plugin;
 let mc_version = settings.minecraft_version;
@@ -132,7 +131,11 @@ export function initBot(username) {
     bot.loadPlugin(pathfinder);
     bot.loadPlugin(pvp);
     bot.loadPlugin(collectblock);
-    bot.loadPlugin(autoEat);
+    // fix70: mineflayer-auto-eat is not loaded. fix18 (a0009a1) made eating a learned skill and called autoEat.disable(), but
+    // only in agent.js's spawn handler, after its 1 s wait: the plugin's 'health' listener ran first with its own defaults
+    // (startAt 16, offhand: true) and, at food <= 16, equipped the best food to the OFF-HAND and ate from there. The stack
+    // stayed in slot 45 (no old off-hand item to put back), outside the slots consume searched: 89 [vitals] warnings, hp 8,
+    // 0 eats, death at 14:28Z. The restarts at food 15 show it (cooked_mutton 50 -> 49 -> 48 with no consume line).
     // fix27: mineflayer-armor-manager no longer loaded (auto-equip reflex); equipping armour is learned via skills.equip
     bot.once('resourcePack', () => {
         bot.acceptResourcePack();

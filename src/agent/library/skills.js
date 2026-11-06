@@ -4,6 +4,7 @@ import pf from 'mineflayer-pathfinder';
 import Vec3 from 'vec3';
 import settings from "../../../settings.js";
 import { watchPathing } from "../../utils/movement_model.js";
+import { findCarried } from "../../utils/carried.js";
 
 const blockPlaceDelay = settings.block_place_delay == null ? 0 : settings.block_place_delay;
 const useDelay = blockPlaceDelay > 0;
@@ -1149,7 +1150,8 @@ export async function equip(bot, itemName) {
                 log(bot, `Unequipped hand.`);
                 return true;
             }
-            let item = bot.inventory.slots.find(slot => slot && slot.name === itemName);
+            // fix70: the carried slots getInventoryCounts counts (not the 2x2 crafting grid, which it does not count)
+            let item = findCarried(bot, itemName);
             if (!item) {
                 if (bot.game.gameMode === "creative") {
                     try { await bot.creative.setInventorySlot(36, mc.makeItem(itemName, 1)); } catch (e) { console.log('[creative] setInventorySlot not confirmed (ViaProxy):', e.message); await new Promise(r => setTimeout(r, 300)); }
@@ -1354,9 +1356,11 @@ export async function consume(bot, itemName="") {
      * @example
      * await skills.eat(bot, "apple");
      **/
+    // fix70: look the item up in every slot getInventoryCounts counts (off-hand and armour included); findInventoryItem
+    // searched 9-44 only, so the off-hand stack of 50 cooked_mutton (put there by the auto-eat plugin) was "not had"
     let item, name;
     if (itemName) {
-        item = bot.inventory.findInventoryItem(itemName);
+        item = findCarried(bot, itemName);
         name = itemName;
     }
     if (!item) {
@@ -1376,7 +1380,7 @@ export async function consume(bot, itemName="") {
             await ensureInventoryWindowClosed(bot);
             
             // Verify item is still available after potential window close
-            item = bot.inventory.findInventoryItem(itemName);
+            item = findCarried(bot, itemName);
             if (!item) {
                 log(bot, `FAILED to consume ${itemName}: item no longer in inventory after closing window.`);
                 return false;

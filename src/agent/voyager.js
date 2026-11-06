@@ -24,7 +24,7 @@ import minecraftData from 'minecraft-data';
 import { Ollama } from '../models/ollama.js';
 import { setCallDurationStore } from '../models/call_durations.js';
 import { setMovementStore, learnedKinds, recordStep, recordCut, stepBound, noteUnbounded } from '../utils/movement_model.js';
-import { signatureOf, depsOf, missingCalls, findCycle, findAllCycles, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf } from './skill_graph.js';
+import { signatureOf, depsOf, missingCalls, findCycle, findAllCycles, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf, thrownIn } from './skill_graph.js';
 import { getBareAPI, collectBareApiUsedInSource } from './coder.js';   // fix40: unified bare-name API helper
 import { withStallPhase } from '../utils/event_loop_guard.js';
 import { watchdogEvidencePath } from '../utils/main_thread_watchdog.js';
@@ -2000,7 +2000,9 @@ Use only c; no other globals.`;
         const goalItems = goal?.items || (goal?.item ? [goal.item] : null);
         if (entry && ok && !trial) this._learnEffects(entry, before, after, goalItems);
         // fix56: an unverified open goal is neither a pass nor a failure of the skill: no run stats, no blame of the root for the goal
-        if (entry && !unverified) this._recordRun(entry, task, ok, trial);
+        // fix70: a run whose error was raised in library code is that code's fault, not a run of the learned skill
+        const libFault = !ok && this._libraryFault(this.agent.bot.__psnTrace, r.name);
+        if (entry && !unverified && !libFault) this._recordRun(entry, task, ok, trial);
         // ADAM-style: record inventory delta for needs/produces learning
         if (ok) this.npGraph.recordDelta(r.name, before.inventory, after.inventory, goalItems);
         this._attribute(r.name, task, unverified ? true : ok, over);   // fix10: per-call trace -> contract results -> blame -> targeted repair
@@ -2115,7 +2117,10 @@ Use only c; no other globals.`;
         if (!isBareIdentifier(t)) return { kind: 'open' };
         const e = this.skills.find(s => s.name === t);
         if (!e) return { kind: 'invalid', why: `"${t}" is neither an item goal ("<verb> N <item>", "Smelt N <raw> into N <out>", "ensure <block>") nor the name of a known skill` };
-        if (e.demoted) return { kind: 'invalid', why: `skill ${t} is demoted` };
+        // fix70: a demoted skill with a repair candidate is still a valid goal: the candidate's trial runs are the learner's only way
+        // back for it (a promotion clears demoted). fix55 (#48) made every demoted skill goal invalid, so _gateTrial's dedicated
+        // trial of the eatCookedMutton candidate was refused ("not replaying ... skill eatCookedMutton is demoted") every 5 min
+        if (e.demoted && !e.candidate) return { kind: 'invalid', why: `skill ${t} is demoted` };
         if (e.mergedInto) return { kind: 'invalid', why: `skill ${t} was merged into ${e.mergedInto}; propose ${e.mergedInto}` };
         const need = requiredArgs(e);
         if (need.length) return { kind: 'invalid', why: `skill ${t} needs arguments (${need.join(', ')}); propose an item goal instead` };
@@ -2605,6 +2610,25 @@ Use only c; no other globals.`;
     // fix47: per-prompt breakdown logging (uses shared helper, no magic threshold)
     _logPromptBreakdown(kind, sections) {
         return logPromptBreakdown(kind, sections);
+    }
+    // fix70 (blame-aware accounting): when the traced call `name` threw and the error's top frame is outside the staged program
+    // (thrownIn: the seeded library, mineflayer, node), the fault is counted against THAT code in progress.libraryFaults
+    // ("<fn> <file:line>": n), loudly, and not against the learned skill's stats or gate (no fail, no streak, no demotion,
+    // no trial verdict). Where the frame lives is the only criterion: no name lists. An error raised in learned or
+    // generated code (its frames are the compartment's "<anonymous>:L:C") stays the skill's own failure.
+    // Returns the counted fault { fn, loc } or null.
+    _libraryFault(trace, name) {
+        if (!Array.isArray(trace)) return null;
+        const rec = trace.find(t => t.name === name && t.err !== undefined);
+        if (!rec || typeof rec.errTop !== 'string') return null;
+        const w = thrownIn(rec.errTop);
+        if (w.staged) return null;
+        const key = `${w.fn} ${w.loc}`;
+        const lf = (this.progress.libraryFaults ||= {});
+        lf[key] = (lf[key] || 0) + 1;
+        this._saveProgress();
+        console.log(`!!! [blame] LIBRARY FAULT in ${key} (x${lf[key]}): ${name} threw "${rec.err}" from library code; counted against that code, not against ${name}'s stats or gate`);
+        return w;
     }
     _recordRun(entry, task, ok, trial) {
         if (trial) {
@@ -3764,7 +3788,7 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
             if (name === root) continue;
             const rec = trace.find(t => t.name === name);
             const e = this.skills.find(s => s.name === name);
-            if (rec && e?.candidate && !rec.intr) { gateLog(`trial run of candidate ${name} inside ${root}: contract ${rec.ok ? 'ok' : 'FAILED'}`); this._recordRun(e, task, rec.ok, true); }
+            if (rec && e?.candidate && !rec.intr && !(!rec.ok && this._libraryFault(trace, name))) { gateLog(`trial run of candidate ${name} inside ${root}: contract ${rec.ok ? 'ok' : 'FAILED'}`); this._recordRun(e, task, rec.ok, true); }   // fix70: not on a library fault
         }
         // fix27: no hotspot filter; deaths stay traced failures (above) and blame/repair learns avoidance
         // fix19 (5): an explicit FAILED line from a skill is a contract failure even if the task check passed (e.g. ensureChest inside a storage task)
@@ -3774,6 +3798,14 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         console.log(`[psn] execution trace of ${root} (${trace.length} calls):\n${traceText(trace)}`);
         const learned = n => !!this.skills.find(s => s.name === n);   // fix33: seeded primitives included   // fix24: includes hand-written (repairs become learned candidates)
         let bs = blameAll(trace, n => this._isLeaf(n), learned).slice(0, 3);   // at most 3 patches per failure (deepest first)
+        // fix70: a blamed skill that ran its CANDIDATE code in this run failed as that candidate: the gate already counted the
+        // trial against the candidate. Queuing a repair of the skill with that evidence repaired the INCUMBENT for an error its
+        // code never raised (13:40Z: the 13:39Z eatCookedMutton candidate's TypeError "reading 'food'" became the evidence of
+        // the 14:12Z repair of the incumbent, which only ever returned undefined).
+        const ranCandidate = bs.filter(b => Object.prototype.hasOwnProperty.call(over, b.target));
+        for (const b of ranCandidate) console.log(`[psn] blame of ${b.target} is its candidate's trial failure (counted by the gate); no repair of the incumbent from it: ${b.evidence.slice(0, 160)}`);
+        bs = bs.filter(b => !ranCandidate.includes(b));
+        if (!bs.length && ranCandidate.length) return;
         // fix19 (2): no learned skill on a failure path: the root's own composition is at fault
         if (!bs.length) {
             const b0 = blame(trace, n => this._isLeaf(n));

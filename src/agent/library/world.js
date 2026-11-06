@@ -1,6 +1,7 @@
 import pf from 'mineflayer-pathfinder';
 import { Vec3 } from 'vec3';
 import * as mc from '../../utils/mcdata.js';
+import { carriedSlots } from '../../utils/carried.js';
 
 
 // fix42: getAllFreeSpaces returns all valid positions (for retry logic when placeBlock fails at one cell)
@@ -310,7 +311,8 @@ export function getInventoryCounts(bot) {
      **/
     let inventory = {};
     // skip slots 0-4 (crafting result + 2x2 grid): items there are not usable inventory and made failed crafts look successful
-    for (const slot of bot.inventory.slots.slice(5)) {
+    // fix70: the carried slots are defined once (utils/carried.js) and shared with consume/equip
+    for (const slot of carriedSlots(bot)) {
         if (slot != null && slot.name) {
             if (inventory[slot.name] == null) {
                 inventory[slot.name] = 0;

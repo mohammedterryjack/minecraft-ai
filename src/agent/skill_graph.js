@@ -241,6 +241,8 @@ export function instrumentSrc(names) {
     //      that call's thenable so nested traced calls after `await` still see this frame. One path on every Node.
     //      finish() always runs on a fresh stack via Promise.resolve().then (inventory snapshots need stack;
     //      overflowing inside finish must not escape as uncaught). threw() only writes the FAILED line and flags (no snapshot).
+    // fix70: a traced call that throws also records the top frame of the error's stack (rec.errTop; the same for every caller
+    //        it is rethrown through), so the learner can tell where the error was raised: see thrownIn
     const wrap = `const __T = bot.__psnTrace = [];
 const __rawInventoryCounts = getInventoryCounts;
 const __inv = () => __rawInventoryCounts(bot);
@@ -260,7 +262,7 @@ const __wrap = (n, f) => function (...a) {
     bot.__psnStackStr = __stackStr;
     const id = __T.push(rec) - 1;
     const settle = (r) => { rec.ret = r === undefined ? 'undefined' : String(JSON.stringify(r)).slice(0, 60); rec.rv = r === null || typeof r !== 'object' ? r : null; rec.fail = r === false || r === null || r === 0; return r; };
-    const threw = (e) => { rec.fail = true; const msg = e instanceof Error ? e.message : String(e); rec.err = msg; rec.rv = false; if (!__reported.has(e)) { if (e !== null && typeof e === 'object') __reported.add(e); bot.output = bot.output + '\\nFAILED: ' + n + ' threw ' + msg + '\\n'; } };
+    const threw = (e) => { rec.fail = true; const msg = e instanceof Error ? e.message : String(e); rec.err = msg; rec.rv = false; if (e instanceof Error) rec.errTop = String(e.stack).split('\\n').find(l => l.trimStart().startsWith('at ')); if (!__reported.has(e)) { if (e !== null && typeof e === 'object') __reported.add(e); bot.output = bot.output + '\\nFAILED: ' + n + ' threw ' + msg + '\\n'; } };
     const finishBody = () => { __harness(__stackStr, () => { rec.t1 = Date.now(); if (!n.startsWith('skills.')) rec.s1 = __st(); rec.o1 = (bot.output || '').length; bot.__psnOut = bot.output; const post = __have(); rec.delta = {}; for (const k of new Set([...Object.keys(rec.pre || {}), ...Object.keys(post)])) { const d = (post[k] || 0) - ((rec.pre || {})[k] || 0); if (d) rec.delta[k] = d; } delete rec.pre; rec.intr = !!bot.interrupt_code; }); bot.__psnRunningSkill = par >= 0 ? __T[par].name : null; bot.__psnStackStr = __stackParts.join(' <- '); };
     const finish = () => { Promise.resolve().then(finishBody); };
     const prev = __syncParent;
@@ -281,6 +283,18 @@ const __wrap = (n, f) => function (...a) {
     })();
 };`;
     return wrap + '\n' + names.map(n => `${n} = __wrap(${JSON.stringify(n)}, ${n});`).join('\n');
+}
+// fix70: where a thrown error was raised, from its top stack frame. The staged program (learned skills + generated code) is
+// source evaluated in an SES compartment with no file of its own: V8 ends its frames' location in "<anonymous>:L:C". Every
+// other frame lives in a module file or node internals (the seeded library, mineflayer, node): an error raised there is a
+// fault of that code, not of the learned skill that called it. Returns { staged, fn, loc }.
+export function thrownIn(top) {
+    if (typeof top !== 'string' || !top.trimStart().startsWith('at ')) throw new Error(`thrownIn: not a stack frame line: ${JSON.stringify(top)}`);
+    const f = top.trim().slice(3), open = f.indexOf(' (');
+    const fn = open >= 0 && f.endsWith(')') ? f.slice(0, open) : '<anonymous function>';
+    const loc = open >= 0 && f.endsWith(')') ? f.slice(open + 2, -1) : f;
+    const tail = loc.slice(loc.lastIndexOf(', ') + 1).trim();
+    return { staged: /^<anonymous>:\d+:\d+$/.test(tail), fn, loc: tail };
 }
 const FAIL_LINE = /FAILED|\bfailed\b|\bneed (?:a |an )?\w+_\w+|\bno \w+ within\b|cannot|can't|not enough/i;
 // per-call contract result: failed return/exception, or a failure line emitted by the call itself (not by its children)

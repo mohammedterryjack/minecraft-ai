@@ -195,13 +195,7 @@ export class Agent {
             respondFunc(username, message);
         });
 
-        // Set up auto-eat
-        this.bot.autoEat.options = {
-            priority: 'foodPoints',
-            startAt: 14,
-            bannedFood: ["rotten_flesh", "spider_eye", "poisonous_potato", "pufferfish", "chicken"]
-        };
-        this.bot.autoEat.disable();   // fix18: eating is a learned skill, not a reflex
+        // fix18/fix70: eating is a learned skill, not a reflex; the auto-eat plugin is not loaded at all (utils/mcdata.js)
 
         if (save_data?.self_prompt) {
             if (init_message) {

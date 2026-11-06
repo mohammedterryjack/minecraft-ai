@@ -22,9 +22,11 @@ function createMockBot(options = {}) {
         game: { gameMode: 'survival' },
         heldItem: null,
         inventory: {
-            slots: options.inventorySlots || [],
+            // fix70: the real player-window layout (46 slots; items from the hotbar, slot 36). The flat array put the item at
+            // slot 0 (crafting result) and findInventoryItem searched every slot, so the tests never met the real 9-44 search.
+            slots: (() => { const s = Array(46).fill(null); (options.inventorySlots || []).forEach((it, i) => { s[36 + i] = { ...it, slot: 36 + i }; }); return s; })(),
             findInventoryItem: function(name) {
-                return this.slots.find(s => s && s.name === name);
+                return this.slots.slice(9, 45).find(s => s && s.name === name);
             },
             items: function() { return this.slots.filter(Boolean); },
             emptySlotCount: () => 10,
