@@ -109,10 +109,15 @@ export function checkRecord(rec) {
         if (!isPlainObject(rec.set)) throw new Error(`${label}: index record needs a set object ({} when it only deletes), got ${JSON.stringify(rec.set)}`);
         if (!Array.isArray(rec.delete) || !rec.delete.every(k => typeof k === 'string' && k)) throw new Error(`${label}: index record needs a delete array of keys ([] when it only sets), got ${JSON.stringify(rec.delete)}`);
         if (!Object.keys(rec.set).length && !rec.delete.length) throw new Error(`${label}: index record changes nothing (empty set and delete)`);
+    } else if (rec.file === 'progress' && Object.hasOwn(rec, 'delete_entry_where')) {
+        // fix79b: delete ONE entry of the list at path, matched by deep equality on every listed field (the match is the expect)
+        if (!Array.isArray(rec.path) || !rec.path.length) throw new Error(`${label}: progress record needs path[]`);
+        if (!isPlainObject(rec.delete_entry_where) || !Object.keys(rec.delete_entry_where).length) throw new Error(`${label}: delete_entry_where needs a non-empty object of fields to match, got ${JSON.stringify(rec.delete_entry_where)}`);
+        if (Object.hasOwn(rec, 'expect') || Object.hasOwn(rec, 'delete_path')) throw new Error(`${label}: delete_entry_where is its own operation; expect/delete_path do not belong on it`);
     } else if (rec.file === 'progress') {
         if (!Array.isArray(rec.path) || !rec.path.length) throw new Error(`${label}: progress record needs path[]`);
         if (!Object.hasOwn(rec, 'expect')) throw new Error(`${label}: progress record needs expect (the value at path it resets)`);
-        if (rec.delete_path !== true) throw new Error(`${label}: progress record needs delete_path: true (the only progress operation), got ${JSON.stringify(rec.delete_path)}`);
+        if (rec.delete_path !== true) throw new Error(`${label}: progress record needs delete_path: true or delete_entry_where, got ${JSON.stringify(rec.delete_path)}`);
     } else {
         throw new Error(`${label}: unknown file ${rec.file}`);
     }
@@ -169,6 +174,15 @@ export function applyManifest({ manifest, botsDir, apply = false, log = console.
                     changes.push({ id: label, op: 'delete-noop', target: `${rec.skill}.${k}`, before: undefined, after: undefined });
                 }
             }
+        } else if (rec.file === 'progress' && Object.hasOwn(rec, 'delete_entry_where')) {
+            const got = getAt(progress, rec.path);
+            if (!got.ok || !Array.isArray(got.value)) throw new Error(`${label}: ${rec.path.join('.')} is not a list (${JSON.stringify(got.value)})`);
+            const where = rec.delete_entry_where;
+            const hits = got.value.map((e, i) => [e, i]).filter(([e]) => isPlainObject(e) && Object.entries(where).every(([k, v]) => Object.hasOwn(e, k) && deepEqual(e[k], v)));
+            if (hits.length !== 1) throw new Error(`${label}: delete_entry_where matched ${hits.length} entries of ${rec.path.join('.')} (needs exactly 1): ${JSON.stringify(where)}`);
+            const [[entry, i]] = hits;
+            got.value.splice(i, 1);
+            changes.push({ id: label, op: 'delete_entry', target: `${rec.path.join('.')}[${i}]`, before: entry, after: undefined });
         } else if (rec.file === 'progress') {
             const got = getAt(progress, rec.path);
             // expect is the whole value at path (required, checkRecord)

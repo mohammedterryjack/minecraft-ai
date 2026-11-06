@@ -155,6 +155,14 @@ describe('fix79 every _attribute call states its route evidence', () => {
     it('MISROUTED is exported for callers', () => assert.strictEqual(typeof MISROUTED, 'string'));
 });
 
+// the live deferred misroute repair (iMac progress.json deferredRepairs[4] at 17:46) beside an unrelated one
+const LIVE_PROGRESS = {
+    deferredRepairs: [
+        { target: 'ensureFurnace', leaf: 'ensureFurnace', path: ['ensureFurnace'], kind: 'callee_fix', swallowed: false, evidence: 'x', task: 'lint against the current built-in API', defers: 1, notBefore: 1 },
+        { target: 'scanForIronOreBlocks', leaf: 'scanForIronOreBlocks', path: ['scanForIronOreBlocks'], kind: 'callee_fix', swallowed: false, evidence: 'every call met its contract but the task outcome failed', task: 'Mine 1 diamond_ore', trace: 'scanForIronOreBlocks() -> [{"type":41,"metadata":0,"light":0,"skyLight":0,"biome":{"co', peers: ['scanForIronOreBlocks'], sig: 'scanForIronOreBlocks:1qayo94:every call met its contract but the task outcome failed', defers: 3, notBefore: 1793987031290 },
+    ],
+    deferCounts: { 'scanForIronOreBlocks:callee_fix': 4, 'ensureFurnace:callee_fix': 1 },
+};
 describe('fix79 reset manifest (applied only after deploy)', () => {
     it('is a valid reset_bug_poisoned manifest and plans exactly the misroute stats + demotion on the live record', async () => {
         const { loadManifest, applyManifest } = await import('../scripts/reset_bug_poisoned.js');
@@ -164,10 +172,11 @@ describe('fix79 reset manifest (applied only after deploy)', () => {
         try {
             mkdirSync(`${dir}/skills`);
             writeFileSync(`${dir}/skills/index.json`, JSON.stringify([LIVE]));
-            writeFileSync(`${dir}/skills/progress.json`, '{}');
+            writeFileSync(`${dir}/skills/progress.json`, JSON.stringify(LIVE_PROGRESS));
             const r = applyManifest({ manifest: m, botsDir: dir, apply: false, log: () => {} });
             assert.deepStrictEqual(r.changes.map(c => [c.target, c.before, c.after]), [
-                ['scanForIronOreBlocks.stats.fail', 10, 0], ['scanForIronOreBlocks.stats.streakFail', 10, 0], ['scanForIronOreBlocks.demoted', true, false]]);
+                ['scanForIronOreBlocks.stats.fail', 10, 0], ['scanForIronOreBlocks.stats.streakFail', 10, 0], ['scanForIronOreBlocks.demoted', true, false],
+                ['deferredRepairs[1]', LIVE_PROGRESS.deferredRepairs[1], undefined], ['deferCounts.scanForIronOreBlocks:callee_fix', 4, undefined]]);
             writeFileSync(`${dir}/skills/index.json`, JSON.stringify([{ ...LIVE, stats: { ...LIVE.stats, fail: 11, streakFail: 11 } }]));
             assert.throws(() => applyManifest({ manifest: m, botsDir: dir, apply: false, log: () => {} }), /expect mismatch/, 'a further misroute before deploy refuses the stale count');
         } finally { rmSync(dir, { recursive: true }); }

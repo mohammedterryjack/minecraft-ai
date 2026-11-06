@@ -25,6 +25,33 @@
       "expect": { "demoted": true },
       "set": { "demoted": false },
       "delete": []
+    },
+    {
+      "id": "deferredRepairs.scanForIronOreBlocks.misroute",
+      "file": "progress",
+      "path": ["deferredRepairs"],
+      "cause": { "fix": "fix79", "commit": "c3025b8", "name": "root blame 'every call met its contract' from the diamond misroute, deferred while the candidate was under trial" },
+      "evidence": "iMac skills/progress.json deferredRepairs[4] at 17:46 (read-only). Matched on every field except defers and notBefore, which _deferRepair rewrites on each re-deferral (live: defers 3, notBefore 1793987031290). After its 6th deferral the bot drops it itself; then this record matches 0 entries and refuses, and comes out of the manifest.",
+      "delete_entry_where": {
+        "target": "scanForIronOreBlocks",
+        "leaf": "scanForIronOreBlocks",
+        "path": ["scanForIronOreBlocks"],
+        "kind": "callee_fix",
+        "swallowed": false,
+        "evidence": "every call met its contract but the task outcome failed",
+        "task": "Mine 1 diamond_ore",
+        "trace": "scanForIronOreBlocks() -> [{\"type\":41,\"metadata\":0,\"light\":0,\"skyLight\":0,\"biome\":{\"co",
+        "peers": ["scanForIronOreBlocks"],
+        "sig": "scanForIronOreBlocks:1qayo94:every call met its contract but the task outcome failed"
+      }
+    },
+    {
+      "id": "deferCounts.scanForIronOreBlocks.callee_fix.misroute",
+      "file": "progress",
+      "path": ["deferCounts", "scanForIronOreBlocks:callee_fix"],
+      "cause": { "fix": "fix79", "commit": "c3025b8", "name": "deferral counter of the misroute repair above (the earlier 04:17Z repair's counter was deleted when it was DROPPED, mindcraft.log 198258)" },
+      "expect": 4,
+      "delete_path": true
     }
   ]
 }
