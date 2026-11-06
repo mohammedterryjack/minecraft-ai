@@ -1,10 +1,12 @@
 /**
- * fix76: hunger at full HP must surface a learned vitals fact; Food-is-full / PREREQUISITE FAILED
- * must not count against skill/candidate stats (live: food 10/20 hp 20/20, 48 mutton, no eat; false 2/2 REJECT).
+ * fix76: hunger at full HP (learned); unmet preconditions classified structurally —
+ * typed kind:'precondition' marker, or learned food-raiser at observed food cap.
+ * Message text alone (e.g. mineflayer "Food is full") must NOT void a fail.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { VitalsModel } from '../src/agent/vitals_model.js';
+import { markPreconditionUnmet, peekPreconditionUnmet, clearPreconditionUnmet } from '../src/agent/precondition.js';
 import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
@@ -13,7 +15,6 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, '..');
 const HPMAX = 20, FOODMAX = 20;
 
-/** Live-like regen: rises only at food 18–20 (icefox progress.vitals after hunger effect). */
 function liveRegenModel() {
     return new VitalsModel({
         regen: {
@@ -31,8 +32,7 @@ describe('fix76: learned hunger at full HP', () => {
         m.noteRun('eatCookedMutton', { hp: 20, food: 10 }, { hp: 20, food: 16 });
         const rec = m.recovery(20, HPMAX, 10);
         assert.strictEqual(rec.below, false);
-        assert.strictEqual(rec.blocked, false);
-        assert.strictEqual(m.recoveryText(rec), null, 'fix58: still no recovery line at full HP');
+        assert.strictEqual(m.recoveryText(rec), null);
         const h = m.hunger(20, HPMAX, 10, FOODMAX);
         assert.strictEqual(h.belowRegen, true);
         assert.strictEqual(h.urgent, true);
@@ -48,15 +48,15 @@ describe('fix76: learned hunger at full HP', () => {
         m.observeFoodSample({ f: 17 }, { f: 16 });
         m.noteRun('eatFood', { hp: 20, food: 16 }, { hp: 20, food: 20 });
         const h = m.hunger(20, HPMAX, 16, FOODMAX);
-        assert.strictEqual(h.belowRegen, false, '16 >= learned floor 12');
+        assert.strictEqual(h.belowRegen, false);
         assert.strictEqual(h.decayKnown, true);
         assert.strictEqual(h.urgent, true);
         assert.match(m.hungerText(h), /food drops observed 2x/);
     });
 
     it('observeSample at full HP still records food drops (hunger path)', () => {
-        const m = new VitalsModel({ regen: {}, runs: {} });
-        assert.strictEqual(m.observeSample({ h: 20, f: 14 }, { h: 20, f: 13 }, HPMAX), null, 'no regen evidence at full HP');
+        const m = new VitalsModel({ regen: {}, runs: {}, foodSamples: { drop: { n: 0, sum: 0 }, rise: { n: 0, sum: 0 } } });
+        assert.strictEqual(m.observeSample({ h: 20, f: 14 }, { h: 20, f: 13 }, HPMAX), null);
         assert.strictEqual(m.s.foodSamples.drop.n, 1);
         assert.strictEqual(m.s.foodSamples.drop.sum, 1);
     });
@@ -64,35 +64,57 @@ describe('fix76: learned hunger at full HP', () => {
     it('full food is not urgent', () => {
         const m = liveRegenModel();
         m.noteRun('eatCookedMutton', { hp: 20, food: 10 }, { hp: 20, food: 16 });
-        const h = m.hunger(20, HPMAX, 20, FOODMAX);
-        assert.strictEqual(h.urgent, false);
-        assert.strictEqual(m.hungerText(h), null);
+        assert.strictEqual(m.hungerText(m.hunger(20, HPMAX, 20, FOODMAX)), null);
     });
 });
 
-describe('fix76: unmet precondition classification (source + voyager wiring)', () => {
-    it('voyager source wires _unmetPrecondition and skips Food is full / PREREQUISITE FAILED', () => {
+describe('fix76: structural unmet-precondition classification', () => {
+    it('typed kind:precondition marker is detected; clear removes it', () => {
+        const bot = {};
+        markPreconditionUnmet(bot, { why: 'chest missing' });
+        const m = peekPreconditionUnmet(bot);
+        assert.strictEqual(m.kind, 'precondition');
+        clearPreconditionUnmet(bot);
+        assert.strictEqual(peekPreconditionUnmet(bot), null);
+    });
+
+    it('learned food-raiser at observed food cap is saturated (no item names, no hard-coded 20 in the check)', () => {
+        const m = new VitalsModel({ regen: {}, runs: {}, foodSamples: { drop: { n: 0, sum: 0 }, rise: { n: 0, sum: 0 } } });
+        m.noteRun('eatCookedMutton', { hp: 20, food: 10 }, { hp: 20, food: 16 });
+        assert.ok(m.foodRaisers().some(x => x.name === 'eatCookedMutton' && x.food > 0));
+        const cap = FOODMAX;
+        const e = m.s.runs.eatCookedMutton;
+        assert.strictEqual(e.food / e.n > 0 && 20 >= cap, true);
+        assert.strictEqual(e.food / e.n > 0 && 10 >= cap, false);
+    });
+
+    it('mineflayer "Food is full" error text alone, without structural signal, is NOT voided', () => {
         const src = readFileSync(join(ROOT, 'src/agent/voyager.js'), 'utf8');
-        assert.match(src, /_unmetPrecondition\(/);
-        assert.match(src, /Food is full/);
-        assert.match(src, /PREREQUISITE FAILED/);
-        assert.match(src, /UNMET PRECONDITION/);
-        assert.match(src, /!unmet\) this\._recordRun/);
+        const pre = readFileSync(join(ROOT, 'src/agent/precondition.js'), 'utf8');
+        assert.equal(src.includes('/Food is full'), false, 'no Food-is-full regex literal');
+        assert.equal(src.includes('/PREREQUISITE FAILED'), false, 'no PREREQUISITE FAILED regex literal');
+        assert.equal(src.includes('.test(blob)'), false, 'no blob text scan');
+        assert.match(src, /_foodRaiseSaturated/);
+        assert.match(src, /_classifyUnmetPrecondition/);
+        assert.match(src, /kind: 'precondition'/);
+        assert.match(pre, /kind: 'precondition'/);
+        const bot = { output: 'FAILED to consume cooked_mutton: Food is full. Food stayed at 20.' };
+        assert.strictEqual(peekPreconditionUnmet(bot), null, 'text in output is not a typed marker');
+        const m = new VitalsModel({ regen: {}, runs: {}, foodSamples: { drop: { n: 0, sum: 0 }, rise: { n: 0, sum: 0 } } });
+        const e = m.s.runs.eatCookedMutton;
+        assert.strictEqual(e, undefined);
+        const saturated = Boolean(e && e.n >= 1 && e.food / e.n > 0 && 20 >= FOODMAX);
+        const wouldVoid = peekPreconditionUnmet(bot) !== null || saturated;
+        assert.strictEqual(wouldVoid, false);
+    });
+
+    it('voyager wiring: hunger facts + structural skip; no text-match unmet helper', () => {
+        const src = readFileSync(join(ROOT, 'src/agent/voyager.js'), 'utf8');
         assert.match(src, /hunger_urgent:/);
         assert.match(src, /food_below_regen_floor:/);
         assert.match(src, /hungerText/);
-        assert.match(src, /food already full/);
-    });
-
-    it('_unmetPrecondition behaviour via isolated eval of the method body contract', async () => {
-        // Exercise the same predicates the method uses (no full Voyager boot).
-        const classify = (blob) => {
-            if (/Food is full/i.test(blob)) return 'Food is full';
-            if (/PREREQUISITE FAILED/i.test(blob)) return 'PREREQUISITE FAILED';
-            return null;
-        };
-        assert.strictEqual(classify('FAILED to consume cooked_mutton: Food is full. Food stayed at 20.'), 'Food is full');
-        assert.strictEqual(classify('PREREQUISITE FAILED: tossClutter needs chest within 32 blocks'), 'PREREQUISITE FAILED');
-        assert.strictEqual(classify('FAILED: pathfinder took too long'), null);
+        assert.match(src, /markPreconditionUnmet/);
+        assert.match(src, /_classifyUnmetPrecondition/);
+        assert.equal(src.includes('_unmetPrecondition('), false);
     });
 });

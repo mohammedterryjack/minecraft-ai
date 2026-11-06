@@ -71,7 +71,11 @@ export class VitalsModel {
         // with at least one observed food-raiser (so eating is a known option).
         const decayKnown = fs.drop.n > 0;
         const raisers = rec.raisers;
-        const urgent = notFull && (belowRegen || (decayKnown && raisers.length > 0));
+        let urgent = false;
+        if (notFull) {
+            if (belowRegen) urgent = true;
+            else if (decayKnown && raisers.length > 0) urgent = true;
+        }
         return {
             urgent, belowRegen, notFull, decayKnown,
             food, foodMax, hp, hpMax,
@@ -104,7 +108,8 @@ export class VitalsModel {
     }
     // fix76: plain hunger facts for the curriculum even when hp is full; null when not urgent
     hungerText(h) {
-        if (!h || !h.urgent) return null;
+        if (!h) throw new Error('[fix76] hungerText requires a hunger() result');
+        if (!h.urgent) return null;
         const floor = h.firstRise ? `learned regen food floor ${h.firstRise.f}` : 'no regen food floor learned yet';
         const decay = h.decayKnown ? `food drops observed ${h.drop.n}x (mean ${h.drop.mean.toFixed(1)}/drop)` : 'no food drops observed yet';
         const raisers = h.raisers.length ? h.raisers.slice(0, 3).map(x => `${x.name} +${x.food.toFixed(1)} food/run (${x.n} runs)`).join(', ') : 'none observed yet';
