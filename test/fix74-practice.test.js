@@ -14,6 +14,8 @@ import { describe, it, before } from 'node:test';
 import assert from 'node:assert';
 import { readFileSync } from 'node:fs';
 import { recordEffectEvidence, verifiedEffects } from '../src/agent/consume_evidence.js';
+import { checkInterruptSource } from '../src/agent/action_manager.js';
+import { markPreconditionUnmet, peekPreconditionUnmet } from '../src/agent/precondition.js';
 
 const LIVE = JSON.parse(readFileSync(new URL('./fixtures/fix74-live-travelWest.json', import.meta.url), 'utf8')).record;
 const SRC = readFileSync(new URL('../src/agent/voyager.js', import.meta.url), 'utf8');
@@ -27,12 +29,12 @@ const rootRec = (name, { t0, t1, from, to, intr = false, rv }) => ({ name, paren
 
 // a voyager whose practice program is the given body (it gets the bot and writes the trace the harness would write)
 function mkPracticeV(skills, run, extra = {}) {
-    const calls = { interrupts: 0, pathfinderStops: 0 };
+    const calls = { interrupts: 0, pathfinderStops: 0, sources: [] };
     const bot = { interrupt_code: false, output: '', pathfinder: { stop() { calls.pathfinderStops++; } } };
     const v = Object.create(Voyager.prototype);
     Object.assign(v, {
         skills, progress: {}, _saveSkills: () => {}, _idlePracticeActive: true, _unjudgeableNoted: new Set(), _unverifiedConsumesNoted: new Set(),
-        agent: { bot, isIdle: () => true, requestInterrupt: () => { calls.interrupts++; bot.interrupt_code = true; bot.pathfinder.stop(); } },
+        agent: { bot, isIdle: () => true, requestInterrupt: (source) => { checkInterruptSource(source); calls.sources.push(source); calls.interrupts++; bot.interrupt_code = true; bot.pathfinder.stop(); } },
         _threats: () => 'none', observe: () => ({ inventory: { ...bot.inv } }), _libSrcSubset: () => '', _closure: () => [],
         _timedBotForSkillRun: () => bot,
         _stageLintExecTraced: async () => ({ lint: null, staged: { func: { main: async b => { b.__psnTrace = []; b.__psnOut = ''; await run(b); } } } }),
@@ -147,6 +149,7 @@ describe('fix74: the practice cap is learned per skill', () => {
         assert.strictEqual(r.ok, false);
         assert.match(r.detail, /cut at its learned bound 40ms/);
         assert.strictEqual(calls.interrupts, 1);
+        assert.strictEqual(calls.sources[0].kind, 'practice', 'fix75: the interrupt names its source');
         assert.strictEqual(calls.pathfinderStops, 1, 'the movement it set going was stopped');
         assert.strictEqual(returned, true, 'the skill returned before the slot was given back (fix70 awaiting)');
         assert.deepStrictEqual([s.stats.success, s.stats.fail], [1, 1]);
@@ -165,6 +168,26 @@ describe('fix74: the practice cap is learned per skill', () => {
         assert.strictEqual(calls.pathfinderStops, 1);
         assert.deepStrictEqual([s.stats.success, s.stats.fail], [1, 0], 'abort is not the skill\'s fault');
         assert.strictEqual(Object.hasOwn(s, 'runMs'), false);
+    });
+});
+
+describe('fix74 on fix76: an unmet precondition is no verdict in practice either', () => {
+    it('a practice run that fails after marking its precondition unmet leaves stats alone and clears the marker', async () => {
+        const s = live();
+        const { v, bot } = mkPracticeV([s], async b => { markPreconditionUnmet(b, { item: 'cooked_mutton' }); b.__psnTrace.push(rootRec(s.name, { t0: 0, t1: 5000, from: { x: -25, y: 69, z: 70 }, to: { x: -30, y: 69, z: 70 } })); });
+        const r = await v._runPracticeSkill(s);
+        assert.strictEqual(r.ok, null, r.detail);
+        assert.match(r.detail, /unmet precondition \(precondition\)/);
+        assert.deepStrictEqual([s.stats.success, s.stats.fail], [1, 0], 'not counted against the skill');
+        assert.strictEqual(peekPreconditionUnmet(bot), null, 'the marker does not outlive the run');
+    });
+    it('a stale marker from before the run cannot void a real failure', async () => {
+        const s = live();
+        const { v, bot } = mkPracticeV([s], async b => { b.__psnTrace.push(rootRec(s.name, { t0: 0, t1: 5000, from: { x: -25, y: 69, z: 70 }, to: { x: -30, y: 69, z: 70 } })); });
+        markPreconditionUnmet(bot);
+        const r = await v._runPracticeSkill(s);
+        assert.strictEqual(r.ok, false);
+        assert.deepStrictEqual([s.stats.success, s.stats.fail], [1, 1]);
     });
 });
 

@@ -129,11 +129,13 @@ const modes_list = [
                 say(agent, 'I\'m stuck!');
                 this.stuck_time = 0;
                 execute(this, agent, async () => {
-                    // after 10 s stop the unstuck move cleanly; only kill if it ignores the stop for 20 s more
-                    const stopTimer = setTimeout(() => { console.log('[unstuck] moveAway over 10 s, interrupting it'); agent.requestInterrupt({ kind: 'mode', by: 'mode:unstuck (moveAway over 10 s)' }); }, 10000);
+                    // fix74: no fixed 10 s stop. b2e2338 added it (with the kill raised 10 s -> 30 s) before moveAway's walk had any
+                    // no-progress check; since fix66 moveAway -> goToGoal -> watchPathing stops a step that runs longer than every
+                    // completed step of its kind (learned, utils/movement_model.js), so a moveAway that is not getting anywhere is
+                    // already stopped on learned evidence, and one that is getting somewhere is no longer cut at an arbitrary 10 s
                     const crashTimeout = setTimeout(() => { agent.cleanKill("Got stuck and couldn't get unstuck") }, 30000);
                     try { await skills.moveAway(bot, 5); }
-                    finally { clearTimeout(stopTimer); clearTimeout(crashTimeout); }
+                    finally { clearTimeout(crashTimeout); }
                     if (bot.interrupt_code) { say(agent, 'Still stuck, giving up on unsticking for now.'); return; }
                     say(agent, 'I\'m free.');
                 });

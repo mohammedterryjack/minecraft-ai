@@ -5,6 +5,9 @@ import Vec3 from 'vec3';
 import settings from "../../../settings.js";
 import { watchPathing } from "../../utils/movement_model.js";
 import { findCarried } from "../../utils/carried.js";
+// fix74 (nit on fix76): the one writer of the typed unmet-precondition marker is a bare API function, so seeded primitives
+// (and learned code) set it through markPreconditionUnmet's checks instead of assigning bot.__unmetPrecondition by hand
+export { markPreconditionUnmet } from '../precondition.js';
 
 const blockPlaceDelay = settings.block_place_delay == null ? 0 : settings.block_place_delay;
 const useDelay = blockPlaceDelay > 0;

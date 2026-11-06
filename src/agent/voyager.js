@@ -380,6 +380,8 @@ export class Voyager {
             if (!s.effects) s.effects = [];
             if (!s.consumes) s.consumes = {};
             if (!s.stats) s.stats = newStats();
+            // fix74: effects are read directly everywhere (no `|| []`); a candidate is created with them (saveSkill HOLD, fix25)
+            if (s.candidate && !Array.isArray(s.candidate.effects)) throw new Error(`[psn] skill ${s.name}: candidate has no effects array (${JSON.stringify(s.candidate.effects)})`);
         }
         this.progress = existsSync(this.progressFile) ? JSON.parse(readFileSync(this.progressFile, 'utf8'))
             : { completed: [], failed: [], enabled: true, goalStats: {} };
@@ -1251,7 +1253,7 @@ Use only c; no other globals.`;
                 // fix45: when task passed and the skill's delta shows positive gain for its effects, don't attribute VIOLATED
                 // The delta is the ground truth; if the contract formula disagrees, the contract is wrong, not the skill
                 if (taskOk && k === 'post') {
-                    const effects = e.effects || [];
+                    const effects = e.effects;
                     const deltaGained = effects.some(eff => (r.delta?.[eff] || 0) > 0);
                     if (deltaGained) {
                         console.log(`[contract] fix45: ${e.name} postcondition disagreed but delta shows gain for effects [${effects.join(',')}]; queuing contract repair, not skill repair`);
@@ -1366,7 +1368,7 @@ Use only c; no other globals.`;
         }
         if (!learnable.length) return 0;
         const system = `You write PSN skill contracts for a Minecraft mineflayer skill library.\n${Voyager.CONTRACT_SPEC}\nReply ONLY with JSON: {"<skillName>": {"pre": "c => ...", "post": "c => ...", "text": "<one-line contract summary>"}, ...} for exactly the skills given.`;
-        const user = learnable.map(e => `--- ${e.name} ---\ndescription: ${e.description}\nobserved effects: ${JSON.stringify(e.effects || [])}\n${e.contract ? `current contract (${fixNote || 'to fix'}): ${JSON.stringify(e.contract)}\n` : ''}code:\n${String(e.code).slice(0, 1800)}`).join('\n');
+        const user = learnable.map(e => `--- ${e.name} ---\ndescription: ${e.description}\nobserved effects: ${JSON.stringify(e.effects)}\n${e.contract ? `current contract (${fixNote || 'to fix'}): ${JSON.stringify(e.contract)}\n` : ''}code:\n${String(e.code).slice(0, 1800)}`).join('\n');
         console.log(`[contract] learning contracts for ${learnable.length} skill(s) (${why}): ${learnable.map(e => e.name).join(', ')}`);
         let out; try { out = parseJSON(await this._ask(system, user)); } catch (err) { console.log(`[contract] learning FAILED: ${err.message}`); return 0; }
         let n = 0;
@@ -1452,7 +1454,13 @@ Use only c; no other globals.`;
         };
         bot.on('physicsTick', onTick);
         this._lastRunMsg = ''; this._lastRunTimedOut = null;
-        try { const r = await this.agent.actions.runAction(label, fn, { timeout }); this._lastRunMsg = String(r?.message || ''); this._lastRunTimedOut = r.timedout; return r; } finally { bot.removeListener('physicsTick', onTick); }
+        // fix74: _executeAction returns { message: string } on every path (output summary, exception text, loop kill); a result
+        //        without one is an action-manager bug, not an empty output (was String(r?.message || ''))
+        try {
+            const r = await this.agent.actions.runAction(label, fn, { timeout });
+            if (typeof r.message !== 'string') throw new Error(`[voyager] _run(${label}): action result has no message string (got ${JSON.stringify(r.message)})`);
+            this._lastRunMsg = r.message; this._lastRunTimedOut = r.timedout; return r;
+        } finally { bot.removeListener('physicsTick', onTick); }
     }
     _stalledInRun() { const s = this._stall; return s && s.t >= (this._runStart || Infinity) ? s : null; }
     /** fix65: candidate code staged in place for a replay of `root`; `rootTrial` = the goal-overlap gate's verdict on root's own candidate */
@@ -2001,7 +2009,7 @@ Use only c; no other globals.`;
         // Prevents trialing e.g. craftIronHelmet on an iron_pickaxe goal (wastes ingots, wrong outcome)
         let trial = false;
         if (entry?.candidate) {
-            const candidateEffects = entry.candidate.effects || entry.effects || [];
+            const candidateEffects = entry.candidate.effects;   // fix74: every candidate is created with effects (saveSkill HOLD, fix25 migrate; checked at load)
             const goalItems = goal?.items || (goal?.item ? [goal.item] : []);
             const effectsOverlap = goalItems.length === 0 || candidateEffects.some(eff => goalItems.includes(eff));
             if (effectsOverlap) {
@@ -2465,13 +2473,13 @@ Use only c; no other globals.`;
     // NO hard-coded ore/smelt tables - producers come from skill.effects and observed graph recordings
     // fix44: resolve mergedInto to validated active skills (merge targets that are not candidate/demoted)
     _producers(item) {
-        const fromSkills = this.skills.filter(s => !s.demoted && !s.mergedInto && !s.candidate && !/^(repair|refactor)\b/.test(s.task || '') && (s.effects || []).includes(item)
+        const fromSkills = this.skills.filter(s => !s.demoted && !s.mergedInto && !s.candidate && !/^(repair|refactor)\b/.test(s.task || '') && s.effects.includes(item)
             && !(signatureOf(s.code, s.name).match(/\(([^)]*)\)/)?.[1] || '').split(',').slice(1).some(x => x.trim() && !x.includes('=')))
             .map(s => ({ s, V: this._maturity(s).V }));
         
         // fix44: check merged skills - if a merged skill produces the item, include its merge target
         // ONLY if the merge target is a validated active skill (not candidate, not demoted)
-        for (const merged of this.skills.filter(s => s.mergedInto && (s.effects || []).includes(item))) {
+        for (const merged of this.skills.filter(s => s.mergedInto && s.effects.includes(item))) {
             const target = this.skills.find(s => s.name === merged.mergedInto);
             if (target && !target.demoted && !target.candidate && !fromSkills.some(x => x.s.name === target.name)) {
                 fromSkills.push({ s: target, V: this._maturity(target).V });
@@ -2544,7 +2552,7 @@ Use only c; no other globals.`;
             }
         }
         let n = 0;
-        const L = this.skills.filter(s => !s.primitive && !s.handwritten && !s.demoted && !s.mergedInto && !s.candidate && s.embedding && (s.effects || []).length);
+        const L = this.skills.filter(s => !s.primitive && !s.handwritten && !s.demoted && !s.mergedInto && !s.candidate && s.embedding && s.effects.length);
         for (let i = 0; i < L.length; i++) for (let j = i + 1; j < L.length; j++) {
             const a = L[i], b = L[j]; if (a.mergedInto || b.mergedInto || a.embedding.length !== b.embedding.length) continue;
             if (JSON.stringify([...a.effects].sort()) !== JSON.stringify([...b.effects].sort()) || cosineSimilarity(a.embedding, b.embedding) < 0.97) continue;
@@ -2574,7 +2582,7 @@ Use only c; no other globals.`;
     _detectGeneralise() {
         if (this._generaliseDue) return;
         const cands = this.skills.filter(s => !s.primitive && !s.handwritten && !s.demoted && !s.mergedInto && !s.candidate
-            && (s.effects || []).length && !/\(bot\s*,/.test(signatureOf(s.code, s.name)));
+            && s.effects.length && !/\(bot\s*,/.test(signatureOf(s.code, s.name)));
         const groups = new Map();
         for (const s of cands) {
             const base = s.name.replace(/^(craft|mine|get|make|collect)/, '').replace(/(Wooden|Stone|Iron|Golden|Diamond|Netherite|Oak|Birch|Spruce|Dark_?Oak|Jungle|Acacia|Mangrove|Cherry|Bamboo)/i, '').toLowerCase();
@@ -3075,7 +3083,7 @@ Use only c; no other globals.`;
         const hasLearnedProducer = new Set();
         for (const s of this.skills) {
             if (s.demoted || s.mergedInto || s.candidate) continue;
-            for (const eff of (s.effects || [])) {
+            for (const eff of s.effects) {
                 hasLearnedProducer.add(eff);
             }
         }
@@ -3197,6 +3205,7 @@ Use only c; no other globals.`;
         const bound = this._practiceBound(skill);
         if (bound === null) console.log(`[idle-practice] ${skill.name}: no observed run duration yet; uncapped, ends when it returns or the code-model call completes`);
         const traceWas = bot.__psnTrace;
+        clearPreconditionUnmet(bot);   // fix76: only a marker this run sets can void its verdict
         const stateBefore = this.observe();   // fix70: measured right before this run
         const practiceStart = Date.now();
         // fix70: the practice run is over only when the skill's own code has returned (live 01:07:52Z: pickupNearbyItems
@@ -3206,11 +3215,13 @@ Use only c; no other globals.`;
         // fix74: a cut or abort interrupts the skill AND what it set going. fix70's ended() only set bot.interrupt_code, which
         //        learned code reads only between its own awaits; a skill waiting in a pathfinder goto (travelWestAvoidDeathHotspot)
         //        kept walking until the goal or a stall, and _ask (#65) awaited that walk before handing back the model reply.
-        //        agent.requestInterrupt() is the one stop the action manager uses: stopDigging, collectBlock.cancelTask,
+        //        agent.requestInterrupt is the one stop the action manager uses: stopDigging, collectBlock.cancelTask,
         //        pathfinder.stop + setGoal(null) (rejects a pending goto at once), pvp.stop.
-        const ended = async () => {
+        // fix75 (ae731ed): every interrupt names its source; this one is idle practice ending its own run (no action is
+        //        executing while the bot practises, so ActionManager.noteInterrupt records nothing)
+        const ended = async (why) => {
             const was = bot.interrupt_code;
-            this.agent.requestInterrupt();
+            this.agent.requestInterrupt({ kind: 'practice', by: `idle-practice ${skill.name}: ${why}` });
             const s = await settled;
             if (s.kind === 'threw') console.log(`[idle-practice] ${skill.name} ended after interrupt with: ${s.err.message}`);
             bot.interrupt_code = was;   // this interrupt was only to end this practice run; the next practice run starts as this one did
@@ -3224,6 +3235,7 @@ Use only c; no other globals.`;
         const finish = (verdict) => {
             const trace = bot.__psnTrace;
             bot.__psnTrace = traceWas;
+            clearPreconditionUnmet(bot);   // fix76's marker belongs to this run; it must not reach the next task's verdict
             skill.stats.lastRun = Date.now();
             skill.stats.practiceRuns = (Object.hasOwn(skill.stats, 'practiceRuns') ? skill.stats.practiceRuns : 0) + 1;
             if (verdict.ok !== null) this._recordRun(skill, null, verdict.ok, false);
@@ -3232,13 +3244,13 @@ Use only c; no other globals.`;
         };
         if (outcome.kind === 'aborted') {
             console.log(`[idle-practice] ABORTED ${skill.name}: code-model call completed`);
-            await ended();
+            await ended('code-model call completed');
             finish({ ok: null, detail: 'aborted' });
             return null;
         }
         if (outcome.kind === 'cut') {
             console.log(`[idle-practice] TIMEOUT ${skill.name}: still running after ${bound}ms, the longest it has returned in (n=${skill.runMs.n}); interrupting`);
-            await ended();
+            await ended(`cut at its learned bound ${bound}ms`);
             return finish({ ok: false, detail: `cut at its learned bound ${bound}ms` });
         }
         const after = this.observe();
@@ -3250,9 +3262,15 @@ Use only c; no other globals.`;
             console.error(`[idle-practice] EXECUTION FAILED ${skill.name}: ${outcome.err.message}`);
             const lib = this._libraryFault(trace, skill.name);
             if (lib) return finish({ ok: null, detail: `threw in library code (${lib.fn} ${lib.loc}), not the skill's fault` });
+            const unmetT = this._classifyUnmetPrecondition(skill.name, stateBefore.food_value);
+            if (unmetT) return finish({ ok: null, detail: `unmet precondition (${unmetT}), not evidence about the skill` });
             return finish({ ok: false, detail: `threw: ${outcome.err.message}` });
         }
         const verdict = this._practiceRunChanged(skill, stateBefore, after);
+        // fix76 semantics for practice: a failed run whose precondition was unmet (typed marker, or a learned food-raiser
+        //        started at the food cap) is no verdict on the skill, as in replay (_classifyUnmetPrecondition)
+        const unmet = verdict.ok === false && this._classifyUnmetPrecondition(skill.name, stateBefore.food_value);
+        if (unmet) return finish({ ok: null, detail: `${verdict.detail}; unmet precondition (${unmet}), not evidence about the skill` });
         if (verdict.ok === true) this._learnEffects(skill, stateBefore, after, null);   // a verified run is a measured run
         return finish({ ...verdict, detail: `${verdict.detail} in ${Date.now() - practiceStart}ms` });
     }
@@ -5243,7 +5261,7 @@ Voyager.SEEDED_PRIMITIVES = [
         const chest = getNearestBlock(bot, b => /chest|barrel|shulker/.test(b.name), 32);
         if (!chest) {
             if (depositList.length || (bot.inventory.emptySlotCount() < 2 && uncertainList.length)) {
-                bot.__unmetPrecondition = { kind: 'precondition' };
+                markPreconditionUnmet(bot);
                 log(bot, \`PREREQUISITE FAILED: tossClutter needs chest within 32 blocks to deposit items (have \${depositList.length} deposit candidates, \${uncertainList.length} uncertain items). Place or find a chest first.\`);
                 return false;
             }
@@ -5374,7 +5392,7 @@ Voyager.SEEDED_PRIMITIVES = [
                 if (!crafted && shortfall > 0) {
                     // fix51: fail loud with structured prerequisite info for decomposition/needs-produces
                     bot.__prereqFail = { item: ingItem.name, need: shortfall + (inv[ingItem.name] || 0), have: inv[ingItem.name] || 0 };
-                    bot.__unmetPrecondition = { kind: 'precondition' };
+                    markPreconditionUnmet(bot);
                     log(bot, \`PREREQUISITE FAILED: ensureCraftingTable needs \${shortfall} more \${ingItem.name} but cannot craft it (no 2x2 recipe or missing sub-ingredients). Decompose to obtain \${ingItem.name} first.\`);
                     return false;
                 }
@@ -5412,7 +5430,7 @@ Voyager.SEEDED_PRIMITIVES = [
                     }
                 }
             }
-            bot.__unmetPrecondition = { kind: 'precondition' };
+            markPreconditionUnmet(bot);
             log(bot, \`PREREQUISITE FAILED: ensureCraftingTable cannot craft - missing: \${missingIngredients.join(', ')}. Decompose to obtain prerequisites.\`);
             return false;
         }

@@ -94,15 +94,45 @@ function stamp() {
     return `${d.getUTCFullYear()}${p(d.getUTCMonth() + 1)}${p(d.getUTCDate())}T${p(d.getUTCHours())}${p(d.getUTCMinutes())}${p(d.getUTCSeconds())}Z`;
 }
 
-export function loadManifest(manifestPath) {
-    const m = readJson(manifestPath);
+const isPlainObject = v => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+// fix74 (nit on fix76): every record states all of its fields; nothing is defaulted. Before, an index record without
+// expect/set/delete read `rec.expect || {}`, `rec.set || {}`, `rec.delete || []`: a record with a misspelt or missing expect
+// applied its set/delete with NO precondition check (the stale-manifest guard silently off), and a progress record with
+// neither delete_path nor set changed nothing and said nothing.
+export function checkRecord(rec) {
+    if (!isPlainObject(rec) || typeof rec.id !== 'string' || !rec.id) throw new Error(`manifest record needs an id: ${JSON.stringify(rec)}`);
+    const label = rec.id;
+    if (rec.file === 'index') {
+        if (typeof rec.skill !== 'string' || !rec.skill) throw new Error(`${label}: index record needs skill`);
+        if (!isPlainObject(rec.expect) || !Object.keys(rec.expect).length) throw new Error(`${label}: index record needs a non-empty expect object (the state it resets), got ${JSON.stringify(rec.expect)}`);
+        if (!isPlainObject(rec.set)) throw new Error(`${label}: index record needs a set object ({} when it only deletes), got ${JSON.stringify(rec.set)}`);
+        if (!Array.isArray(rec.delete) || !rec.delete.every(k => typeof k === 'string' && k)) throw new Error(`${label}: index record needs a delete array of keys ([] when it only sets), got ${JSON.stringify(rec.delete)}`);
+        if (!Object.keys(rec.set).length && !rec.delete.length) throw new Error(`${label}: index record changes nothing (empty set and delete)`);
+    } else if (rec.file === 'progress') {
+        if (!Array.isArray(rec.path) || !rec.path.length) throw new Error(`${label}: progress record needs path[]`);
+        if (!Object.hasOwn(rec, 'expect')) throw new Error(`${label}: progress record needs expect (the value at path it resets)`);
+        if (rec.delete_path !== true) throw new Error(`${label}: progress record needs delete_path: true (the only progress operation), got ${JSON.stringify(rec.delete_path)}`);
+    } else {
+        throw new Error(`${label}: unknown file ${rec.file}`);
+    }
+}
+
+export function checkManifest(m) {
+    if (!isPlainObject(m)) throw new Error('manifest must be an object');
     if (m.version !== 1) throw new Error(`unsupported manifest version: ${m.version}`);
     if (!Array.isArray(m.records) || !m.records.length) throw new Error('manifest.records must be a non-empty array');
-    if (!m.files?.index || !m.files?.progress) throw new Error('manifest.files.index and .progress are required');
+    if (!isPlainObject(m.files) || typeof m.files.index !== 'string' || typeof m.files.progress !== 'string') throw new Error('manifest.files.index and .progress are required');
+    for (const rec of m.records) checkRecord(rec);
     return m;
 }
 
+export function loadManifest(manifestPath) {
+    return checkManifest(readJson(manifestPath));
+}
+
 export function applyManifest({ manifest, botsDir, apply = false, log = console.log }) {
+    checkManifest(manifest);
     const indexPath = join(botsDir, manifest.files.index);
     const progressPath = join(botsDir, manifest.files.progress);
     const index = readJson(indexPath);
@@ -113,9 +143,8 @@ export function applyManifest({ manifest, botsDir, apply = false, log = console.
     for (const rec of manifest.records) {
         const label = rec.id;
         if (rec.file === 'index') {
-            if (!rec.skill) throw new Error(`${label}: index record needs skill`);
             const { skill } = findSkill(index, rec.skill);
-            for (const [k, want] of Object.entries(rec.expect || {})) {
+            for (const [k, want] of Object.entries(rec.expect)) {
                 const got = k.includes('.') ? getAt(skill, k) : { ok: Object.hasOwn(skill, k) || (want === null && skill[k] == null), value: skill[k] };
                 const actual = k.includes('.') ? got.value : skill[k];
                 const present = k.includes('.') ? got.ok : (want === null ? (skill[k] == null) : Object.hasOwn(skill, k));
@@ -126,12 +155,12 @@ export function applyManifest({ manifest, botsDir, apply = false, log = console.
                 }
             }
             if (mismatches.some(m => m.id === label)) continue;
-            for (const [k, v] of Object.entries(rec.set || {})) {
+            for (const [k, v] of Object.entries(rec.set)) {
                 const before = k.includes('.') ? getAt(skill, k).value : skill[k];
                 if (k.includes('.')) setAt(skill, k, v); else skill[k] = v;
                 changes.push({ id: label, op: 'set', target: `${rec.skill}.${k}`, before, after: v });
             }
-            for (const k of rec.delete || []) {
+            for (const k of rec.delete) {
                 const before = skill[k];
                 if (Object.hasOwn(skill, k) || skill[k] !== undefined) {
                     delete skill[k];
@@ -141,28 +170,14 @@ export function applyManifest({ manifest, botsDir, apply = false, log = console.
                 }
             }
         } else if (rec.file === 'progress') {
-            if (!Array.isArray(rec.path) || !rec.path.length) throw new Error(`${label}: progress record needs path[]`);
             const got = getAt(progress, rec.path);
-            if (rec.expect !== undefined) {
-                if (typeof rec.expect === 'object' && rec.expect !== null && !Array.isArray(rec.expect) && Object.keys(rec.expect).every(k => !k.includes('.'))) {
-                    // expect is the whole value at path
-                    if (!got.ok || !deepEqual(got.value, rec.expect)) {
-                        mismatches.push({ id: label, key: rec.path.join('.'), expect: rec.expect, actual: got.ok ? got.value : undefined });
-                        continue;
-                    }
-                }
+            // expect is the whole value at path (required, checkRecord)
+            if (!got.ok || !deepEqual(got.value, rec.expect)) {
+                mismatches.push({ id: label, key: rec.path.join('.'), expect: rec.expect, actual: got.ok ? got.value : undefined });
+                continue;
             }
-            if (rec.delete_path) {
-                const before = got.ok ? got.value : undefined;
-                if (!got.ok) {
-                    mismatches.push({ id: label, key: rec.path.join('.'), expect: rec.expect, actual: undefined });
-                    continue;
-                }
-                deletePath(progress, rec.path);
-                changes.push({ id: label, op: 'delete_path', target: rec.path.join('.'), before, after: undefined });
-            } else if (rec.set !== undefined) {
-                throw new Error(`${label}: progress set-at-path not used in this manifest; use delete_path or extend the script`);
-            }
+            deletePath(progress, rec.path);
+            changes.push({ id: label, op: 'delete_path', target: rec.path.join('.'), before: got.value, after: undefined });
         } else {
             throw new Error(`${label}: unknown file ${rec.file}`);
         }

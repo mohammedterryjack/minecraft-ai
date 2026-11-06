@@ -85,6 +85,13 @@ export class VitalsModel {
             rise: { n: fs.rise.n, mean: fs.rise.n ? fs.rise.sum / fs.rise.n : 0 },
         };
     }
+    // fix74 (nit on fix58/fix76): every learned food-raiser, best first. Was raisers.slice(0, 3) in both texts: a fixed cut that
+    //        could hide the one raiser the bot holds food for. The list is bounded by the skills seen raising food (foodRaisers).
+    static raisersText(raisers) {
+        if (!Array.isArray(raisers)) throw new Error(`[fix74] raisersText needs the foodRaisers() list, got ${JSON.stringify(raisers)}`);
+        if (!raisers.length) return 'none observed yet';
+        return raisers.map(x => `${x.name} +${x.food.toFixed(1)} food/run (${x.n} runs)`).join(', ');
+    }
     // fix59: which part of the LEARNED recovery outlook changed between two recovery() results, or null if none did.
     // Replaces _planStale's fixed "hp/food dropped by 6": vitals only invalidate a plan when they cross a learned boundary.
     static outlookChange(a, b) {
@@ -103,7 +110,7 @@ export class VitalsModel {
         const hp = r.hp.toFixed(1);
         const rise = r.firstRise ? `lowest food level at which hp has risen: ${r.firstRise.f} (${r.firstRise.up}/${r.firstRise.n} samples)` : 'hp has not been seen rising at any food level yet';
         const out = r.blocked ? `; so hp is not recovering at food ${r.food}` : '';
-        const raisers = r.raisers.length ? r.raisers.slice(0, 3).map(x => `${x.name} +${x.food.toFixed(1)} food/run (${x.n} runs)`).join(', ') : 'none observed yet';
+        const raisers = VitalsModel.raisersText(r.raisers);
         return `health_recovery (learned from own vitals): hp ${hp}/${r.hpMax}, food ${r.food}; at food <= ${r.food} hp rose in ${r.low.up}/${r.low.n} below-max samples; ${rise}${out}; skills observed raising food: ${raisers}`;
     }
     // fix76: plain hunger facts for the curriculum even when hp is full; null when not urgent
@@ -112,7 +119,7 @@ export class VitalsModel {
         if (!h.urgent) return null;
         const floor = h.firstRise ? `learned regen food floor ${h.firstRise.f}` : 'no regen food floor learned yet';
         const decay = h.decayKnown ? `food drops observed ${h.drop.n}x (mean ${h.drop.mean.toFixed(1)}/drop)` : 'no food drops observed yet';
-        const raisers = h.raisers.length ? h.raisers.slice(0, 3).map(x => `${x.name} +${x.food.toFixed(1)} food/run (${x.n} runs)`).join(', ') : 'none observed yet';
+        const raisers = VitalsModel.raisersText(h.raisers);
         const why = h.belowRegen ? `food ${h.food}/${h.foodMax} is below ${floor}` : `food ${h.food}/${h.foodMax} is not full and ${decay}`;
         return `hunger (learned from own vitals): ${why}; ${decay}; skills observed raising food: ${raisers}`;
     }

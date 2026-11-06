@@ -2,7 +2,7 @@ import { withStallPhase } from '../utils/event_loop_guard.js';
 import { wrapBotForApiTiming } from '../utils/bot_api_timing.js';
 
 // fix75: an interrupt source is { kind, by }: kind is what fired it (preempt, timeout, mode, stall, death, player,
-// process-error, exception, command, self-prompter), by says which one. Missing or malformed is our bug: throw.
+// process-error, exception, command, self-prompter, practice), by says which one. Missing or malformed is our bug: throw.
 export function checkInterruptSource(source) {
     if (!source || typeof source !== 'object' || typeof source.kind !== 'string' || !source.kind || typeof source.by !== 'string' || !source.by)
         throw new Error(`interrupt without a source: ${JSON.stringify(source)} (every interrupt must say { kind, by } where it fires)`);
