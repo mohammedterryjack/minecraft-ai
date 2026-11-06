@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "bot": "icefox2000",
+  "inventory": "fix84: equipBestToolForIronOre was saved NEW at 14:43:51Z returning iron_shovel (test/fix73). A postcondition that requires iron_shovel while naming iron_ore is not an enumerated name list, so fix83 contractNameLists accepts it. iron_ore.harvestTools are only the pickaxes (stone, iron, diamond, netherite). Deleting contract and contractTried lets the next contract backfill relearn it under the fix84 harvestTools check. The gitignored bots/icefox2000 snapshot has no equipBestToolForIronOre record and no contract, so apply on the live index fails loud on expect mismatch until expect.contract is the contract actually stored. Apply with the fix84 deploy (stop at a step boundary, dry-run, apply, start).",
+  "files": {
+    "index": "skills/index.json",
+    "progress": "skills/progress.json"
+  },
+  "records": [
+    {
+      "id": "equipBestToolForIronOre.harvestTool",
+      "file": "index",
+      "skill": "equipBestToolForIronOre",
+      "cause": {
+        "fix": "fix84",
+        "name": "post expects iron_shovel for iron_ore, which harvestTools omit"
+      },
+      "evidence": "fix83 contractNameLists accepts a single name; iron_ore harvestTools are stone_pickaxe, iron_pickaxe, diamond_pickaxe, netherite_pickaxe",
+      "expect": {
+        "contract": {
+          "pre": "c => c.pre.alive && c.game.block('iron_ore')",
+          "post": "c => c.ret === false || c.ret === null || (c.post.alive && c.post.eq.heldItem === 'iron_shovel')",
+          "text": "Equips iron_shovel to mine iron_ore.",
+          "learned": "2026-11-06T14:43:51.000Z",
+          "why": "live skill returned iron_shovel"
+        }
+      },
+      "set": {},
+      "delete": [
+        "contract",
+        "contractTried"
+      ]
+    }
+  ]
+}

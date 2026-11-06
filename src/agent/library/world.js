@@ -323,6 +323,30 @@ export function getInventoryCounts(bot) {
     return inventory;
 }
 
+// fix84: how many more of itemName the stackable window can accept. Empty slots and partial stacks of that
+// item count; both use the item's minecraft-data stackSize. Armour and off-hand are outside this window
+// (inventoryStart..inventoryEnd, the same range emptySlotCount uses).
+export function roomForItem(bot, itemName) {
+    if (!bot || !bot.inventory || !Array.isArray(bot.inventory.slots)) throw new Error('[fix84] roomForItem: bot.inventory.slots required');
+    const start = bot.inventory.inventoryStart, end = bot.inventory.inventoryEnd;
+    if (!Number.isInteger(start) || !Number.isInteger(end) || end <= start) throw new Error(`[fix84] roomForItem: inventory window range required, got ${JSON.stringify(start)}..${JSON.stringify(end)}`);
+    const reg = bot.registry;
+    if (!reg || !reg.itemsByName) throw new Error('[fix84] roomForItem: bot.registry required');
+    const it = reg.itemsByName[itemName];
+    if (!it) throw new Error(`[fix84] roomForItem: ${JSON.stringify(itemName)} is not an item`);
+    if (!Number.isInteger(it.stackSize) || it.stackSize < 1) throw new Error(`[fix84] roomForItem: ${itemName} has no stackSize in the game data`);
+    let room = 0;
+    for (let i = start; i < end; i++) {
+        const s = bot.inventory.slots[i];
+        if (s == null) { room += it.stackSize; continue; }
+        if (s.name !== itemName) continue;
+        if (!Number.isInteger(s.count)) throw new Error(`[fix84] roomForItem: slot ${i} count is not an integer`);
+        if (s.count > it.stackSize) throw new Error(`[fix84] roomForItem: slot ${i} holds ${s.count} ${itemName}, above stackSize ${it.stackSize}`);
+        if (s.count < it.stackSize) room += it.stackSize - s.count;
+    }
+    return room;
+}
+
 
 export function getCraftableItems(bot) {
     /**

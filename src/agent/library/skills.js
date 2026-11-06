@@ -5,6 +5,7 @@ import Vec3 from 'vec3';
 import settings from "../../../settings.js";
 import { watchPathing } from "../../utils/movement_model.js";
 import { findCarried } from "../../utils/carried.js";
+import { markPreconditionUnmet } from "../precondition.js";
 
 const blockPlaceDelay = settings.block_place_delay == null ? 0 : settings.block_place_delay;
 const useDelay = blockPlaceDelay > 0;
@@ -539,33 +540,31 @@ export async function defendSelf(bot, range=9) {
 
 
 
-// fix43: _freeInventory uses POSITIVE learned signals only (bot.__safeToToss set by voyager)
-// NO hard-coded junk/useful lists - what's safe to toss is determined by POSITIVE learned producer + surplus
-// Unknown items (no learned producer) are NOT auto-tossed - they stay in uncertain list
+// fix84: toss the learned surplus counts (bot.__surplus, verified consumption). No name list, no whole-stack guess.
 // fix43: fail loud when deposit prerequisite (chest) missing
 // fix25: raised threshold from >= 2 to < 4 so it runs when 2-3 empty (not just 0-1)
 async function _freeInventory(bot, keepName) {
     // survival-only: toss surplus items when nearly full
     if (bot.inventory.emptySlotCount() >= 4) return;  // fix25: was >= 2
-    
-    // fix43: use learned safe-to-toss signals (populated by voyager._prepareTossSignals)
-    const safeList = bot.__safeToToss || [];
-    const depositList = bot.__depositCandidates || [];
-    const uncertainList = bot.__uncertainItems || [];
-    
-    // Phase 1: toss safe items (items with POSITIVE learned producer signal)
+    if (!Array.isArray(bot.__surplus)) throw new Error('[_freeInventory] bot.__surplus is not an array (voyager._prepareTossSignals not called)');
+    if (!Array.isArray(bot.__depositCandidates)) throw new Error('[_freeInventory] bot.__depositCandidates is not an array (voyager._prepareTossSignals not called)');
+    if (!Array.isArray(bot.__uncertainItems)) throw new Error('[_freeInventory] bot.__uncertainItems is not an array (voyager._prepareTossSignals not called)');
+    const surplus = bot.__surplus;
+    const depositList = bot.__depositCandidates;
+    const uncertainList = bot.__uncertainItems;
     let freed = 0;
-    for (const tossName of safeList) {
-        if (tossName === keepName) continue;
-        const it = bot.inventory.items().find(i => i.name === tossName);
-        if (!it) continue;
-        
-        // Toss the whole stack - surplus threshold already computed by voyager
-        try { await bot.toss(it.type, null, it.count); freed++; console.log(`[_freeInventory] tossed ${it.count} ${tossName} (has learned producer)`); }
-        catch (e) { console.log(`[_freeInventory] FAILED to toss ${tossName}: ${e.message}`); }  // fail loud
+    for (const s of surplus) {
+        if (s.item === keepName) continue;
+        if (typeof s.item !== 'string' || !Number.isInteger(s.count) || s.count < 1) throw new Error(`[_freeInventory] surplus entry ${JSON.stringify(s)} is not { item, count }`);
+        const it = bot.inventory.items().find(i => i.name === s.item);
+        if (!it) throw new Error(`[_freeInventory] learned surplus ${s.item} is not in the inventory`);
+        const n = s.count < it.count ? s.count : it.count;
+        await bot.toss(it.type, null, n);
+        freed++;
+        console.log(`[_freeInventory] tossed ${n} ${s.item} (verified surplus)`);
         if (bot.inventory.emptySlotCount() >= 4) break;
     }
-    if (freed) log(bot, `[_freeInventory] dropped ${freed} stacks using learned safe-to-toss signals (items with known producers).`);
+    if (freed) log(bot, `[_freeInventory] dropped ${freed} surplus stack(s) from verified consumption.`);
     
     // Phase 2: if still low on space, try to deposit to chest
     // fix51: use ONLY learned chest memory (no world search, no distance cap)
@@ -611,12 +610,25 @@ async function _freeInventory(bot, keepName) {
     
     // fix43: fail loud if we couldn't free space
     if (bot.inventory.emptySlotCount() < 2) {
-        if (uncertainList.length && !safeList.length) {
-            log(bot, `[_freeInventory] FAILED: ${uncertainList.length} item(s) have NO learned producer signal (${uncertainList.slice(0, 3).join(', ')}${uncertainList.length > 3 ? '...' : ''}) - cannot auto-toss unknown items. Return decision to model/planning.`);
-        } else if (!safeList.length && !depositList.length) {
-            log(bot, '[_freeInventory] FAILED: no learned signal indicates what is safe to toss/deposit');
+        if (uncertainList.length && !surplus.length) {
+            log(bot, `[_freeInventory] FAILED: ${uncertainList.length} item(s) have no verified consumption and were not tossed.`);
+        } else if (!surplus.length && !depositList.length) {
+            log(bot, '[_freeInventory] FAILED: no verified consumption says what is surplus, and nothing is marked to deposit');
         }
     }
+}
+
+// fix84: the item a broken block adds to the inventory, from the game data. null when the block drops nothing.
+function _blockDropName(bot, block) {
+    if (!bot.registry || !bot.registry.blocksByName || !bot.registry.blocksByName[block.name]) throw new Error(`collectBlock: ${block.name} is not a block in the game data`);
+    const drops = bot.registry.blocksByName[block.name].drops;
+    if (!Array.isArray(drops)) throw new Error(`collectBlock: ${block.name} has no drops list in the game data`);
+    if (drops.length === 0) return null;
+    const dropId = drops[0];
+    const id = typeof dropId === 'number' ? dropId : dropId.drop.id;
+    const item = bot.registry.items[id];
+    if (!item) throw new Error(`collectBlock: drop ${JSON.stringify(dropId)} of ${block.name} is not an item`);
+    return item.name;
 }
 
 function _survivalMovements(bot, {dig = true} = {}) {
@@ -723,7 +735,6 @@ export async function collectBlock(bot, blockType, num=1, exclude=null) {
     const unsafeBlocks = ['obsidian'];
 
     for (let i=0; i<num; i++) {
-        await _freeInventory(bot, blockType);
         let blocks = world.getNearestBlocksWhere(bot, block => {
             if (!blocktypes.includes(block.name)) {
                 return false;
@@ -751,6 +762,7 @@ export async function collectBlock(bot, blockType, num=1, exclude=null) {
             break;
         }
         const block = blocks[0];
+        const dropName = _blockDropName(bot, block);
         await equipToolForBlock(bot, block);   // fix62: cheapest tool that works (mineflayer-tool equipForBlock sorts by dig time = top tier)
         if (isLiquid) {
             const bucket = bot.inventory.findInventoryItem('bucket');
@@ -763,6 +775,12 @@ export async function collectBlock(bot, blockType, num=1, exclude=null) {
         const itemId = bot.heldItem ? bot.heldItem.type : null
         if (!block.canHarvest(itemId)) {
             log(bot, `Don't have right tools to harvest ${blockType}.`);
+            return false;
+        }
+        // fix84: a full inventory is a structured slot need (the same marker as a missing chest), not a toss-in-place
+        if (dropName !== null && world.roomForItem(bot, dropName) < 1) {
+            markPreconditionUnmet(bot, { need: { item: dropName, count: num - collected, reason: 'slot' } });
+            log(bot, `PREREQUISITE FAILED: no free slot for ${dropName}.`);
             return false;
         }
         try {
@@ -791,12 +809,10 @@ export async function collectBlock(bot, blockType, num=1, exclude=null) {
         }
         catch (err) {
             if (err.name === 'NoChests') {
-                await _freeInventory(bot, blockType);
-                if (bot.inventory.emptySlotCount() === 0) {
-                    log(bot, `Failed to collect ${blockType}: Inventory full of non-junk items; store items in a chest first.`);
-                    break;
-                }
-                continue;
+                if (dropName === null) throw new Error(`collectBlock: inventory refused ${block.name}, which drops nothing`);
+                markPreconditionUnmet(bot, { need: { item: dropName, count: num - collected, reason: 'slot' } });
+                log(bot, `PREREQUISITE FAILED: no free slot for ${dropName}.`);
+                return false;
             }
             else {
                 log(bot, `Failed to collect ${blockType}: ${err}.`);
@@ -825,6 +841,15 @@ export async function pickupNearbyItems(bot) {
     let nearestItem = getNearestItem(bot);
     let pickedUp = 0;
     for (let tries = 0; nearestItem && tries < 12; tries++) {
+        // fix84: the drop names its item; no room is a slot need, the same marker collectBlock uses
+        if (typeof nearestItem.getDroppedItem !== 'function') throw new Error('pickupNearbyItems: dropped item entity has no getDroppedItem()');
+        const dropped = nearestItem.getDroppedItem();
+        if (dropped === null || typeof dropped !== 'object' || typeof dropped.name !== 'string' || !Number.isInteger(dropped.count) || dropped.count < 1) throw new Error(`pickupNearbyItems: dropped entity has no item: ${JSON.stringify(dropped)}`);
+        if (world.roomForItem(bot, dropped.name) < 1) {
+            markPreconditionUnmet(bot, { need: { item: dropped.name, count: dropped.count, reason: 'slot' } });
+            log(bot, `PREREQUISITE FAILED: no free slot for ${dropped.count} ${dropped.name}.`);
+            return false;
+        }
         bot.pathfinder.setMovements(_survivalMovements(bot, {dig: false}));
         // fix69: goToGoal reports every pathfinder outcome (NoPath, Timeout, GoalChanged, PathStopped, stall, interrupt)
         // as a logged FAILED line and `false`; it throws only on a bug, which now surfaces instead of being swallowed.

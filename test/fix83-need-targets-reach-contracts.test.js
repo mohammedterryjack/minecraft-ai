@@ -295,12 +295,14 @@ await craftSticks(bot);`;
         assert.match(oneFunctionFeedback(own, violations, pasted), /craftSticks is a learned skill already defined for your code: call it by name, do not paste its source\./);
         assert.deepStrictEqual(pastedLibrarySkills(`${LIB}\n\nasync function makeSticks(bot) { return craftSticks(bot, 3); }`, 'makeSticks', new Set(['craftSticks'])), ['craftSticks'], 'a pasted skill beside a new one');
         assert.deepStrictEqual(pastedLibrarySkills(LIB, 'craftSticks', new Set(['craftSticks'])), [], 'one new version of a library skill is not a paste');
-        assert.strictEqual(parsesAsScript('async function f(bot) {'), false);
+        const bad = parsesAsScript('async function f(bot) {');
+        assert.strictEqual(typeof bad, 'string');
+        assert.match(bad, /Unexpected token/);
     });
     it('writeCode and the repair loop read the shape before the lint\'s module parse; the prompt says not to paste', () => {
         const src = readFileSync(new URL('../src/agent/voyager.js', import.meta.url), 'utf8');
-        assert.match(src, /const split = parsesAsScript\(code\) \? splitGeneratedCode\(code, own\) : null;\n\s*let lint = split !== null && split\.violations\.length \? oneFunctionFeedback\(own, split\.violations, pastedLibrarySkills\(code, own, libraryNames\)\) : null;\n\s*if \(lint === null\) lint = this\.agent\.coder\.userGeneratedCodeLintBlockers/);
-        assert.match(src, /const split = parsesAsScript\(code\) \? splitGeneratedCode\(code, e\.name\) : null;/);
+        assert.match(src, /const scriptParse = parsesAsScript\(code\);\n\s*const split = scriptParse === true \? splitGeneratedCode\(code, own\) : null;\n\s*let lint = scriptParse !== true \? `does not parse as a script: \$\{scriptParse\}` : \(split\.violations\.length \? oneFunctionFeedback\(own, split\.violations, pastedLibrarySkills\(code, own, libraryNames\)\) : null\);\n\s*if \(lint === null\) lint = this\.agent\.coder\.userGeneratedCodeLintBlockers/);
+        assert.match(src, /const split = scriptParse === true \? splitGeneratedCode\(code, e\.name\) : null;/);
         assert.match(src, /--- learned skills you can call \(already defined for your code: call them by name, never paste their source\) ---/);
     });
 });
