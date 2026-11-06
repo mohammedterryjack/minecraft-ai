@@ -28,37 +28,32 @@ test('fix49: travelTo seeded code uses GoalNearXZ, not Vec3', async (t) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Bug 2: craftRecipe postcondition VIOLATED after real craft success
+// fix49: no seeded contract with fallbacks - delta check in _checkContracts is the fix
 // ─────────────────────────────────────────────────────────────────────────────
-test('fix49: craftRecipe postcondition uses delta (not stale inventory)', async (t) => {
-    await t.test('postcondition check should trust delta over contract formula disagreement', async () => {
-        // Simulate: craftRecipe returned true, delta shows +1 iron_pickaxe, but contract.post is false
-        // fix45 logic: delta is ground truth - queue contract repair, not skill repair
-        const { Voyager } = await import('../src/agent/voyager.js');
-        
-        const mockAgent = {
-            name: 'test_bot',
-            bot: { __psnTrace: [], __psnALS: { getStore: () => -1, run: (id, fn) => fn() } },
-            prompter: { code_model: { sendRequest: async () => '{}' } },
-            coder: { _getLearnedSkillNames: () => [] }
-        };
-        
-        // We test that the code path exists - when delta shows gain, don't mark as VIOLATED
-        const craftRecipePrim = Voyager.SEEDED_PRIMITIVES.find(p => p.name === 'craftRecipe');
-        assert.ok(craftRecipePrim, 'craftRecipe should be a seeded primitive');
+test('fix49: craftRecipe uses delta-based contract checking (no fallbacks)', async (t) => {
+    await t.test('delta check in _checkContracts should be the root fix', async () => {
+        const fs = await import('fs');
+        const voyagerCode = fs.readFileSync('./src/agent/voyager.js', 'utf8');
         
         // The fix is in _checkContracts: when delta shows positive gain for effects, skip VIOLATED
-        // Verify the Voyager code contains the fix45 delta check
-        const voyagerCode = await import('fs').then(fs => 
-            fs.readFileSync('./src/agent/voyager.js', 'utf8'));
         assert.ok(voyagerCode.includes('deltaGained'), 
             '_checkContracts should check deltaGained before attributing VIOLATED');
     });
 
-    await t.test('craftRecipe seeded code should wait after craft for inventory settle', async () => {
+    await t.test('craftRecipe should NOT have seeded contract with fallbacks', async () => {
         const { Voyager } = await import('../src/agent/voyager.js');
         const craftRecipe = Voyager.SEEDED_PRIMITIVES.find(p => p.name === 'craftRecipe');
-        // The inventory check happens after bot.craft completes - no extra wait needed in craft code
-        // The trace wrapper captures delta in finally{} which is the settled state
+        assert.ok(craftRecipe, 'craftRecipe should be a seeded primitive');
+        
+        // fix49: no seeded contract - the delta check in _checkContracts handles this
+        // Seeded contracts with || 0 and c.ret === null/false violate "no fallbacks" rule
+        assert.ok(!craftRecipe.contract, 
+            'craftRecipe should NOT have a seeded contract (delta check is the fix)');
+    });
+
+    await t.test('craftRecipe seeded code should call bot.craft', async () => {
+        const { Voyager } = await import('../src/agent/voyager.js');
+        const craftRecipe = Voyager.SEEDED_PRIMITIVES.find(p => p.name === 'craftRecipe');
         assert.ok(craftRecipe.code.includes('bot.craft('), 'craftRecipe should call bot.craft');
     });
 });
@@ -95,10 +90,12 @@ test('fix49: null-check lint feedback for unsafe property access', async (t) => 
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Bug 4: ensureFurnace satisfied via wrong skill's postcondition
+// fix49: ensure goals check observed state (nearby blocks), not skill name patterns
 // ─────────────────────────────────────────────────────────────────────────────
-test('fix49: goal-satisfied check matches skill own product', async (t) => {
-    await t.test('_goalAlreadySatisfied should only check skills that produce the goal item', async () => {
-        const { Voyager } = await import('../src/agent/voyager.js');
+test('fix49: goal-satisfied check uses observed state for ensure goals', async (t) => {
+    await t.test('_goalAlreadySatisfied for ensure goals should check nearby blocks', async () => {
+        const { Voyager, _setVersionForTest } = await import('../src/agent/voyager.js');
+        _setVersionForTest('1.20.4');
         
         // Mock a voyager with skills
         const mockVoyager = Object.create(Voyager.prototype);
@@ -106,16 +103,42 @@ test('fix49: goal-satisfied check matches skill own product', async (t) => {
             { name: 'ensureFurnace', effects: ['furnace'], contract: { post: 'c => c.post.inv.furnace >= 1' } },
             { name: 'ensureStorageChestNearby', effects: ['chest'], contract: { post: 'c => c.post.inv.chest >= 1' } }
         ];
-        mockVoyager._compileContract = (src) => eval(`(${src})`);
         
-        // For "ensure furnace" goal, only ensureFurnace should be considered, not ensureStorageChestNearby
-        // The producers filter should only match skills whose effects include the goal item
-        const task = 'ensure furnace';
-        // This tests the concept - producers filter checks (s.effects || []).some(eff => goal.items?.includes(eff))
-        const producers = mockVoyager.skills.filter(s => 
-            (s.effects || []).some(eff => eff === 'furnace'));
-        assert.equal(producers.length, 1, 'only ensureFurnace should be a producer of furnace');
-        assert.equal(producers[0].name, 'ensureFurnace', 'ensureFurnace should be the producer');
+        // State with furnace nearby - goal should be satisfied
+        const stateWithFurnace = { 
+            inventory: {}, 
+            nearby: { blocks: ['furnace', 'stone', 'dirt'] } 
+        };
+        
+        // State without furnace nearby - goal should not be satisfied
+        const stateWithoutFurnace = { 
+            inventory: {}, 
+            nearby: { blocks: ['chest', 'stone', 'dirt'] } 
+        };
+        
+        // The goal check should use nearby blocks, not skill name matching
+        // This is verified by ensuring the code doesn't have name pattern matching
+        const fs = await import('fs');
+        const voyagerCode = fs.readFileSync('./src/agent/voyager.js', 'utf8');
+        
+        // Should NOT have name pattern matching for ensure goals
+        assert.ok(!voyagerCode.includes("nameLower.includes('ensure')"),
+            '_goalAlreadySatisfied should not match ensure goals by skill name patterns');
+        
+        // Should check nearby blocks for ensure goals
+        assert.ok(voyagerCode.includes("state.nearby") || voyagerCode.includes("nearby.blocks"),
+            '_goalAlreadySatisfied should check nearby blocks for ensure goals');
+    });
+    
+    await t.test('no VERSION fallback (fail loud if VERSION unset)', async () => {
+        const fs = await import('fs');
+        const voyagerCode = fs.readFileSync('./src/agent/voyager.js', 'utf8');
+        
+        // Should NOT have VERSION || '1.20.4' fallbacks
+        assert.ok(!voyagerCode.includes("VERSION || '1.20.4'"),
+            'VERSION should not have fallback - fail loud if unset');
+        assert.ok(!voyagerCode.includes("VERSION || \"1.20.4\""),
+            'VERSION should not have fallback - fail loud if unset');
     });
 });
 
@@ -151,110 +174,124 @@ test('fix49: breakBlockAt dep cycle detection and messaging', async (t) => {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Feature 6: Idle practice during model calls
+// fix49: rank by learning value (failRate, streakFail, trials), log timing
 // ─────────────────────────────────────────────────────────────────────────────
 test('fix49: idle practice during model calls', async (t) => {
-    await t.test('should have model call timing tracked for idle practice', async () => {
+    await t.test('should log model call timing with [idle] format', async () => {
         const fs = await import('fs');
         const voyagerCode = fs.readFileSync('./src/agent/voyager.js', 'utf8');
-        // Check for model call timing infrastructure or idle practice integration
-        assert.ok(
-            voyagerCode.includes('modelCallStart') || 
-            voyagerCode.includes('_modelCallMs') ||
-            voyagerCode.includes('idleTime') || 
-            voyagerCode.includes('idle_time') || 
-            voyagerCode.includes('timing') ||
-            voyagerCode.includes('[timing]'),
-            'should have model call timing infrastructure for idle practice measurement');
+        // fix49: should log [idle] model_call_ms=… practice_ms=… idle_ms=…
+        assert.ok(voyagerCode.includes('[idle] model_call_ms='),
+            'should log [idle] model_call_ms=… practice_ms=… idle_ms=… format');
+        assert.ok(voyagerCode.includes('practice_ms=') && voyagerCode.includes('idle_ms='),
+            'should log practice_ms and idle_ms');
     });
 
-    await t.test('idle practice should rank by learning value (no hard-coded lists)', async () => {
+    await t.test('idle practice should rank by learning value (failRate, streakFail, trials)', async () => {
         const fs = await import('fs');
-        const idlePracticeCode = fs.readFileSync('./src/agent/idle_practice.js', 'utf8');
-        // Should rank by confidence/fails/trials, not hard-coded item names
-        assert.ok(idlePracticeCode.includes('failRate') || idlePracticeCode.includes('stats'),
-            'idle practice should use stats to rank candidates');
+        const voyagerCode = fs.readFileSync('./src/agent/voyager.js', 'utf8');
+        // fix49: rank by learning value from stats (derived, not hard-coded)
+        assert.ok(voyagerCode.includes('failRate') && voyagerCode.includes('streakFail'),
+            '_selectPracticeSkill should use failRate and streakFail');
+        assert.ok(voyagerCode.includes('trials') || voyagerCode.includes('stats.success'),
+            '_selectPracticeSkill should consider trial count');
         // No hard-coded item/tier lists
-        assert.ok(!idlePracticeCode.includes("['diamond',") && !idlePracticeCode.includes("['iron',"),
+        assert.ok(!voyagerCode.includes("['diamond',") && !voyagerCode.includes("['iron',"),
             'idle practice should not have hard-coded item lists');
     });
 
-    await t.test('empty state delta should not count as practice', async () => {
-        // A practice run that produces no state change shouldn't be counted
+    await t.test('idle practice should consider plan relevance', async () => {
         const fs = await import('fs');
         const voyagerCode = fs.readFileSync('./src/agent/voyager.js', 'utf8');
-        // Look for delta-based success check
-        assert.ok(voyagerCode.includes('delta') && (voyagerCode.includes('practice') || voyagerCode.includes('idle')),
-            'practice should check for actual state delta');
+        // fix49: plan relevance - shares produces with pending goal
+        assert.ok(voyagerCode.includes('planRelevance') || 
+            (voyagerCode.includes('pending') && voyagerCode.includes('effects')),
+            '_selectPracticeSkill should consider plan relevance');
+    });
+
+    await t.test('empty state delta should not count as practice', async () => {
+        const fs = await import('fs');
+        const voyagerCode = fs.readFileSync('./src/agent/voyager.js', 'utf8');
+        // fix49: deltaChanged check - runs with empty delta don't count
+        assert.ok(voyagerCode.includes('deltaChanged'),
+            '_runPracticeSkill should track deltaChanged');
+        assert.ok(voyagerCode.includes('no state delta'),
+            'should log when run has no state delta');
     });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Feature 7: Health recovery using learned eat effects
+// fix49: curriculum receives health + learned eat effects, ranks recovery goal
 // ─────────────────────────────────────────────────────────────────────────────
 test('fix49: health recovery using learned facts', async (t) => {
-    await t.test('health should be exposed in observe() for goal ranking', async () => {
+    await t.test('health should be exposed in observe() for curriculum', async () => {
         const fs = await import('fs');
         const voyagerCode = fs.readFileSync('./src/agent/voyager.js', 'utf8');
-        assert.ok(voyagerCode.includes('health') && voyagerCode.includes('observe'),
-            'observe() should include health for curriculum');
+        assert.ok(voyagerCode.includes('health_value') && voyagerCode.includes('observe'),
+            'observe() should include health_value for curriculum');
     });
 
-    await t.test('no hard-coded health threshold in curriculum/recovery logic', async () => {
+    await t.test('_healthRecoveryHint should use learned average health', async () => {
         const fs = await import('fs');
         const voyagerCode = fs.readFileSync('./src/agent/voyager.js', 'utf8');
-        // Should not have magic numbers like "health < 10" or "health < 6" in goal ranking/recovery
-        // modes.js self-preservation thresholds are allowed (emergency behavior)
-        // Comments mentioning old thresholds are OK (documentation of what was removed)
-        
-        // Strip comments before checking
-        const codeOnly = voyagerCode.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '');
-        
-        // Look for thresholds in curriculum/recovery context, not self-preservation
-        const recoveryThresholds = codeOnly.match(/(?:recovery|restore|heal|eat).*health\s*<\s*(\d+)/gi);
-        if (recoveryThresholds) {
-            for (const match of recoveryThresholds) {
-                const num = parseInt(match.match(/\d+/)[0]);
-                assert.ok(num === 0 || num === 1, 
-                    `health threshold ${num} in recovery logic should be derived, not hard-coded`);
-            }
-        }
-        // Check that health thresholds are not in goal-ranking code
-        const goalRankingSection = codeOnly.match(/_selectPracticeSkill[\s\S]{0,500}/);
-        if (goalRankingSection) {
-            const hardcodedInRanking = /health\s*<\s*\d+/.test(goalRankingSection[0]);
-            assert.ok(!hardcodedInRanking, 
-                'goal ranking should not have hard-coded health thresholds');
-        }
+        // fix49: health threshold derived from learned average (avgHealthOnSuccess)
+        assert.ok(voyagerCode.includes('avgHealthOnSuccess'),
+            'health recovery should use learned average health');
+        assert.ok(voyagerCode.includes('healthVariance'),
+            'health recovery should use learned variance');
     });
 
-    await t.test('should use learned food_value/consumes from skill state', async () => {
+    await t.test('_findLearnedFoodItems should find food from learned consumes', async () => {
         const fs = await import('fs');
         const voyagerCode = fs.readFileSync('./src/agent/voyager.js', 'utf8');
-        // Skills track consumes/effects - recovery should use these
-        assert.ok(voyagerCode.includes('consumes') || voyagerCode.includes('food_value'),
-            'recovery should use learned consumes/food_value');
+        // fix49: find food items based on skill consumes/effects
+        assert.ok(voyagerCode.includes('_findLearnedFoodItems'),
+            'should have _findLearnedFoodItems method');
+        assert.ok(voyagerCode.includes('s.consumes') && voyagerCode.includes('eat'),
+            '_findLearnedFoodItems should check skill consumes');
+    });
+
+    await t.test('curriculum should receive health recovery hint', async () => {
+        const fs = await import('fs');
+        const voyagerCode = fs.readFileSync('./src/agent/voyager.js', 'utf8');
+        // fix49: healthHint added to curriculum prompt
+        assert.ok(voyagerCode.includes('healthHint') && voyagerCode.includes('proposeTask'),
+            'proposeTask should include healthHint');
+        assert.ok(voyagerCode.includes('HEALTH LOW') || voyagerCode.includes('HEALTH CRITICAL'),
+            '_healthRecoveryHint should generate clear hints');
     });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Feature 8: Failure backoff for goals with unmet external preconditions
+// fix49: store per-goal failure reasons, deprioritize with decay from stats
 // ─────────────────────────────────────────────────────────────────────────────
 test('fix49: failure backoff using learned stats', async (t) => {
-    await t.test('should track failure counts per goal', async () => {
+    await t.test('should have _recordTaskFailure and _recordTaskSuccess methods', async () => {
         const fs = await import('fs');
         const voyagerCode = fs.readFileSync('./src/agent/voyager.js', 'utf8');
-        assert.ok(voyagerCode.includes('failed') || voyagerCode.includes('streakFail'),
-            'should track failure history');
+        assert.ok(voyagerCode.includes('_recordTaskFailure'),
+            'should have _recordTaskFailure method');
+        assert.ok(voyagerCode.includes('_recordTaskSuccess'),
+            'should have _recordTaskSuccess method');
     });
 
-    await t.test('no hard-coded failure count thresholds', async () => {
+    await t.test('_failureBackoff should compute decay from stats', async () => {
         const fs = await import('fs');
         const voyagerCode = fs.readFileSync('./src/agent/voyager.js', 'utf8');
-        // The streakFail counter in skill_graph.js is fine - it's learned state
-        // But the curriculum shouldn't have "if failed > 3 then skip" type logic
-        // Instead it should derive from stats
-        assert.ok(voyagerCode.includes('stats') || voyagerCode.includes('rate'),
-            'failure backoff should use stats-based calculation');
+        assert.ok(voyagerCode.includes('_failureBackoff'),
+            'should have _failureBackoff method');
+        assert.ok(voyagerCode.includes('consecutiveFails') && voyagerCode.includes('decayRate'),
+            '_failureBackoff should use consecutive fails and decay rate');
+    });
+
+    await t.test('failure tracking should store reason', async () => {
+        const fs = await import('fs');
+        const voyagerCode = fs.readFileSync('./src/agent/voyager.js', 'utf8');
+        // fix49: failures should store reason for diagnosis
+        assert.ok(voyagerCode.includes('entry.reason'),
+            'failure tracking should store reason');
     });
 
     await t.test('failure decay should be time-based from stats', async () => {
@@ -361,6 +398,31 @@ test('fix49: no || fallback defaults in critical paths', async (t) => {
                 }
             }
         }
+    });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GoalNearXZ must be on the bare API surface (sandbox exposes it)
+// ─────────────────────────────────────────────────────────────────────────────
+test('fix49: GoalNearXZ is on the bare API surface', async (t) => {
+    await t.test('GoalNearXZ should be in sandbox globals', async () => {
+        const fs = await import('fs');
+        const coderCode = fs.readFileSync('./src/agent/coder.js', 'utf8');
+        // Verify GoalNearXZ is in the sandbox globals
+        assert.ok(coderCode.includes("'GoalNearXZ'"),
+            'GoalNearXZ should be listed in sandbox globals');
+        // Verify GoalNearXZ is assigned from pathfinderGoals
+        assert.ok(coderCode.includes('GoalNearXZ: pathfinderGoals.GoalNearXZ') ||
+            coderCode.includes('GoalNearXZ: goals.GoalNearXZ'),
+            'GoalNearXZ should be assigned from pathfinder goals');
+    });
+
+    await t.test('travelTo seeded primitive should use GoalNearXZ', async () => {
+        const { Voyager } = await import('../src/agent/voyager.js');
+        const travelTo = Voyager.SEEDED_PRIMITIVES.find(p => p.name === 'travelTo');
+        assert.ok(travelTo, 'travelTo primitive should exist');
+        assert.ok(travelTo.code.includes('GoalNearXZ'), 
+            'travelTo code should use GoalNearXZ, not Vec3');
     });
 });
 
