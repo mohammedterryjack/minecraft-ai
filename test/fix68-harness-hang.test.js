@@ -32,6 +32,11 @@ function runChild(arg, ms) {
         c.on('exit', (code, signal) => { clearTimeout(t); resolve({ out, signal }); });
     });
 }
+async function mkCoder() {
+    const coder = new Coder({ name: NAME });
+    while (!coder.code_lint_template || !coder.code_template) await new Promise(r => setImmediate(r));
+    return coder;
+}
 function mkBot() {
     return { output: '', interrupt_code: false, __psnALS: new AsyncLocalStorage(), inventory: { slots: Array(46).fill(null), emptySlotCount: () => 36 },
         waitForTicks: async () => {}, entity: { position: new Vec3(0, 64, 0) }, blockAt: () => null, health: 20, food: 20, oxygenLevel: 20, game: { dimension: 'overworld' }, quickBarSlot: 0 };
@@ -48,23 +53,20 @@ describe('fix68: the trace harness cannot re-enter itself', () => {
         assert.strictEqual(signal, null, 'not killed');
         assert.match(out, /DONE 1 trace=mineOneIronOre,getInventoryCounts\n/);
     });
-    it('a traced sync function stays sync (built-in or learned), and a sync throw is a loud false', async () => {
-        const coder = new Coder({ name: NAME });
-        while (!coder.code_lint_template || !coder.code_template) await new Promise(r => setImmediate(r));
-        const code = 'function isSafeTarget(bot) { return false; }\nfunction boom(bot) { throw new Error("bad"); }\n'
-            + 'async function mineOne(bot) {\n    const c = getInventoryCounts(bot);\n    bot.got = [typeof c.then, isSafeTarget(bot), boom(bot)];\n    return 1;\n}\n'
-            + instrumentSrc(['mineOne', 'isSafeTarget', 'boom', 'getInventoryCounts']) + '\nawait mineOne(bot);';
+    it('a traced sync function stays sync (built-in or learned)', async () => {
+        const coder = await mkCoder();
+        const code = 'function isSafeTarget(bot) { return false; }\n'
+            + 'async function mineOne(bot) {\n    const c = getInventoryCounts(bot);\n    bot.got = [typeof c.then, isSafeTarget(bot)];\n    return 1;\n}\n'
+            + instrumentSrc(['mineOne', 'isSafeTarget', 'getInventoryCounts']) + '\nawait mineOne(bot);';
         const staged = await coder._stageCode(code, { lintOnly: false });
         const bot = mkBot();
         await staged.func.main(bot);
-        assert.deepStrictEqual(bot.got, ['undefined', false, false]);
-        assert.match(bot.output, /FAILED: boom threw bad/);
-        assert.deepStrictEqual(bot.__psnTrace.map(r => [r.name, r.depth]), [['mineOne', 0], ['getInventoryCounts', 1], ['isSafeTarget', 1], ['boom', 1]]);
+        assert.deepStrictEqual(bot.got, ['undefined', false]);
+        assert.deepStrictEqual(bot.__psnTrace.map(r => [r.name, r.depth]), [['mineOne', 0], ['getInventoryCounts', 1], ['isSafeTarget', 1]]);
         assert.ok(bot.__psnTrace.every(r => r.delta && r.t1 >= r.t0), 'every record is finished');
     });
     it('while the harness snapshots state the published stack says so: "<stack> <- (psn trace)"', async () => {
-        const coder = new Coder({ name: NAME });
-        while (!coder.code_lint_template || !coder.code_template) await new Promise(r => setImmediate(r));
+        const coder = await mkCoder();
         const code = 'async function inner(bot) { bot.inSkill = bot.__psnStackStr; return 1; }\nasync function outer(bot) {\n    await inner(bot);\n    return 1;\n}\n'
             + instrumentSrc(['outer', 'inner']) + '\nawait outer(bot);';
         const staged = await coder._stageCode(code, { lintOnly: false });
@@ -75,6 +77,46 @@ describe('fix68: the trace harness cannot re-enter itself', () => {
         assert.strictEqual(bot.inSkill, 'outer <- inner');
         assert.ok(seen.length > 0 && seen.every(s => / <- \(psn trace\)$/.test(s)), seen.join(' | '));
         assert.ok(seen.includes('outer <- inner <- (psn trace)'));
+    });
+});
+
+describe('fix68b: an error inside traced code is never turned into a value', () => {
+    // the 14:02 towers' RangeErrors were dropped at the async wrapper boundary (unawaited snapshot promises), and fix51 (#42)
+    // made the wrapper's catch `return false`: an exception in traced code reached its caller as a plain failed return
+    const run = async (code, names, call) => {
+        const coder = await mkCoder();
+        const staged = await coder._stageCode(code + '\n' + instrumentSrc(names) + '\n' + call, { lintOnly: false });
+        const bot = mkBot();
+        let err = null;
+        try { await staged.func.main(bot); } catch (e) { err = e; }
+        return { bot, err };
+    };
+    const failedLines = (out) => out.split('\n').filter(l => l.startsWith('FAILED:'));
+    it('a stack overflow in async traced code propagates to the caller and is reported once, where it was thrown', async () => {
+        const { bot, err } = await run('async function deep(bot, n) {\n    return await deep(bot, n + 1);\n}\nasync function outer(bot) {\n    const r = await deep(bot, 0);\n    bot.reached = true;\n    return r;\n}', ['outer', 'deep'], 'await outer(bot);');
+        assert.ok(err instanceof RangeError, String(err));
+        assert.match(err.message, /Maximum call stack size exceeded/);
+        assert.strictEqual(bot.reached, undefined, 'the caller did not continue past the throw');
+        const lines = failedLines(bot.output);
+        assert.strictEqual(lines.length, 1, lines.join(' | '));
+        assert.match(lines[0], /^FAILED: deep threw Maximum call stack size exceeded/);
+        const outerRec = bot.__psnTrace.find(r => r.name === 'outer');
+        assert.strictEqual(outerRec.fail, true); assert.match(outerRec.err, /Maximum call stack/);
+    });
+    it('a sync stack overflow and a sync throw propagate too (no false, no default)', async () => {
+        const a = await run('function spin(bot) {\n    return spin(bot);\n}\nasync function outer(bot) {\n    const r = spin(bot);\n    bot.reached = r;\n    return r;\n}', ['outer', 'spin'], 'await outer(bot);');
+        assert.ok(a.err instanceof RangeError, String(a.err));
+        assert.strictEqual(a.bot.reached, undefined);
+        assert.match(failedLines(a.bot.output)[0], /^FAILED: spin threw Maximum call stack size exceeded/);
+        const b = await run('function boom(bot) {\n    throw new Error("bad");\n}\nasync function outer(bot) {\n    const r = boom(bot);\n    bot.reached = r;\n    return r;\n}', ['outer', 'boom'], 'await outer(bot);');
+        assert.strictEqual(b.err.message, 'bad');
+        assert.strictEqual(b.bot.reached, undefined);
+        assert.deepStrictEqual(failedLines(b.bot.output), ['FAILED: boom threw bad']);
+        assert.deepStrictEqual(b.bot.__psnTrace.map(r => [r.name, r.fail, r.err]), [['outer', true, 'bad'], ['boom', true, 'bad']]);
+    });
+    it('the staged root itself rejects on a throw in the root traced call (runAction then reports it as "Code threw exception")', async () => {
+        const { err } = await run('async function inner(bot) {\n    throw new RangeError("Maximum call stack size exceeded");\n}', ['inner'], 'await inner(bot);');
+        assert.ok(err instanceof RangeError);
     });
 });
 

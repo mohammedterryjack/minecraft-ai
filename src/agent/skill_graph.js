@@ -224,6 +224,12 @@ export function instrumentSrc(names) {
     //   2. the wrapper was async, so a traced SYNC function (getInventoryCounts, a learned sync helper such as
     //      isSafeTarget) returned a Promise to its caller: `counts.raw_iron` was undefined, `if (isSafeTarget(b))` always
     //      true. A sync function is now traced synchronously and returns its own value; only a returned thenable is awaited.
+    //   (fix68b) nothing in the harness turns an error into a value. The towers' RangeErrors were dropped at the async
+    //      wrapper boundary: `async function (...a)` turns a throw before its first await into a rejected promise, and the
+    //      harness stored that promise unawaited in the snapshot (`pre: __have()`, `inv: __inv()`), so the caller simply
+    //      went on to its next snapshot and the next tower. And fix51 (#42) changed fix10's `catch (e) { ...; throw e; }`
+    //      to `return false`, so every exception inside traced code became a plain failed return. A traced call that throws
+    //      now records the failure, writes one FAILED line (where it was thrown) and rethrows to its caller.
     //   3. the watchdog saw stack "getInventoryCounts": the harness's own bookkeeping, outside any skill, was shown as a
     //      skill. While the harness snapshots state the published stack says so: "<stack> <- (psn trace)".
     const wrap = `const __T = bot.__psnTrace = []; const __als = bot.__psnALS; if (!__als) throw new Error('PSN trace: bot.__psnALS (AsyncLocalStorage) missing');
@@ -233,6 +239,7 @@ const __eq = () => { const s = bot.inventory.slots; return { heldItem: s[bot.qui
 const __have = () => __inv();
 const __st = () => { const p = bot.entity.position, b = bot.blockAt(p.floored().offset(0, 1, 0)); return { pos: { x: p.x, y: p.y, z: p.z }, hp: bot.health, food: bot.food, oxygen: bot.oxygenLevel, sky: b ? b.skyLight : null, alive: bot.health > 0, dim: String(bot.game?.dimension || ''), inv: __inv(), free: bot.inventory.emptySlotCount(), eq: __eq() }; };
 let __inHarness = false;
+const __reported = new WeakSet();   // an error is reported once, by the traced call it was thrown in; callers see it rethrown
 const __harness = (stackStr, fn) => { const was = bot.__psnStackStr; bot.__psnStackStr = stackStr + ' <- (psn trace)'; __inHarness = true; try { return fn(); } finally { __inHarness = false; bot.__psnStackStr = was; } };
 const __wrap = (n, f) => function (...a) {
     if (__inHarness || __T.length >= 1500) return f.apply(this, a);
@@ -243,15 +250,15 @@ const __wrap = (n, f) => function (...a) {
     bot.__psnStackStr = __stackStr;
     const id = __T.push(rec) - 1;
     const settle = (r) => { rec.ret = r === undefined ? 'undefined' : String(JSON.stringify(r)).slice(0, 60); rec.rv = r === null || typeof r !== 'object' ? r : null; rec.fail = r === false || r === null || r === 0; return r; };
-    const threw = (e) => { rec.fail = true; const msg = String(e?.message || e); rec.err = msg; bot.output = bot.output + '\\nFAILED: ' + n + ' threw ' + msg + '\\n'; rec.rv = false; return false; };
+    const threw = (e) => { rec.fail = true; const msg = e instanceof Error ? e.message : String(e); rec.err = msg; rec.rv = false; if (!__reported.has(e)) { if (e !== null && typeof e === 'object') __reported.add(e); bot.output = bot.output + '\\nFAILED: ' + n + ' threw ' + msg + '\\n'; } };
     const finish = () => { __harness(__stackStr, () => { rec.t1 = Date.now(); if (!n.startsWith('skills.')) rec.s1 = __st(); rec.o1 = (bot.output || '').length; bot.__psnOut = bot.output; const post = __have(); rec.delta = {}; for (const k of new Set([...Object.keys(rec.pre), ...Object.keys(post)])) { const d = (post[k] || 0) - (rec.pre[k] || 0); if (d) rec.delta[k] = d; } delete rec.pre; rec.intr = !!bot.interrupt_code; }); bot.__psnRunningSkill = par >= 0 ? __T[par].name : null; bot.__psnStackStr = __stackParts.join(' <- '); };
     let r;
     try { r = __als.run(id, () => f.apply(this, a)); }
-    catch (e) { const v = threw(e); finish(); return v; }
+    catch (e) { threw(e); finish(); throw e; }
     if (r === null || typeof r !== 'object' || typeof r.then !== 'function') { settle(r); finish(); return r; }
     return (async () => {
         try { return settle(await r); }
-        catch (e) { return threw(e); }
+        catch (e) { threw(e); throw e; }
         finally { await bot.waitForTicks(1); finish(); }
     })();
 };`;
