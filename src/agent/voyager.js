@@ -12,6 +12,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, renameS
 import { NeedsProducesGraph } from './needs_produces.js';
 import { RepairMemory } from './repair_memory.js';
 import { IdlePractice } from './idle_practice.js';
+import { VitalsModel } from './vitals_model.js';   // fix58
 // fix14: crash-safe writes (tmp file + rename)
 export function writeAtomic(fp, text) { const tmp = `${fp}.tmp-${process.pid}`; writeFileSync(tmp, text); renameSync(tmp, fp); }
 import * as world from './library/world.js';
@@ -363,6 +364,9 @@ export class Voyager {
             : { completed: [], failed: [], enabled: true, goalStats: {} };
         // fix49: ensure goalStats exists (older progress files may not have it)
         if (!this.progress.goalStats) this.progress.goalStats = {};
+        // fix58: learned vitals relations (food level -> hp regen, skill -> food/hp change), persisted with progress
+        if (!this.progress.vitals) this.progress.vitals = { regen: {}, runs: {} };
+        this.vitals = new VitalsModel(this.progress.vitals);
         this.running = false;
         this.abort = false;
         this.lastPlayerMsg = 0;
@@ -1150,6 +1154,11 @@ Use only c; no other globals.`;
         }
         return parts.join('; ');
     }
+    // fix58: every traced skill run with pre/post snapshots teaches that skill's observed food/hp change
+    _learnVitalsEffects(trace) {
+        for (const r of trace) { if (r.intr || !r.s0 || !r.s1 || !r.s0.alive || !r.s1.alive) continue; this.vitals.noteRun(r.name, r.s0, r.s1); }
+    }
+    _recovery() { const bot = this.agent.bot; return this.vitals.recovery(bot.health, skills.getVitalsMax(bot).health, bot.food); }
     // evaluate contracts on every traced library call; violations become contract failures in the trace
     _checkContracts(trace, taskOk) {
         const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
@@ -1343,9 +1352,10 @@ Use only c; no other globals.`;
     // fix51: also samples oxygen_level (bot.oxygenLevel) for drowning analysis
     _sample() {
         const bot = this.agent.bot, now = Date.now(); if (!bot?.entity || now - (this._lastSample || 0) < 1000) return; this._lastSample = now;
-        const p = bot.entity.position, h = bot.health, o = bot.oxygenLevel, prev = (this._samples ||= []).slice(-1)[0];
+        const p = bot.entity.position, h = bot.health, f = bot.food, o = bot.oxygenLevel, prev = (this._samples ||= []).slice(-1)[0];
+        if (prev) this.vitals.observeSample(prev, { h, f }, skills.getVitalsMax(bot).health);   // fix58: learn food level -> hp regen
         const hit = prev && h < prev.h ? { t: now, dmg: +(prev.h - h).toFixed(1), near: (() => { const e = bot.nearestEntity(x => x !== bot.entity && x.type !== 'object' && x.position.distanceTo(p) < 8); return e ? `${e.name || e.username} ${e.position.distanceTo(p).toFixed(0)}m` : 'no entity within 8m'; })(), onGround: bot.entity.onGround, inLava: !!bot.entity.isInLava, inWater: !!bot.entity.isInWater } : null;
-        this._samples.push({ t: now, y: p.y, h, o, hit }); if (this._samples.length > 30) this._samples.shift();
+        this._samples.push({ t: now, y: p.y, h, f, o, hit }); if (this._samples.length > 30) this._samples.shift();
     }
     // fix51: _deathDetail now accepts optional beforeInv to compute items dropped on death
     _deathDetail(d, beforeInv = null) {
@@ -1428,6 +1438,8 @@ Use only c; no other globals.`;
             food_max: skills.VITALS_MAX.food,
             health_value: Math.round(bot.health),
             health_max: skills.VITALS_MAX.health,
+            // fix58: learned: hp below max and not recovering at the current food level (from the bot's own vitals history)
+            health_recovery_blocked: this._recovery().blocked,
             // fix51: oxygen level as protocol value (300 = full breath, decreases when submerged, 0 = drowning damage)
             oxygen_level: bot.oxygenLevel,
             inventory: world.getInventoryCounts(bot),  // fix41: host code uses world. prefix
@@ -3102,6 +3114,7 @@ Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
         const ph = s => s.time.split(' ')[0]; if (ph(pl.basis) !== ph(now)) return `time of day changed (${ph(pl.basis)} -> ${ph(now)})`;
         if (parseInt(now.health) < parseInt(pl.basis.health) - 6 || parseInt(now.food) < parseInt(pl.basis.food) - 6) return 'health/food dropped';
         if ((now.threats === 'none') !== (pl.basis.threats === 'none')) return 'threat situation changed';
+        if (now.health_recovery_blocked !== pl.basis.health_recovery_blocked) return `learned health recovery changed (${pl.basis.health_recovery_blocked ? 'blocked' : 'not blocked'} -> ${now.health_recovery_blocked ? 'blocked' : 'not blocked'})`;   // fix58
         if (now.recent_deaths !== pl.basis.recent_deaths) return 'the bot died since';
         return null;
     }
@@ -3220,10 +3233,14 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "task": "...", "contex
         const edibleHint = edible.length > 0 
             ? `\nedible_inventory: ${edible.map(e => `${e.item}(${e.count}, food=${e.foodPoints})`).join(', ')}`
             : '';
+        // fix58: learned recovery facts (food level -> hp regen, skills' observed food change) so the ranking can weigh recovery
+        const rec = this._recovery(), recText = this.vitals.recoveryText(rec);
+        if (rec.blocked) console.log(`[vitals] ${recText}`);
+        const recoveryHint = recText ? `\n${recText}` : '';
         const user = `known_skills: ${JSON.stringify(knownSkillsFacts)}
 replayable_tasks (cheap, no new code needed): ${JSON.stringify(replayableTasks)} plus any "Mine N <block or ore>", "Collect N <log>", "Get N <item>", "Smelt N <raw> into N <out>", "Kill N <mob>", "Harvest N <crop>"
 completed_tasks: ${JSON.stringify(this.progress.completed.slice(-30))}
-failed_tasks: ${JSON.stringify(this.progress.failed.slice(-15))}${blockerHint}${edibleHint}
+failed_tasks: ${JSON.stringify(this.progress.failed.slice(-15))}${blockerHint}${edibleHint}${recoveryHint}
 --- state (compact) ---
 ${compactStateText}
 current_health: ${Math.round(bot.health)}/20\ncurrent_food: ${bot.food}/20 (20/20 = full)${this._cursorLimited() ? '\nIMPORTANT: the code-writing model is unavailable right now, so ONLY propose a task from replayable_tasks or "Mine N <block>".' : ''}${workflowHints ? '\n' + workflowHints : ''}`;   // fix31: slow-changing lists first so Ollama reuses the cached prompt prefix
@@ -3494,6 +3511,7 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         if (!Array.isArray(trace) || !trace.length) { console.log('[psn] no execution trace recorded'); return; }
         annotateTrace(trace, bot.__psnOut || '');
         this._checkContracts(trace, ok);   // fix22: learned pre/postconditions against real state
+        this._learnVitalsEffects(trace);   // fix58
         // candidate children: their contract result in this run is a trial run (regression gate)
         for (const name of Object.keys(over)) {
             if (name === root) continue;
