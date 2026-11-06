@@ -22,3 +22,20 @@ export function callDurationBound(key) {
     if (!s || s.max === s.min) return null;
     return { ms: s.max + (s.max - s.min), stats: s };
 }
+
+// fix61: a model+endpoint with no learned bound is announced ONCE, not on every call. The startup library re-embed fires its
+// nomic-embed-text calls concurrently, all before any has finished, so per-call logging printed the same line ~94 times.
+// The calls made while unbounded are counted, and the moment the bound is learned it is announced once with that count.
+const _unbounded = {};
+export function noteUnboundedCall(key) {
+    const first = !(key in _unbounded);
+    _unbounded[key] = (_unbounded[key] || 0) + 1;
+    return first;
+}
+export function takeLearnedBound(key) {
+    if (!(key in _unbounded)) return null;
+    const bound = callDurationBound(key);
+    if (!bound) return null;
+    const calls = _unbounded[key]; delete _unbounded[key];
+    return { calls, bound };
+}

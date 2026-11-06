@@ -1786,9 +1786,10 @@ Use only c; no other globals.`;
         const replayClosure = new Set([r.name, ...this._closure(r.name)]);
         const tracedNames = Voyager._tracedSkillNamesForInstrument(this, replayClosure, over);
         const libPart = this._libSrcSubset(replayClosure, over);
-        const full = libPart + '\n\n' + instrumentSrc(tracedNames) + '\n\nasync function __replay(bot) {\n    try { ' + r.call + ' } finally { bot.__psnOut = bot.output; }\n}\nawait __replay(bot);';
-        const { lint, staged } = await this._stageLintExec(full, replayClosure, `voyager:replay:${r.name}`);
-        if (lint) { console.error(`[voyager] replay ${r.name}: lint failed before run`); return { ok: false }; }
+        const call = '\n\nasync function __replay(bot) {\n    try { ' + r.call + ' } finally { bot.__psnOut = bot.output; }\n}\nawait __replay(bot);';
+        const full = libPart + '\n\n' + instrumentSrc(tracedNames) + call;
+        const { lint, staged } = await this._stageLintExecTraced(libPart + call, full, replayClosure, `voyager:replay:${r.name}`);
+        if (lint) { console.error(`[voyager] replay ${r.name}: lint failed before run: ${lint}`); return { ok: false, name: r.name, output: '', reason: `lint failed before run: ${lint}` }; }
         if (!staged) return { ok: false };
         this._runStart = Date.now();
         const res = await this._run(`voyager:replay:${task}`, async () => {
@@ -1878,14 +1879,19 @@ Use only c; no other globals.`;
         }
         return { bareApiFilter, learnedNamesForLint };
     }
-    async _stageLintExec(bundleSrc, skillNameSet, label = 'voyager') {
-        const opts = this._coderStageOpts(bundleSrc, skillNameSet);
-        console.log(`[staging] ${label}: bundle ${bundleSrc.length} chars, ${bundleSrc.split('\n').length} lines, ${skillNameSet instanceof Set ? skillNameSet.size : '?'} skill names in closure`);
-        const lintSt = await withStallPhase('voyager:stage-lint', () => this.agent.coder._stageCode(bundleSrc, { ...opts, lintOnly: true }));
+    async _stageLintExec(bundleSrc, skillNameSet, label = 'voyager') { return this._stageLintExecTraced(bundleSrc, bundleSrc, skillNameSet, label); }
+    // fix61: lintSrc is everything a model or skill wrote (library closure + generated code + call); execSrc is lintSrc with the
+    // harness's PSN instrumentation (`name = __wrap("name", name)`) spliced in. #44 linted execSrc, so ESLint's no-func-assign
+    // flagged the instrumentation itself on every traced bundle: every replay "lint failed before run" (craftItem for
+    // "Craft 1 iron_pickaxe" included) and fell through to the code model, whose feedback then named lines it never wrote.
+    async _stageLintExecTraced(lintSrc, execSrc, skillNameSet, label) {
+        const opts = this._coderStageOpts(execSrc, skillNameSet);
+        console.log(`[staging] ${label}: bundle ${execSrc.length} chars, ${execSrc.split('\n').length} lines, ${skillNameSet instanceof Set ? skillNameSet.size : '?'} skill names in closure`);
+        const lintSt = await withStallPhase('voyager:stage-lint', () => this.agent.coder._stageCode(lintSrc, { ...opts, lintOnly: true }));
         if (typeof lintSt.preludeLines !== 'number') throw new Error('[voyager] _stageLintExec: lint stage must return numeric preludeLines');
         const lint = await withStallPhase('voyager:lint', () => this.agent.coder._lintCode(lintSt.src_lint_copy, lintSt.preludeLines));
         if (lint) return { lint, staged: null };
-        const staged = await withStallPhase('voyager:stage-exec', () => this.agent.coder._stageCode(bundleSrc, { ...opts, lintOnly: false }));
+        const staged = await withStallPhase('voyager:stage-exec', () => this.agent.coder._stageCode(execSrc, { ...opts, lintOnly: false }));
         return { lint: null, staged };
     }
     _graph(exclude) { const g = {}; for (const s of this.skills) if (s.name !== exclude) g[s.name] = s.deps || []; return g; }
@@ -4342,7 +4348,7 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             let lint = this.agent.coder.userGeneratedCodeLintBlockers(code, this.skills.map(s => s.name));
             let staged = null;
             if (!lint) {
-                const { lint: lint2, staged: st } = await this._stageLintExec(execBundle, stageNameSet, `voyager:writeCode:${task}:att${i}`);
+                const { lint: lint2, staged: st } = await this._stageLintExecTraced(libSrc + (libSrc ? '\n\n' : '') + code, execBundle, stageNameSet, `voyager:writeCode:${task}:att${i}`);
                 lint = lint2;
                 staged = st;
             }
