@@ -7,6 +7,7 @@ import {
     reportBlockAtOffset,
     getFirstBlockAboveHead
 } from "./world.js";
+import { Vec3 } from "vec3";
 import convoManager from '../conversation.js';
 
 export function getFullState(agent) {
@@ -28,9 +29,9 @@ export function getFullState(agent) {
     else if (bot.time.timeOfDay < 12000) timeLabel = 'Afternoon';
 
     // fix65: an unloaded cell is reported as UNLOADED, not as air
-    const below = reportBlockAtOffset(bot, 0, -1, 0);
-    const legs = reportBlockAtOffset(bot, 0, 0, 0);
-    const head = reportBlockAtOffset(bot, 0, 1, 0);
+    const below = reportBlockAtOffset(bot, new Vec3(0, -1, 0));
+    const legs = reportBlockAtOffset(bot, new Vec3(0, 0, 0));
+    const head = reportBlockAtOffset(bot, new Vec3(0, 1, 0));
 
     let players = getNearbyPlayerNames(bot);
     let bots = convoManager.getInGameAgents().filter(b => b !== agent.name);

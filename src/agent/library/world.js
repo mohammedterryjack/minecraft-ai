@@ -58,34 +58,45 @@ export function getNearestFreeSpace(bot, size=1, distance=8) {
  */
 export const UNLOADED = 'unloaded (unknown, not air)';
 
-export function getBlockAtPosition(bot, x=0, y=0, z=0) {
-     /**
+// fix67: two lookups, each saying which frame its argument is in, so nothing is inferred. fix65's getBlockAtPosition took
+// three numbers that could be read either way and guessed "absolute" when they lay nearer the bot than the origin; a real
+// far offset or an absolute position near the world origin was then read in the wrong frame.
+function _requireVec3(fn, arg, what, args) {
+    if (args.length !== 2 || !(arg instanceof Vec3)) {
+        throw new Error(`${fn}(bot, ${what}) takes exactly one Vec3 after bot, e.g. ${fn}(bot, new Vec3(0, -1, 0)); got ${args.length - 1} argument(s): ${[...args].slice(1).map(a => JSON.stringify(a)).join(', ')}`);
+    }
+}
+
+export function getBlockAtOffset(bot, offset) {
+    /**
      * Get the block at an offset RELATIVE to the bot's feet.
      * @param {Bot} bot - The bot to get the block for.
-     * @param {number} x - The relative x offset to search, default 0.
-     * @param {number} y - The relative y offset to search, default 0.
-     * @param {number} z - The relative z offset to search, default 0.
+     * @param {Vec3} offset - The offset from the bot's feet, e.g. new Vec3(0, -1, 0) for the block below.
      * @returns {Block|null} - The block, or null when its chunk is not loaded (unknown: NOT air).
-     * Throws when the arguments are an absolute position near the bot (use bot.blockAt(new Vec3(x, y, z)) for that).
      * @example
-     * let blockBelow = world.getBlockAtPosition(bot, 0, -1, 0);
-     * let blockAbove = world.getBlockAtPosition(bot, 0, 2, 0); since minecraft position is at the feet
+     * let blockBelow = getBlockAtOffset(bot, new Vec3(0, -1, 0));
+     * let blockAbove = getBlockAtOffset(bot, new Vec3(0, 2, 0)); since minecraft position is at the feet
      **/
-    // fix65: an unloaded chunk used to come back as {name: 'air'} (copied in 6a7820b from the 2024 modes.js
-    // "hacky fix when blocks are not loaded", dc520a9/b4a60cb, which only stopped a null crash). Fake air hid both unloaded
-    // chunks and absolute coordinates passed as offsets: the 09:37Z collectBlock candidate read every ore as missing.
-    const feet = bot.entity.position.floored();
-    const asOffset = new Vec3(x, y, z);
-    // Absolute coordinates of a nearby block lie closer to the bot than to the origin of offsets; a real offset does not.
-    if (asOffset.distanceTo(feet) < asOffset.distanceTo(new Vec3(0, 0, 0))) {
-        throw new Error(`getBlockAtPosition(bot, ${x}, ${y}, ${z}): these are absolute coordinates (the bot stands at ${feet}), but getBlockAtPosition takes offsets RELATIVE to the bot. For an absolute position use bot.blockAt(new Vec3(${x}, ${y}, ${z})).`);
-    }
-    return bot.blockAt(bot.entity.position.offset(x, y, z));
+    _requireVec3('getBlockAtOffset', offset, 'offset', arguments);
+    return bot.blockAt(bot.entity.position.plus(offset));
+}
+
+export function getBlockAtAbsolute(bot, position) {
+    /**
+     * Get the block at an ABSOLUTE world position.
+     * @param {Bot} bot - The bot to get the block for.
+     * @param {Vec3} position - The world position, e.g. new Vec3(-124, 33, 57) or block.position.
+     * @returns {Block|null} - The block, or null when its chunk is not loaded (unknown: NOT air).
+     * @example
+     * let ore = getBlockAtAbsolute(bot, new Vec3(-124, 33, 57));
+     **/
+    _requireVec3('getBlockAtAbsolute', position, 'position', arguments);
+    return bot.blockAt(position);
 }
 
 /** fix65: name of the block at a relative offset for reports, or UNLOADED; never a guessed name. */
-function _reportBlockAt(bot, x, y, z) {
-    const b = getBlockAtPosition(bot, x, y, z);
+function _reportBlockAt(bot, offset) {
+    const b = getBlockAtOffset(bot, offset);
     return b ? b.name : UNLOADED;
 }
 
@@ -98,16 +109,16 @@ export function getSurroundingBlocks(bot) {
      **/
     // Create a list of block position results that can be unpacked.
     let res = [];
-    res.push(`Block Below: ${_reportBlockAt(bot, 0, -1, 0)}`);
-    res.push(`Block at Legs: ${_reportBlockAt(bot, 0, 0, 0)}`);
-    res.push(`Block at Head: ${_reportBlockAt(bot, 0, 1, 0)}`);
+    res.push(`Block Below: ${_reportBlockAt(bot, new Vec3(0, -1, 0))}`);
+    res.push(`Block at Legs: ${_reportBlockAt(bot, new Vec3(0, 0, 0))}`);
+    res.push(`Block at Head: ${_reportBlockAt(bot, new Vec3(0, 1, 0))}`);
 
     return res;
 }
 
 /** fix65: exported for full_state.js, which reports the same three cells */
-export function reportBlockAtOffset(bot, x, y, z) {
-    return _reportBlockAt(bot, x, y, z);
+export function reportBlockAtOffset(bot, offset) {
+    return _reportBlockAt(bot, offset);
 }
 
 

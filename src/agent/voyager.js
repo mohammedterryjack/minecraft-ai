@@ -1237,6 +1237,41 @@ Use only c; no other globals.`;
         const fb = this.skills.find(s => s.name === 'fillBucket'); if (fb && !fb.contract) { delete fb.contractTried; console.log('[fix25] fillBucket contract retry queued'); }
         this.progress.fix25 = true; this._saveProgress(); this._saveSkills();
     }
+    // fix67: the built-in API changed (getBlockAtPosition's inferred frame -> getBlockAtOffset / getBlockAtAbsolute). A learned
+    // skill written against an API that no longer exists cannot lint, so every bundle holding it fails "lint failed before run"
+    // and no failure is ever blamed on it. Each learned skill is linted alone against the current API once per (API, skill
+    // version); one that fails is queued for a normal repair with the lint text as evidence, so the code model rewrites it and
+    // the trial gate decides (no hand edit, no rewrite rule). Clean results are remembered so restarts do not re-lint.
+    _apiSignature() { return this._skillHash({ code: getBareAPI().sigs.join('\n') }); }
+    async _queueApiLintRepairs() {
+        const api = this._apiSignature();
+        const prior = this.progress.apiLint;
+        const clean = prior && prior.api === api ? prior.clean : {};
+        const seeded = new Set(Voyager.SEEDED_PRIMITIVES.map(p => p.name));   // repo-owned, linted by the tests
+        const names = new Set(this.skills.map(s => s.name));
+        let linted = 0; const broken = [];
+        for (const e of this.skills) {
+            if (seeded.has(e.name) || e.mergedInto) continue;
+            const h = this._skillHash(e);
+            if (clean[e.name] === h) continue;
+            const st = await this.agent.coder._stageCode(e.code, { ...this._coderStageOpts(e.code, names), lintOnly: true });
+            const lint = await this.agent.coder._lintCode(st.src_lint_copy, st.preludeLines);
+            linted++;
+            if (!lint) { clean[e.name] = h; continue; }
+            delete clean[e.name];
+            broken.push(e.name);
+            const rq = [...(this._repairQueue || [])];
+            if (rq.some(x => x.target === e.name)) { console.log(`[api-lint] ${e.name} does not lint against the current API; a repair is already queued`); continue; }
+            rq.push({ target: e.name, leaf: e.name, path: [e.name], kind: 'callee_fix', swallowed: false, task: 'lint against the current built-in API',
+                evidence: `${e.name} does not lint against the current built-in API, so it cannot run: ${String(lint).replace(/\s+/g, ' ').slice(0, 600)}`, trace: '', depth: 0 });
+            this._repairQueue = rq;
+            console.log(`[api-lint] QUEUED REPAIR of ${e.name}: it does not lint against the current built-in API`);
+        }
+        this.progress.apiLint = { api, clean };
+        this._saveProgress();
+        console.log(`[api-lint] API ${api}: linted ${linted} learned skill(s), ${broken.length} need repair${broken.length ? ` (${broken.join(', ')})` : ''}`);
+        return broken;
+    }
     _queueContractFix(e, why) {
         const rq = [...(this._repairQueue || [])];
         if (rq.some(x => x.target === e.name && x.kind === 'contract_fix')) return;
@@ -4225,6 +4260,7 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
         this._oneshot();
         // fix18: no hard-coded survival/housekeeping policy; the curriculum proposes it and the PSN learns it
         this._requeueDeferred();   // fix26
+        if (this._apiLinted !== this._apiSignature()) { this._apiLinted = this._apiSignature(); await this._queueApiLintRepairs(); }   // fix67
         if (this._repairQueue?.length) { await this._repair(); return; }
         if (this._decomposeQueue) { const dq = this._decomposeQueue; this._decomposeQueue = null; await this._decompose(dq.task, dq.reason); return; }
         if (!this.progress.fix25) this._fix25Migrate();

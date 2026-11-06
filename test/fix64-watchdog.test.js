@@ -91,11 +91,15 @@ async function turnsDuring(run) {
     return { r, turns };
 }
 
+// the world.getBlockAtPosition the live candidate ran against (12:44Z): offsets RELATIVE to the feet, unloaded read as air.
+// fix65 made unloaded null, fix67 removed the three-number form (getBlockAtOffset / getBlockAtAbsolute take one Vec3).
+const LIVE_GET_BLOCK_AT_POSITION = (bot, x = 0, y = 0, z = 0) => bot.blockAt(bot.entity.position.offset(x, y, z)) ?? { name: 'air' };
+
 describe('fix64: async loops yield every iteration', () => {
     it('the live collectBlock candidate, run as written, never yields: one full scan per ore and zero event-loop turns', async () => {
         const world = await import('../src/agent/library/world.js');
         const skills = await import('../src/agent/library/skills.js');
-        const fn = new Function('getNearestBlocksWhere', 'getBlockAtPosition', 'log', `return (${RUNNABLE_CANDIDATE});`)(world.getNearestBlocksWhere, world.getBlockAtPosition, skills.log);
+        const fn = new Function('getNearestBlocksWhere', 'getBlockAtPosition', 'log', `return (${RUNNABLE_CANDIDATE});`)(world.getNearestBlocksWhere, LIVE_GET_BLOCK_AT_POSITION, skills.log);
         const ores = 40;
         const bot = oreWorld(ores);
         const { r, turns } = await turnsDuring(() => fn(bot, 'iron_ore', 5));
@@ -107,7 +111,7 @@ describe('fix64: async loops yield every iteration', () => {
 
     it('the same candidate staged for exec yields once per iteration, so the loop no longer holds the event loop', async () => {
         const c = await coder();
-        const staged = await c._stageCode(`${RUNNABLE_CANDIDATE}\nawait collectBlock(bot, 'iron_ore', 5);`, { lintOnly: false });
+        const staged = await c._stageCode(`const getBlockAtPosition = ${LIVE_GET_BLOCK_AT_POSITION};\n${RUNNABLE_CANDIDATE}\nawait collectBlock(bot, 'iron_ore', 5);`, { lintOnly: false });   // fix67: the API it ran against
         const ores = 40;
         const bot = oreWorld(ores);
         const { turns } = await turnsDuring(() => staged.func.main(bot));

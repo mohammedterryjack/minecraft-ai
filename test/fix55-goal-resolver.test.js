@@ -171,7 +171,7 @@ describe('fix55 invalid goal is rejected back to the planner', () => {
     it('_step rejects "buildCastle", re-proposes with the reason as a note', async () => {
         const v = mk([SHELTER]);
         for (const m of ['_checkHomeGround', '_watchWindows', '_watchDimension', '_oneshot', '_requeueDeferred']) v[m] = () => {};
-        for (const m of ['_gateTrial', '_backfillContracts', '_refactor', '_prune', '_generalise', '_split', '_retention', '_idlePractice']) v[m] = async () => false;
+        for (const m of ['_queueApiLintRepairs', '_gateTrial', '_backfillContracts', '_refactor', '_prune', '_generalise', '_split', '_retention', '_idlePractice']) v[m] = async () => false;
         v.agent = { bot: { currentWindow: null } };
         v.observe = () => ({ inventory: {}, equipment: eq });
         v._subgoalTask = () => null;
