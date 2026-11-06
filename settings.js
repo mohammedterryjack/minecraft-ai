@@ -57,8 +57,6 @@ const settings = {
     "narrate_behavior": false, // chat simple automatic actions ('Picking up item!')
     "chat_bot_messages": true, // publicly chat messages to other bots
 
-    // Mineflayer → minecraft-protocol client keep-alive (ms). Passed to createBot as checkTimeoutInterval; stall guard uses the same value as the blocking threshold (see src/utils/event_loop_guard.js).
-    "check_timeout_interval_ms": 60000,
     // How often to read monitorEventLoopDelay max delay (ms). Must be configured explicitly (no code default).
     "event_loop_stall_poll_interval_ms": 500,
     // Lint warns on findBlock/findBlocks (and pathfinder scans) when maxDistance (or similar) is a numeric literal >= this value.

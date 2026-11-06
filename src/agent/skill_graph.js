@@ -1,7 +1,43 @@
 // Stage 1 (PSN-style skill network + Skill-V-style regression gate) helpers.
+import * as acorn from 'acorn';
+
+/** Function declaration / async function expression assigned to `name` — AST only (no name regex on user code). */
 export function signatureOf(code, name) {
-    const m = String(code).match(new RegExp('(?:async\\s+)?function\\s+' + name + '\\s*\\(([^)]*)\\)'));
-    return m ? `${name}(${m[1].replace(/\s+/g, ' ').trim()})` : `${name}(bot)`;
+    let ast;
+    try { ast = acorn.parse(String(code), { ecmaVersion: 'latest', sourceType: 'module', allowAwaitOutsideFunction: true }); }
+    catch { return `${name}(bot)`; }
+    const paramsFrom = (fnNode) => {
+        if (!fnNode.body) return '';
+        const header = String(code).slice(fnNode.start, fnNode.body.start);
+        const open = header.indexOf('(');
+        const close = header.lastIndexOf(')');
+        if (open < 0 || close <= open) return '';
+        return header.slice(open + 1, close).replace(/\s+/g, ' ').trim();
+    };
+    let found = null;
+    const walk = (node) => {
+        if (!node || typeof node.type !== 'string') return;
+        if (node.type === 'ExportDefaultDeclaration' && node.declaration?.type === 'FunctionDeclaration' && node.declaration.id?.name === name) {
+            found = node.declaration;
+            return;
+        }
+        if (node.type === 'FunctionDeclaration' && node.id?.name === name) {
+            found = node;
+            return;
+        }
+        if (node.type === 'VariableDeclarator' && node.id?.type === 'Identifier' && node.id.name === name) {
+            const init = node.init;
+            if (init && (init.type === 'FunctionExpression' || init.type === 'ArrowFunctionExpression')) found = init;
+        }
+        for (const k in node) {
+            const v = node[k];
+            if (Array.isArray(v)) v.forEach(walk);
+            else if (v && typeof v.type === 'string') walk(v);
+        }
+    };
+    walk(ast);
+    if (found) return `${name}(${paramsFrom(found)})`;
+    return `${name}(bot)`;
 }
 function stripComments(code) { return String(code).replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, ''); }
 // fix51: strip string literals so names inside strings aren't counted as dependencies

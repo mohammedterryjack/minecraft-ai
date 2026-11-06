@@ -51,7 +51,7 @@ If you encounter issues, check the [FAQ](https://github.com/mindcraft-bots/mindc
 
 You can configure project details in `settings.js`. [See file.](settings.js)
 
-**Protocol keep-alive and event-loop stalls:** `check_timeout_interval_ms` in `settings.js` is passed to mineflayer as `createBot({ checkTimeoutInterval })` (see [mineflayer options](https://github.com/PrismarineJS/mineflayer/blob/master/docs/api.md) — default there is `30 * 1000` ms). The stall guard uses the same value as the blocking threshold and samples on `event_loop_stall_poll_interval_ms`. On login you should see `[event-loop] stall guard: threshold … (= check_timeout_interval_ms …)`; a stall logs `[event-loop] STALL: …` with phase, running skill name, and PSN call stack when available.
+**Event-loop stalls:** `createBot` does not override mineflayer’s default `checkTimeoutInterval` (see [mineflayer options](https://github.com/PrismarineJS/mineflayer/blob/master/docs/api.md)). The stall guard learns its threshold from **inbound** `keep_alive` packet spacing on `bot._client` (time between server keep-alives). Until two packets have been seen it logs once (loudly) that the guard is not armed. It samples `monitorEventLoopDelay` on `event_loop_stall_poll_interval_ms` from `settings.js`. A stall logs `[event-loop] STALL: …` with phase, running skill name, and PSN call stack when available.
 
 You can configure the agent's name, model, and prompts in their profile like `andy.json`. The model can be specified with the `model` field, with values like `model: "gemini-2.5-pro"`. You will need the correct API key for the API provider you choose. See all supported APIs below.
 

@@ -18,7 +18,7 @@ import settings from './settings.js';
 import { Task } from './tasks/tasks.js';
 import { speak } from './speak.js';
 import { log, validateNameFormat } from './connection_handler.js';
-import { startEventLoopStallGuard, stallThresholdMs } from '../utils/event_loop_guard.js';
+import { startEventLoopStallGuard } from '../utils/event_loop_guard.js';
 
 export class Agent {
     async start(load_mem=false, init_message=null, count_id=0) {
@@ -94,7 +94,6 @@ export class Agent {
 
         this.bot.on('login', () => {
             console.log(this.name, 'logged in!');
-            this.bot.__stallThresholdMs = stallThresholdMs(this.bot);
             startEventLoopStallGuard(this.bot);
             serverProxy.login();
             

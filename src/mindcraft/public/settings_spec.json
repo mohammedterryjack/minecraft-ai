@@ -137,11 +137,6 @@
         "description": "Number of seconds allowed for the bot to spawn before throwing an error. Increase when spawning takes a while.",
         "default": 30
     },
-    "check_timeout_interval_ms": {
-        "type": "number",
-        "description": "Mineflayer createBot checkTimeoutInterval (minecraft-protocol client keep-alive period in ms). The event-loop stall threshold equals this interval.",
-        "default": 60000
-    },
     "event_loop_stall_poll_interval_ms": {
         "type": "number",
         "description": "How often to sample monitorEventLoopDelay for stall logging (ms). Must be set in settings.js; no code default.",

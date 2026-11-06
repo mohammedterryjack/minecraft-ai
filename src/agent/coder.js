@@ -72,20 +72,30 @@ export function getRealAPI() {
 
 /** Which built-in skill/world bare names appear as call sites in source (for smaller lint/exec bindings). */
 export function collectBareApiUsedInSource(combinedSrc) {
-    const src = String(combinedSrc);
-    const bare = getBareAPI();
     const skillNames = new Set();
-    for (const name of bare.names) {
-        if (skills[name] === undefined) continue;
-        const re = new RegExp(`\\b${name.replace(/[$]/g, '\\$')}\\s*\\(`);
-        if (re.test(src)) skillNames.add(name);
-    }
     const worldNames = new Set();
-    for (const k of Object.keys(world)) {
-        if (typeof world[k] !== 'function') continue;
-        const re = new RegExp(`\\b${k.replace(/[$]/g, '\\$')}\\s*\\(`);
-        if (re.test(src)) worldNames.add(k);
+    const skillKeySet = new Set(Object.keys(skills).filter((k) => typeof skills[k] === 'function' && k !== 'log'));
+    const worldKeySet = new Set(Object.keys(world).filter((k) => typeof world[k] === 'function'));
+    let ast;
+    try {
+        ast = acorn.parse(String(combinedSrc), { ecmaVersion: 'latest', sourceType: 'module', allowAwaitOutsideFunction: true });
+    } catch {
+        return { skillNames, worldNames };
     }
+    const walk = (node) => {
+        if (!node || typeof node.type !== 'string') return;
+        if (node.type === 'CallExpression' && node.callee?.type === 'Identifier') {
+            const id = node.callee.name;
+            if (skillKeySet.has(id)) skillNames.add(id);
+            if (worldKeySet.has(id)) worldNames.add(id);
+        }
+        for (const k in node) {
+            const v = node[k];
+            if (Array.isArray(v)) v.forEach(walk);
+            else if (v && typeof v.type === 'string') walk(v);
+        }
+    };
+    walk(ast);
     return { skillNames, worldNames };
 }
 
@@ -689,9 +699,9 @@ export class Coder {
                 return `  ${call} -> use bare name: ${suggestionText}`;
             }).join('\n');
             block += '\n\nAVAILABLE FUNCTIONS (call by bare name, e.g. goToPosition(bot, x, y, z)):\n';
-            block += builtInSigs.slice(0, 20).join('\n') + (builtInSigs.length > 20 ? `\n... (${builtInSigs.length - 20} more built-in)` : '');
+            block += builtInSigs.join('\n');
             if (learned.length) {
-                block += '\n\nLEARNED SKILLS (also bare names):\n' + learned.slice(0, 15).join(', ') + (learned.length > 15 ? ` ... (${learned.length - 15} more)` : '');
+                block += '\n\nLEARNED SKILLS (also bare names):\n' + learned.join(', ');
             }
             console.log(header + block);
             return header + block;
@@ -839,7 +849,7 @@ export class Coder {
         code = code.replaceAll('console.log(', 'log(bot,');
         code = code.replaceAll('log("', 'log(bot,"');
 
-        console.log(`[staging] coder:_stageCode (${code.length} chars, ${code.split('\n').length} lines; tail for orientation only): """${code.length > 400 ? code.slice(-400) + '\n...[truncated]' : code}"""`);   // fix27: tail only (the new code is at the end)
+        console.log(`[staging] coder:_stageCode staged_source=${code.length} chars lines=${code.split('\n').length}`);
 
         // fix44: interrupt guard uses __mcLog__ (collision-safe binding injected into endowments)
         // String/template aware: naive `;\n` replacement breaks instrumentSrc template bodies that contain `;`+newline

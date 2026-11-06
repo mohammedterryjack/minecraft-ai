@@ -4292,16 +4292,7 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             const libSrc = libSkills.map(s => over[s.name] ?? s.code).join('\n\n');
             const traced = Voyager._tracedSkillNamesForInstrument(this, stageNameSet, over);
             const execBundle = libSrc + (libSrc ? '\n\n' : '') + instrumentSrc(traced) + '\n\n' + code;
-            const shownUnionStaging = new Set(shown);
-            shownUnionStaging.add(own);
-            for (const n of this._closure(own)) shownUnionStaging.add(n);
-            const shownLibSkills = this.skills.filter(s => shownUnionStaging.has(s.name) && s.name !== own);
-            const shownLibSrc = shownLibSkills.map(s => over[s.name] ?? s.code).join('\n\n');
-            const shownTraced = Voyager._tracedSkillNamesForInstrument(this, shownUnionStaging, over);
-            const baselineBundle = shownLibSrc + (shownLibSrc ? '\n\n' : '') + instrumentSrc(shownTraced) + '\n\n' + code;
-            const savings = baselineBundle.length - execBundle.length;
-            const savingsPct = baselineBundle.length ? ((savings / baselineBundle.length) * 100).toFixed(1) : '0.0';
-            console.log(`[staging] voyager:writeCode task="${task}" attempt=${i} closure_only: ${execBundle.length} chars, ${stageNameSet.size} traced names (${libSkills.length} lib skills); embedding_shown_union baseline: ${baselineBundle.length} chars, ${shownUnionStaging.size} traced names (${shownLibSkills.length} lib skills); savings ${savings} chars (${savingsPct}%)`);
+            console.log(`[staging] voyager:writeCode task="${task}" attempt=${i} bundle=${execBundle.length} chars closure_skills=${stageNameSet.size}`);
             let lint = this.agent.coder.userGeneratedCodeLintBlockers(code, this.skills.map(s => s.name));
             let staged = null;
             if (!lint) {

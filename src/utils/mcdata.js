@@ -55,17 +55,12 @@ export const WOOL_COLORS = [
 
 export function initBot(username) {
     if (settings.minecraft_version && settings.minecraft_version !== "auto") mc_version = settings.minecraft_version;
-    const checkMs = typeof settings.check_timeout_interval_ms === 'number' ? settings.check_timeout_interval_ms : rootSettings.check_timeout_interval_ms;
-    if (typeof checkMs !== 'number' || !Number.isFinite(checkMs) || checkMs <= 0) {
-        throw new Error('[mcdata] check_timeout_interval_ms must be a positive number in settings (mineflayer createBot checkTimeoutInterval / protocol keep-alive)');
-    }
     const options = {
         username: username,
         host: settings.host,
         port: settings.port,
         auth: settings.auth,
         version: mc_version,
-        checkTimeoutInterval: checkMs,
     }
     if (!mc_version || mc_version === "auto") {
         delete options.version;

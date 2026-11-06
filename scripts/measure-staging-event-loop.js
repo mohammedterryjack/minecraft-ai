@@ -14,7 +14,6 @@ import { Coder, collectBareApiUsedInSource } from '../src/agent/coder.js';
 import { withStallPhase } from '../src/utils/event_loop_guard.js';
 
 setSettings({
-    check_timeout_interval_ms: rootSettings.check_timeout_interval_ms,
     event_loop_stall_poll_interval_ms: rootSettings.event_loop_stall_poll_interval_ms,
     world_scan_stall_warn_distance: rootSettings.world_scan_stall_warn_distance,
 });

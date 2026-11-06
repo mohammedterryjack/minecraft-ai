@@ -1,22 +1,11 @@
 /**
- * Event-loop stall monitoring for long synchronous work (staging, lint, SES eval).
- * Threshold equals the minecraft-protocol client keep-alive interval (mineflayer: bot._client.checkTimeoutInterval),
- * set at createBot from settings.check_timeout_interval_ms (see src/utils/mcdata.js). Poll interval comes from
- * settings.event_loop_stall_poll_interval_ms.
+ * Event-loop stall monitoring: threshold is the most recently observed gap between inbound
+ * `keep_alive` packets from the server (minecraft-protocol), measured on `bot._client`.
+ * Poll cadence comes from settings.event_loop_stall_poll_interval_ms only.
  */
 import { monitorEventLoopDelay } from 'node:perf_hooks';
 import agentSettings from '../agent/settings.js';
 import rootSettings from '../../settings.js';
-
-function checkTimeoutMs() {
-    if (typeof agentSettings.check_timeout_interval_ms === 'number') {
-        return agentSettings.check_timeout_interval_ms;
-    }
-    if (typeof rootSettings.check_timeout_interval_ms === 'number') {
-        return rootSettings.check_timeout_interval_ms;
-    }
-    throw new Error('[event_loop_guard] check_timeout_interval_ms missing: set in settings.js (root) or agent settings after MindServer sync');
-}
 
 function stallPollIntervalMs() {
     if (typeof agentSettings.event_loop_stall_poll_interval_ms === 'number') {
@@ -28,25 +17,19 @@ function stallPollIntervalMs() {
     throw new Error('[event_loop_guard] event_loop_stall_poll_interval_ms missing: set in settings.js (root) or agent settings after MindServer sync');
 }
 
-let _histogram = null;
-let _watchInterval = null;
 let _phase = 'idle';
 
-/** @param {import('mineflayer').Bot} bot */
-export function protocolKeepaliveIntervalMs(bot) {
-    const ms = checkTimeoutMs();
-    if (!Number.isFinite(ms) || ms <= 0) {
-        throw new Error('[event_loop_guard] check_timeout_interval_ms must be a positive finite number');
-    }
-    const c = bot && bot._client;
-    if (c && typeof c.checkTimeoutInterval === 'number' && c.checkTimeoutInterval !== ms) {
-        throw new Error(`[event_loop_guard] bot._client.checkTimeoutInterval (${c.checkTimeoutInterval}) !== configured check_timeout_interval_ms (${ms})`);
-    }
-    return ms;
-}
-
+/**
+ * After at least two server keep_alive packets, holds the latest observed interval (ms).
+ * @param {import('mineflayer').Bot} bot
+ */
 export function stallThresholdMs(bot) {
-    return protocolKeepaliveIntervalMs(bot);
+    if (!bot) throw new Error('[event_loop_guard] bot required');
+    const t = bot.__eventLoopStallThresholdMs;
+    if (typeof t !== 'number' || !Number.isFinite(t) || t <= 0) {
+        throw new Error('[event_loop_guard] stall threshold not learned yet (need two inbound keep_alive packets from server)');
+    }
+    return t;
 }
 
 export function setStallPhase(phase) {
@@ -57,37 +40,89 @@ export function getStallPhase() {
     return _phase;
 }
 
-export function startEventLoopStallGuard(bot) {
-    if (_watchInterval) return;
-    const threshold = stallThresholdMs(bot);
-    const ms = protocolKeepaliveIntervalMs(bot);
+/**
+ * @param {import('mineflayer').Bot} bot
+ */
+function _armStallPoll(bot) {
+    if (bot.__stallPollInterval) return;
     const pollMs = stallPollIntervalMs();
     if (!Number.isFinite(pollMs) || pollMs <= 0) {
         throw new Error('[event_loop_guard] event_loop_stall_poll_interval_ms must be a positive finite number');
     }
-    console.log(`[event-loop] stall guard: threshold ${threshold}ms (= check_timeout_interval_ms ${ms}ms, mineflayer createBot checkTimeoutInterval / minecraft-protocol keep-alive); poll every ${pollMs}ms`);
-    _histogram = monitorEventLoopDelay({ resolution: 20 });
-    _histogram.enable();
-    _watchInterval = setInterval(() => {
-        const maxNs = _histogram.max;
-        _histogram.reset();
+    const thresholdMs = bot.__eventLoopStallThresholdMs;
+    if (typeof thresholdMs !== 'number' || !Number.isFinite(thresholdMs) || thresholdMs <= 0) {
+        throw new Error(`[event_loop_guard] cannot arm stall poll: invalid threshold on bot`);
+    }
+    console.log(`[event-loop] stall guard ARMED: threshold tracks observed server keep_alive gap (currently ${thresholdMs}ms); poll every ${pollMs}ms`);
+
+    bot.__stallEventLoopHist = monitorEventLoopDelay({ resolution: 20 });
+    bot.__stallEventLoopHist.enable();
+
+    bot.__stallPollInterval = setInterval(() => {
+        const threshold = bot.__eventLoopStallThresholdMs;
+        if (typeof threshold !== 'number' || !Number.isFinite(threshold) || threshold <= 0) return;
+        const h = bot.__stallEventLoopHist;
+        if (!h) return;
+        const maxNs = h.max;
+        h.reset();
         const maxMs = maxNs / 1e6;
         if (maxMs >= threshold) {
-            const skill = bot && bot.__psnRunningSkill !== undefined && bot.__psnRunningSkill !== null ? String(bot.__psnRunningSkill) : '(none)';
-            const stack = bot && bot.__psnStackStr !== undefined && bot.__psnStackStr !== null ? String(bot.__psnStackStr) : '(none)';
-            console.error(`[event-loop] STALL: event loop delayed ${maxMs.toFixed(0)}ms (>= ${threshold}ms) during phase "${_phase}" skill="${skill}" stack="${stack}"`);
+            const skill = bot.__psnRunningSkill !== undefined && bot.__psnRunningSkill !== null ? String(bot.__psnRunningSkill) : '(none)';
+            const stack = bot.__psnStackStr !== undefined && bot.__psnStackStr !== null ? String(bot.__psnStackStr) : '(none)';
+            console.error(`[event-loop] STALL: event loop delayed ${maxMs.toFixed(0)}ms (>= ${threshold}ms observed keep_alive gap) during phase "${_phase}" skill="${skill}" stack="${stack}"`);
         }
     }, pollMs);
 }
 
-export function stopEventLoopStallGuard() {
-    if (_watchInterval) {
-        clearInterval(_watchInterval);
-        _watchInterval = null;
+/**
+ * Subscribe once per bot; learn threshold from inter-arrival time of inbound keep_alive packets.
+ * @param {import('mineflayer').Bot} bot
+ */
+export function startEventLoopStallGuard(bot) {
+    if (!bot || !bot._client || typeof bot._client.on !== 'function') {
+        throw new Error('[event_loop_guard] bot._client.on missing (cannot observe keep_alive)');
     }
-    if (_histogram) {
-        _histogram.disable();
-        _histogram = null;
+    if (bot.__eventLoopStallGuardHooked) return;
+    bot.__eventLoopStallGuardHooked = true;
+
+    const onKeepAlive = () => {
+        const now = Date.now();
+        const prev = bot.__prevServerKeepAliveAt;
+        bot.__prevServerKeepAliveAt = now;
+        if (prev === undefined || prev === null) {
+            if (!bot.__stallGuardUnarmedLogged) {
+                bot.__stallGuardUnarmedLogged = true;
+                console.error('[event-loop] LOUD: stall guard is NOT ARMED yet — waiting for a second inbound keep_alive from the server to learn the keep-alive interval; STALL detection stays off until then.');
+            }
+            return;
+        }
+        const intervalMs = now - prev;
+        if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
+            throw new Error(`[event_loop_guard] invalid observed keep_alive gap ${intervalMs}ms`);
+        }
+        bot.__serverKeepAliveIntervalMs = intervalMs;
+        bot.__eventLoopStallThresholdMs = intervalMs;
+        _armStallPoll(bot);
+    };
+    bot.__stallGuardKeepAliveHandler = onKeepAlive;
+    bot._client.on('keep_alive', onKeepAlive);
+}
+
+export function stopEventLoopStallGuard(bot) {
+    if (bot && bot.__stallPollInterval) {
+        clearInterval(bot.__stallPollInterval);
+        bot.__stallPollInterval = null;
+    }
+    if (bot && bot.__stallEventLoopHist) {
+        bot.__stallEventLoopHist.disable();
+        bot.__stallEventLoopHist = null;
+    }
+    if (bot && bot._client && bot.__stallGuardKeepAliveHandler) {
+        bot._client.removeListener('keep_alive', bot.__stallGuardKeepAliveHandler);
+        bot.__stallGuardKeepAliveHandler = null;
+    }
+    if (bot) {
+        bot.__eventLoopStallGuardHooked = false;
     }
 }
 
