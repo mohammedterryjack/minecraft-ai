@@ -1055,7 +1055,7 @@ describe('fix51 issue 21: null dereference protection', async () => {
     it('__wrap records any thrown error as FAILED with full message (repair path, not crash)', () => {
         const sgSrc = readFileSync('./src/agent/skill_graph.js', 'utf8');
         assert.ok(!sgSrc.includes('Cannot read propert'), '__wrap must not special-case TypeError text');
-        assert.ok(sgSrc.includes("bot.output = bot.output + '\\nFAILED: ' + n + ' threw ' + msg"), '__wrap should log FAILED with full message to bot output');
+        assert.ok(sgSrc.includes("bot.output = bot.output + '\\\\nFAILED: ' + n + ' threw ' + msg"), '__wrap should log FAILED with full message to bot output');
         assert.ok(sgSrc.includes('rec.err = msg;'), 'rec.err must not be truncated');
     });
 });

@@ -186,7 +186,7 @@ const __wrap = (n, f) => async function (...a) {
         rec.fail = true;
         const msg = String(e?.message || e);
         rec.err = msg;
-        bot.output = bot.output + '\nFAILED: ' + n + ' threw ' + msg + '\n';
+        bot.output = bot.output + '\\nFAILED: ' + n + ' threw ' + msg + '\\n';
         rec.rv = false;
         return false;
     }
