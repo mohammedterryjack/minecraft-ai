@@ -39,6 +39,7 @@ async function mkCoder() {
     while (!coder.code_lint_template || !coder.code_template) await new Promise(r => setImmediate(r));
     return coder;
 }
+async function flushTrace() { await Promise.resolve(); await Promise.resolve(); }
 function mkBot() {
     return { output: '', interrupt_code: false, __psnALS: new AsyncLocalStorage(), inventory: { slots: Array(46).fill(null), emptySlotCount: () => 36 },
         waitForTicks: async () => {}, entity: { position: new Vec3(0, 64, 0) }, blockAt: () => null, health: 20, food: 20, oxygenLevel: 20, game: { dimension: 'overworld' }, quickBarSlot: 0 };
@@ -63,6 +64,7 @@ describe('fix68: the trace harness cannot re-enter itself', () => {
         const staged = await coder._stageCode(code, { lintOnly: false });
         const bot = mkBot();
         await staged.func.main(bot);
+        await flushTrace();
         assert.deepStrictEqual(bot.got, ['undefined', false]);
         assert.deepStrictEqual(bot.__psnTrace.map(r => [r.name, r.depth]), [['mineOne', 0], ['getInventoryCounts', 1], ['isSafeTarget', 1]]);
         assert.ok(bot.__psnTrace.every(r => r.delta && r.t1 >= r.t0), 'every record is finished');
@@ -76,9 +78,24 @@ describe('fix68: the trace harness cannot re-enter itself', () => {
         const slots = bot.inventory.slots;
         Object.defineProperty(bot.inventory, 'slots', { get() { seen.push(bot.__psnStackStr); return slots; } });
         await staged.func.main(bot);
+        await flushTrace();
         assert.strictEqual(bot.inSkill, 'outer <- inner');
         assert.ok(seen.length > 0 && seen.every(s => / <- \(psn trace\)$/.test(s)), seen.join(' | '));
         assert.ok(seen.includes('outer <- inner <- (psn trace)'));
+    });
+    it('a nested traced call after await still sees this frame as parent (__syncParent, no ALS)', async () => {
+        const coder = await mkCoder();
+        const code = 'async function inner(bot) { return 1; }\n'
+            + 'async function outer(bot) {\n    await Promise.resolve();\n    await inner(bot);\n    return 1;\n}\n'
+            + instrumentSrc(['outer', 'inner']) + '\nawait outer(bot);';
+        const staged = await coder._stageCode(code, { lintOnly: false });
+        const bot = mkBot();
+        await staged.func.main(bot);
+        await flushTrace();
+        assert.deepStrictEqual(
+            bot.__psnTrace.map(r => [r.name, r.parent, r.depth]),
+            [['outer', -1, 0], ['inner', 0, 1]],
+        );
     });
 });
 
@@ -91,6 +108,7 @@ describe('fix68b: an error inside traced code is never turned into a value', () 
         const bot = mkBot();
         let err = null;
         try { await staged.func.main(bot); } catch (e) { err = e; }
+        await flushTrace();
         return { bot, err };
     };
     const failedLines = (out) => out.split('\n').filter(l => l.startsWith('FAILED:'));

@@ -206,19 +206,10 @@ export function gateLog(msg) { console.log('[gate] ' + msg); }
 // instrumentSrc: JS appended after the skill library inside the staged program; rebinds every skill to a wrapper that
 // records one trace record per call (name, args, parent, depth, own output span, inventory delta, return, error).
 
-/** fix68b: Node versions where AsyncLocalStorage stack overflow is catchable (CVE-2025-59466 fixed / AsyncContextFrame). */
-function psnAlsOverflowSafe() {
-    const p = String((typeof process !== 'undefined' && process.versions && process.versions.node) || '').split('.');
-    const maj = +p[0] || 0, min = +p[1] || 0;
-    if (maj > 24) return true;
-    if (maj === 24) return true; // ALS via AsyncContextFrame
-    if (maj === 22 && min >= 22) return true;
-    if (maj === 20 && min >= 20) return true;
-    return false;
-}
 
 export function instrumentSrc(names) {
-    // fix11 (B6): parent call tracked with AsyncLocalStorage (bot.__psnALS, set by voyager.js before each run; fix12: SES compartments have their own globalThis), so parallel calls get the right parent
+    // fix11 (B6) / fix68b: parent is __syncParent (explicit slot). Was AsyncLocalStorage; ALS.run around user code is
+    //        fatal under stack overflow on Node 20.19 (CVE-2025-59466). fix12 SES note still applies to the prelude scope.
     // fix43: __st() now includes equipment state (eq) so equip skill contracts can be idempotent (already-equipped = success)
     // fix59: __st() also records free (empty inventory slots) so a skill's slot effect is learned, not matched by name
     // fix65: when a traced call returns, bot.__psnRunningSkill/__psnStackStr go back to its CALLER (they were cleared, so a
@@ -244,18 +235,13 @@ export function instrumentSrc(names) {
     //      now records the failure, writes one FAILED line (where it was thrown) and rethrows to its caller.
     //   3. the watchdog saw stack "getInventoryCounts": the harness's own bookkeeping, outside any skill, was shown as a
     //      skill. While the harness snapshots state the published stack says so: "<stack> <- (psn trace)".
-    // fix68b (node20): on Node 20.19.x (and any Node where AsyncLocalStorage still rides async_hooks callbacks), a
-    //      "Maximum call stack size exceeded" inside user code while ALS context is active is FATAL: Node exits 7 and
-    //      skips try/catch and uncaughtException (CVE-2025-59466; https://nodejs.org/en/blog/vulnerability/january-2026-dos-mitigation-async-hooks).
-    //      The staged-bundle path reproduced it: async recursion through __wrap → __als.run → deep → __wrap → … ends as
-    //      an uncaught RangeError at `<anonymous_script>` / PromiseRejectCallback, killing icefox. Sync overflow under
-    //      ALS.run is still catchable. Node 24+ ALS uses V8 AsyncContextFrame (no fatal hooks for ALS alone), so the
-    //      same overflow is a normal rejection there. Fix: on unsafe Node, call user code OUTSIDE __als.run and track
-    //      the parent with a sync __syncParent slot (same nesting ALS.run used to provide across a single turn). On safe
-    //      Node, keep __als.run. Reporting (threw/finish) that itself overflows is deferred via queueResolve so the
-    //      catch path cannot turn a caught RangeError into a second fatal escape.
-    const __alsSafeLiteral = psnAlsOverflowSafe() ? 'true' : 'false';
-    const wrap = `const __T = bot.__psnTrace = []; const __als = bot.__psnALS; if (!__als) throw new Error('PSN trace: bot.__psnALS (AsyncLocalStorage) missing');
+    // fix68b: never run user code inside AsyncLocalStorage / async_hooks. On Node 20.19.5 a stack overflow
+    //      while ALS hooks are on the stack is fatal (exit 7, CVE-2025-59466). Parent is an explicit __syncParent
+    //      slot: set for the sync apply, restored when apply returns, then held again for the duration of awaiting
+    //      that call's thenable so nested traced calls after `await` still see this frame. One path on every Node.
+    //      finish() always runs on a fresh stack via Promise.resolve().then (inventory snapshots need stack;
+    //      overflowing inside finish must not escape as uncaught). threw() only writes the FAILED line and flags (no snapshot).
+    const wrap = `const __T = bot.__psnTrace = [];
 const __rawInventoryCounts = getInventoryCounts;
 const __inv = () => __rawInventoryCounts(bot);
 const __eq = () => { const s = bot.inventory.slots; return { heldItem: s[bot.quickBarSlot + 36]?.name || null, offHand: s[45]?.name || null, helmet: s[5]?.name || null, chestplate: s[6]?.name || null, leggings: s[7]?.name || null, boots: s[8]?.name || null }; };
@@ -263,12 +249,11 @@ const __have = () => __inv();
 const __st = () => { const p = bot.entity.position, b = bot.blockAt(p.floored().offset(0, 1, 0)); return { pos: { x: p.x, y: p.y, z: p.z }, hp: bot.health, food: bot.food, oxygen: bot.oxygenLevel, sky: b ? b.skyLight : null, alive: bot.health > 0, dim: String(bot.game?.dimension || ''), inv: __inv(), free: bot.inventory.emptySlotCount(), eq: __eq() }; };
 let __inHarness = false;
 let __syncParent = -1;
-const __reported = new WeakSet();   // an error is reported once, by the traced call it was thrown in; callers see it rethrown
+const __reported = new WeakSet();
 const __harness = (stackStr, fn) => { const was = bot.__psnStackStr; bot.__psnStackStr = stackStr + ' <- (psn trace)'; __inHarness = true; try { return fn(); } finally { __inHarness = false; bot.__psnStackStr = was; } };
-const __alsSafe = ${__alsSafeLiteral};
 const __wrap = (n, f) => function (...a) {
     if (__inHarness || __T.length >= 1500) return f.apply(this, a);
-    const par = (__alsSafe ? (__als.getStore() ?? __syncParent) : __syncParent);
+    const par = __syncParent;
     const __stackParts = []; for (let __i = par; __i >= 0 && __i < __T.length; __i = __T[__i].parent) __stackParts.push(__T[__i].name); const __stackStr = [...__stackParts.reverse(), n].join(' <- ');
     bot.__psnRunningSkill = n;
     const rec = __harness(__stackStr, () => { const r0 = { name: n, args: JSON.stringify(a.slice(1)).slice(0, 120), parent: par, depth: par < 0 ? 0 : __T[par].depth + 1, o0: (bot.output || '').length, t0: Date.now(), pre: __have(), argv: a.slice(1).map(x => x === null || typeof x !== 'object' ? x : null) }; if (!n.startsWith('skills.')) r0.s0 = __st(); return r0; });
@@ -276,14 +261,13 @@ const __wrap = (n, f) => function (...a) {
     const id = __T.push(rec) - 1;
     const settle = (r) => { rec.ret = r === undefined ? 'undefined' : String(JSON.stringify(r)).slice(0, 60); rec.rv = r === null || typeof r !== 'object' ? r : null; rec.fail = r === false || r === null || r === 0; return r; };
     const threw = (e) => { rec.fail = true; const msg = e instanceof Error ? e.message : String(e); rec.err = msg; rec.rv = false; if (!__reported.has(e)) { if (e !== null && typeof e === 'object') __reported.add(e); bot.output = bot.output + '\\nFAILED: ' + n + ' threw ' + msg + '\\n'; } };
-    const finish = () => { __harness(__stackStr, () => { rec.t1 = Date.now(); if (!n.startsWith('skills.')) rec.s1 = __st(); rec.o1 = (bot.output || '').length; bot.__psnOut = bot.output; const post = __have(); rec.delta = {}; for (const k of new Set([...Object.keys(rec.pre), ...Object.keys(post)])) { const d = (post[k] || 0) - (rec.pre[k] || 0); if (d) rec.delta[k] = d; } delete rec.pre; rec.intr = !!bot.interrupt_code; }); bot.__psnRunningSkill = par >= 0 ? __T[par].name : null; bot.__psnStackStr = __stackParts.join(' <- '); };
-    const reportFinish = () => { try { finish(); } catch (_) { queueResolve(() => { try { finish(); } catch (_) {} }); } };
+    const finishBody = () => { __harness(__stackStr, () => { rec.t1 = Date.now(); if (!n.startsWith('skills.')) rec.s1 = __st(); rec.o1 = (bot.output || '').length; bot.__psnOut = bot.output; const post = __have(); rec.delta = {}; for (const k of new Set([...Object.keys(rec.pre || {}), ...Object.keys(post)])) { const d = (post[k] || 0) - ((rec.pre || {})[k] || 0); if (d) rec.delta[k] = d; } delete rec.pre; rec.intr = !!bot.interrupt_code; }); bot.__psnRunningSkill = par >= 0 ? __T[par].name : null; bot.__psnStackStr = __stackParts.join(' <- '); };
+    const finish = () => { Promise.resolve().then(finishBody); };
     const prev = __syncParent;
     __syncParent = id;
     let r;
-    try {
-        r = __alsSafe ? __als.run(id, () => f.apply(this, a)) : f.apply(this, a);
-    } catch (e) { threw(e); reportFinish(); throw e; }
+    try { r = f.apply(this, a); }
+    catch (e) { threw(e); finish(); throw e; }
     finally { __syncParent = prev; }
     if (r === null || typeof r !== 'object' || typeof r.then !== 'function') { settle(r); finish(); return r; }
     return (async () => {
@@ -292,13 +276,10 @@ const __wrap = (n, f) => function (...a) {
         try {
             try { return settle(await r); }
             catch (e) { threw(e); throw e; }
-            finally { await bot.waitForTicks(1); reportFinish(); }
+            finally { await bot.waitForTicks(1); finish(); }
         } finally { __syncParent = prev2; }
     })();
 };`;
-    // fix40: bare-name API - builtins and learned skills both use bare names
-    // Wrap all provided names (both built-in and learned) for tracing
-    // Built-in primitives (like goToPosition) are traced with their bare name
     return wrap + '\n' + names.map(n => `${n} = __wrap(${JSON.stringify(n)}, ${n});`).join('\n');
 }
 const FAIL_LINE = /FAILED|\bfailed\b|\bneed (?:a |an )?\w+_\w+|\bno \w+ within\b|cannot|can't|not enough/i;
