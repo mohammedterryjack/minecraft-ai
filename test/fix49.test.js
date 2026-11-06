@@ -27,7 +27,7 @@ test('fix49: travelTo seeded code uses GoalNearXZ, not Vec3', async (t) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // Bug 2: craftRecipe postcondition VIOLATED after real craft success
 // Root cause: post snapshot taken before inventory settles, auto-equip reads as -1
-// Fix: (a) use __have() (inv + held + offhand) for pre/post/delta on EVERY call
+// Fix: (a) use __have() (getInventoryCounts: slots 5+ include held/offhand/armor) for pre/post/delta on EVERY call
 //      (b) await bot.waitForTicks(1) before post snapshot (one server tick, not magic timers)
 //      (c) no name gating, no try/catch fallback in __have
 // ─────────────────────────────────────────────────────────────────────────────
@@ -44,21 +44,11 @@ test('fix49: craftRecipe inventory settle and have count', async (t) => {
             'post snapshot should use __have() for delta computation');
     });
 
-    await t.test('__have = inv + held + offhand, no try/catch fallback', async () => {
+    await t.test('__have = getInventoryCounts view only (slots 5+ already hold armor, held and off-hand: no double count)', async () => {
         const fs = await import('fs');
         const skillGraphCode = fs.readFileSync('./src/agent/skill_graph.js', 'utf8');
-        
-        assert.ok(skillGraphCode.includes('__have'),
-            'should have __have function');
-        assert.ok(skillGraphCode.includes('eq.heldItem'),
-            '__have should count heldItem');
-        assert.ok(skillGraphCode.includes('eq.offHand'),
-            '__have should count offHand');
-        // No try/catch fallback in __have
-        const haveMatch = skillGraphCode.match(/const __have = \(\) => \{[^}]+\}/);
-        assert.ok(haveMatch, 'should find __have definition');
-        assert.ok(!haveMatch[0].includes('try {') && !haveMatch[0].includes('catch'),
-            '__have should NOT have try/catch fallback - let it throw');
+        assert.ok(skillGraphCode.includes('const __have = () => __inv();'),
+            '__have must be the single inventory view (fix51: no inventory+equipment double count)');
     });
 
     await t.test('waitForTicks(1) before post snapshot, no magic timers', async () => {

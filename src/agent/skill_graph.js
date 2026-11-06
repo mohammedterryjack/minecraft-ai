@@ -4,9 +4,16 @@ export function signatureOf(code, name) {
     return m ? `${name}(${m[1].replace(/\s+/g, ' ').trim()})` : `${name}(bot)`;
 }
 function stripComments(code) { return String(code).replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, ''); }
+// fix51: strip string literals so names inside strings aren't counted as dependencies
+function stripStrings(code) {
+    return String(code)
+        .replace(/`(?:[^`\\]|\\.)*`/g, '""')  // template literals
+        .replace(/"(?:[^"\\]|\\.)*"/g, '""')  // double-quoted strings
+        .replace(/'(?:[^'\\]|\\.)*'/g, '""'); // single-quoted strings
+}
 // names of library skills this code calls (excluding itself)
 export function depsOf(code, name, names) {
-    const src = stripComments(code);
+    const src = stripStrings(stripComments(code));
     const out = new Set();
     const re = /(?<![.\w])([A-Za-z_]\w*)\s*\(/g;
     let m;
@@ -84,7 +91,8 @@ export function missingCalls(code, name, names) {
         local.add(m[1]);
     }
     
-    const builtins = new Set(['if','for','while','switch','return','catch','function','await','async','Math','Promise','setTimeout','Number','String','Array','Object','Set','Map','JSON','Vec3','log','parseInt','parseFloat','isNaN','Boolean','Error','Date','require','console']);
+    // fix51: JS builtins derived from the real global object (isFinite, encodeURIComponent, ...), not a hand list
+    const builtins = new Set(Object.getOwnPropertyNames(globalThis));
     const out = new Set();
     const re = /(?<![.\w])([a-z]\w*[A-Z]\w*)\s*\(/g;   // camelCase bare calls only
     let m;
@@ -161,12 +169,12 @@ export function gateLog(msg) { console.log('[gate] ' + msg); }
 export function instrumentSrc(names) {
     // fix11 (B6): parent call tracked with AsyncLocalStorage (bot.__psnALS, set by voyager.js before each run; fix12: SES compartments have their own globalThis), so parallel calls get the right parent
     // fix43: __st() now includes equipment state (eq) so equip skill contracts can be idempotent (already-equipped = success)
-    // fix49: __have() = inv + held + offhand for pre/post/delta (auto-equip yields +1, not -1)
+    // fix49/fix51: __have() = getInventoryCounts (slots 5+ already include armor, held hotbar slot and off-hand: counting eq again double-counts)
     //        waitForTicks(1) before post snapshot (one server tick, not magic timers)
     const wrap = `const __T = bot.__psnTrace = []; const __als = bot.__psnALS; if (!__als) throw new Error('PSN trace: bot.__psnALS (AsyncLocalStorage) missing'); const __inv = () => { try { return world.getInventoryCounts(bot); } catch { return {}; } };
 const __eq = () => { const s = bot.inventory.slots; return { heldItem: s[bot.quickBarSlot + 36]?.name || null, offHand: s[45]?.name || null, helmet: s[5]?.name || null, chestplate: s[6]?.name || null, leggings: s[7]?.name || null, boots: s[8]?.name || null }; };
-const __have = () => { const inv = __inv(), eq = __eq(), h = {...inv}; if (eq.heldItem) h[eq.heldItem] = (h[eq.heldItem] || 0) + 1; if (eq.offHand) h[eq.offHand] = (h[eq.offHand] || 0) + 1; return h; };
-const __st = () => { try { const p = bot.entity.position, b = bot.blockAt(p.floored().offset(0, 1, 0)), inv = __inv(), eq = __eq(), have = __have(); return { pos: { x: p.x, y: p.y, z: p.z }, hp: bot.health, food: bot.food, sky: b ? b.skyLight : null, alive: bot.health > 0, dim: String(bot.game?.dimension || ''), inv, eq, have }; } catch (e) { return { err: String(e?.message || e) }; } };
+const __have = () => __inv();
+const __st = () => { try { const p = bot.entity.position, b = bot.blockAt(p.floored().offset(0, 1, 0)); return { pos: { x: p.x, y: p.y, z: p.z }, hp: bot.health, food: bot.food, oxygen: bot.oxygenLevel, sky: b ? b.skyLight : null, alive: bot.health > 0, dim: String(bot.game?.dimension || ''), inv: __inv(), eq: __eq() }; } catch (e) { return { err: String(e?.message || e) }; } };
 const __wrap = (n, f) => async function (...a) {
     if (__T.length >= 1500) return await f.apply(this, a);
     const par = __als.getStore() ?? -1;
@@ -174,7 +182,14 @@ const __wrap = (n, f) => async function (...a) {
     if (!n.startsWith('skills.')) rec.s0 = __st();
     const id = __T.push(rec) - 1;
     try { const r = await __als.run(id, () => f.apply(this, a)); rec.ret = r === undefined ? 'undefined' : String(JSON.stringify(r)).slice(0, 60); rec.rv = r === null || typeof r !== 'object' ? r : null; rec.fail = r === false || r === null || r === 0; return r; }
-    catch (e) { rec.fail = true; rec.err = String(e?.message || e).slice(0, 200); throw e; }
+    catch (e) {
+        rec.fail = true;
+        const msg = String(e?.message || e);
+        rec.err = msg;
+        bot.output = bot.output + '\nFAILED: ' + n + ' threw ' + msg + '\n';
+        rec.rv = false;
+        return false;
+    }
     finally { await bot.waitForTicks(1); rec.t1 = Date.now(); if (!n.startsWith('skills.')) rec.s1 = __st(); rec.o1 = (bot.output || '').length; bot.__psnOut = bot.output; const post = __have(); rec.delta = {}; for (const k of new Set([...Object.keys(rec.pre), ...Object.keys(post)])) { const d = (post[k] || 0) - (rec.pre[k] || 0); if (d) rec.delta[k] = d; } delete rec.pre; rec.intr = !!bot.interrupt_code; }
 };`;
     // fix40: bare-name API - builtins and learned skills both use bare names

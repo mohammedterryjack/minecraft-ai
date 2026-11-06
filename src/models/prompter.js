@@ -73,7 +73,6 @@ export class Prompter {
                 catch (e) { console.warn(`[prompter] failed to configure free fallback coder: ${e.message}`); }
             }
             this.code_model = new CodeModel(createModel(code_model_profile), 60 * 60 * 1000, 'code-model', freeFallback);
-            if (code_model_profile.api === 'cursor') this.code_model.timeoutMs = 180 * 1000;
         }
         else {
             this.code_model = this.chat_model;

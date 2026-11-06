@@ -182,7 +182,8 @@ describe('fix45: already-have goal satisfaction', () => {
         mockVoyager.npGraph = { consumesOf: () => ({}), getProducersOf: () => [], getRequirementsOf: () => [] };
         
         const state = {
-            inventory: { iron_pickaxe: 1 }
+            inventory: { iron_pickaxe: 1 },
+            equipment: { hand: 'empty', off_hand: 'empty', head: 'empty', torso: 'empty', legs: 'empty', feet: 'empty' }
         };
         
         const result = mockVoyager._goalAlreadySatisfied('obtain 1 iron_pickaxe', state);
@@ -200,7 +201,8 @@ describe('fix45: already-have goal satisfaction', () => {
         mockVoyager.npGraph = { consumesOf: () => ({}), getProducersOf: () => [], getRequirementsOf: () => [] };
         
         const state = {
-            inventory: { iron_pickaxe: 0 }
+            inventory: { iron_pickaxe: 0 },
+            equipment: { hand: 'empty', off_hand: 'empty', head: 'empty', torso: 'empty', legs: 'empty', feet: 'empty' }
         };
         
         const result = mockVoyager._goalAlreadySatisfied('obtain 1 iron_pickaxe', state);
@@ -217,7 +219,8 @@ describe('fix45: already-have goal satisfaction', () => {
         mockVoyager.npGraph = { consumesOf: () => ({}), getProducersOf: () => [], getRequirementsOf: () => [] };
         
         const state = {
-            inventory: { cobblestone: 64, stone: 10 }
+            inventory: { cobblestone: 64, stone: 10 },
+            equipment: { hand: 'empty', off_hand: 'empty', head: 'empty', torso: 'empty', legs: 'empty', feet: 'empty' }
         };
         
         const result = mockVoyager._goalAlreadySatisfied('mine 20 cobblestone', state);
@@ -237,7 +240,7 @@ describe('fix45: already-have goal satisfaction', () => {
         mockVoyager.progress = { completed: [], failed: [] };
         mockVoyager._saveProgress = () => {};
         
-        const satisfied = mockVoyager._goalAlreadySatisfied('obtain 1 iron_pickaxe', { inventory: { iron_pickaxe: 1 } });
+        const satisfied = mockVoyager._goalAlreadySatisfied('obtain 1 iron_pickaxe', { inventory: { iron_pickaxe: 1 }, equipment: { hand: 'empty', off_hand: 'empty', head: 'empty', torso: 'empty', legs: 'empty', feet: 'empty' } });
         
         if (satisfied.satisfied) {
             mockVoyager.progress.completed.push('obtain 1 iron_pickaxe');

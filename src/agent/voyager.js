@@ -7,6 +7,7 @@ import settings from '../../settings.js';
 //   - AWM repair/workflow memory (https://arxiv.org/abs/2409.07429)
 //   - SkillWeaver-style idle practice (https://arxiv.org/abs/2504.07079)
 import { AsyncLocalStorage } from 'async_hooks';
+import * as acorn from 'acorn';
 import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, renameSync, statSync, copyFileSync, truncateSync, appendFileSync, readdirSync } from 'fs';
 import { NeedsProducesGraph } from './needs_produces.js';
 import { RepairMemory } from './repair_memory.js';
@@ -150,18 +151,25 @@ export function parseNumberWord(word) {
 
 function countGoal(task) {
     // fix47: support both numeric ("5") and word ("five") counts
-    const m = task.match(/^(mine|collect|gather|craft|smelt|obtain|get|chop|cook)\s+(\d+|[a-z]+)\s+([a-z_]+)\b/i);
+    const m = task.match(/^(mine|collect|gather|craft|smelt|obtain|get|chop|cook)\s+(\d+|[a-z]+)\s+([a-z_ ]+)/i);
     if (!m) return null;
     const verb = m[1].toLowerCase();
     const countParsed = parseNumberWord(m[2]);
     if (countParsed === null) return null;  // not a valid number
-    let item = m[3].toLowerCase();
-    // plural item names from the curriculum ("torches", "sticks") -> registry id
-    // fix49: fail loud if VERSION is not set (no fallback) - throw like ensureGoal does
+    // fix51: item = longest leading word run that is a registry item/block ("iron pickaxe" -> iron_pickaxe, never "iron")
+    // fix49: fail loud if VERSION is not set (no fallback)
     if (!VERSION) throw new Error(`[fix49] LOUD FAIL: countGoal called but VERSION is null - bot version must be set before parsing goals`);
     const md = minecraftData(VERSION);
-    { const irr = { torches: 'torch' }; if (irr[item]) item = irr[item];
-      else if (!md.itemsByName[item] && item.endsWith('s') && md.itemsByName[item.slice(0, -1)]) item = item.slice(0, -1); }
+    const words = m[3].toLowerCase().trim().split(/[\s_]+/);
+    const inReg = n => Boolean(md.itemsByName[n] || md.blocksByName[n]);
+    let item = null;
+    for (let k = words.length; k > 0 && !item; k--) {
+        const cand = words.slice(0, k).join('_');
+        if (inReg(cand)) item = cand;
+        else if (cand.endsWith('s') && inReg(cand.slice(0, -1))) item = cand.slice(0, -1);
+        else if (cand.endsWith('es') && inReg(cand.slice(0, -2))) item = cand.slice(0, -2);
+    }
+    if (!item) return null;
     // mining a block counts its loot drops too (iron_ore -> raw_iron, coal_ore -> coal, stone -> cobblestone)
     let items = [item];
     if (['mine', 'collect', 'gather', 'chop', 'get', 'obtain'].includes(verb)) {
@@ -265,8 +273,31 @@ export function parseVerboseGoal(task) {
         }
     }
     
+    // fix51: try camelCase skill names like "craftIronHelmet" -> iron_helmet (count defaults to 1)
+    // Try every contiguous span of camel-parts against minecraft-data names, longest first
     if (candidates.length === 0) {
-        console.log(`[fix46] LOUD: parseVerboseGoal failed for "${task.slice(0, 100)}": no valid item name found in registry`);
+        const camelParts = task.match(/[A-Z]?[a-z0-9]+/g);
+        if (camelParts && camelParts.length >= 1) {
+            // Try all contiguous spans, longest first (greedy)
+            for (let len = camelParts.length; len > 0; len--) {
+                for (let start = 0; start <= camelParts.length - len; start++) {
+                    const span = camelParts.slice(start, start + len);
+                    const itemName = span.map(p => p.toLowerCase()).join('_');
+                    const resolved = resolveItem(itemName);
+                    if (resolved) {
+                        console.log(`[fix51] parsed camelCase "${task}" -> ${resolved} (count 1)`);
+                        return { count: 1, item: resolved, items: [resolved] };
+                    }
+                }
+            }
+        }
+    }
+    
+    if (candidates.length === 0) {
+        // fix51: enhanced LOUD logging - include full goal text and log to file for analysis
+        console.log(`[fix46] LOUD: parseVerboseGoal failed for "${task}": no valid item name found in registry`);
+        mkdirSync('./bots', { recursive: true });
+        appendFileSync(`./bots/parseVerboseGoal_failures.jsonl`, JSON.stringify({ at: new Date().toISOString(), task, version: VERSION }) + '\n');
         return null;
     }
     
@@ -734,10 +765,49 @@ export class Voyager {
         const graph = this._graph();
         const allCycles = findAllCycles(graph);
         if (allCycles.length > 0) {
-            const cycleStrs = allCycles.map(c => c.join(' -> ')).join('; ');
-            const msg = `[psn] DEPENDENCY CYCLES DETECTED: ${cycleStrs}`;
-            console.error(msg);
-            throw new Error(msg);
+            // fix51: one-time data migration - demote promoted skills that create cycles back to prev/handwritten_original
+            let demoted = 0;
+            for (const cycle of allCycles) {
+                for (const skillName of cycle) {
+                    const s = this.skills.find(x => x.name === skillName);
+                    if (!s || s.seeded || s.primitive) continue;
+                    // If this skill has a prev or handwritten_original, demote to it
+                    if (s.prev || s.handwritten_original) {
+                        const restore = s.handwritten_original || s.prev;
+                        console.log(`[fix51] DEMOTING ${skillName} back to prev version (cycle: ${cycle.join(' -> ')})`);
+                        s.code = restore.code;
+                        s.description = restore.description;
+                        s.deps = restore.deps;
+                        delete s.candidate;
+                        s.demoted = false;
+                        demoted++;
+                    }
+                }
+            }
+            if (demoted > 0) {
+                this._saveSkills();
+                // Recalculate deps and re-check cycles after demoting
+                for (const s of this.skills) {
+                    if (s.seeded) continue;
+                    const d = depsOf(s.code, s.name, names);
+                    s.deps = d;
+                }
+                const graphAfter = this._graph();
+                const cyclesAfter = findAllCycles(graphAfter);
+                if (cyclesAfter.length === 0) {
+                    console.log(`[fix51] demoted ${demoted} skill(s), cycles resolved`);
+                } else {
+                    const cycleStrs = cyclesAfter.map(c => c.join(' -> ')).join('; ');
+                    const msg = `[psn] DEPENDENCY CYCLES PERSIST after demoting ${demoted} skill(s): ${cycleStrs}`;
+                    console.error(msg);
+                    throw new Error(msg);
+                }
+            } else {
+                const cycleStrs = allCycles.map(c => c.join(' -> ')).join('; ');
+                const msg = `[psn] DEPENDENCY CYCLES DETECTED: ${cycleStrs}`;
+                console.error(msg);
+                throw new Error(msg);
+            }
         }
         // Original per-skill cycle check (kept for completeness)
         for (const s of this.skills) { const c = findCycle(s.name, s.deps, this._graph(s.name)); if (c) throw new Error(`[psn] relink: dependency cycle ${c.join(' -> ')}`); }
@@ -861,6 +931,134 @@ Use only c; no other globals.`;
         try { for (const k of ['pre', 'post']) { const r = this._compileContract(ct[k])(c); if (typeof r !== 'boolean') return `${k} returned ${typeof r}, not boolean`; } } catch (e) { return `throws: ${e.message}`; }
         return null;
     }
+    // fix51: parse a contract with acorn; returns { root, param, src } where root is the contract function node
+    _parseContract(contractSrc) {
+        const src = String(contractSrc);
+        const ast = acorn.parse(`(${src})`, { ecmaVersion: 'latest' });
+        const root = ast.body[0].expression;
+        if (!root.params) throw new Error(`contract is not a function: ${src}`);
+        const param = root.params.length ? root.params[0] : null;
+        if (param && param.type !== 'Identifier') throw new Error(`contract parameter is not an identifier: ${src}`);
+        return { root, param: param ? param.name : null, src: `(${src})` };
+    }
+    // fix51: member path rooted at the contract parameter, e.g. c.post.inv.stone -> ['post','inv','stone']; dynamic keys -> '*'
+    _contractPath(node, param) {
+        const keys = [];
+        let n = node;
+        while (n.type === 'MemberExpression') {
+            if (!n.computed) keys.unshift(n.property.name);
+            else if (n.property.type === 'Literal') keys.unshift(String(n.property.value));
+            else keys.unshift('*');
+            n = n.object;
+        }
+        if (n.type !== 'Identifier' || n.name !== param) return null;
+        return keys;
+    }
+    _walkAst(node, visit) {
+        if (!node || typeof node.type !== 'string') return;
+        visit(node);
+        for (const v of Object.values(node)) {
+            if (Array.isArray(v)) { for (const x of v) this._walkAst(x, visit); }
+            else if (v && typeof v === 'object' && typeof v.type === 'string') this._walkAst(v, visit);
+        }
+    }
+    // fix51: extract fields the postcondition reads (acorn AST over MemberExpressions on the contract parameter)
+    // Returns { delta: ['stone', '*'], pos, hp, food, inv: [...], eq: [...], dist, ret }
+    _extractPostFields(postSrc) {
+        const fields = { delta: [], pos: false, hp: false, food: false, inv: [], eq: [], dist: false, ret: false };
+        const { root, param } = this._parseContract(postSrc);
+        if (param === null) return fields;
+        this._walkAst(root.body, node => {
+            if (node.type !== 'MemberExpression') return;
+            const p = this._contractPath(node, param);
+            if (!p) return;
+            if (p[0] === 'delta' && p.length === 2) fields.delta.push(p[1]);
+            else if (p[0] === 'dist' && p.length === 1) fields.dist = true;
+            else if (p[0] === 'ret' && p.length === 1) fields.ret = true;
+            else if ((p[0] === 'post' || p[0] === 'pre') && p.length >= 2) {
+                if (p[1] === 'pos') fields.pos = true;
+                else if (p[1] === 'hp') fields.hp = true;
+                else if (p[1] === 'food') fields.food = true;
+                else if (p[1] === 'inv' && p.length === 3) fields.inv.push(p[2]);
+                else if (p[1] === 'eq' && p.length === 3) fields.eq.push(p[2]);
+            }
+        });
+        fields.delta = [...new Set(fields.delta)]; fields.inv = [...new Set(fields.inv)]; fields.eq = [...new Set(fields.eq)];
+        return fields;
+    }
+    // fix51: observation-based contract mismatch detection
+    // When post fails, check if post references fields that didn't change while other fields did change
+    // This detects contracts that don't match what the skill actually does, without using name patterns
+    _detectContractMismatch(e, r, postFailed) {
+        if (!postFailed || !e?.contract?.post || !r.s0 || !r.s1) return null;
+        const fields = this._extractPostFields(e.contract.post);
+        
+        // Compute what actually changed (r.delta is always set by __wrap in skill_graph.js)
+        const deltaEmpty = Object.keys(r.delta).length === 0;
+        const posMoved = r.s0.pos && r.s1.pos && 
+            (Math.abs(r.s1.pos.x - r.s0.pos.x) > 1 || Math.abs(r.s1.pos.y - r.s0.pos.y) > 1 || Math.abs(r.s1.pos.z - r.s0.pos.z) > 1);
+        const hpChanged = r.s0.hp !== r.s1.hp;
+        const foodChanged = r.s0.food !== r.s1.food;
+        const eqChanged = JSON.stringify(r.s0.eq) !== JSON.stringify(r.s1.eq);
+        
+        // Build observed changes summary
+        const changed = [];
+        const unchanged = [];
+        if (posMoved) changed.push('position'); else unchanged.push('position');
+        if (!deltaEmpty) changed.push(`delta(${Object.keys(r.delta).join(',')})`); else unchanged.push('delta');
+        if (hpChanged) changed.push('hp');
+        if (foodChanged) changed.push('food');
+        if (eqChanged) changed.push('equipment');
+        
+        // Detect mismatch: post checks fields that didn't change, but other fields did change
+        const postChecksDelta = fields.delta.length > 0;
+        const postChecksPos = fields.pos || fields.dist;
+        
+        // Case: post checks delta but delta is empty, and position changed
+        if (postChecksDelta && deltaEmpty && posMoved && !postChecksPos) {
+            return `postcondition checks delta fields [${fields.delta.join(',')}] but delta was empty; position changed. Contract doesn't match skill behavior. Changed: ${changed.join(', ')}; Unchanged: ${unchanged.join(', ')}`;
+        }
+        // Case: post checks position but position didn't change, and delta changed
+        if (postChecksPos && !posMoved && !deltaEmpty && !postChecksDelta) {
+            return `postcondition checks position but position didn't change; delta changed [${Object.keys(r.delta).join(',')}]. Contract doesn't match skill behavior. Changed: ${changed.join(', ')}; Unchanged: ${unchanged.join(', ')}`;
+        }
+        // Case: post checks specific delta items that aren't in actual delta, but other things changed
+        if (postChecksDelta && !fields.delta.includes('*')) {
+            const checkedButMissing = fields.delta.filter(item => !r.delta[item]);
+            if (checkedButMissing.length === fields.delta.length && changed.length > 0) {
+                return `postcondition checks delta items [${fields.delta.join(',')}] but none were in actual delta; other state changed. Changed: ${changed.join(', ')}; Unchanged: ${unchanged.join(', ')}`;
+            }
+        }
+        return null;
+    }
+    // fix51: analyze why a contract failed: walk comparison nodes (acorn) whose side reads the contract parameter and report actual values
+    _analyzeContractFailure(contractSrc, c, r) {
+        const { root, param, src } = this._parseContract(contractSrc);
+        const parts = [];
+        const COMPARE = new Set(['<', '<=', '>', '>=', '==', '===', '!=', '!==']);
+        if (param !== null) this._walkAst(root.body, node => {
+            if (node.type !== 'BinaryExpression' || !COMPARE.has(node.operator)) return;
+            const expected = src.slice(node.right.start, node.right.end);
+            const lhs = node.left;
+            if (lhs.type === 'CallExpression') {
+                const cp = this._contractPath(lhs.callee, param);
+                if (cp && cp.length === 1 && cp[0] === 'dist') parts.push(`dist(pre.pos,post.pos)=${c.dist(c.pre.pos, c.post.pos).toFixed(1)} (expected ${node.operator}${expected})`);
+                return;
+            }
+            if (lhs.type !== 'MemberExpression') return;
+            const p = this._contractPath(lhs, param);
+            if (!p || p.includes('*')) return;
+            let v = c;
+            for (const k of p) { if (v === null || v === undefined) break; v = v[k]; }
+            parts.push(`c.${p.join('.')}=${v === undefined ? 'undefined' : JSON.stringify(v)} (expected ${node.operator}${expected})`);
+        });
+        if (parts.length === 0) {
+            const deltaKeys = Object.keys(c.delta);
+            const deltaStr = deltaKeys.length ? deltaKeys.map(k => `${k}:${c.delta[k]}`).join(',') : 'empty';
+            return `delta={${deltaStr}}, ret=${c.ret}, alive=${c.post.alive}`;
+        }
+        return parts.join('; ');
+    }
     // evaluate contracts on every traced library call; violations become contract failures in the trace
     _checkContracts(trace, taskOk) {
         const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
@@ -868,8 +1066,12 @@ Use only c; no other globals.`;
             if (r.intr || !r.s0 || !r.s1) continue;
             const e = this.skills.find(s => s.name === r.name);
             if (!e?.contract) continue;
-            const c = { args: r.argv || [], ret: r.rv, pre: r.s0, post: r.s1, delta: r.delta || {}, dist };
+            const c = { args: r.argv, ret: r.rv, pre: r.s0, post: r.s1, delta: r.delta, dist };
             for (const k of ['pre', 'post']) {
+                // fix51: when skill explicitly returns false, skip postcondition checking
+                // The skill already signaled failure; evaluating post would just mark VIOLATED for expected failure
+                // This fixes craftSticks/tossClutter VIOLATED when they legitimately can't succeed
+                if (k === 'post' && r.rv === false) continue;
                 let ok;
                 try { ok = this._compileContract(e.contract[k])(c); }
                 catch (err) { console.log(`!!! [contract] ${e.name}.${k} THREW: ${err.message}; queued contract repair`); this._queueContractFix(e, `${k} threw: ${err.message}`); continue; }
@@ -886,9 +1088,28 @@ Use only c; no other globals.`;
                         continue;
                     }
                 }
+                // fix51: observation-based contract mismatch detection (no name patterns)
+                // If post checks fields that didn't change but other fields did, the contract doesn't match the skill
+                if (k === 'post') {
+                    const mismatch = this._detectContractMismatch(e, r, true);
+                    if (mismatch) {
+                        console.log(`[contract] MISMATCH ${e.name}: ${mismatch}`);
+                        this._queueContractFix(e, mismatch);
+                        continue;
+                    }
+                }
                 r.ok = false; r.fail = true; if (k === 'pre') r.preFail = true;
                 r.ownFail = [...(r.ownFail || []), `${k === 'pre' ? 'PRECONDITION' : 'POSTCONDITION'} violated: ${e.contract.text || e.contract[k]} (post pos ${r.s1.pos ? [r.s1.pos.x, r.s1.pos.y, r.s1.pos.z].map(Math.round).join(',') : '?'}, sky ${r.s1.sky}, alive ${r.s1.alive})`];
-                console.log(`[contract] ${e.name}(${(r.argv || []).join(',')}) ${k}condition VIOLATED: ${e.contract[k].slice(0, 160)}`);
+                // fix51: enhanced VIOLATED logging with exact context for debugging
+                const stateInfo = `pre.inv=${JSON.stringify(r.s0.inv)}, post.inv=${JSON.stringify(r.s1.inv)}, delta=${JSON.stringify(r.delta)}`;
+                // fix51: analyze why the contract failed by evaluating sub-expressions
+                const analysis = this._analyzeContractFailure(e.contract[k], c, r);
+                console.log(`[contract] VIOLATED ${e.name}(${r.argv.join(',')}) ${k}condition: ${e.contract[k]}`);
+                console.log(`[contract] VIOLATED analysis: ${analysis}`);
+                console.log(`[contract] VIOLATED context: task=${this.currentTask}, ${stateInfo}`);
+                // Log to file for next run analysis
+                mkdirSync(`./bots/${this.agent.name}`, { recursive: true });
+                appendFileSync(`./bots/${this.agent.name}/violated_contracts.jsonl`, JSON.stringify({ at: new Date().toISOString(), skill: e.name, field: k, contract: e.contract[k], args: r.argv, task: this.currentTask, analysis, state: { pre: r.s0, post: r.s1, delta: r.delta } }) + '\n');
                 // the task outcome disagrees with the contract: the contract itself may be wrong -> it is repairable
                 if (taskOk && k === 'post' && r.parent < 0) this._queueContractFix(e, `postcondition failed but the task check passed`);
             }
@@ -976,6 +1197,8 @@ Use only c; no other globals.`;
     async _run(label, fn, timeout) {
         // fix42: populate bot.__safeToToss before any skill run (for tossClutter/freeInventory)
         this._prepareTossSignals();
+        // fix51: track inventory+equipment before run for death item-drop reporting (same view as satisfaction check)
+        this._beforeRunInv = this._getInventoryWithEquipment();
         // fix28: progress = position, inventory, health, food, open-window contents (crafting/furnace UI) or a lit furnace/smoker nearby (smelting wait)
         const bot = this.agent.bot;
         const lit = () => !!bot.findBlock({ matching: b => /furnace|smoker/.test(b.name) && b.getProperties?.().lit === true, maxDistance: 6 });
@@ -994,12 +1217,22 @@ Use only c; no other globals.`;
     _diedInRun() { const d = this.agent.lastDeath; return d && d.t >= (this._runStart || Infinity) ? d : null; }
     _interruptReason(output = '') {
         const died = this._diedInRun();
-        if (died) return `died: ${died.message} at ${died.pos}${this._deathDetail(died)}`;
-        const st = this._stalledInRun(); if (st) return `stalled: no progress (no new ground reached, inventory, window, lit furnace) for 60s at ${st.pos}`;
-        const bot = this.agent.bot, p = bot.entity.position, by = this.agent.actions.lastInterruptBy || 'unknown';
+        // fix51: set structured kind field (no text parsing needed later)
+        if (died) {
+            this._lastCutKind = 'death';
+            return `died: ${died.message} at ${died.pos}${this._deathDetail(died, this._beforeRunInv)}`;
+        }
+        const st = this._stalledInRun();
+        if (st) {
+            this._lastCutKind = 'stall';
+            return `stalled: no progress (no new ground reached, inventory, window, lit furnace) for 60s at ${st.pos}`;
+        }
+        const bot = this.agent.bot, p = bot.entity.position, by = this.agent.actions.lastInterruptBy;
+        if (!by) throw new Error('_interruptReason called but no interrupt source (lastInterruptBy missing)');
         const s = this._surfaceY(p.x, p.z), under = s !== null && p.y < s - 4;
         const travelling = /travelTo|goToPosition|goToSurface|path|Moving|travell/i.test(String(output).slice(-800));
         const what = by === 'mode:unstuck' ? 'stuck' : `cut off by ${by}`;
+        this._lastCutKind = 'interrupt';
         return `interrupted: ${what}${travelling ? ' while travelling' : ''}${under ? ` (underground: y=${Math.floor(p.y)}, surface y=${s})` : ''}`;
     }
 
@@ -1014,17 +1247,42 @@ Use only c; no other globals.`;
     }
 
     // fix28: 1 Hz motion/health samples so a death carries fall height and the damage that preceded it
+    // fix51: also samples oxygen_level (bot.oxygenLevel) for drowning analysis
     _sample() {
         const bot = this.agent.bot, now = Date.now(); if (!bot?.entity || now - (this._lastSample || 0) < 1000) return; this._lastSample = now;
-        const p = bot.entity.position, h = bot.health, prev = (this._samples ||= []).slice(-1)[0];
+        const p = bot.entity.position, h = bot.health, o = bot.oxygenLevel, prev = (this._samples ||= []).slice(-1)[0];
         const hit = prev && h < prev.h ? { t: now, dmg: +(prev.h - h).toFixed(1), near: (() => { const e = bot.nearestEntity(x => x !== bot.entity && x.type !== 'object' && x.position.distanceTo(p) < 8); return e ? `${e.name || e.username} ${e.position.distanceTo(p).toFixed(0)}m` : 'no entity within 8m'; })(), onGround: bot.entity.onGround, inLava: !!bot.entity.isInLava, inWater: !!bot.entity.isInWater } : null;
-        this._samples.push({ t: now, y: p.y, h, hit }); if (this._samples.length > 30) this._samples.shift();
+        this._samples.push({ t: now, y: p.y, h, o, hit }); if (this._samples.length > 30) this._samples.shift();
     }
-    _deathDetail(d) {
+    // fix51: _deathDetail now accepts optional beforeInv to compute items dropped on death
+    _deathDetail(d, beforeInv = null) {
         const ss = (this._samples || []).filter(x => x.t >= d.t - 10e3 && x.t <= d.t + 1500); if (!ss.length) return '';
         const dy = +d.pos.split(',')[1], fall = Math.max(0, Math.round(Math.max(...ss.map(x => x.y)) - dy));
         const hits = ss.filter(x => x.hit).map(x => `-${x.hit.dmg}hp (${x.hit.near}${x.hit.inLava ? ', in lava' : ''}${x.hit.inWater ? ', in water' : ''}${x.hit.onGround ? '' : ', airborne'})`);
-        return `; fall height ${fall} blocks in the last 10s; damage taken: ${hits.length ? hits.join(', ') : 'none sampled'}`;
+        // fix51: report observed oxygen trend (no threshold classification)
+        const oxygenSamples = ss.filter(x => typeof x.o === 'number');
+        let oxygenTrend = '';
+        if (oxygenSamples.length >= 2) {
+            const first = oxygenSamples[0].o, last = oxygenSamples[oxygenSamples.length - 1].o;
+            const minO = Math.min(...oxygenSamples.map(x => x.o));
+            if (first !== last || minO < first) {
+                const elapsed = Math.round((oxygenSamples[oxygenSamples.length - 1].t - oxygenSamples[0].t) / 1000);
+                oxygenTrend = `; oxygen ${first} -> ${last} (min ${minO}) over ${elapsed}s`;
+            }
+        }
+        // fix51: compute items dropped on death (inventory+equipment delta, same view as satisfaction check)
+        let itemsLost = '';
+        if (beforeInv) {
+            const afterInv = this._getInventoryWithEquipment();
+            const lost = [];
+            for (const [item, beforeCount] of Object.entries(beforeInv)) {
+                const afterCount = afterInv[item] || 0;
+                const delta = beforeCount - afterCount;
+                if (delta > 0) lost.push(`${item}:${delta}`);
+            }
+            if (lost.length > 0) itemsLost = `; items dropped: ${lost.join(', ')}`;
+        }
+        return `; fall height ${fall} blocks in the last 10s; damage taken: ${hits.length ? hits.join(', ') : 'none sampled'}${oxygenTrend}${itemsLost}`;
     }
     update() {
         try { this._sample(); } catch (e) { console.log('[death] sampler error: ' + e.message); }
@@ -1077,6 +1335,8 @@ Use only c; no other globals.`;
             food_max: skills.VITALS_MAX.food,
             health_value: Math.round(bot.health),
             health_max: skills.VITALS_MAX.health,
+            // fix51: oxygen level as protocol value (300 = full breath, decreases when submerged, 0 = drowning damage)
+            oxygen_level: bot.oxygenLevel,
             inventory: world.getInventoryCounts(bot),  // fix41: host code uses world. prefix
             inventory_slots: `${usedSlots}/${totalSlots}`,
             empty_inventory_slots: emptySlots,
@@ -1097,6 +1357,11 @@ Use only c; no other globals.`;
             death_hotspots: this._deathHotspots(),
         };
     }
+    // fix51: get inventory+equipment combined view (same as satisfaction check uses for __have)
+    _getInventoryWithEquipment() {
+        // fix51: getInventoryCounts reads slots 5..45, which already include armour (5-8), hotbar/held (36-44) and off-hand (45)
+        return world.getInventoryCounts(this.agent.bot);
+    }
     // fix19 (6): places where the bot died 2+ times (16-block cells): a problem for the curriculum to learn to handle, no reflex
     _deathHotspots() {
         const hs = Object.values(this.progress.deathSpots || {}).filter(c => c.n >= 2).sort((a, b) => b.n - a.n).slice(0, 3);
@@ -1106,7 +1371,8 @@ Use only c; no other globals.`;
         const [x, y, z] = d.pos.split(',').map(Number), k = `${Math.floor(x / 16)},${Math.floor(z / 16)}`;
         const c = ((this.progress.deathSpots ||= {})[k] ||= { n: 0, pos: d.pos, causes: [], tasks: [] });
         c.n++; c.last = Date.now(); c.times = [...(c.times || []), c.last].slice(-20); c.pos = d.pos; c.causes = [...c.causes, d.message].slice(-5); c.tasks = [...c.tasks, task].slice(-5); this._saveProgress();
-        console.log(`[psn] death during "${task}": ${d.message} at ${d.pos}${this._deathDetail(d)} (death #${c.n} in this area)${c.n >= 2 ? '; surfaced to the curriculum as a death hotspot' : ''}`);
+        // fix51: pass beforeInv for items-dropped reporting
+        console.log(`[psn] death during "${task}": ${d.message} at ${d.pos}${this._deathDetail(d, this._beforeRunInv)} (death #${c.n} in this area)${c.n >= 2 ? '; surfaced to the curriculum as a death hotspot' : ''}`);
     }
     // fix18: perception only (no policy): hostiles within 32 blocks, nearest first
     _threats() {
@@ -1169,10 +1435,10 @@ Use only c; no other globals.`;
     // fix47: compact state format for efficient prompts (one line, critical info only)
     // Includes full inventory as k:v pairs (no slice - hiding items causes bugs like raw_iron:28 invisible)
     _compactState(s) {
-        const inv = s.inventory || {};
+        const inv = s.inventory;
         const items = Object.entries(inv).sort((a, b) => b[1] - a[1]);
         const invSummary = items.length ? items.map(([k, v]) => `${k}:${v}`).join(',') : 'empty';
-        const eq = s.equipment || {};
+        const eq = s.equipment;
         const held = eq.hand !== 'empty' ? eq.hand : '';
         return `pos:(${s.position}) biome:${s.biome} time:${(s.time || '').split(' ')[0]} hp:${s.health_value}/${s.health_max} food:${s.food_value}/${s.food_max} inv:${s.inventory_slots},${s.empty_inventory_slots}empty${held ? ` held:${held}` : ''} threats:${s.threats || 'none'} items:[${invSummary}]`;
     }
@@ -1390,16 +1656,25 @@ Use only c; no other globals.`;
         const cut = res.interrupted || this._diedInRun() || this._stalledInRun() ? this._interruptReason(res.message) : '';   // fix14: a cut-off replay is a failure
         if (this._diedInRun()) this._noteDeath(this._diedInRun(), task);
         if (cut) { ok = false; console.log(`[voyager] replay ${r.name} ${cut}; counting as a failure`); } else
+        if (!res.success) { ok = false; console.log(`[voyager] replay ${r.name} EXEC_FAILED: ${String(res.message)}`); } else
         if (r.free) { const e = this.agent.bot.inventory.emptySlotCount(); ok = e >= r.free; console.log(`[voyager] inventory check: ${e} empty slots (need ${r.free})`); }
         else if (r.at) { const p = this.agent.bot.entity.position; ok = Math.hypot(p.x - r.at.x, p.z - r.at.z) <= 8; }
         else if (goal && ['mine','collect','gather','chop','craft','smelt','cook','get','obtain'].includes(goal.verb)) ok = gainedFor(goal, before, after) >= goal.count;
-        else if (entry?.effects?.length) {   // PSN rule-based effect check: the skill's recorded expected effects must show up again
-            const gotten = entry.effects.filter(it => (after.inventory[it] || 0) > (before.inventory[it] || 0));
-            ok = gotten.length > 0;
-            console.log(`[psn] effect check ${r.name}: expected +[${entry.effects.join(', ')}], got +[${gotten.join(', ')}] -> ${ok}`);
+        else {
+            const resolvedGoal = this._resolveGoalItemUnified(task);
+            if (!resolvedGoal) {
+                console.log(`[psn] LOUD: cannot resolve goal product item from task "${task}" — replay NOT satisfied`);
+                ok = false;
+            } else {
+                // fix51: inventory counts already include held/worn/off-hand slots (slots 5..45); exact item name only
+                const haveNow = after.inventory[resolvedGoal.item] || 0;
+                const targetCount = resolvedGoal.count || 1;
+                ok = haveNow >= targetCount;
+                console.log(`[psn] fix51 goal check: ${resolvedGoal.item} have=${haveNow} target=${targetCount} -> ${ok}`);
+            }
         }
-        else if (this._postHolds(entry)) { ok = true; console.log(`[psn] learned postcondition of ${r.name} holds; critic skipped`); }
-        else { const v = await this.critique(task, before, after, extractFeedback(res.message, 1500)); ok = !!v.success; }   // fix38: preserve FAILED lines
+        if (!ok) this._tryDecomposePrerequisiteFailure(task);
+        else delete this.agent.bot.__prereqFail;
         // fix44: pass goal items to filter learned effects and produces (denoise)
         const goalItems = goal?.items || (goal?.item ? [goal.item] : null);
         if (entry && ok && !trial) this._learnEffects(entry, before, after, goalItems);
@@ -1457,11 +1732,102 @@ Use only c; no other globals.`;
         for (const k of down) con[k] = Math.max(con[k] || 0, (inv0[k] || 0) - (inv1[k] || 0));
         if (JSON.stringify(eff) !== JSON.stringify(e.effects || []) || JSON.stringify(con) !== JSON.stringify(e.consumes || {})) { e.effects = eff; e.consumes = con; this._saveSkills(); }
     }
+    // fix51: UNIFIED goal item resolver - ONE path, no fallbacks
+    // Combines smeltGoal, countGoal, parseVerboseGoal, and minecraft-data registry lookup
+    // Returns { item, count, items } or null if not resolvable
+    _resolveGoalItemUnified(task) {
+        if (!task || typeof task !== 'string') return null;
+        
+        // Try structured parsers first (they extract count too)
+        const smelt = smeltGoal(task);
+        if (smelt) return smelt;
+        
+        const ensure = ensureGoal(task);  // fix49: before countGoal
+        if (ensure) return ensure;
+
+        const count = countGoal(task);
+        if (count) return count;
+        
+        const verbose = parseVerboseGoal(task);
+        if (verbose) return verbose;
+        
+        // Final attempt: find item name in task text using minecraft-data registry
+        const t = task.toLowerCase().replace(/_/g, ' ').trim();
+        const md = minecraftData(VERSION);
+        if (!md || !md.itemsArray) return null;
+        
+        // Look for the longest matching item name in the task
+        let best = null;
+        for (const item of md.itemsArray) {
+            const itemName = item.name.replace(/_/g, ' ');
+            if (t.includes(itemName) && (!best || item.name.length > best.name.length)) {
+                best = item;
+            }
+        }
+        if (best) {
+            return { item: best.name, count: 1, items: [best.name] };
+        }
+        return null;
+    }
+    // fix51: decompose a structured prerequisite failure (bot.__prereqFail = { item, need, have }) via learned graph
+    _tryDecomposePrerequisiteFailure(parentTask) {
+        const bot = this.agent.bot;
+        if (!Object.hasOwn(bot, '__prereqFail')) return false;
+        const { item, need, have } = bot.__prereqFail;
+        delete bot.__prereqFail;
+        const shortfall = need - have;
+        if (!(shortfall > 0)) throw new Error(`__prereqFail for ${item} has non-positive shortfall (need ${need}, have ${have})`);
+        const inv = this.observe().inventory;
+        const sub = this._subgoalToObtainItem(item, shortfall, inv);
+        if (!sub) {
+            console.log(`[psn] PREREQUISITE FAILED for ${item} but no learned producer subgoal (needs/produces + skill library)`);
+            return false;
+        }
+        const d = (this.progress.decomposed ||= {}), q = (this.progress.subgoals ||= []);
+        const depth = (this._curSub?.task === parentTask ? this._curSub.depth : 0);
+        d[parentTask] = { subs: [sub], skills: [], at: Date.now(), reason: `prerequisite: need ${shortfall} more ${item}` };
+        q.unshift({ task: sub, parent: parentTask, depth: depth + 1 }, { task: parentTask, retry: true, depth });
+        this._saveProgress();
+        console.log(`[psn] DECOMPOSE (prerequisite) "${parentTask}" -> ${sub} (missing ${shortfall} ${item})`);
+        return true;
+    }
+    // fix51: pick a subgoal task string from learned producers / consumes chain (depth-first on missing inputs)
+    _subgoalToObtainItem(item, shortfall, inv) {
+        const producers = this._producers(item);
+        if (!producers.length) return null;
+        const picked = this._boltzmann(producers);
+        const skill = picked.s;
+        const consumes = Object.hasOwn(skill, 'consumes') ? skill.consumes : {};
+        for (const [consumed, amt] of Object.entries(consumes)) {
+            const have = inv[consumed] || 0;
+            if (have < amt) {
+                const sub = this._subgoalToObtainItem(consumed, amt - have, inv);
+                if (sub) return sub;
+            }
+        }
+        if (skill.task) return skill.task;
+        return null;
+    }
+    // fix51: idle practice success requires real inventory/effect change (not empty delta / instant return)
+    _practiceRunChanged(skill, before, after) {
+        const effects = Object.hasOwn(skill, 'effects') ? skill.effects : [];
+        if (effects.length) {
+            const gained = effects.filter(it => (after.inventory[it] || 0) > (before.inventory[it] || 0));
+            if (gained.length) return { ok: true, detail: `+${gained.join(',')}` };
+            return { ok: false, detail: `no gain for effects [${effects.join(',')}]` };
+        }
+        const inv0 = before.inventory, inv1 = after.inventory;
+        const keys = new Set([...Object.keys(inv0), ...Object.keys(inv1)]);
+        for (const k of keys) {
+            if ((inv1[k] || 0) !== (inv0[k] || 0)) return { ok: true, detail: `inv delta includes ${k}` };
+        }
+        return { ok: false, detail: 'empty inventory delta' };
+    }
     // fix32 (H): does the root call of the last trace satisfy the skill's learned postcondition (and report success)?
     _postHolds(e) {
         const tr = this.agent.bot.__psnTrace; if (!e?.contract || !Array.isArray(tr)) return false;
         const r = tr.find(t => t.name === e.name && (t.parent ?? -1) < 0); if (!r || r.intr || !r.s0 || !r.s1 || r.fail || r.rv === false || r.rv === null) return false;
-        try { return this._compileContract(e.contract.post)({ args: r.argv || [], ret: r.rv, pre: r.s0, post: r.s1, delta: r.delta || {}, dist: (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z) }) === true; }
+        try { return this._compileContract(e.contract.post)({ args: r.argv, ret: r.rv, pre: r.s0, post: r.s1, delta: r.delta, dist: (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z) }) === true; }
         catch (err) { this._queueContractFix(e, `post threw: ${err.message}`); return false; }
     }
 
@@ -1524,86 +1890,35 @@ Use only c; no other globals.`;
         return { shortfall, plan: 'gather', producible };
     }
 
-    // fix37 (B): check if a goal is already satisfied BEFORE running any task, using learned postconditions/contracts
-    // Returns { satisfied: boolean, reason: string, noLearnedCheck?: boolean, plan?: object }
-    // Uses learned skill contracts (postconditions) and learned effects - no hard-coded special cases
-    // fix25: prefer smeltGoal so "Smelt X into Y" checks Y (product), not X (ingredient)
-    // fix45: use parseVerboseGoal as fallback for verbose goals like "craftItem: Craft 1 iron_pickaxe..."
-    // fix47: enhanced to compute producible items and shortfall
-    // fix49: added ensureGoal for "ensure X" tasks - checks observed state, not skill names
+    // fix51: goal satisfaction = ONE path only — resolved product item + exact inventory+equipment count
+    // Sub-skill / component contract posts must NEVER mark a parent goal satisfied
     _goalAlreadySatisfied(task, state) {
-        const goal = smeltGoal(task) || ensureGoal(task) || countGoal(task) || parseVerboseGoal(task);  // fix49: ensureGoal before countGoal
-        if (!goal) return { satisfied: false, reason: 'goal not parseable as count/smelt/verbose', noLearnedCheck: true };
+        const goal = this._resolveGoalItemUnified(task);
+        if (!goal) {
+            console.log(`[fix51] LOUD: cannot resolve goal product item from task "${task}" — treating as NOT satisfied`);
+            return { satisfied: false, reason: `cannot resolve goal product item from task "${task}"`, noLearnedCheck: true };
+        }
 
-        const inv = state.inventory || {};
-        
-        // fix49: for "ensure" goals, check observed state directly (is the block nearby?)
-        // Exact block-name match only - no substring matching
+        // fix49: for "ensure" goals, check observed state directly (exact block-name match)
         if (goal.verb === 'ensure') {
             if (!state.nearby) throw new Error('[fix49] state.nearby required for ensure goals');
             const blocks = state.nearby.blocks;
             if (!Array.isArray(blocks)) throw new Error('[fix49] state.nearby.blocks must be an array');
-            // exact match only - no includes()
-            const found = blocks.some(b => b === goal.item);
-            if (found) {
-                return { satisfied: true, reason: `${goal.item} is already placed nearby (observed state)` };
-            }
+            if (blocks.some(b => b === goal.item)) return { satisfied: true, reason: `${goal.item} is already placed nearby (observed state)` };
             return { satisfied: false, reason: `${goal.item} not found nearby (need to place it)`, goal };
         }
-        
-        // fix47: compute what we have + can produce (no fallback - producible is the single source)
+
+        const inv = state.inventory;
+        // fix51: inventory counts already include held/worn/off-hand slots; exact item name only (no double count)
+        const haveExact = inv[goal.item] || 0;
         const shortfallInfo = this._computeShortfall(goal, inv);
-        const have = shortfallInfo.producible.count;
 
-        // 1) Check inventory against learned skill contracts that produce the goal item
-        // Find skills whose learned effects include the goal item and have a postcondition
-        const producers = this.skills.filter(s => !s.demoted && !s.mergedInto && !s.candidate
-            && (s.effects || []).some(eff => goal.items?.includes(eff) || eff === goal.item)
-            && s.contract?.post);
-
-        for (const skill of producers) {
-            try {
-                // Build a synthetic contract context as if the skill just ran and produced the current state
-                // fix26: use 'inv' not 'inventory' to match CONTRACT_SPEC (c.post.inv, not c.post.inventory)
-                // fix26: include all state fields from CONTRACT_SPEC to avoid undefined errors
-                // fix43: include eq (equipment state) for idempotent equip contracts
-                const eq = state.equipment || { heldItem: null, offHand: null, helmet: null, chestplate: null, leggings: null, boots: null };
-                const syntheticState = { inv, pos: state.pos || { x: 0, y: 64, z: 0 }, hp: 20, food: 20, sky: 15, alive: true, dim: 'overworld', eq };
-                const c = {
-                    args: [goal.item, goal.count],
-                    ret: true,
-                    pre: { inv: {}, pos: { x: 0, y: 64, z: 0 }, hp: 20, food: 20, sky: 15, alive: true, dim: 'overworld', eq: { heldItem: null, offHand: null, helmet: null, chestplate: null, leggings: null, boots: null } },
-                    post: syntheticState,
-                    delta: { [goal.item]: have },
-                    dist: (a, b) => Math.hypot((a?.x || 0) - (b?.x || 0), (a?.y || 0) - (b?.y || 0), (a?.z || 0) - (b?.z || 0))
-                };
-                const postOk = this._compileContract(skill.contract.post)(c);
-                if (postOk && have >= goal.count) {
-                    return { satisfied: true, reason: `learned postcondition of ${skill.name} holds (have ${have}/${goal.count} ${goal.item})` };
-                }
-            } catch (err) {
-                console.log(`[fix37] postcondition check for ${skill.name} threw: ${err.message}`);
-            }
-        }
-
-        // 2) Check learned effects: if a skill's learned effects include the item and we already have enough
-        // This is the "learned facts" approach: the skill library knows what produces what
-        const effectProducers = this.skills.filter(s => !s.demoted && !s.mergedInto && !s.candidate
-            && (s.effects || []).some(eff => goal.items?.includes(eff) || eff === goal.item));
-
-        if (effectProducers.length > 0 && have >= goal.count) {
-            const skillNames = effectProducers.slice(0, 3).map(s => s.name).join(', ');
-            return { satisfied: true, reason: `already have ${have}/${goal.count} ${goal.item} (learned producers: ${skillNames})` };
-        }
-
-        // fix45: if inventory count >= goal count, the goal is satisfied regardless of producer graph
-        // Rule from #15/#25: inventory count is the ground truth; we don't need a learned producer to verify
-        // The "no learned skill produces it" case proceeds but is still satisfied - no failed attempts
-        if (have >= goal.count) {
-            return { satisfied: true, reason: `already have ${have}/${goal.count} ${goal.item} (inventory check; no learned producer)` };
+        if (haveExact >= goal.count) {
+            return { satisfied: true, reason: `already have ${haveExact}/${goal.count} ${goal.item} (exact inventory+equipment)` };
         }
 
         // fix47: check if we can produce enough via learned producers (inventory-first planning)
+        // Note: this returns NOT satisfied but with a plan, so canProduce is appropriate here
         if (shortfallInfo.shortfall === 0 && shortfallInfo.produceItems?.length > 0) {
             const produceDesc = shortfallInfo.produceItems.map(s => `${s.count} ${s.item} via ${s.producer || s.type}`).join(', ');
             return {
@@ -1615,7 +1930,8 @@ Use only c; no other globals.`;
         }
 
         // 4) Not satisfied: don't have enough items
-        return { satisfied: false, reason: `need ${goal.count} ${goal.item}, have ${have}`, plan: shortfallInfo, goal };
+        // fix51: report exact inventory count, not producible count
+        return { satisfied: false, reason: `need ${goal.count} ${goal.item}, have ${haveExact}`, plan: shortfallInfo, goal };
     }
 
     // fix32 (PSN backward chaining): a goal item is produced by a learned skill whose learned effects contain it; the skill is
@@ -1938,9 +2254,13 @@ Use only c; no other globals.`;
     // Skill-V style regression check: rerun a candidate on one recorded past task that has a deterministic inventory check
     async _regressionRun(entry, code) {
         if (!/async\s+function\s+\w+\s*\(\s*bot\s*\)/.test(code)) return null;   // parameterised: can't rerun blindly -> trial runs instead
-        const past = (entry.stats?.tasks || []).slice().reverse().find(t => countGoal(t) || smeltGoal(t));
-        if (!past) return null;
-        const goal = smeltGoal(past) || countGoal(past);
+        // fix51: a past task is a valid regression check only if its goal items are among the skill's learned effects;
+        // callee skills (e.g. pickupNearbyItems) inherit their caller's task in stats and can't satisfy it alone
+        if (!Array.isArray(entry.effects)) { gateLog(`regression rerun of ${entry.name}: no learned effects; trial runs instead`); return null; }
+        const goalOf = t => smeltGoal(t) || countGoal(t);
+        const past = (entry.stats?.tasks || []).slice().reverse().find(t => { const g = goalOf(t); return g && g.items.some(it => entry.effects.includes(it)); });
+        if (!past) { gateLog(`regression rerun of ${entry.name}: no past task whose goal overlaps learned effects [${entry.effects.join(', ')}]; trial runs instead`); return null; }
+        const goal = goalOf(past);
         const before = this.observe();
         gateLog(`regression rerun of candidate ${entry.name} on past task "${past}"`);
         const staged = await this.agent.coder._stageCode(this._libSrc({ [entry.name]: code }) + `\n\nawait ${entry.name}(bot);`);
@@ -2275,11 +2595,13 @@ Use only c; no other globals.`;
         };
     }
     // fix43: populate bot.__safeToToss, __depositCandidates, and __uncertainItems before running tossClutter/freeInventory
+    // fix51: also populate __knownChests from chestMemory (deposit uses ONLY learned chests)
     _prepareTossSignals() {
         const lists = this._computeTossAndDepositLists();
         this.agent.bot.__safeToToss = lists.toss;
         this.agent.bot.__depositCandidates = lists.deposit;
         this.agent.bot.__uncertainItems = lists.uncertain || [];
+        this.agent.bot.__knownChests = this.chestMemory;
     }
     // fix37/fix49: run a practice skill safely - returns { message, deltaChanged } on success, false on context-fail, null on abort
     // fix49: tracks state delta - empty delta means the run doesn't count as practice
@@ -2287,6 +2609,7 @@ Use only c; no other globals.`;
     async _runPracticeSkill(skill) {
         if (this._idlePracticeAbort) return null;
         const bot = this.agent.bot;
+        const before = this.observe();
         // safety gates: log clearly when skipped (not silent)
         if (!this.agent.isIdle()) {
             console.log(`[idle-practice] SKIPPED ${skill.name}: bot is not idle`);
@@ -2300,7 +2623,6 @@ Use only c; no other globals.`;
         }
         // fix49: capture state before to compute delta
         const stateBefore = this.observe();
-        const invBefore = { ...stateBefore.inventory };
         
         // stage and run the skill (fail-loud: log errors, rethrow critical ones)
         const call = `await ${skill.name}(bot);`;
@@ -2340,18 +2662,8 @@ Use only c; no other globals.`;
             await new Promise(r => setTimeout(r, 200));
         }
         try { await runPromise; } catch (e) { /* already logged above */ }
-        
-        // fix49: compute state delta - empty delta means no practice value
-        const stateAfter = this.observe();
-        const invAfter = stateAfter.inventory || {};
-        const delta = {};
-        for (const k of new Set([...Object.keys(invBefore), ...Object.keys(invAfter)])) {
-            const diff = (invAfter[k] || 0) - (invBefore[k] || 0);
-            if (diff !== 0) delta[k] = diff;
-        }
-        const deltaChanged = Object.keys(delta).length > 0;
-        
-        // record the practice run (updates stats)
+        const after = this.observe();
+        const changed = this._practiceRunChanged(skill, stateBefore, after);
         if (skill.stats) {
             skill.stats.lastRun = Date.now();
             skill.stats.practiceRuns = (skill.stats.practiceRuns || 0) + 1;
@@ -2360,7 +2672,11 @@ Use only c; no other globals.`;
         if (practiceError) {
             return false;
         }
-        return { message: `completed in ${Date.now() - practiceStart}ms`, deltaChanged, delta };
+        if (!changed.ok) {
+            console.log(`[idle-practice] NOT SUCCESS ${skill.name}: ${changed.detail} (no ranking bump)`);
+            return false;
+        }
+        return { message: `${changed.detail} in ${Date.now() - practiceStart}ms`, deltaChanged: changed.ok };
     }
 
     // fix47: compute cheapest tool to break a block by recursing through recipes
@@ -2975,15 +3291,19 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         }
         // fix19 (6): a death is a failure of the call that was running (deepest open call) and all its ancestors
         const died = this._diedInRun();
-        if (died) { let i = -1; for (let k = 0; k < trace.length; k++) if ((trace[k].t0 || 0) <= died.t && (trace[k].t1 ?? Infinity) >= died.t - 1500 && (i < 0 || trace[k].depth >= trace[i].depth)) i = k; if (i < 0) i = trace.length - 1; console.log(`[psn] death attributed to the call running at death time: ${trace[i].name} (depth ${trace[i].depth})`); trace[i].ownFail = [`DIED: ${died.message} at ${died.pos}${this._deathDetail(died)}`]; for (; i >= 0; i = trace[i].parent) { trace[i].intr = false; trace[i].ok = false; trace[i].fail = true; } ok = false; }
+        // fix51: pass beforeInv for items-dropped reporting
+        if (died) { let i = -1; for (let k = 0; k < trace.length; k++) if ((trace[k].t0 || 0) <= died.t && (trace[k].t1 ?? Infinity) >= died.t - 1500 && (i < 0 || trace[k].depth >= trace[i].depth)) i = k; if (i < 0) i = trace.length - 1; console.log(`[psn] death attributed to the call running at death time: ${trace[i].name} (depth ${trace[i].depth})`); trace[i].ownFail = [`DIED: ${died.message} at ${died.pos}${this._deathDetail(died, this._beforeRunInv)}`]; for (; i >= 0; i = trace[i].parent) { trace[i].intr = false; trace[i].ok = false; trace[i].fail = true; } ok = false; }
         const stalled = !died && this._stalledInRun();   // fix27: a stall is a failure of the deepest call open at stall time
         if (stalled) { let i = -1; for (let k = 0; k < trace.length; k++) if ((trace[k].t0 || 0) <= stalled.t && (trace[k].t1 ?? Infinity) >= stalled.t - 1500 && (i < 0 || trace[k].depth >= trace[i].depth)) i = k; if (i < 0) i = trace.length - 1; console.log(`[psn] stall attributed to the call running at stall time: ${trace[i].name} (depth ${trace[i].depth})`); trace[i].ownFail = [`FAILED: STALLED: no progress (no new ground reached, inventory, window, lit furnace) for 60s at ${stalled.pos}`]; for (; i >= 0; i = trace[i].parent) { trace[i].intr = false; trace[i].ok = false; trace[i].fail = true; } ok = false; }
-        const timedOut = !died && !stalled && /timed out/i.test(this._lastRunMsg || '');   // fix33: a timeout is a failure of the deepest call running at the cut
-        if (timedOut) { const ix = trace.map((r, k) => k).filter(k => trace[k].intr && trace[k].t1); const cutT = Math.min(...ix.map(k => trace[k].t1)); let i = -1;
+        const timedOut = !died && !stalled && /timed out/i.test(this._lastRunMsg);   // fix33: a timeout is a failure of the deepest call running at the cut
+        if (timedOut) {
+            this._lastCutKind = 'timeout';  // fix51: set structured kind field
+            const ix = trace.map((r, k) => k).filter(k => trace[k].intr && trace[k].t1); const cutT = Math.min(...ix.map(k => trace[k].t1)); let i = -1;
             for (const k of ix) if (trace[k].t1 <= cutT + 1500 && (i < 0 || trace[k].depth >= trace[i].depth)) i = k;
-            if (i < 0) i = trace.length - 1; while (i >= 0 && trace[i].name.startsWith('skills.') && trace[i].parent >= 0) i = trace[i].parent;   // raw API -> the library skill that called it
+            if (i < 0) i = trace.length - 1; while (i >= 0 && trace[i].name.startsWith('skills.') && trace[i].parent >= 0) i = trace[i].parent;
             console.log(`[psn] timeout attributed to the call running at the cut: ${trace[i].name} (depth ${trace[i].depth})`);
-            trace[i].ownFail = [`FAILED: TIMED OUT while running (${String(trace[i].ownFail?.join(' | ') || '').slice(0, 200)})`]; for (; i >= 0; i = trace[i].parent) { trace[i].intr = false; trace[i].ok = false; trace[i].fail = true; } ok = false; }
+            trace[i].ownFail = [`FAILED: TIMED OUT while running (${String(trace[i].ownFail?.join(' | '))})`]; for (; i >= 0; i = trace[i].parent) { trace[i].intr = false; trace[i].ok = false; trace[i].fail = true; } ok = false;
+        }
         // fix27: no hotspot filter; deaths stay traced failures (above) and blame/repair learns avoidance
         // fix19 (5): an explicit FAILED line from a skill is a contract failure even if the task check passed (e.g. ensureChest inside a storage task)
         const explicit = trace.some(r => !r.intr && (r.ownFail || []).some(l => /FAILED|CONDITION violated/.test(l)));   // fix22: contract violations count
@@ -3810,6 +4130,31 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
         const finalInvFull = this._detectInventoryFullFailure(task, before, this.observe(), '');
         const invFullReason = finalInvFull ? ` Inventory state: ${finalInvFull}` : '';
 
+        // fix51: track per-goal::reason failures using learned (s+1)/(n+2) Laplace-smoothed rate
+        // Key by normalized structured source: skill name (from trace) + failure kind (set by _interruptReason)
+        if (anyCut) {
+            // _lastCutKind is set by _interruptReason when a cut occurs
+            if (!this._lastCutKind) throw new Error('anyCut set but _lastCutKind missing (structured failure kind not recorded)');
+            const failKind = this._lastCutKind;
+            const trace = this.agent.bot.__psnTrace;
+            if (!trace) throw new Error('__psnTrace missing when recording failure');
+            const failingCalls = trace.filter(t => t.fail && !t.intr);
+            // Only record backoff if there's a failing skill to attribute
+            if (failingCalls.length > 0) {
+                const failSkill = failingCalls[0].name;
+                const reasonKey = `${task}::${failSkill}::${failKind}`;
+                const goalStats = (this.progress.goalFailures ||= {});
+                const gs = (goalStats[reasonKey] ||= { success: 0, fail: 0 });
+                gs.fail++;
+                gs.lastFail = Date.now();
+                const rate = (gs.success + 1) / (gs.success + gs.fail + 2);  // Laplace-smoothed
+                console.log(`[fix51] goal::reason "${reasonKey}" rate=${rate.toFixed(2)} (${gs.success}s/${gs.fail}f)`);
+                gs.rate = rate;
+            }
+            this._lastCutKind = null;  // reset for next run
+        }
+        this._saveProgress();
+
         // fix19 (1): failed twice (recently) or cut off -> decompose
         const fails = this.progress.failed.slice(-20).filter(t => t === task).length;
         if (fails >= 2 || anyCut || this._decomposeQueue?.task === task) { if (this._decomposeQueue?.task === task) this._decomposeQueue = null; await this._decompose(task, anyCut || `failed ${fails}x; last critic: ${String(feedback).slice(-300)}${invFullReason}`); }
@@ -3914,36 +4259,33 @@ Voyager.SEEDED_PRIMITIVES = [
         if (!recipes || !recipes.length) { log(bot, \`No recipe for \${itemName} or missing ingredients.\`); return false; }
         craftingTable = getNearestBlock(bot, 'crafting_table', 16);
         if (!craftingTable) {
-            const hasTable = (getInventoryCounts(bot)['crafting_table'] || 0) > 0;
-            if (hasTable) {
-                const freeSpaces = getAllFreeSpaces(bot, 1, 6, 5);
-                if (!freeSpaces.length) { log(bot, \`FAILED: no free space within 6 blocks to place crafting_table\`); return false; }
-                for (const pos of freeSpaces) {
-                    const ok = await placeBlock(bot, 'crafting_table', pos.x, pos.y, pos.z);
-                    await sleep(150);
-                    const check = bot.blockAt(pos.floored ? pos.floored() : pos);
-                    if (ok && check && check.name === 'crafting_table') { placedTable = true; break; }
-                }
-                if (!placedTable) { log(bot, \`FAILED: could not place crafting_table at any of \${freeSpaces.length} free space(s)\`); return false; }
-                craftingTable = getNearestBlock(bot, 'crafting_table', 16);
-            } else { log(bot, \`Crafting \${itemName} requires a crafting table.\`); return false; }
+            // fix51: call ensureCraftingTable to get/craft/place a table (fail loud if can't)
+            const ensured = await ensureCraftingTable(bot);
+            if (!ensured) { log(bot, \`FAILED: craftRecipe(\${itemName}) needs a crafting table but ensureCraftingTable failed\`); return false; }
+            craftingTable = getNearestBlock(bot, 'crafting_table', 16);
+            if (!craftingTable) { log(bot, \`FAILED: ensureCraftingTable returned true but no table found\`); return false; }
+            placedTable = true;
         }
         if (craftingTable) recipes = bot.recipesFor(bot.registry.itemsByName[itemName]?.id, null, 1, craftingTable);
     }
     if (!recipes || !recipes.length) { log(bot, \`Cannot craft \${itemName}: missing ingredients.\`); if (placedTable) await collectBlock(bot, 'crafting_table', 1); return false; }
-    if (craftingTable) await goToPosition(bot, craftingTable.position.x, craftingTable.position.y, craftingTable.position.z, 3);
+    // fix51: navigate to within reach of the crafting table, verify reachability before crafting
+    if (craftingTable) {
+        const reached = await goToPosition(bot, craftingTable.position.x, craftingTable.position.y, craftingTable.position.z, 3);
+        if (!reached) { log(bot, \`FAILED: craftRecipe(\${itemName}) could not reach crafting table\`); if (placedTable) await collectBlock(bot, 'crafting_table', 1); return false; }
+        const dist = bot.entity.position.distanceTo(craftingTable.position);
+        if (dist > 4) { log(bot, \`FAILED: craftRecipe(\${itemName}) crafting table out of reach at distance \${dist.toFixed(1)}\`); if (placedTable) await collectBlock(bot, 'crafting_table', 1); return false; }
+        if (!bot.canSeeBlock(craftingTable)) { log(bot, \`FAILED: craftRecipe(\${itemName}) no line of sight to crafting table at \${craftingTable.position}\`); if (placedTable) await collectBlock(bot, 'crafting_table', 1); return false; }
+    }
     const before = getInventoryCounts(bot)[itemName] || 0;
     try { await bot.craft(recipes[0], Math.min(num, 64), craftingTable); }
-    catch (err) { log(bot, \`Crafting \${itemName} failed: \${err.message}\`); if (placedTable) await collectBlock(bot, 'crafting_table', 1); return false; }
+    catch (err) { log(bot, \`FAILED: craftRecipe(\${itemName}) threw: \${err.message}\`); if (placedTable) await collectBlock(bot, 'crafting_table', 1); return false; }
     const after = getInventoryCounts(bot)[itemName] || 0;
     if (placedTable) await collectBlock(bot, 'crafting_table', 1);
     if (after > before) { log(bot, \`Crafted \${itemName}, now have \${after}.\`); return true; }
-    log(bot, \`Crafting \${itemName} produced no items.\`); return false;
+    log(bot, \`FAILED: Crafting \${itemName} produced no items.\`); return false;
 }`,
-        deps: ['placeBlock', 'collectBlock'],
-        // fix49: no seeded contract - the delta-based check in _checkContracts handles this correctly
-        // The fix45 deltaGained check is the root-cause fix: when delta shows gain, the skill succeeded
-        // Adding a seeded contract with || 0 fallbacks would violate the "no fallbacks" rule
+        deps: ['placeBlock', 'collectBlock', 'ensureCraftingTable'],
     },
     {
         name: 'attackNearest',
@@ -4079,25 +4421,50 @@ Voyager.SEEDED_PRIMITIVES = [
         task: 'deposit items to free inventory space',
         code: `async function depositToChest(bot, itemName, count = 64) {
     if (!itemName) { log(bot, 'FAILED: depositToChest requires an item name'); return false; }
-    const chest = getNearestBlock(bot, b => /chest|barrel|shulker/.test(b.name), 32);
-    if (!chest) { log(bot, 'FAILED: no chest/barrel/shulker_box within 32 blocks to deposit items'); return false; }
+    if (!bot.__knownChests) {
+        log(bot, 'FAIL LOUD: bot.__knownChests not initialized (voyager._prepareTossSignals not called before depositToChest)');
+        return false;
+    }
     const item = bot.inventory.items().find(it => it.name === itemName);
-    if (!item) { log(bot, \`Don't have any \${itemName} to deposit.\`); return false; }
+    if (!item) { log(bot, \`[deposit] reject \${itemName}: not in inventory\`); return false; }
     const toDeposit = Math.min(count, item.count);
-    if (bot.entity.position.distanceTo(chest.position) > 4) {
-        await goToPosition(bot, chest.position.x, chest.position.y, chest.position.z, 3);
+    const chestKeys = Object.keys(bot.__knownChests);
+    if (chestKeys.length === 0) {
+        log(bot, \`[deposit] reject all chests: chestMemory empty (0 known positions); have \${toDeposit} \${itemName} to deposit\`);
+        return false;
     }
-    const containerWindow = await bot.openContainer(chest);
-    if (!containerWindow) { log(bot, 'FAILED: could not open chest'); return false; }
-    try {
-        const slot = bot.inventory.items().find(it => it.name === itemName);
-        if (!slot) { containerWindow.close(); log(bot, \`Item \${itemName} not found after opening chest\`); return false; }
-        await containerWindow.deposit(slot.type, null, toDeposit);
-        log(bot, \`[chest] Deposited \${toDeposit} \${itemName} to chest.\`);
-    } finally {
-        containerWindow.close();
+    const botPos = bot.entity.position;
+    const candidates = [];
+    for (const key of chestKeys) {
+        const parts = key.split(',');
+        if (parts.length !== 3) { console.log(\`[deposit] reject \${key}: invalid memory key\`); continue; }
+        const cx = Number(parts[0]), cy = Number(parts[1]), cz = Number(parts[2]);
+        if (Number.isNaN(cx)) { console.log(\`[deposit] reject \${key}: non-numeric coordinates\`); continue; }
+        const block = bot.blockAt(new Vec3(cx, cy, cz));
+        if (!block) { console.log(\`[deposit] reject \${key}: blockAt null (chunk unloaded or position invalid)\`); continue; }
+        candidates.push({ block, key, dist: Math.hypot(cx - botPos.x, cy - botPos.y, cz - botPos.z) });
     }
-    return true;
+    candidates.sort((p, q) => p.dist - q.dist);
+    for (const cand of candidates) {
+        if (bot.entity.position.distanceTo(cand.block.position) > 4) {
+            const reached = await goToPosition(bot, cand.block.position.x, cand.block.position.y, cand.block.position.z, 3);
+            if (!reached) { console.log(\`[deposit] reject \${cand.key}: pathfinder could not reach\`); continue; }
+        }
+        let containerWindow;
+        try { containerWindow = await bot.openContainer(cand.block); }
+        catch (err) { console.log(\`[deposit] reject \${cand.key}: \${err.message}\`); continue; }
+        try {
+            const slot = bot.inventory.items().find(it => it.name === itemName);
+            if (!slot) throw new Error(\`depositToChest: \${itemName} not in inventory after opening \${cand.key}\`);
+            await containerWindow.deposit(slot.type, null, toDeposit);
+            log(bot, \`[chest] Deposited \${toDeposit} \${itemName} to known chest at \${cand.key}.\`);
+        } finally {
+            containerWindow.close();
+        }
+        return true;
+    }
+    log(bot, \`[deposit] reject all \${chestKeys.length} known chest candidate(s): none opened\`);
+    return false;
 }`,
         deps: [],
     },
@@ -4127,9 +4494,23 @@ Voyager.SEEDED_PRIMITIVES = [
         code: `async function tossClutter(bot, minFree = 4) {
     const start = bot.entity.position.clone();
     let tossed = 0;
-    const safeList = bot.__safeToToss || [];
-    const depositList = bot.__depositCandidates || [];
-    const uncertainList = bot.__uncertainItems || [];
+    let depositedTotal = 0;
+    // fix51: fail loud if signals not initialized (no fallback)
+    if (!Array.isArray(bot.__safeToToss)) {
+        log(bot, 'FAIL LOUD: bot.__safeToToss not initialized (voyager._prepareTossSignals not called before tossClutter)');
+        return false;
+    }
+    if (!Array.isArray(bot.__depositCandidates)) {
+        log(bot, 'FAIL LOUD: bot.__depositCandidates not initialized');
+        return false;
+    }
+    if (!Array.isArray(bot.__uncertainItems)) {
+        log(bot, 'FAIL LOUD: bot.__uncertainItems not initialized');
+        return false;
+    }
+    const safeList = bot.__safeToToss;
+    const depositList = bot.__depositCandidates;
+    const uncertainList = bot.__uncertainItems;
     
     // Phase 1: toss safe items (items with POSITIVE learned producer signal + surplus)
     if (safeList.length) {
@@ -4140,7 +4521,14 @@ Voyager.SEEDED_PRIMITIVES = [
             if (!pick) break;
             const it = bot.inventory.items().find(x => x.name === pick);
             if (!it) { inv[pick] = 0; continue; }
-            if (bot.currentWindow) { bot.closeWindow(bot.currentWindow); await sleep(500); }
+            if (bot.currentWindow) {
+                const win = bot.currentWindow;
+                bot.closeWindow(win);
+                await new Promise(resolve => {
+                    const onClose = (w) => { if (!w || w === win) { bot.off('windowClose', onClose); resolve(); } };
+                    bot.on('windowClose', onClose);
+                });
+            }
             await bot.tossStack(it);
             inv[pick] = Math.max(0, (inv[pick] || 0) - it.count);
             tossed++;
@@ -4159,7 +4547,7 @@ Voyager.SEEDED_PRIMITIVES = [
         if (!chest) {
             if (depositList.length || (bot.inventory.emptySlotCount() < 2 && uncertainList.length)) {
                 log(bot, \`PREREQUISITE FAILED: tossClutter needs chest within 32 blocks to deposit items (have \${depositList.length} deposit candidates, \${uncertainList.length} uncertain items). Place or find a chest first.\`);
-                return bot.inventory.emptySlotCount();
+                return false;
             }
         } else if (depositList.length) {
             console.log(\`[toss] still only \${bot.inventory.emptySlotCount()} empty after tossing \${tossed} stacks; depositing \${depositList.length} candidate(s) to chest at \${chest.position}\`);
@@ -4172,6 +4560,7 @@ Voyager.SEEDED_PRIMITIVES = [
                 if (ok) deposited++;
                 else depositFailed = true;
             }
+            depositedTotal = deposited;
             if (deposited) console.log(\`[toss] deposited \${deposited} item type(s) to chest (empty slots now \${bot.inventory.emptySlotCount()})\`);
             if (bot.inventory.emptySlotCount() < minFree && !bot.interrupt_code) {
                 if (depositFailed) {
@@ -4184,14 +4573,17 @@ Voyager.SEEDED_PRIMITIVES = [
     }
     
     // fix43: if we couldn't free space and have uncertain items, surface this for model/planning
+    // fix51: return false when failing to meet minFree, so postcondition skip (r.rv === false) works
     if (bot.inventory.emptySlotCount() < minFree && !bot.interrupt_code) {
         if (uncertainList.length && !safeList.length) {
             log(bot, \`FAILED tossClutter: \${uncertainList.length} item(s) have NO learned producer signal (\${uncertainList.slice(0,3).join(', ')}\${uncertainList.length > 3 ? '...' : ''}) - cannot auto-toss unknown items. Return decision to model/planning.\`);
         } else if (!safeList.length && !depositList.length) {
             log(bot, 'FAILED tossClutter: no learned signal indicates what is safe to toss/deposit');
         }
+        return false;  // fix51: explicit failure so postcondition isn't evaluated
     }
-    return bot.inventory.emptySlotCount();
+    // fix51: return stacks removed (0 when space was already free) so a truthy ret always means inventory shrank (seeded post)
+    return tossed + depositedTotal;
 }`,
         deps: ['moveAway', 'depositToChest'],
     },
@@ -4210,11 +4602,11 @@ Voyager.SEEDED_PRIMITIVES = [
     if (!hasTable) {
         console.log('[ensureCraftingTable] no crafting_table in inventory, attempting inline 2x2 craft...');
         const tableId = bot.registry.itemsByName['crafting_table']?.id;
-        if (!tableId) throw new Error('[ensureCraftingTable] FAILED: crafting_table not in registry');
+        if (!tableId) { log(bot, 'FAILED: ensureCraftingTable - crafting_table not in registry'); return false; }
         
         let recipes = bot.recipesFor(tableId, null, 1, null);
         const allRecipes = bot.recipesAll(tableId, null, null);
-        if (!allRecipes.length) throw new Error('[ensureCraftingTable] FAILED: no recipe for crafting_table in registry');
+        if (!allRecipes.length) { log(bot, 'FAILED: ensureCraftingTable - no recipe for crafting_table in registry'); return false; }
         let inv = getInventoryCounts(bot);
         let canCraft = false;
         
@@ -4269,7 +4661,7 @@ Voyager.SEEDED_PRIMITIVES = [
                     
                     if (canCraftIng) {
                         // Compute how many times to craft based on recipe output
-                        if (!ingRecipe.result?.count) throw new Error(\`[ensureCraftingTable] FAILED: recipe for \${ingItem.name} has no result.count\`);
+                        if (!ingRecipe.result?.count) { log(bot, \`FAILED: ensureCraftingTable - recipe for \${ingItem.name} has no result.count\`); return false; }
                         const resultCount = ingRecipe.result.count;
                         const craftTimes = Math.ceil(shortfall / resultCount);
                         
@@ -4282,7 +4674,10 @@ Voyager.SEEDED_PRIMITIVES = [
                 }
                 
                 if (!crafted && shortfall > 0) {
-                    throw new Error(\`[ensureCraftingTable] FAILED: cannot craft \${ingItem.name} - no 2x2 recipe with available ingredients\`);
+                    // fix51: fail loud with structured prerequisite info for decomposition/needs-produces
+                    bot.__prereqFail = { item: ingItem.name, need: shortfall + (inv[ingItem.name] || 0), have: inv[ingItem.name] || 0 };
+                    log(bot, \`PREREQUISITE FAILED: ensureCraftingTable needs \${shortfall} more \${ingItem.name} but cannot craft it (no 2x2 recipe or missing sub-ingredients). Decompose to obtain \${ingItem.name} first.\`);
+                    return false;
                 }
             }
             
@@ -4301,7 +4696,7 @@ Voyager.SEEDED_PRIMITIVES = [
             }
         }
         
-        // FAIL loud if still can't craft
+        // FAIL loud if still can't craft - provide prerequisite info for decomposition
         if (!canCraft && !hasTable) {
             inv = getInventoryCounts(bot);
             const missingIngredients = [];
@@ -4313,24 +4708,25 @@ Voyager.SEEDED_PRIMITIVES = [
                     const have = inv[ingItem.name] || 0;
                     const need = Math.abs(ing.count);
                     if (have < need) {
+                        if (!bot.__prereqFail) bot.__prereqFail = { item: ingItem.name, need, have };
                         missingIngredients.push(\`\${ingItem.name} (need \${need}, have \${have})\`);
                     }
                 }
             }
-            throw new Error(\`[ensureCraftingTable] FAILED: cannot craft - missing: \${missingIngredients.join(', ') || 'unknown'}\`);
+            log(bot, \`PREREQUISITE FAILED: ensureCraftingTable cannot craft - missing: \${missingIngredients.join(', ')}. Decompose to obtain prerequisites.\`);
+            return false;
         }
     }
     
     // fix25: multi-cell retry pattern
     const freeSpaces = getAllFreeSpaces(bot, 1, 6, 5);
-    if (!freeSpaces.length) throw new Error('[ensureCraftingTable] FAILED: no free space within 6 blocks to place crafting_table');
+    if (!freeSpaces.length) { log(bot, 'FAILED: ensureCraftingTable - no free space within 6 blocks to place crafting_table'); return false; }
     let placed = false;
     const tried = [];
     for (const pos of freeSpaces) {
         if (bot.interrupt_code) return false;
         tried.push(\`(\${Math.floor(pos.x)},\${Math.floor(pos.y)},\${Math.floor(pos.z)})\`);
         const ok = await placeBlock(bot, 'crafting_table', pos.x, pos.y, pos.z);
-        await sleep(150);
         const check = bot.blockAt(pos.floored ? pos.floored() : pos);
         if (ok && check && check.name === 'crafting_table') {
             log(bot, \`Placed crafting_table at \${tried[tried.length - 1]}.\`);
@@ -4341,7 +4737,8 @@ Voyager.SEEDED_PRIMITIVES = [
         else console.log(\`[ensureCraftingTable] placeBlock returned true at \${tried[tried.length - 1]} but block is \${check?.name || 'null'}, trying next cell...\`);
     }
     if (!placed) {
-        throw new Error(\`[ensureCraftingTable] FAILED: could not place crafting_table at any of \${tried.length} free space(s): \${tried.join(', ')}\`);
+        log(bot, \`FAILED: ensureCraftingTable - could not place crafting_table at any of \${tried.length} free space(s): \${tried.join(', ')}\`);
+        return false;
     }
     return true;
 }`,
