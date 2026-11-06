@@ -169,7 +169,7 @@ describe('fix60: Ollama calls have no implicit undici header/body timeout', () =
     it('uses a dedicated dispatcher with headersTimeout/bodyTimeout disabled', () => {
         const s = readFileSync('./src/models/ollama.js', 'utf8');
         assert.ok(s.includes('new Agent({ headersTimeout: 0, bodyTimeout: 0 })'));
-        assert.ok(s.includes('fetch(request, { dispatcher: OLLAMA_DISPATCHER })'));
+        assert.ok(s.includes('fetch(request, bound ? { dispatcher: OLLAMA_DISPATCHER, signal: AbortSignal.timeout(bound.ms) } : { dispatcher: OLLAMA_DISPATCHER })'));
     });
     it('a slow reply (headers sent only when generation ends) still arrives', async () => {
         const srv = http.createServer((req, res) => { req.resume(); req.on('end', () => setTimeout(() => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ embeddings: [[1, 2]] })); }, 300)); });
@@ -178,5 +178,36 @@ describe('fix60: Ollama calls have no implicit undici header/body timeout', () =
         const v = await o.embed('x');
         srv.close();
         assert.deepStrictEqual(v, [1, 2]);
+    });
+});
+
+describe('fix60: a hung Ollama call is cut by a learned bound, never silently', () => {
+    const serve = (delay) => new Promise(r => { const srv = http.createServer((req, res) => { req.resume(); req.on('end', () => { if (delay < 0) return; setTimeout(() => { res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ embeddings: [[1]] })); }, delay); }); }); srv.listen(0, '127.0.0.1', () => r(srv)); });
+    it('unbounded (loud) until two different successful durations exist; then max + range', async () => {
+        const cd = await import('../src/models/call_durations.js');
+        const store = {}; cd.setCallDurationStore(store);
+        assert.strictEqual(cd.callDurationBound('m /api/embed'), null);
+        cd.recordCallDuration('m /api/embed', 100);
+        assert.strictEqual(cd.callDurationBound('m /api/embed'), null, 'one duration: no spread learned yet');
+        cd.recordCallDuration('m /api/embed', 300);
+        assert.strictEqual(cd.callDurationBound('m /api/embed').ms, 500);
+        assert.deepStrictEqual(store['m /api/embed'], { n: 2, min: 100, max: 300 });
+    });
+    it('a server that never answers is aborted loudly at the learned bound, and the cut widens the next bound', async () => {
+        const cd = await import('../src/models/call_durations.js');
+        const store = {}; cd.setCallDurationStore(store);
+        const fast = await serve(20), hang = await serve(-1);
+        const a = new Ollama('hm', `http://127.0.0.1:${fast.address().port}`, {});
+        await a.embed('x'); store['hm /api/embed'].min = 10; store['hm /api/embed'].max = 60;   // learned: 10..60 ms
+        const b = new Ollama('hm', `http://127.0.0.1:${hang.address().port}`, {});
+        const t0 = Date.now();
+        await assert.rejects(b.embed('x'), e => e.code === 'OLLAMA_LEARNED_BOUND' && /learned bound 110ms/.test(e.message));
+        assert.ok(Date.now() - t0 < 5000, 'cut near the learned bound, not after an implicit library timeout');
+        assert.ok(store['hm /api/embed'].max >= 110, 'censored observation widens the next bound');
+        fast.close(); hang.closeAllConnections(); hang.close();
+    });
+    it('sendRequest rethrows the learned-bound abort instead of a canned reply', () => {
+        assert.ok(readFileSync('./src/models/ollama.js', 'utf8').includes("if (err.code === 'OLLAMA_LEARNED_BOUND') throw err;"));
+        assert.ok(readFileSync('./src/agent/voyager.js', 'utf8').includes('setCallDurationStore(this.progress.callDurations)'));
     });
 });

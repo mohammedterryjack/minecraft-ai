@@ -23,6 +23,7 @@ import { getAllItems, getAllBlocks, getItemCraftingRecipes, isHostile, isDatapac
 import { cosineSimilarity } from '../utils/math.js';
 import minecraftData from 'minecraft-data';
 import { Ollama } from '../models/ollama.js';
+import { setCallDurationStore } from '../models/call_durations.js';
 import { signatureOf, depsOf, missingCalls, findCycle, findAllCycles, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf } from './skill_graph.js';
 import { getBareAPI, collectBareApiUsedInSource } from './coder.js';   // fix40: unified bare-name API helper
 import { withStallPhase } from '../utils/event_loop_guard.js';
@@ -371,6 +372,9 @@ export class Voyager {
         // fix59: learned per-skill inventory-slot effect (replaces the fix39 free-space name regex/list)
         if (!this.progress.slots) this.progress.slots = { runs: {} };
         this.slotEffects = new SlotEffects(this.progress.slots);
+        // fix60: learned local-model call durations (bound a hung Ollama call), persisted with progress
+        if (!this.progress.callDurations) this.progress.callDurations = {};
+        setCallDurationStore(this.progress.callDurations);
         this.running = false;
         this.abort = false;
         this.lastPlayerMsg = 0;
