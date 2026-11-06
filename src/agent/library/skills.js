@@ -2404,7 +2404,12 @@ export async function digDown(bot, distance = 10) {
      * await skills.digDown(bot, 10);
      **/
 
-    let start_block_pos = bot.blockAt(bot.entity.position).position;
+    const startBlock = bot.blockAt(bot.entity.position);
+    if (!startBlock) {
+        log(bot, 'FAILED: digDown - no block found at current position (chunk unloaded)');
+        return false;
+    }
+    let start_block_pos = startBlock.position;
     for (let i = 1; i <= distance; i++) {
         const targetBlock = bot.blockAt(start_block_pos.offset(0, -i, 0));
         let belowBlock = bot.blockAt(start_block_pos.offset(0, -i-1, 0));

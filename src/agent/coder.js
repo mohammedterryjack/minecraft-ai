@@ -314,6 +314,61 @@ export class Coder {
         walk(ast);
         return warnings;
     }
+    // fix51: check for potential null dereference on findBlock/blockAt results (feedback only)
+    // Pattern: x = getNearestBlock(...) or x = bot.blockAt(...) followed by x.property access without null check
+    _checkNullDeref(code, preludeLines = 0) {
+        const warnings = [];
+        const codeLines = code.split('\n');
+        // Simple pattern matching - not full AST analysis, just common cases
+        // Look for patterns like: const block = getNearestBlock(...); ... block.position
+        const nullableAssigns = new Map();
+        for (let i = 0; i < codeLines.length; i++) {
+            const line = codeLines[i];
+            const lineNum = i + 1;
+            if (lineNum <= preludeLines) continue;
+            
+            // Match: const/let/var x = getNearestBlock(...) or bot.blockAt(...) or findBlock(...)
+            const assignMatch = line.match(/(?:const|let|var)\s+(\w+)\s*=\s*(?:getNearestBlock|bot\.blockAt|bot\.findBlock)\s*\(/);
+            if (assignMatch) {
+                nullableAssigns.set(assignMatch[1], lineNum);
+            }
+            
+            // Check for immediate property access on same line without null check
+            const immediateDeref = line.match(/(?:getNearestBlock|bot\.blockAt|bot\.findBlock)\s*\([^)]*\)\s*\.(name|position|count)/);
+            if (immediateDeref) {
+                warnings.push({ line: lineNum, text: line.trim() });
+            }
+        }
+        
+        // Look for subsequent access without null check
+        for (let i = 0; i < codeLines.length; i++) {
+            const line = codeLines[i];
+            const lineNum = i + 1;
+            if (lineNum <= preludeLines) continue;
+            
+            // Check if any nullable var is accessed without a prior null check on the same line or preceding lines
+            for (const [varName, assignLine] of nullableAssigns.entries()) {
+                if (lineNum <= assignLine) continue;
+                // Check for varName.property access
+                const accessMatch = line.match(new RegExp(`\\b${varName}\\.(name|position|count)\\b`));
+                if (accessMatch) {
+                    // Check if there's a null check between assign and access
+                    let hasNullCheck = false;
+                    for (let j = assignLine; j < lineNum; j++) {
+                        if (codeLines[j].includes(`!${varName}`) || codeLines[j].includes(`${varName} === null`) || codeLines[j].includes(`${varName} == null`)) {
+                            hasNullCheck = true;
+                            break;
+                        }
+                    }
+                    if (!hasNullCheck) {
+                        warnings.push({ line: lineNum, text: line.trim() });
+                        break;  // Only report first access per variable
+                    }
+                }
+            }
+        }
+        return warnings;
+    }
     // fix40: extract skills.*/world.* calls from code using acorn - these are NOW FORBIDDEN
     // All functions must be called by bare name, not with skills.*/world.* prefix
     _extractOldStyleCalls(code) {
@@ -410,6 +465,22 @@ export class Coder {
             result += 'This will prevent log(bot, ...) calls from working in that scope.\n';
             result += 'Consider renaming your variable to avoid collision (e.g., `logBlock`, `targetBlock`, `nearestLog`):\n';
             for (const w of shadowLogWarnings) {
+                result += `  Line ${w.line}: ${w.text}\n`;
+            }
+            result += '\n';
+        }
+
+        // fix51: lint check for potential null dereference on findBlock/blockAt results (feedback only)
+        // These functions can return null (chunk unloaded, no block found), and accessing .name/.position/.count will TypeError
+        const nullDerefWarnings = this._checkNullDeref(code, preludeLines);
+        if (nullDerefWarnings.length > 0) {
+            result += 'WARNING: Potential null dereference on findBlock/blockAt result detected.\n';
+            result += 'These functions return null when no block is found or the chunk is unloaded.\n';
+            result += 'Accessing properties like .name, .position, or .count on null will throw TypeError.\n';
+            result += 'Check for null before accessing properties:\n';
+            result += '  WRONG:  const block = getNearestBlock(bot, "iron_ore", 16); const pos = block.position;\n';
+            result += '  RIGHT:  const block = getNearestBlock(bot, "iron_ore", 16); if (!block) { log(bot, "no iron_ore found"); return false; } const pos = block.position;\n';
+            for (const w of nullDerefWarnings) {
                 result += `  Line ${w.line}: ${w.text}\n`;
             }
             result += '\n';

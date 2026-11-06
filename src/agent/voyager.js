@@ -1472,13 +1472,32 @@ Use only c; no other globals.`;
         if (r.free) { const e = this.agent.bot.inventory.emptySlotCount(); ok = e >= r.free; console.log(`[voyager] inventory check: ${e} empty slots (need ${r.free})`); }
         else if (r.at) { const p = this.agent.bot.entity.position; ok = Math.hypot(p.x - r.at.x, p.z - r.at.z) <= 8; }
         else if (goal && ['mine','collect','gather','chop','craft','smelt','cook','get','obtain'].includes(goal.verb)) ok = gainedFor(goal, before, after) >= goal.count;
-        else if (entry?.effects?.length) {   // PSN rule-based effect check: the skill's recorded expected effects must show up again
-            const gotten = entry.effects.filter(it => (after.inventory[it] || 0) > (before.inventory[it] || 0));
-            ok = gotten.length > 0;
-            console.log(`[psn] effect check ${r.name}: expected +[${entry.effects.join(', ')}], got +[${gotten.join(', ')}] -> ${ok}`);
+        else {
+            // fix51: resolve goal item from task text and check exact inventory+equipment count
+            // A sub-skill's post must NEVER satisfy the parent goal - only the resolved goal item count matters
+            const resolvedGoal = smeltGoal(task) || countGoal(task) || parseVerboseGoal(task) || this._resolveGoalItem(task);
+            if (resolvedGoal && resolvedGoal.item) {
+                const invCount = (after.inventory[resolvedGoal.item] || 0);
+                const eqCount = Object.values(after.equipment).filter(v => v === resolvedGoal.item).length;
+                const haveNow = invCount + eqCount;
+                const hadBefore = (before.inventory[resolvedGoal.item] || 0) + Object.values(before.equipment).filter(v => v === resolvedGoal.item).length;
+                const targetCount = resolvedGoal.count || 1;
+                ok = haveNow >= targetCount || (haveNow > hadBefore && haveNow > 0);
+                console.log(`[psn] fix51 goal-item check: ${resolvedGoal.item} before=${hadBefore} after=${haveNow} target=${targetCount} -> ${ok}`);
+            } else if (entry?.effects?.length) {
+                // Fallback: PSN rule-based effect check only when no goal item resolvable
+                const gotten = entry.effects.filter(it => (after.inventory[it] || 0) > (before.inventory[it] || 0));
+                ok = gotten.length > 0;
+                console.log(`[psn] effect check ${r.name}: expected +[${entry.effects.join(', ')}], got +[${gotten.join(', ')}] -> ${ok}`);
+            } else if (this._postHolds(entry)) {
+                // Last resort: skill's own post holds - but warn that this may not reflect goal satisfaction
+                console.log(`[psn] WARN: postcondition of ${r.name} holds but no goal-item check; goal satisfaction uncertain`);
+                ok = true;
+            } else {
+                const v = await this.critique(task, before, after, extractFeedback(res.message, 1500));
+                ok = !!v.success;
+            }
         }
-        else if (this._postHolds(entry)) { ok = true; console.log(`[psn] learned postcondition of ${r.name} holds; critic skipped`); }
-        else { const v = await this.critique(task, before, after, extractFeedback(res.message, 1500)); ok = !!v.success; }   // fix38: preserve FAILED lines
         // fix44: pass goal items to filter learned effects and produces (denoise)
         const goalItems = goal?.items || (goal?.item ? [goal.item] : null);
         if (entry && ok && !trial) this._learnEffects(entry, before, after, goalItems);
@@ -1525,6 +1544,30 @@ Use only c; no other globals.`;
         const eff = [...new Set([...(e.effects || []), ...up])].slice(0, 12), con = { ...(e.consumes || {}) };
         for (const k of down) con[k] = Math.max(con[k] || 0, (inv0[k] || 0) - (inv1[k] || 0));
         if (JSON.stringify(eff) !== JSON.stringify(e.effects || []) || JSON.stringify(con) !== JSON.stringify(e.consumes || {})) { e.effects = eff; e.consumes = con; this._saveSkills(); }
+    }
+    // fix51: resolve goal item from task text using minecraft-data registry
+    // Tries to extract item name (e.g., "craft iron pickaxe" -> "iron_pickaxe")
+    // Returns { item, count } or null if not resolvable
+    _resolveGoalItem(task) {
+        if (!task || typeof task !== 'string') return null;
+        const t = task.toLowerCase().replace(/_/g, ' ').trim();
+        
+        // Try to find item name in task text using minecraft-data
+        const md = minecraftData(VERSION);
+        if (!md || !md.itemsArray) return null;
+        
+        // Look for the longest matching item name in the task
+        let best = null;
+        for (const item of md.itemsArray) {
+            const itemName = item.name.replace(/_/g, ' ');
+            if (t.includes(itemName) && (!best || item.name.length > best.name.length)) {
+                best = item;
+            }
+        }
+        if (best) {
+            return { item: best.name, count: 1 };
+        }
+        return null;
     }
     // fix32 (H): does the root call of the last trace satisfy the skill's learned postcondition (and report success)?
     _postHolds(e) {
@@ -4211,11 +4254,11 @@ Voyager.SEEDED_PRIMITIVES = [
     if (!hasTable) {
         console.log('[ensureCraftingTable] no crafting_table in inventory, attempting inline 2x2 craft...');
         const tableId = bot.registry.itemsByName['crafting_table']?.id;
-        if (!tableId) throw new Error('[ensureCraftingTable] FAILED: crafting_table not in registry');
+        if (!tableId) { log(bot, 'FAILED: ensureCraftingTable - crafting_table not in registry'); return false; }
         
         let recipes = bot.recipesFor(tableId, null, 1, null);
         const allRecipes = bot.recipesAll(tableId, null, null);
-        if (!allRecipes.length) throw new Error('[ensureCraftingTable] FAILED: no recipe for crafting_table in registry');
+        if (!allRecipes.length) { log(bot, 'FAILED: ensureCraftingTable - no recipe for crafting_table in registry'); return false; }
         let inv = getInventoryCounts(bot);
         let canCraft = false;
         
@@ -4270,7 +4313,7 @@ Voyager.SEEDED_PRIMITIVES = [
                     
                     if (canCraftIng) {
                         // Compute how many times to craft based on recipe output
-                        if (!ingRecipe.result?.count) throw new Error(\`[ensureCraftingTable] FAILED: recipe for \${ingItem.name} has no result.count\`);
+                        if (!ingRecipe.result?.count) { log(bot, \`FAILED: ensureCraftingTable - recipe for \${ingItem.name} has no result.count\`); return false; }
                         const resultCount = ingRecipe.result.count;
                         const craftTimes = Math.ceil(shortfall / resultCount);
                         
@@ -4283,7 +4326,9 @@ Voyager.SEEDED_PRIMITIVES = [
                 }
                 
                 if (!crafted && shortfall > 0) {
-                    throw new Error(\`[ensureCraftingTable] FAILED: cannot craft \${ingItem.name} - no 2x2 recipe with available ingredients\`);
+                    // fix51: fail loud with prerequisite info for decomposition/needs-produces
+                    log(bot, \`PREREQUISITE FAILED: ensureCraftingTable needs \${shortfall} more \${ingItem.name} but cannot craft it (no 2x2 recipe or missing sub-ingredients). Decompose to obtain \${ingItem.name} first.\`);
+                    return false;
                 }
             }
             
@@ -4302,7 +4347,7 @@ Voyager.SEEDED_PRIMITIVES = [
             }
         }
         
-        // FAIL loud if still can't craft
+        // FAIL loud if still can't craft - provide prerequisite info for decomposition
         if (!canCraft && !hasTable) {
             inv = getInventoryCounts(bot);
             const missingIngredients = [];
@@ -4318,20 +4363,20 @@ Voyager.SEEDED_PRIMITIVES = [
                     }
                 }
             }
-            throw new Error(\`[ensureCraftingTable] FAILED: cannot craft - missing: \${missingIngredients.join(', ') || 'unknown'}\`);
+            log(bot, \`PREREQUISITE FAILED: ensureCraftingTable cannot craft - missing: \${missingIngredients.join(', ') || 'unknown'}. Decompose to obtain prerequisites.\`);
+            return false;
         }
     }
     
     // fix25: multi-cell retry pattern
     const freeSpaces = getAllFreeSpaces(bot, 1, 6, 5);
-    if (!freeSpaces.length) throw new Error('[ensureCraftingTable] FAILED: no free space within 6 blocks to place crafting_table');
+    if (!freeSpaces.length) { log(bot, 'FAILED: ensureCraftingTable - no free space within 6 blocks to place crafting_table'); return false; }
     let placed = false;
     const tried = [];
     for (const pos of freeSpaces) {
         if (bot.interrupt_code) return false;
         tried.push(\`(\${Math.floor(pos.x)},\${Math.floor(pos.y)},\${Math.floor(pos.z)})\`);
         const ok = await placeBlock(bot, 'crafting_table', pos.x, pos.y, pos.z);
-        await sleep(150);
         const check = bot.blockAt(pos.floored ? pos.floored() : pos);
         if (ok && check && check.name === 'crafting_table') {
             log(bot, \`Placed crafting_table at \${tried[tried.length - 1]}.\`);
@@ -4342,7 +4387,8 @@ Voyager.SEEDED_PRIMITIVES = [
         else console.log(\`[ensureCraftingTable] placeBlock returned true at \${tried[tried.length - 1]} but block is \${check?.name || 'null'}, trying next cell...\`);
     }
     if (!placed) {
-        throw new Error(\`[ensureCraftingTable] FAILED: could not place crafting_table at any of \${tried.length} free space(s): \${tried.join(', ')}\`);
+        log(bot, \`FAILED: ensureCraftingTable - could not place crafting_table at any of \${tried.length} free space(s): \${tried.join(', ')}\`);
+        return false;
     }
     return true;
 }`,

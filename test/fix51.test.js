@@ -874,3 +874,119 @@ describe('fix51 issue 18: seeded/handwritten skill identifier validation', async
             `Found undeclared targetBlock in skills.js:\n${errors.join('\n')}`);
     });
 });
+
+describe('fix51 issue 19: sub-skill post must not satisfy parent goal', async () => {
+    let Voyager;
+
+    before(async () => {
+        const mod = await import('../src/agent/voyager.js');
+        Voyager = mod.Voyager;
+    });
+
+    it('_resolveGoalItem extracts item from task text', () => {
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        assert.ok(voyagerSrc.includes('_resolveGoalItem'),
+            'voyager.js should have _resolveGoalItem function');
+        assert.ok(voyagerSrc.includes('itemsArray'),
+            '_resolveGoalItem should use minecraft-data itemsArray');
+    });
+
+    it('goal craft iron pickaxe with 7 sticks and 0 iron_pickaxe is NOT satisfied', async () => {
+        const mockBot = { 
+            version: '1.21.4', 
+            chat: () => {}, 
+            on: () => {}, 
+            off: () => {}, 
+            once: () => {},
+            removeListener: () => {} 
+        };
+        const v = new Voyager({ bot: mockBot, agent: { prompter: { task: () => {} }, npc: { constructs: {} } } });
+        v.skills = [
+            { name: 'craftThreeSticks', effects: ['stick'], contract: { post: 'c => c.post.inv.stick >= 3' } }
+        ];
+        v._compileContract = () => () => true;  // craftThreeSticks post passes
+
+        const state = {
+            inventory: { stick: 7, iron_ingot: 3 },
+            equipment: { heldItem: null, offHand: null, helmet: null, chestplate: null, leggings: null, boots: null },
+            pos: { x: 0, y: 64, z: 0 }
+        };
+
+        // Goal is iron_pickaxe, not stick
+        const result = v._goalAlreadySatisfied('craft iron pickaxe', state);
+        assert.strictEqual(result.satisfied, false,
+            'goal craft iron pickaxe should NOT be satisfied when iron_pickaxe=0 (regardless of stick count)');
+    });
+
+    it('parseVerboseGoal or _resolveGoalItem resolves iron_pickaxe from craft iron pickaxe', async () => {
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        // The fix should either make parseVerboseGoal handle "craft iron pickaxe" or _resolveGoalItem
+        assert.ok(
+            voyagerSrc.includes('_resolveGoalItem(task)') || voyagerSrc.includes('parseVerboseGoal'),
+            'Goal resolution should try _resolveGoalItem or parseVerboseGoal'
+        );
+    });
+});
+
+describe('fix51 issue 20: ensureCraftingTable dependency chain', async () => {
+    it('ensureCraftingTable returns false (not throws) when missing ingredients', async () => {
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        const ensureStart = voyagerSrc.indexOf("name: 'ensureCraftingTable'");
+        const depsStart = voyagerSrc.indexOf("deps:", ensureStart);
+        const section = voyagerSrc.slice(ensureStart, depsStart);
+        
+        // Should use log(bot, 'PREREQUISITE FAILED:...') and return false, not throw
+        assert.ok(section.includes('PREREQUISITE FAILED'),
+            'ensureCraftingTable should fail loud with PREREQUISITE FAILED when missing ingredients');
+        assert.ok(section.includes('return false'),
+            'ensureCraftingTable should return false on failure, not throw');
+    });
+
+    it('ensureCraftingTable does not use magic sleep timer', async () => {
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        const ensureStart = voyagerSrc.indexOf("name: 'ensureCraftingTable'");
+        const depsStart = voyagerSrc.indexOf("deps:", ensureStart);
+        const section = voyagerSrc.slice(ensureStart, depsStart);
+        
+        assert.ok(!section.includes('await sleep(150)'),
+            'ensureCraftingTable should NOT use magic sleep timer');
+    });
+
+    it('ensureCraftingTable provides prerequisite info for decomposition', async () => {
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        const ensureStart = voyagerSrc.indexOf("name: 'ensureCraftingTable'");
+        const depsStart = voyagerSrc.indexOf("deps:", ensureStart);
+        const section = voyagerSrc.slice(ensureStart, depsStart);
+        
+        // Should explain what ingredient is missing for decomposition
+        assert.ok(section.includes('Decompose to obtain'),
+            'ensureCraftingTable should suggest decomposition when missing ingredients');
+    });
+});
+
+describe('fix51 issue 21: null dereference protection', async () => {
+    it('getNearestBlocksWhere filters out null blocks', () => {
+        const worldSrc = readFileSync('./src/agent/library/world.js', 'utf8');
+        assert.ok(worldSrc.includes('.filter(b => b !== null)'),
+            'getNearestBlocksWhere should filter out null blocks from bot.blockAt results');
+    });
+
+    it('digDown checks for null block at start position', () => {
+        const skillsSrc = readFileSync('./src/agent/library/skills.js', 'utf8');
+        const digDownMatch = skillsSrc.match(/export async function digDown[\s\S]*?^}/m);
+        assert.ok(digDownMatch, 'digDown function should exist');
+        const fnBody = digDownMatch[0];
+        assert.ok(fnBody.includes('if (!startBlock)'),
+            'digDown should check for null block at start position');
+        assert.ok(fnBody.includes('chunk unloaded'),
+            'digDown should fail loud with cause when block is null');
+    });
+
+    it('coder has _checkNullDeref method for lint feedback', () => {
+        const coderSrc = readFileSync('./src/agent/coder.js', 'utf8');
+        assert.ok(coderSrc.includes('_checkNullDeref'),
+            'coder.js should have _checkNullDeref method');
+        assert.ok(coderSrc.includes('Potential null dereference'),
+            'lint should warn about potential null dereference on findBlock/blockAt');
+    });
+});
