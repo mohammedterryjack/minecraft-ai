@@ -1,6 +1,13 @@
 import { withStallPhase } from '../utils/event_loop_guard.js';
 import { wrapBotForApiTiming } from '../utils/bot_api_timing.js';
 
+// fix75: an interrupt source is { kind, by }: kind is what fired it (preempt, timeout, mode, stall, death, player,
+// process-error, exception, command, self-prompter), by says which one. Missing or malformed is our bug: throw.
+export function checkInterruptSource(source) {
+    if (!source || typeof source !== 'object' || typeof source.kind !== 'string' || !source.kind || typeof source.by !== 'string' || !source.by)
+        throw new Error(`interrupt without a source: ${JSON.stringify(source)} (every interrupt must say { kind, by } where it fires)`);
+}
+
 export class ActionManager {
     constructor(agent) {
         this.agent = agent;
@@ -8,6 +15,11 @@ export class ActionManager {
         this.currentActionLabel = '';
         this.currentActionFn = null;
         this.timedout = false;
+        // fix75: what cut the running action off, recorded where the interrupt fires (agent.requestInterrupt). Reset when an
+        // action starts; returned with that action's result as `interruptedBy`. Before, only pre-emption recorded itself
+        // (fix14 lastInterruptBy, set by the NEW action before it stopped the old one), so a timeout or a mode/stall/death/
+        // player interrupt left it unset, and since fix51 (fea5d83) voyager's _interruptReason threw on that.
+        this.interruptSource = null;
         this.resume_func = null;
         this.resume_name = '';
         this.last_action_time = 0;
@@ -26,18 +38,28 @@ export class ActionManager {
         }
     }
 
-    async stop() {
+    // fix75: every stop names its source ({ kind, by }); see agent.requestInterrupt
+    async stop(source) {
+        checkInterruptSource(source);
         if (!this.executing) return;
         const timeout = setTimeout(() => {
             this.agent.cleanKill('Code execution refused stop after 10 seconds. Killing process.');
         }, 10000);
         while (this.executing) {
-            this.agent.requestInterrupt();
+            this.agent.requestInterrupt(source);
             console.log('waiting for code to finish executing...');
             await new Promise(resolve => setTimeout(resolve, 300));
         }
         clearTimeout(timeout);
     } 
+
+    // fix75: the first interrupt of the running action is the one that cut it off; later ones (stop() re-requests every
+    // poll, a second source racing the first) do not overwrite it. No action running: nothing is cut off, nothing recorded.
+    noteInterrupt(source) {
+        checkInterruptSource(source);
+        if (!this.executing) return;
+        if (this.interruptSource === null) this.interruptSource = source;
+    }
 
     cancelResume() {
         this.resume_func = null;
@@ -89,12 +111,13 @@ export class ActionManager {
             // also tell agent.bot to stop various actions
             if (this.executing) {
                 console.log(`action "${actionLabel}" trying to interrupt current action "${this.currentActionLabel}"`);
-                this.lastInterruptBy = actionLabel;   // fix14: who cut the action off (voyager failure feedback)
             }
-            await this.stop();
+            await this.stop({ kind: 'preempt', by: actionLabel });   // fix75: recorded on the pre-empted action (was fix14 lastInterruptBy)
 
             // clear bot logs and reset interrupt code
             this.agent.clearBotLogs();
+            this.interruptSource = null;   // fix75: this action's own record starts empty
+            this.timedout = false;   // fix75: was never reset (8d5c995): after one timeout every later action reported timedout
 
             this.executing = true;
             this.currentActionLabel = actionLabel;
@@ -122,6 +145,7 @@ export class ActionManager {
             let output = this.getBotOutputSummary();
             let interrupted = this.agent.bot.interrupt_code;
             let timedout = this.timedout;
+            const interruptedBy = this.interruptSource;
             this.agent.clearBotLogs();
 
             // if not interrupted and not generating, emit idle event
@@ -130,7 +154,7 @@ export class ActionManager {
             }
 
             // return action status report
-            return { success: true, message: output, interrupted, timedout };
+            return { success: true, message: output, interrupted, timedout, interruptedBy };
         } catch (err) {
             this.executing = false;
             this.currentActionLabel = '';
@@ -140,7 +164,7 @@ export class ActionManager {
             console.error("Code execution triggered catch:", err);
             // Log the full stack trace
             console.error(err.stack);
-            await this.stop();
+            await this.stop({ kind: 'exception', by: actionLabel });
             err = err.toString();
 
             let message = this.getBotOutputSummary() +
@@ -149,11 +173,12 @@ export class ActionManager {
                 'Stack trace:\n' + err.stack+'\n';
 
             let interrupted = this.agent.bot.interrupt_code;
+            const timedout = this.timedout, interruptedBy = this.interruptSource;   // fix75: was a literal timedout:false
             this.agent.clearBotLogs();
             if (!interrupted) {
                 this.agent.bot.emit('idle');
             }
-            return { success: false, message, interrupted, timedout: false };
+            return { success: false, message, interrupted, timedout, interruptedBy };
         }
     }
 
@@ -178,7 +203,7 @@ export class ActionManager {
             console.warn(`Code execution timed out after ${TIMEOUT_MINS} minutes. Attempting force stop.`);
             this.timedout = true;
             this.agent.history.add('system', `Code execution timed out after ${TIMEOUT_MINS} minutes. Attempting force stop.`);
-            await this.stop(); // last attempt to stop
+            await this.stop({ kind: 'timeout', by: `${TIMEOUT_MINS}-minute action limit` }); // last attempt to stop
         }, TIMEOUT_MINS * 60 * 1000);
     }
 

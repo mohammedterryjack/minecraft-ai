@@ -140,7 +140,7 @@ describe('fix65: trial candidates are retired by the learner', () => {
     it('a crash during the step is attributed to the call running when it was thrown', () => {
         const v = liveVoyager();
         v.running = true; v.currentTask = 'Mine 1 iron_ore';
-        v.agent.bot.interrupt_code = false; v.agent.actions = { stop: () => {} };
+        v.agent.bot.interrupt_code = false; v.agent.actions = { stop: () => {} }; v.agent.requestInterrupt = () => { v.agent.bot.interrupt_code = true; };   // fix75: the process error records itself as an interrupt source
         v._runStart = Date.now() - 4;
         v._onProcessError('UNCAUGHT EXCEPTION', new Error('boom'));
         const c = v._crashedInRun();
