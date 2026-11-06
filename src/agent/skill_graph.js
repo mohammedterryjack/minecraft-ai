@@ -4,8 +4,11 @@ import * as acorn from 'acorn';
 /** Function declaration / async function expression assigned to `name` — AST only (no name regex on user code). */
 export function signatureOf(code, name) {
     let ast;
-    try { ast = acorn.parse(String(code), { ecmaVersion: 'latest', sourceType: 'module', allowAwaitOutsideFunction: true }); }
-    catch { return `${name}(bot)`; }
+    try {
+        ast = acorn.parse(String(code), { ecmaVersion: 'latest', sourceType: 'module', allowAwaitOutsideFunction: true });
+    } catch (e) {
+        throw new Error(`[skill_graph] signatureOf: parse failed for skill "${name}": ${e && e.message ? e.message : String(e)}`);
+    }
     const paramsFrom = (fnNode) => {
         if (!fnNode.body) return '';
         const header = String(code).slice(fnNode.start, fnNode.body.start);
@@ -37,7 +40,7 @@ export function signatureOf(code, name) {
     };
     walk(ast);
     if (found) return `${name}(${paramsFrom(found)})`;
-    return `${name}(bot)`;
+    throw new Error(`[skill_graph] signatureOf: no function declaration or assignment for "${name}" in skill source`);
 }
 function stripComments(code) { return String(code).replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, ''); }
 // fix51: strip string literals so names inside strings aren't counted as dependencies
@@ -216,7 +219,7 @@ const __wrap = (n, f) => async function (...a) {
     const par = __als.getStore() ?? -1;
     const __stackParts = []; for (let __i = par; __i >= 0 && __i < __T.length; __i = __T[__i].parent) __stackParts.push(__T[__i].name); const __stackStr = [...__stackParts.reverse(), n].join(' <- ');
     bot.__psnRunningSkill = n; bot.__psnStackStr = __stackStr;
-    const rec = { name: n, args: (() => { try { return JSON.stringify(a.slice(1)).slice(0, 120); } catch { return '?'; } })(), parent: par, depth: par < 0 ? 0 : __T[par].depth + 1, o0: (bot.output || '').length, t0: Date.now(), pre: __have(), argv: a.slice(1).map(x => x === null || typeof x !== 'object' ? x : null) };
+    const rec = { name: n, args: (() => { const s = a.slice(1); return JSON.stringify(s).slice(0, 120); })(), parent: par, depth: par < 0 ? 0 : __T[par].depth + 1, o0: (bot.output || '').length, t0: Date.now(), pre: __have(), argv: a.slice(1).map(x => x === null || typeof x !== 'object' ? x : null) };
     if (!n.startsWith('skills.')) rec.s0 = __st();
     const id = __T.push(rec) - 1;
     try { const r = await __als.run(id, () => f.apply(this, a)); rec.ret = r === undefined ? 'undefined' : String(JSON.stringify(r)).slice(0, 60); rec.rv = r === null || typeof r !== 'object' ? r : null; rec.fail = r === false || r === null || r === 0; return r; }

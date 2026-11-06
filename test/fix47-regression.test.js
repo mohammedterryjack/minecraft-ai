@@ -196,6 +196,7 @@ describe('fix47: decompose subtracts inventory and producible items', () => {
         voyager.skills = [{
             name: 'smeltRawIron',
             task: 'Smelt 1 raw_iron into 1 iron_ingot',
+            code: 'async function smeltRawIron(bot) { return true; }',
             effects: ['iron_ingot'],
             consumes: { raw_iron: 1 },  // Learned: consumes 1 raw_iron per iron_ingot
             demoted: false,
@@ -229,6 +230,7 @@ describe('fix47: decompose subtracts inventory and producible items', () => {
         voyager.skills = [{
             name: 'smeltRawIron',
             task: 'Smelt 1 raw_iron into 1 iron_ingot',
+            code: 'async function smeltRawIron(bot) { return true; }',
             effects: ['iron_ingot'],
             consumes: { raw_iron: 1 },
             demoted: false,

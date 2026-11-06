@@ -7,16 +7,9 @@
  */
 import { mkdirSync, writeFileSync } from 'fs';
 import { monitorEventLoopDelay } from 'node:perf_hooks';
-import { setSettings } from '../src/agent/settings.js';
-import rootSettings from '../settings.js';
 import { instrumentSrc } from '../src/agent/skill_graph.js';
 import { Coder, collectBareApiUsedInSource } from '../src/agent/coder.js';
 import { withStallPhase } from '../src/utils/event_loop_guard.js';
-
-setSettings({
-    event_loop_stall_poll_interval_ms: rootSettings.event_loop_stall_poll_interval_ms,
-    world_scan_stall_warn_distance: rootSettings.world_scan_stall_warn_distance,
-});
 
 const TARGET_CHARS = 110000;
 

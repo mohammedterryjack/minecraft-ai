@@ -10,10 +10,8 @@ import * as acorn from "acorn";
 const { tokenizer: acornTokenizer, tokTypes } = acorn;
 import pf from 'mineflayer-pathfinder';
 import { logPromptBreakdown } from './prompt_utils.js';
-import { withStallPhase, setStallPhase, getStallPhase } from '../utils/event_loop_guard.js';
+import { withStallPhase, pushStallPhase, popStallPhase } from '../utils/event_loop_guard.js';
 import { wrapBotForApiTiming } from '../utils/bot_api_timing.js';
-import agentSettings from './settings.js';
-import rootSettings from '../../settings.js';
 
 // fix38: expose pathfinder goals to generated code (fail loud if missing)
 const pathfinderGoals = pf.goals;
@@ -23,14 +21,11 @@ if (!pathfinderGoals || !pathfinderGoals.GoalNear) {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-function worldScanStallWarnDistance() {
-    if (typeof agentSettings.world_scan_stall_warn_distance === 'number') {
-        return agentSettings.world_scan_stall_warn_distance;
-    }
-    if (typeof rootSettings.world_scan_stall_warn_distance === 'number') {
-        return rootSettings.world_scan_stall_warn_distance;
-    }
-    throw new Error('[coder] world_scan_stall_warn_distance missing: set in settings.js (root) or agent settings after MindServer sync');
+function _trimLineAt(code, line1) {
+    const lines = code.split('\n');
+    const raw = lines[line1 - 1];
+    if (raw === undefined) throw new Error(`[coder] line ${line1} out of range (${lines.length} lines in source)`);
+    return raw.trim();
 }
 
 // fix40/41: unified bare-name API - all functions (built-in + learned) use bare names only
@@ -79,8 +74,9 @@ export function collectBareApiUsedInSource(combinedSrc) {
     let ast;
     try {
         ast = acorn.parse(String(combinedSrc), { ecmaVersion: 'latest', sourceType: 'module', allowAwaitOutsideFunction: true });
-    } catch {
-        return { skillNames, worldNames };
+    } catch (e) {
+        const loc = e && typeof e.pos === 'number' ? ` (at offset ${e.pos})` : '';
+        throw new Error(`[coder] collectBareApiUsedInSource: parse failed${loc}: ${e && e.message ? e.message : String(e)}`);
     }
     const walk = (node) => {
         if (!node || typeof node.type !== 'string') return;
@@ -458,18 +454,20 @@ export class Coder {
      */
     _syncLoopLint(code, preludeLines) {
         let ast;
-        try { ast = acorn.parse(code, { ecmaVersion: 'latest', sourceType: 'module', allowAwaitOutsideFunction: true, locations: true }); }
-        catch { return []; }
+        try {
+            ast = acorn.parse(code, { ecmaVersion: 'latest', sourceType: 'module', allowAwaitOutsideFunction: true, locations: true });
+        } catch (e) {
+            throw new Error(`[coder] _syncLoopLint: parse failed: ${e && e.message ? e.message : String(e)}`);
+        }
         const out = [];
         const loopKinds = new Set(['ForStatement', 'WhileStatement', 'DoWhileStatement', 'ForInStatement', 'ForOfStatement']);
         const walk = (node) => {
             if (!node || typeof node.type !== 'string') return;
             if (loopKinds.has(node.type)) {
                 const body = node.body;
-                const line = body?.loc?.start?.line;
-                if (line && line > preludeLines && !this._astHasAwait(body)) {
-                    const codeLines = code.split('\n');
-                    out.push({ line, text: codeLines[line - 1]?.trim() || String(node.type) });
+                const line = body.loc.start.line;
+                if (line > preludeLines && !this._astHasAwait(body)) {
+                    out.push({ line, text: _trimLineAt(code, line) });
                 }
             }
             for (const k in node) {
@@ -494,11 +492,22 @@ export class Coder {
     /**
      * Warn on large-radius block/entity scans (numeric maxDistance or similar).
      */
-    _largeWorldScanLint(code, preludeLines) {
+    /**
+     * @param {string} code
+     * @param {number} preludeLines
+     * @param {number} warnDistMs numeric literal threshold (derived from observed keep_alive gap ms on the live bot)
+     */
+    _largeWorldScanLint(code, preludeLines, warnDistMs) {
+        if (typeof warnDistMs !== 'number' || !Number.isFinite(warnDistMs) || warnDistMs <= 0) {
+            throw new Error('[coder] _largeWorldScanLint: warnDistMs must be a positive finite number');
+        }
         let ast;
-        try { ast = acorn.parse(code, { ecmaVersion: 'latest', sourceType: 'module', allowAwaitOutsideFunction: true, locations: true }); }
-        catch { return []; }
-        const warnDist = worldScanStallWarnDistance();
+        try {
+            ast = acorn.parse(code, { ecmaVersion: 'latest', sourceType: 'module', allowAwaitOutsideFunction: true, locations: true });
+        } catch (e) {
+            throw new Error(`[coder] _largeWorldScanLint: parse failed: ${e && e.message ? e.message : String(e)}`);
+        }
+        const warnDist = warnDistMs;
         const out = [];
         const scanCalleeNames = new Set(['findBlock', 'findBlocks', 'nearestEntity']);
         const walk = (node) => {
@@ -516,29 +525,28 @@ export class Coder {
                             if (kn !== 'maxDistance' && kn !== 'maxBlocks') continue;
                             const n = this._getNumericLiteral(p.value);
                             if (n !== null && n >= warnDist) {
-                                reportLine = p.value.loc?.start?.line ?? node.loc?.start?.line;
-                                detail = `bot.${callee.property.name} option ${kn}=${n}`;
+                                reportLine = p.value.loc.start.line;
+                                detail = `bot.${callee.property.name} option ${kn}=${n} (>= observed keep_alive gap ${warnDist}ms as stall-risk distance)`;
                             }
                         }
                     }
                     if (callee.property.name === 'nearestEntity' && node.arguments.length >= 2) {
                         const n = this._getNumericLiteral(node.arguments[1]);
                         if (n !== null && n >= warnDist) {
-                            reportLine = node.arguments[1].loc?.start?.line ?? node.loc?.start?.line;
-                            detail = `bot.nearestEntity second arg maxDistance=${n}`;
+                            reportLine = node.arguments[1].loc.start.line;
+                            detail = `bot.nearestEntity second arg maxDistance=${n} (>= observed keep_alive gap ${warnDist}ms as stall-risk distance)`;
                         }
                     }
                 }
                 if (callee?.type === 'Identifier' && callee.name === 'getNearestBlock' && node.arguments.length >= 3) {
                     const n = this._getNumericLiteral(node.arguments[2]);
                     if (n !== null && n >= warnDist) {
-                        reportLine = node.arguments[2].loc?.start?.line ?? node.loc?.start?.line;
-                        detail = `getNearestBlock distance=${n}`;
+                        reportLine = node.arguments[2].loc.start.line;
+                        detail = `getNearestBlock distance=${n} (>= observed keep_alive gap ${warnDist}ms as stall-risk distance)`;
                     }
                 }
-                if (reportLine && reportLine > preludeLines) {
-                    const codeLines = code.split('\n');
-                    out.push({ line: reportLine, text: codeLines[reportLine - 1]?.trim() || detail, detail });
+                if (reportLine !== null && reportLine > preludeLines) {
+                    out.push({ line: reportLine, text: _trimLineAt(code, reportLine), detail });
                 }
             }
             for (const k in node) {
@@ -556,16 +564,18 @@ export class Coder {
      */
     _forbiddenTimerLint(code, preludeLines) {
         let ast;
-        try { ast = acorn.parse(code, { ecmaVersion: 'latest', sourceType: 'module', allowAwaitOutsideFunction: true, locations: true }); }
-        catch { return []; }
+        try {
+            ast = acorn.parse(code, { ecmaVersion: 'latest', sourceType: 'module', allowAwaitOutsideFunction: true, locations: true });
+        } catch (e) {
+            throw new Error(`[coder] _forbiddenTimerLint: parse failed: ${e && e.message ? e.message : String(e)}`);
+        }
         const bad = [];
         const walk = (node) => {
             if (!node || typeof node.type !== 'string') return;
             if (node.type === 'CallExpression' && node.callee?.type === 'Identifier' && (node.callee.name === 'setTimeout' || node.callee.name === 'setInterval')) {
-                const line = node.loc?.start?.line;
-                if (line && line > preludeLines) {
-                    const codeLines = code.split('\n');
-                    bad.push({ line, text: codeLines[line - 1]?.trim() || node.callee.name });
+                const line = node.loc.start.line;
+                if (line > preludeLines) {
+                    bad.push({ line, text: _trimLineAt(code, line) });
                 }
             }
             for (const k in node) {
@@ -751,13 +761,26 @@ export class Coder {
             return header + errors.join('');
         }
 
-        const wd = worldScanStallWarnDistance();
-        const largeScanWarnings = this._largeWorldScanLint(code, preludeLines);
+        const bot = this.agent.bot;
+        const learnedMs =
+            bot &&
+            typeof bot.__eventLoopStallThresholdMs === 'number' &&
+            Number.isFinite(bot.__eventLoopStallThresholdMs) &&
+            bot.__eventLoopStallThresholdMs > 0
+                ? bot.__eventLoopStallThresholdMs
+                : null;
+        if (learnedMs === null) {
+            warnings.push(
+                'WARNING: large-radius scan stall-risk check is OFF until the event-loop guard learns the server keep_alive interval (two inbound keep_alive packets on bot._client).\n'
+            );
+        }
+        const largeScanWarnings = learnedMs === null ? [] : this._largeWorldScanLint(code, preludeLines, learnedMs);
         if (largeScanWarnings.length > 0) {
-            let w = `WARNING: Large-radius block/world scan (numeric distance >= ${wd}) may block the event loop.\n`;
+            const wd = learnedMs;
+            let w = `WARNING: Large-radius block/world scan (numeric distance >= ${wd} — same ms as the observed server keep_alive gap used for stall detection) may block the event loop.\n`;
             w += 'Prefer smaller maxDistance, chunk-aware iteration, or yield with await between batches.\n';
             for (const x of largeScanWarnings) {
-                w += `  Line ${x.line}: ${x.detail || x.text}\n`;
+                w += `  Line ${x.line}: ${x.detail}\n`;
             }
             w += '\n';
             warnings.push(w);
@@ -953,13 +976,12 @@ export class Coder {
             sleep: ms => new Promise(r => setTimeout(r, ms)),   // fix27: the only way to wait; setTimeout itself is not in scope
         });
         const compartment = makeCompartment(endowments);
-        const prevEvalPhase = getStallPhase();
-        setStallPhase('coder:ses-eval');
+        pushStallPhase('coder:ses-eval');
         let mainFn;
         try {
             mainFn = compartment.evaluate(src);
         } finally {
-            setStallPhase(prevEvalPhase);
+            popStallPhase();
         }
         
         if (write_result) {

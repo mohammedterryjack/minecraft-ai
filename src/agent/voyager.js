@@ -23,7 +23,7 @@ import minecraftData from 'minecraft-data';
 import { Ollama } from '../models/ollama.js';
 import { signatureOf, depsOf, missingCalls, findCycle, findAllCycles, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf } from './skill_graph.js';
 import { getBareAPI, collectBareApiUsedInSource } from './coder.js';   // fix40: unified bare-name API helper
-import { withStallPhase, setStallPhase } from '../utils/event_loop_guard.js';
+import { withStallPhase } from '../utils/event_loop_guard.js';
 import { wrapBotForApiTiming } from '../utils/bot_api_timing.js';
 import { logPromptBreakdown, extractBareCalls } from './prompt_utils.js';   // fix47: shared prompt utilities
 const LOCAL = { model: 'qwen3:4b-instruct-2507-q4_K_M', url: 'http://192.168.1.215:11434', params: { format: 'json', options: { num_ctx: 8192, num_predict: 512 } } };   // fix38: raised from 150 to 512 - short JSON replies still need room for reasoning; truncation fails loudly (fix31)
@@ -700,8 +700,11 @@ export class Voyager {
             const code = Object.prototype.hasOwnProperty.call(over, name) ? over[name] : entry?.code;
             if (typeof code !== 'string') continue;
             let ast;
-            try { ast = acorn.parse(code, { ecmaVersion: 'latest', sourceType: 'module', allowAwaitOutsideFunction: true }); }
-            catch { continue; }
+            try {
+                ast = acorn.parse(code, { ecmaVersion: 'latest', sourceType: 'module', allowAwaitOutsideFunction: true });
+            } catch (e) {
+                throw new Error(`[voyager] _tracedSkillNamesForInstrument: parse failed for skill "${name}": ${e && e.message ? e.message : String(e)}`);
+            }
             const walk = (node) => {
                 if (!node || typeof node.type !== 'string') return;
                 if (node.type === 'CallExpression') {

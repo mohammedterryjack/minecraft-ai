@@ -19,6 +19,7 @@ import { Task } from './tasks/tasks.js';
 import { speak } from './speak.js';
 import { log, validateNameFormat } from './connection_handler.js';
 import { startEventLoopStallGuard } from '../utils/event_loop_guard.js';
+import { inspect } from 'node:util';
 
 export class Agent {
     async start(load_mem=false, init_message=null, count_id=0) {
@@ -71,7 +72,8 @@ export class Agent {
         const verbatimReason = (reason) => {
             if (reason === undefined || reason === null) return String(reason);
             if (typeof reason === 'string') return reason;
-            try { return JSON.stringify(reason); } catch (e) { return String(reason); }
+            if (typeof reason === 'bigint') return reason.toString();
+            return inspect(reason, { depth: 6, maxArrayLength: 50, breakLength: 120 });
         };
 
         // Connection Handler: verbatim reason, then exit non-zero (launchd / parent restarts)

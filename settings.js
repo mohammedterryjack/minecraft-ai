@@ -57,11 +57,6 @@ const settings = {
     "narrate_behavior": false, // chat simple automatic actions ('Picking up item!')
     "chat_bot_messages": true, // publicly chat messages to other bots
 
-    // How often to read monitorEventLoopDelay max delay (ms). Must be configured explicitly (no code default).
-    "event_loop_stall_poll_interval_ms": 500,
-    // Lint warns on findBlock/findBlocks (and pathfinder scans) when maxDistance (or similar) is a numeric literal >= this value.
-    "world_scan_stall_warn_distance": 128,
-
     "spawn_timeout": 30, // num seconds allowed for the bot to spawn before throwing error. Increase when spawning takes a while.
     "block_place_delay": 0, // delay between placing blocks (ms) if using newAction. helps avoid bot being kicked by anti-cheat mechanisms on servers.
   

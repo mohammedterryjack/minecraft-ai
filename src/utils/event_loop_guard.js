@@ -1,23 +1,30 @@
 /**
  * Event-loop stall monitoring: threshold is the most recently observed gap between inbound
  * `keep_alive` packets from the server (minecraft-protocol), measured on `bot._client`.
- * Poll cadence comes from settings.event_loop_stall_poll_interval_ms only.
+ * Poll cadence follows the Nyquist sampling rule: sample at least twice per keep-alive period,
+ * i.e. poll interval = (learned interval ms) / 2 (see `stallPollIntervalMsForThreshold`).
+ *
+ * Root cause of long stalls in production was unknown; this guard plus `withStallPhase` phase
+ * stacks attribute stalls to labeled phases so the next step is diagnosis from real logs — not guessing.
  */
 import { monitorEventLoopDelay } from 'node:perf_hooks';
-import agentSettings from '../agent/settings.js';
-import rootSettings from '../../settings.js';
 
-function stallPollIntervalMs() {
-    if (typeof agentSettings.event_loop_stall_poll_interval_ms === 'number') {
-        return agentSettings.event_loop_stall_poll_interval_ms;
+/** @type {string[]} */
+let _phaseStack = [];
+
+/**
+ * Nyquist: sample the event-loop delay at least twice per keep-alive period.
+ * @param {number} thresholdMs observed keep_alive gap (ms)
+ */
+export function stallPollIntervalMsForThreshold(thresholdMs) {
+    if (typeof thresholdMs !== 'number' || !Number.isFinite(thresholdMs) || thresholdMs <= 0) {
+        throw new Error('[event_loop_guard] stallPollIntervalMsForThreshold: need positive finite thresholdMs');
     }
-    if (typeof rootSettings.event_loop_stall_poll_interval_ms === 'number') {
-        return rootSettings.event_loop_stall_poll_interval_ms;
-    }
-    throw new Error('[event_loop_guard] event_loop_stall_poll_interval_ms missing: set in settings.js (root) or agent settings after MindServer sync');
+    const half = thresholdMs / 2;
+    // setInterval requires a positive integer ms; never 0
+    const interval = Math.max(1, Math.floor(half));
+    return interval;
 }
-
-let _phase = 'idle';
 
 /**
  * After at least two server keep_alive packets, holds the latest observed interval (ms).
@@ -33,45 +40,85 @@ export function stallThresholdMs(bot) {
 }
 
 export function setStallPhase(phase) {
-    _phase = String(phase);
+    _phaseStack = [String(phase)];
 }
 
 export function getStallPhase() {
-    return _phase;
+    return _phaseStack.length ? _phaseStack[_phaseStack.length - 1] : 'idle';
+}
+
+/** @returns {string[]} shallow copy of the current phase stack (deepest / innermost last) */
+export function getStallPhaseStack() {
+    return [..._phaseStack];
+}
+
+/**
+ * @param {import('mineflayer').Bot | null | undefined} bot
+ */
+export function captureStallContext(bot) {
+    const phases = getStallPhaseStack();
+    const phaseStr = phases.length ? phases.join(' <- ') : '(no phase)';
+    const skill = bot && bot.__psnRunningSkill != null ? String(bot.__psnRunningSkill) : '(none)';
+    const stack = bot && bot.__psnStackStr != null ? String(bot.__psnStackStr) : '(none)';
+    return { phases, phaseStr, skill, stack };
+}
+
+/**
+ * @param {string} phase
+ * @param {() => void} fn
+ */
+export function pushStallPhase(phase) {
+    _phaseStack.push(String(phase));
+}
+
+export function popStallPhase() {
+    _phaseStack.pop();
 }
 
 /**
  * @param {import('mineflayer').Bot} bot
  */
-function _armStallPoll(bot) {
-    if (bot.__stallPollInterval) return;
-    const pollMs = stallPollIntervalMs();
-    if (!Number.isFinite(pollMs) || pollMs <= 0) {
-        throw new Error('[event_loop_guard] event_loop_stall_poll_interval_ms must be a positive finite number');
+/** Exposed for tests: run one stall poll tick with the current histogram sample. */
+export function runStallPollTickForTest(bot) {
+    _stallPollTick(bot);
+}
+
+function _stallPollTick(bot) {
+    const threshold = bot.__eventLoopStallThresholdMs;
+    if (typeof threshold !== 'number' || !Number.isFinite(threshold) || threshold <= 0) return;
+    const h = bot.__stallEventLoopHist;
+    if (!h) return;
+    const maxNs = h.max;
+    h.reset();
+    const maxMs = maxNs / 1e6;
+    if (maxMs >= threshold) {
+        const ctx = captureStallContext(bot);
+        console.error(`[event-loop] STALL: event loop delayed ${maxMs.toFixed(0)}ms (>= ${threshold}ms observed keep_alive gap) phase_stack="${ctx.phaseStr}" skill="${ctx.skill}" stack="${ctx.stack}"`);
     }
+}
+
+/**
+ * (Re)schedule poll: interval is always derived from current threshold via Nyquist.
+ * @param {import('mineflayer').Bot} bot
+ */
+function _scheduleStallPoll(bot) {
     const thresholdMs = bot.__eventLoopStallThresholdMs;
     if (typeof thresholdMs !== 'number' || !Number.isFinite(thresholdMs) || thresholdMs <= 0) {
-        throw new Error(`[event_loop_guard] cannot arm stall poll: invalid threshold on bot`);
+        throw new Error('[event_loop_guard] cannot schedule stall poll: invalid threshold on bot');
     }
-    console.log(`[event-loop] stall guard ARMED: threshold tracks observed server keep_alive gap (currently ${thresholdMs}ms); poll every ${pollMs}ms`);
+    const pollMs = stallPollIntervalMsForThreshold(thresholdMs);
+    if (bot.__stallPollInterval) {
+        clearInterval(bot.__stallPollInterval);
+        bot.__stallPollInterval = null;
+    }
+    console.log(`[event-loop] stall guard ARMED: threshold tracks observed server keep_alive gap (currently ${thresholdMs}ms); poll every ${pollMs}ms (Nyquist: interval/2)`);
 
-    bot.__stallEventLoopHist = monitorEventLoopDelay({ resolution: 20 });
-    bot.__stallEventLoopHist.enable();
+    if (!bot.__stallEventLoopHist) {
+        bot.__stallEventLoopHist = monitorEventLoopDelay({ resolution: 20 });
+        bot.__stallEventLoopHist.enable();
+    }
 
-    bot.__stallPollInterval = setInterval(() => {
-        const threshold = bot.__eventLoopStallThresholdMs;
-        if (typeof threshold !== 'number' || !Number.isFinite(threshold) || threshold <= 0) return;
-        const h = bot.__stallEventLoopHist;
-        if (!h) return;
-        const maxNs = h.max;
-        h.reset();
-        const maxMs = maxNs / 1e6;
-        if (maxMs >= threshold) {
-            const skill = bot.__psnRunningSkill !== undefined && bot.__psnRunningSkill !== null ? String(bot.__psnRunningSkill) : '(none)';
-            const stack = bot.__psnStackStr !== undefined && bot.__psnStackStr !== null ? String(bot.__psnStackStr) : '(none)';
-            console.error(`[event-loop] STALL: event loop delayed ${maxMs.toFixed(0)}ms (>= ${threshold}ms observed keep_alive gap) during phase "${_phase}" skill="${skill}" stack="${stack}"`);
-        }
-    }, pollMs);
+    bot.__stallPollInterval = setInterval(() => _stallPollTick(bot), pollMs);
 }
 
 /**
@@ -102,7 +149,7 @@ export function startEventLoopStallGuard(bot) {
         }
         bot.__serverKeepAliveIntervalMs = intervalMs;
         bot.__eventLoopStallThresholdMs = intervalMs;
-        _armStallPoll(bot);
+        _scheduleStallPoll(bot);
     };
     bot.__stallGuardKeepAliveHandler = onKeepAlive;
     bot._client.on('keep_alive', onKeepAlive);
@@ -128,20 +175,22 @@ export function stopEventLoopStallGuard(bot) {
 
 /**
  * Run an async function with a stall phase label (for loud logging when the loop lags).
+ * Pushes onto the phase stack for STALL attribution.
  * @template T
  * @param {string} phase
  * @param {() => Promise<T>} fn
  * @returns {Promise<T>}
  */
 export async function withStallPhase(phase, fn) {
-    const prev = _phase;
-    _phase = phase;
+    pushStallPhase(phase);
     const t0 = Date.now();
-    const out = await fn();
-    const dt = Date.now() - t0;
-    if (dt > 100) {
-        console.log(`[event-loop] phase "${phase}" finished in ${dt}ms (async wall time)`);
+    try {
+        return await fn();
+    } finally {
+        popStallPhase();
+        const dt = Date.now() - t0;
+        if (dt > 100) {
+            console.log(`[event-loop] phase "${phase}" finished in ${dt}ms (async wall time)`);
+        }
     }
-    _phase = prev;
-    return out;
 }
