@@ -96,7 +96,9 @@ describe('fix76: structural unmet-precondition classification', () => {
         assert.equal(src.includes('.test(blob)'), false, 'no blob text scan');
         assert.match(src, /_foodRaiseSaturated/);
         assert.match(src, /_classifyUnmetPrecondition/);
-        assert.match(src, /kind: 'precondition'/);
+        // fix74: seeded primitives write the marker only through markPreconditionUnmet (precondition.js owns the kind)
+        assert.match(src, /__mcPreconditionUnmet__\(bot\)/);
+        assert.equal(src.includes('bot.__unmetPrecondition ='), false, 'no bare marker write');
         assert.match(pre, /kind: 'precondition'/);
         const bot = { output: 'FAILED to consume cooked_mutton: Food is full. Food stayed at 20.' };
         assert.strictEqual(peekPreconditionUnmet(bot), null, 'text in output is not a typed marker');

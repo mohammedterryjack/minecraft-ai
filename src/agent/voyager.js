@@ -25,13 +25,13 @@ import minecraftData from 'minecraft-data';
 import { Ollama } from '../models/ollama.js';
 import { setCallDurationStore } from '../models/call_durations.js';
 import { setMovementStore, learnedKinds, recordStep, recordCut, stepBound, noteUnbounded } from '../utils/movement_model.js';
-import { signatureOf, depsOf, missingCalls, findCycle, findAllCycles, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf, thrownIn, declaredNames } from './skill_graph.js';
-import { getBareAPI, collectBareApiUsedInSource } from './coder.js';   // fix40: unified bare-name API helper
+import { signatureOf, depsOf, missingCalls, reservedNamesUsed, findCycle, findAllCycles, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf, thrownIn, declaredNames } from './skill_graph.js';
+import { getBareAPI, collectBareApiUsedInSource, PRECONDITION_UNMET_BINDING } from './coder.js';   // fix40: unified bare-name API helper
 import { withStallPhase } from '../utils/event_loop_guard.js';
 import { watchdogEvidencePath } from '../utils/main_thread_watchdog.js';
 import { wrapBotForApiTiming } from '../utils/bot_api_timing.js';
 import { logPromptBreakdown, extractBareCalls } from './prompt_utils.js';   // fix47: shared prompt utilities
-import { recordConsumeEvidence, verifiedConsumes } from './consume_evidence.js';   // fix70
+import { recordConsumeEvidence, verifiedConsumes, recordEffectEvidence, verifiedEffects, count as invCount } from './consume_evidence.js';   // fix70, fix74
 // fix70: how much of a repair's evidence a [psn] log line shows (a log excerpt; the full evidence stays on the queue entry)
 const LOG_EVIDENCE_CHARS = 160;
 // fix70 (was fix71's inline .slice(0, 600) at both call sites): how much of an API-lint failure goes into the repair evidence
@@ -372,13 +372,16 @@ export class Voyager {
         this.indexFile = `${this.dir}/index.json`;
         this.progressFile = `${this.dir}/progress.json`;
         this.skills = existsSync(this.indexFile) ? JSON.parse(readFileSync(this.indexFile, 'utf8')) : [];
-        this._unverifiedConsumesNoted = new Set();
-        this._lastStepErrSig = null;   // fix75: signature of the previous step's error (null after a step that did not throw)   // fix70: skills whose evidence-less consumes was logged once (see _shouldSkipPractice)
+        this._unverifiedConsumesNoted = new Set();   // fix70: skills whose evidence-less consumes was logged once (see _shouldSkipPractice)
+        this._unjudgeableNoted = new Set();   // fix74: skills logged once as not practisable (nothing can judge their run)
+        this._lastStepErrSig = null;   // fix75: signature of the previous step's error (null after a step that did not throw)
         // fix49: ensure every skill has effects/consumes/stats (older skill files may not have them)
         for (const s of this.skills) {
             if (!s.effects) s.effects = [];
             if (!s.consumes) s.consumes = {};
             if (!s.stats) s.stats = newStats();
+            // fix74: effects are read directly everywhere (no `|| []`); a candidate is created with them (saveSkill HOLD, fix25)
+            if (s.candidate && !Array.isArray(s.candidate.effects)) throw new Error(`[psn] skill ${s.name}: candidate has no effects array (${JSON.stringify(s.candidate.effects)})`);
         }
         this.progress = existsSync(this.progressFile) ? JSON.parse(readFileSync(this.progressFile, 'utf8'))
             : { completed: [], failed: [], enabled: true, goalStats: {} };
@@ -1203,7 +1206,7 @@ Use only c; no other globals.`;
     // fix76: learned hunger outlook (food vs regen floor / decay), including at full HP
     _hunger() { const bot = this.agent.bot, m = skills.getVitalsMax(bot); return this.vitals.hunger(bot.health, m.health, bot.food, m.food); }
     // fix76: structural unmet-precondition classification (no message-text matching).
-    // (1) seeded code called markPreconditionUnmet(bot) -> kind === 'precondition'
+    // (1) seeded code called markPreconditionUnmet(bot) (sandbox binding __mcPreconditionUnmet__, fix74) -> kind === 'precondition'
     // (2) skill's learned vitals effect raises food, and food was already at the observed food cap
     _foodRaiseSaturated(skillName, foodAtStart) {
         if (typeof skillName !== 'string') throw new Error('[fix76] _foodRaiseSaturated: skillName required');
@@ -1250,7 +1253,7 @@ Use only c; no other globals.`;
                 // fix45: when task passed and the skill's delta shows positive gain for its effects, don't attribute VIOLATED
                 // The delta is the ground truth; if the contract formula disagrees, the contract is wrong, not the skill
                 if (taskOk && k === 'post') {
-                    const effects = e.effects || [];
+                    const effects = e.effects;
                     const deltaGained = effects.some(eff => (r.delta?.[eff] || 0) > 0);
                     if (deltaGained) {
                         console.log(`[contract] fix45: ${e.name} postcondition disagreed but delta shows gain for effects [${effects.join(',')}]; queuing contract repair, not skill repair`);
@@ -1365,7 +1368,7 @@ Use only c; no other globals.`;
         }
         if (!learnable.length) return 0;
         const system = `You write PSN skill contracts for a Minecraft mineflayer skill library.\n${Voyager.CONTRACT_SPEC}\nReply ONLY with JSON: {"<skillName>": {"pre": "c => ...", "post": "c => ...", "text": "<one-line contract summary>"}, ...} for exactly the skills given.`;
-        const user = learnable.map(e => `--- ${e.name} ---\ndescription: ${e.description}\nobserved effects: ${JSON.stringify(e.effects || [])}\n${e.contract ? `current contract (${fixNote || 'to fix'}): ${JSON.stringify(e.contract)}\n` : ''}code:\n${String(e.code).slice(0, 1800)}`).join('\n');
+        const user = learnable.map(e => `--- ${e.name} ---\ndescription: ${e.description}\nobserved effects: ${JSON.stringify(e.effects)}\n${e.contract ? `current contract (${fixNote || 'to fix'}): ${JSON.stringify(e.contract)}\n` : ''}code:\n${String(e.code).slice(0, 1800)}`).join('\n');
         console.log(`[contract] learning contracts for ${learnable.length} skill(s) (${why}): ${learnable.map(e => e.name).join(', ')}`);
         let out; try { out = parseJSON(await this._ask(system, user)); } catch (err) { console.log(`[contract] learning FAILED: ${err.message}`); return 0; }
         let n = 0;
@@ -1451,7 +1454,13 @@ Use only c; no other globals.`;
         };
         bot.on('physicsTick', onTick);
         this._lastRunMsg = ''; this._lastRunTimedOut = null;
-        try { const r = await this.agent.actions.runAction(label, fn, { timeout }); this._lastRunMsg = String(r?.message || ''); this._lastRunTimedOut = r.timedout; return r; } finally { bot.removeListener('physicsTick', onTick); }
+        // fix74: _executeAction returns { message: string } on every path (output summary, exception text, loop kill); a result
+        //        without one is an action-manager bug, not an empty output (was String(r?.message || ''))
+        try {
+            const r = await this.agent.actions.runAction(label, fn, { timeout });
+            if (typeof r.message !== 'string') throw new Error(`[voyager] _run(${label}): action result has no message string (got ${JSON.stringify(r.message)})`);
+            this._lastRunMsg = r.message; this._lastRunTimedOut = r.timedout; return r;
+        } finally { bot.removeListener('physicsTick', onTick); }
     }
     _stalledInRun() { const s = this._stall; return s && s.t >= (this._runStart || Infinity) ? s : null; }
     /** fix65: candidate code staged in place for a replay of `root`; `rootTrial` = the goal-overlap gate's verdict on root's own candidate */
@@ -2000,7 +2009,7 @@ Use only c; no other globals.`;
         // Prevents trialing e.g. craftIronHelmet on an iron_pickaxe goal (wastes ingots, wrong outcome)
         let trial = false;
         if (entry?.candidate) {
-            const candidateEffects = entry.candidate.effects || entry.effects || [];
+            const candidateEffects = entry.candidate.effects;   // fix74: every candidate is created with effects (saveSkill HOLD, fix25 migrate; checked at load)
             const goalItems = goal?.items || (goal?.item ? [goal.item] : []);
             const effectsOverlap = goalItems.length === 0 || candidateEffects.some(eff => goalItems.includes(eff));
             if (effectsOverlap) {
@@ -2159,37 +2168,31 @@ Use only c; no other globals.`;
         return `DEPENDENCY CYCLE would be created: ${cyc.join(' -> ')}\nThe skill "${skillName}" cannot call ${deps.filter(d => cyc.includes(d)).join(', ')} because they transitively depend on "${skillName}".`;
     }
 
-    // fix32: learned effects / consumption of a skill from its successful runs (union, capped) - feeds backward chaining
+    // fix32: learned effects / consumption of a skill from its successful runs - feeds backward chaining (fix70/fix74: both carry run evidence)
     // fix44: goalItems hint FILTERS which observed ups count as effects - does NOT fabricate
     // When goalItems present: keep only observed ∩ goal (no fabrication from goal alone)
     // When goalItems absent: keep ALL observed ups (no hard-coded incidental/junk tables)
     _learnEffects(e, before, after, goalItems = null) {
         const inv0 = before.inventory, inv1 = after.inventory;
-        let up = Object.keys(inv1).filter(k => (inv1[k] || 0) > (inv0[k] || 0));
-        const down = Object.keys(inv0).filter(k => (inv1[k] || 0) < (inv0[k] || 0));
-        
-        // fix44: filter up items when goal hint present (observed ∩ goal)
-        // NO hard-coded incidental/junk item tables - when no goal, keep ALL observed ups
+        // fix44: the goal hint filters which observed ups count as effects in this run (observed AND goal; nothing fabricated)
         if (goalItems && goalItems.length) {
-            const excluded = up.filter(k => !goalItems.includes(k));
+            const excluded = Object.keys(inv1).filter(k => invCount(inv1, k) > invCount(inv0, k) && !goalItems.includes(k));
             if (excluded.length) console.log(`[psn] _learnEffects filtered non-goal items: [${excluded.join(',')}]`);
-            up = up.filter(k => goalItems.includes(k));
         }
-        // else: no goal hint -> keep ALL observed ups (no filtering)
-        
         // fix73: every entry is created with effects and consumes (load, saveSkill NEW, split/generalise); the `|| {}` here hid
         // the one creator that left consumes out, so a skill that consumed nothing kept it undefined. Missing is a bug: say so.
         if (!Array.isArray(e.effects) || e.consumes === null || typeof e.consumes !== 'object') throw new Error(`[psn] _learnEffects: skill ${e.name} has no effects/consumes record (effects=${JSON.stringify(e.effects)}, consumes=${JSON.stringify(e.consumes)})`);
-        // fix73: no cap. fix32 (d1ea48e) kept the first 12 of the union: once 12 items had been seen (incidental ups count when
-        // there is no goal hint), a real effect learned later was silently dropped. The set is bounded by the registry's item
-        // names, and no reader of effects needs a bound (producers, practice skip, regression goal overlap, contract prompt).
-        const eff = [...new Set([...e.effects, ...up])];
+        // fix74: effects carry their evidence like consumes (consume_evidence.js recordEffectEvidence). The fix32 union (d1ea48e;
+        //        fix73 dropped its first-12 cap) could never shrink, so one polluted window (pre-fix70 task-window measurement)
+        //        stayed a learned effect for good. The goal hint (fix44) says which ups count in this run.
+        const eff0 = JSON.stringify(e.effects);
+        recordEffectEvidence(e, inv0, inv1, goalItems && goalItems.length ? goalItems : null);
+        if (JSON.stringify(e.effects) !== eff0) console.log(`[psn] ${e.name} effects (from ${e.effectEvidence.runs} measured run(s)): [${e.effects.join(', ')}]`);
         // fix70: consumption carries its evidence (consume_evidence.js); before, consumes was a running max of every item that went
         //        down in any success window and could never shrink, so one polluted window blocked practice for good
         const con0 = JSON.stringify(e.consumes);
         recordConsumeEvidence(e, inv0, inv1);
         if (JSON.stringify(e.consumes) !== con0) console.log(`[psn] ${e.name} consumes (from ${e.consumeEvidence.runs} measured run(s)): ${JSON.stringify(e.consumes)}`);
-        e.effects = eff;
         this._saveSkills();
     }
     // fix55: ONE goal resolver. Each kind comes from one rule over disjoint grammars (no fallback chain):
@@ -2280,21 +2283,55 @@ Use only c; no other globals.`;
         if (skill.task) return skill.task;
         return null;
     }
-    // fix51: idle practice success requires real inventory/effect change (not empty delta / instant return)
-    _practiceRunChanged(skill, before, after) {
-        const effects = Object.hasOwn(skill, 'effects') ? skill.effects : [];
-        if (effects.length) {
-            const gained = effects.filter(it => (after.inventory[it] || 0) > (before.inventory[it] || 0));
-            if (gained.length) return { ok: true, detail: `+${gained.join(',')}` };
-            return { ok: false, detail: `no gain for effects [${effects.join(',')}]` };
+    // fix74: how long a skill has been seen to run before returning on its own, from the trace of every traced run (replay,
+    //        writeCode, practice): skill.runMs = { n, max }. A call that was interrupted (rec.intr) or never returned (no t1)
+    //        did not show how long the skill takes, so it is not a sample.
+    _learnRunDurations(trace) {
+        if (!Array.isArray(trace)) throw new Error('[psn] _learnRunDurations: no trace');
+        for (const r of trace) {
+            if (r.intr || typeof r.t1 !== 'number' || typeof r.t0 !== 'number') continue;
+            const e = this.skills.find(s => s.name === r.name);
+            if (!e) continue;
+            const ms = r.t1 - r.t0;
+            if (!Object.hasOwn(e, 'runMs')) e.runMs = { n: 0, max: ms };
+            e.runMs.n++;
+            if (ms > e.runMs.max) e.runMs.max = ms;
         }
-        const inv0 = before.inventory, inv1 = after.inventory;
-        const keys = new Set([...Object.keys(inv0), ...Object.keys(inv1)]);
-        for (const k of keys) {
-            if ((inv1[k] || 0) !== (inv0[k] || 0)) return { ok: true, detail: `inv delta includes ${k}` };
-        }
-        return { ok: false, detail: 'empty inventory delta' };
     }
+    // fix74: the practice cap is the longest this skill has been seen to run before returning on its own (_learnRunDurations).
+    //        A practice run that is still going past it is outside everything this skill has done: it is cut and counted as a
+    //        failure, as a cut-off replay is (fix14). Task runs are not capped by it, so a slower real run raises it.
+    //        A skill with NO observed run has no cap, by design: there is nothing to derive one from, and any number would be
+    //        a guess. Its run ends when it returns or when the code-model call completes (the abort signal), whichever is
+    //        first; the abort is not a verdict on the skill, so it gets no stats, and the first run that returns on its own is
+    //        its first sample.
+    _practiceBound(skill) {
+        return Object.hasOwn(skill, 'runMs') ? skill.runMs.max : null;
+    }
+    // fix74: what a finished practice run says about the skill. ok true/false is counted; ok null is no verdict. Before, the
+    //        result fed only stats.lastRun/practiceRuns (fa01ee3), so n never moved and the Beta-uncertainty ranking (fix49)
+    //        picked the same n=1 skill forever (travelWestAvoidDeathHotspot: 311 practice runs by 15:47 GMT, stats still 1/0).
+    //   - a learned post-contract judges it on the run's own trace (as open goals are, fix55/fix56)
+    //   - else the effects verified by run evidence (fix74 effectEvidence) judge it by inventory gain
+    //   - else nothing can judge it: an inventory change is not a success (fix51's "any delta" counted a walk that picked
+    //     up a block); _selectPracticeSkill does not pick such a skill
+    _practiceRunChanged(skill, before, after) {
+        if (skill.contract?.post) {
+            const held = this._postHolds(skill);
+            if (!held) return { ok: false, detail: `learned post ${skill.contract.post} does not hold` };
+            const v = this._postVerifiesRun(skill);
+            if (!v.ok) { this._queueContractFix(skill, `post cannot verify a run: ${v.why}`); return { ok: null, detail: `post ${skill.contract.post} held but cannot verify a run (${v.why}); queued contract repair` }; }
+            return { ok: true, detail: `learned post ${skill.contract.post} holds` };
+        }
+        const effects = verifiedEffects(skill);
+        if (effects.length) {
+            const gained = effects.filter(it => invCount(after.inventory, it) > invCount(before.inventory, it));
+            if (gained.length) return { ok: true, detail: `+${gained.join(',')}` };
+            return { ok: false, detail: `no gain for verified effects [${effects.join(',')}]` };
+        }
+        return { ok: null, detail: 'no learned post-contract and no verified effects to judge it by' };
+    }
+    _practiceJudgeable(skill) { return !!skill.contract?.post || verifiedEffects(skill).length > 0; }
     // fix32 (H): does the root call of the last trace satisfy the skill's learned postcondition (and report success)?
     // fix55: the verifier of skill and open goals; every "does not hold" says why
     _postHolds(e) {
@@ -2436,13 +2473,13 @@ Use only c; no other globals.`;
     // NO hard-coded ore/smelt tables - producers come from skill.effects and observed graph recordings
     // fix44: resolve mergedInto to validated active skills (merge targets that are not candidate/demoted)
     _producers(item) {
-        const fromSkills = this.skills.filter(s => !s.demoted && !s.mergedInto && !s.candidate && !/^(repair|refactor)\b/.test(s.task || '') && (s.effects || []).includes(item)
+        const fromSkills = this.skills.filter(s => !s.demoted && !s.mergedInto && !s.candidate && !/^(repair|refactor)\b/.test(s.task || '') && s.effects.includes(item)
             && !(signatureOf(s.code, s.name).match(/\(([^)]*)\)/)?.[1] || '').split(',').slice(1).some(x => x.trim() && !x.includes('=')))
             .map(s => ({ s, V: this._maturity(s).V }));
         
         // fix44: check merged skills - if a merged skill produces the item, include its merge target
         // ONLY if the merge target is a validated active skill (not candidate, not demoted)
-        for (const merged of this.skills.filter(s => s.mergedInto && (s.effects || []).includes(item))) {
+        for (const merged of this.skills.filter(s => s.mergedInto && s.effects.includes(item))) {
             const target = this.skills.find(s => s.name === merged.mergedInto);
             if (target && !target.demoted && !target.candidate && !fromSkills.some(x => x.s.name === target.name)) {
                 fromSkills.push({ s: target, V: this._maturity(target).V });
@@ -2515,7 +2552,7 @@ Use only c; no other globals.`;
             }
         }
         let n = 0;
-        const L = this.skills.filter(s => !s.primitive && !s.handwritten && !s.demoted && !s.mergedInto && !s.candidate && s.embedding && (s.effects || []).length);
+        const L = this.skills.filter(s => !s.primitive && !s.handwritten && !s.demoted && !s.mergedInto && !s.candidate && s.embedding && s.effects.length);
         for (let i = 0; i < L.length; i++) for (let j = i + 1; j < L.length; j++) {
             const a = L[i], b = L[j]; if (a.mergedInto || b.mergedInto || a.embedding.length !== b.embedding.length) continue;
             if (JSON.stringify([...a.effects].sort()) !== JSON.stringify([...b.effects].sort()) || cosineSimilarity(a.embedding, b.embedding) < 0.97) continue;
@@ -2545,7 +2582,7 @@ Use only c; no other globals.`;
     _detectGeneralise() {
         if (this._generaliseDue) return;
         const cands = this.skills.filter(s => !s.primitive && !s.handwritten && !s.demoted && !s.mergedInto && !s.candidate
-            && (s.effects || []).length && !/\(bot\s*,/.test(signatureOf(s.code, s.name)));
+            && s.effects.length && !/\(bot\s*,/.test(signatureOf(s.code, s.name)));
         const groups = new Map();
         for (const s of cands) {
             const base = s.name.replace(/^(craft|mine|get|make|collect)/, '').replace(/(Wooden|Stone|Iron|Golden|Diamond|Netherite|Oak|Birch|Spruce|Dark_?Oak|Jungle|Acacia|Mangrove|Cherry|Bamboo)/i, '').toLowerCase();
@@ -2850,53 +2887,31 @@ Use only c; no other globals.`;
     async _startIdlePractice(callNum) {
         if (this._idlePracticeActive) return;
         this._idlePracticeActive = true;
-        this._idlePracticeAbort = false;
+        this._armPracticeAbort();
         const t0 = Date.now();
-        let practiceMs = 0;  // fix49: track actual practice time
         console.log(`[idle-practice] starting during code-model call #${callNum}`);
+        // fix74: no sleeps. fa01ee3 paused 5 s when no skill was eligible (3 times, then stopped), 5 s after 3 consecutive
+        //        skips/failures, and 2 s between runs, and polled for the abort every 200 ms. Nothing the idle bot does changes
+        //        which skills are eligible, so waiting and re-selecting only re-read the same state; the session ends instead
+        //        and the next code-model call starts a new one. A skipped run (bot busy, threats) ends the session for the same
+        //        reason. Each run's own verdict now moves its stats (and so the ranking), and a run returns only after the
+        //        harness's one-tick settle (instrumentSrc waitForTicks(1)), so back-to-back runs need no pause.
         const practice = async () => {
-            let consecutiveSkips = 0;
-            let practiceCount = 0;
-            const MAX_CONSECUTIVE_SKIPS = 3;
+            let practiceCount = 0, practiceMs = 0;
+            const notAgain = new Map();   // skills this session cannot stage or judge -> why (not re-picked until the next session)
             while (this._idlePracticeActive && !this._idlePracticeAbort) {
-                // select a learned skill to practice (ranked by learning value)
-                const skill = this._selectPracticeSkill();
-                if (!skill) {
-                    console.log(`[idle-practice] no eligible skill to practice; pausing 5s`);
-                    await new Promise(r => setTimeout(r, 5000));
-                    consecutiveSkips++;
-                    if (consecutiveSkips >= MAX_CONSECUTIVE_SKIPS) {
-                        console.log(`[idle-practice] no eligible skills after ${MAX_CONSECUTIVE_SKIPS} attempts; stopping`);
-                        break;
-                    }
-                    continue;
-                }
-                consecutiveSkips = 0;
-                // run the skill and track time
+                const skill = this._selectPracticeSkill(notAgain);
+                if (!skill) { console.log(`[idle-practice] no eligible skill to practice; ending this session (eligibility does not change while the bot idles)`); break; }
                 const runStart = Date.now();
-                const ok = await this._runPracticeSkill(skill);
+                const r = await this._runPracticeSkill(skill);
+                if (r === null) break;   // the code-model call completed
+                if (r.skipped) { console.log(`[idle-practice] ending this session: ${r.skipped}`); break; }
+                if (r.notRun) { notAgain.set(skill.name, r.notRun); continue; }
                 const runMs = Date.now() - runStart;
-                if (ok && ok.message && ok.deltaChanged) {
-                    // fix49: only count as practice if state delta is non-empty
-                    console.log(`[idle-practice] SUCCESS ${skill.name}: ${ok.message} (practice: ${runMs}ms)`);
-                    practiceMs += runMs;
-                    practiceCount++;
-                } else if (ok && ok.message) {
-                    // ran but no state change - doesn't count as practice
-                    console.log(`[idle-practice] ${skill.name}: no state delta (not counted as practice)`);
-                } else if (ok === null) {
-                    break;
-                } else {
-                    consecutiveSkips++;
-                    if (consecutiveSkips >= MAX_CONSECUTIVE_SKIPS) {
-                        console.log(`[idle-practice] ${MAX_CONSECUTIVE_SKIPS} consecutive skips/failures; pausing`);
-                        await new Promise(r => setTimeout(r, 5000));
-                        consecutiveSkips = 0;
-                    }
-                }
-                if (this._idlePracticeActive && !this._idlePracticeAbort) {
-                    await new Promise(r => setTimeout(r, 2000));
-                }
+                practiceMs += runMs;
+                practiceCount++;
+                if (r.ok === null) { notAgain.set(skill.name, r.detail); console.log(`[idle-practice] NO VERDICT ${skill.name}: ${r.detail} (stats unchanged)`); }
+                else console.log(`[idle-practice] ${r.ok ? 'SUCCESS' : 'NOT SUCCESS'} ${skill.name}: ${r.detail} (practice: ${runMs}ms; stats now ${skill.stats.success}/${skill.stats.success + skill.stats.fail})`);
             }
             return { practiceCount, practiceMs };
         };
@@ -2912,15 +2927,24 @@ Use only c; no other globals.`;
         });
         return this._idlePracticePromise;
     }
+    // fix74: the end of the code-model call is a signal (a promise the practice run races), not a flag polled every 200 ms
+    _armPracticeAbort() {
+        this._idlePracticeAbort = false;
+        this._idlePracticeAborted = new Promise(resolve => { this._fireIdlePracticeAbort = resolve; });
+    }
     _stopIdlePractice() {
         if (!this._idlePracticeActive) return;
         this._idlePracticeAbort = true;
+        this._fireIdlePracticeAbort();
         console.log(`[idle-practice] stopping (code-model call completed)`);
     }
     // fix37/fix49: select a learned skill to practice - ranked by learning value
     // Learning value: low success rate, high streakFail, few trials
     // Plan relevance: shares needs/produces with pending goal
-    _selectPracticeSkill() {
+    // fix74: notAgain - skills this practice session could not stage or judge (name -> why); a skill nothing can judge
+    //        (_practiceJudgeable) is not picked: its run could not move its stats, so it would be picked again every run
+    _selectPracticeSkill(notAgain) {
+        if (!(notAgain instanceof Map)) throw new Error('[idle-practice] _selectPracticeSkill: notAgain must be a Map');
         const inv = this.observe().inventory;
         const pending = this._getPendingGoalItems();  // items needed by pending/failed tasks
         const candidates = this.skills.filter(s =>
@@ -2930,6 +2954,11 @@ Use only c; no other globals.`;
         );
         if (!candidates.length) return null;
         const filtered = candidates.filter(s => {
+            if (notAgain.has(s.name)) return false;
+            if (!this._practiceJudgeable(s)) {
+                if (!this._unjudgeableNoted.has(s.name)) { this._unjudgeableNoted.add(s.name); console.log(`[idle-practice] not practising ${s.name}: no learned post-contract and no effects verified by run evidence, so a practice run could not be judged`); }
+                return false;
+            }
             const skip = this._shouldSkipPractice(s, inv, pending);
             if (skip) console.log(`[idle-practice] filtering out ${s.name}: ${skip}`);
             return !skip;
@@ -2992,7 +3021,8 @@ Use only c; no other globals.`;
     // fix49: effects/consumes/stats initialized at load time - read directly
     _shouldSkipPractice(skill, inv, pendingItems) {
         // 1) Check if postcondition is already satisfied (learned path: check effects + inventory)
-        const effects = skill.effects;
+        // fix74: only effects verified by run evidence (an unverified list such as [crafting_table, cobblestone] says nothing)
+        const effects = verifiedEffects(skill);
         if (effects.length > 0) {
             const produced = effects.filter(eff => inv[eff] > 0);
             // if all effects are already in inventory, postcondition is likely met
@@ -3053,7 +3083,7 @@ Use only c; no other globals.`;
         const hasLearnedProducer = new Set();
         for (const s of this.skills) {
             if (s.demoted || s.mergedInto || s.candidate) continue;
-            for (const eff of (s.effects || [])) {
+            for (const eff of s.effects) {
                 hasLearnedProducer.add(eff);
             }
         }
@@ -3140,97 +3170,109 @@ Use only c; no other globals.`;
         this.agent.bot.__uncertainItems = lists.uncertain || [];
         this.agent.bot.__knownChests = this.chestMemory;
     }
-    // fix37/fix49: run a practice skill safely - returns { message, deltaChanged } on success, false on context-fail, null on abort
-    // fix49: tracks state delta - empty delta means the run doesn't count as practice
-    // Fail-loud: all skips and failures are logged clearly
+    // fix37/fix49/fix74: run one practice skill. Returns null when the code-model call completed (abort: no verdict),
+    // { skipped } when the bot cannot practice now, { notRun } when the skill could not be staged, else the run's verdict
+    // { ok: true|false|null, detail }; a true/false verdict is recorded in the skill's stats (_recordRun).
     async _runPracticeSkill(skill) {
         if (this._idlePracticeAbort) return null;
         const bot = this.agent.bot;
-        const before = this.observe();
         // safety gates: log clearly when skipped (not silent)
         if (!this.agent.isIdle()) {
             console.log(`[idle-practice] SKIPPED ${skill.name}: bot is not idle`);
-            return false;
+            return { skipped: 'bot is not idle' };
         }
         // threats are a real-time danger (learned from environment), keep this gate
         const threats = this._threats();
         if (threats !== 'none') {
             console.log(`[idle-practice] SKIPPED ${skill.name}: threats nearby (${threats})`);
-            return false;
+            return { skipped: `threats nearby (${threats})` };
         }
-        // fix49: capture state before to compute delta
-        const stateBefore = this.observe();
-        
-        // stage and run the skill (fail-loud: log errors, rethrow critical ones)
+        // fix74: the practice program is traced like a replay, so the skill's learned post-contract can judge the run and its
+        //        duration is measured (before, _stageLintExec ran it untraced: _postHolds had nothing to read)
         const call = `await ${skill.name}(bot);`;
         const prClosure = new Set([skill.name, ...this._closure(skill.name)]);
-        const full = this._libSrcSubset(prClosure) + `\n\nasync function __practice(bot) {\n    try { ${call} } catch (e) { log(bot, 'PRACTICE FAILED: ' + e.message); throw e; }\n}\nawait __practice(bot);`;
+        const libPart = this._libSrcSubset(prClosure);
+        const body = `\n\nasync function __practice(bot) {\n    try { ${call} } catch (e) { log(bot, 'PRACTICE FAILED: ' + e.message); throw e; } finally { bot.__psnOut = bot.output; }\n}\nawait __practice(bot);`;
+        const full = libPart + '\n\n' + instrumentSrc(Voyager._tracedSkillNamesForInstrument(this, prClosure)) + body;
         let staged;
         try {
-            const { lint, staged: st } = await this._stageLintExec(full, prClosure, `voyager:idle-practice:${skill.name}`);
-            if (lint) { console.error(`[idle-practice] LINT FAILED ${skill.name}`); return false; }
+            const { lint, staged: st } = await this._stageLintExecTraced(libPart + body, full, prClosure, `voyager:idle-practice:${skill.name}`);
+            if (lint) { console.error(`[idle-practice] LINT FAILED ${skill.name}: ${lint}`); return { notRun: `lint failed: ${lint}` }; }
             staged = st;
         }
-        catch (e) { console.error(`[idle-practice] STAGING FAILED ${skill.name}: ${e.message}`); return false; }
-        if (!staged) { console.error(`[idle-practice] STAGING FAILED ${skill.name}: no staged code returned`); return false; }
-        // mark as running, cap at 10 seconds for practice runs
+        catch (e) { console.error(`[idle-practice] STAGING FAILED ${skill.name}: ${e.message}`); return { notRun: `staging failed: ${e.message}` }; }
+        if (!staged) { console.error(`[idle-practice] STAGING FAILED ${skill.name}: no staged code returned`); return { notRun: 'no staged code returned' }; }
+        const bound = this._practiceBound(skill);
+        if (bound === null) console.log(`[idle-practice] ${skill.name}: no observed run duration yet; uncapped, ends when it returns or the code-model call completes`);
+        const traceWas = bot.__psnTrace;
+        clearPreconditionUnmet(bot);   // fix76: only a marker this run sets can void its verdict
+        const stateBefore = this.observe();   // fix70: measured right before this run
         const practiceStart = Date.now();
-        const maxPracticeMs = 10000;
-        let completed = false;
-        let practiceError = null;
-        // fix70: the practice run is over only when the skill's own code has returned. Before, an abort returned at once and a
-        //        timeout only lost the race: the skill kept walking, picking up and tossing beside the NEXT action, whose
-        //        before/after inventory then held its changes (live 01:07:52Z: pickupNearbyItems ABORTED at step end, still running)
+        // fix70: the practice run is over only when the skill's own code has returned (live 01:07:52Z: pickupNearbyItems
+        //        ABORTED at step end, still running beside the next action)
         const mainP = staged.func.main(this._timedBotForSkillRun());
-        const ended = async () => {
+        const settled = mainP.then(() => ({ kind: 'returned' }), err => ({ kind: 'threw', err }));
+        // fix74: a cut or abort interrupts the skill AND what it set going. fix70's ended() only set bot.interrupt_code, which
+        //        learned code reads only between its own awaits; a skill waiting in a pathfinder goto (travelWestAvoidDeathHotspot)
+        //        kept walking until the goal or a stall, and _ask (#65) awaited that walk before handing back the model reply.
+        //        agent.requestInterrupt is the one stop the action manager uses: stopDigging, collectBlock.cancelTask,
+        //        pathfinder.stop + setGoal(null) (rejects a pending goto at once), pvp.stop.
+        // fix75 (ae731ed): every interrupt names its source; this one is idle practice ending its own run (no action is
+        //        executing while the bot practises, so ActionManager.noteInterrupt records nothing)
+        const ended = async (why) => {
             const was = bot.interrupt_code;
-            bot.interrupt_code = true;
-            await mainP.then(() => {}, e => { if (e !== practiceError) console.error(`[idle-practice] ${skill.name} ended after interrupt with: ${e.message}`); });
+            this.agent.requestInterrupt({ kind: 'practice', by: `idle-practice ${skill.name}: ${why}` });
+            const s = await settled;
+            if (s.kind === 'threw') console.log(`[idle-practice] ${skill.name} ended after interrupt with: ${s.err.message}`);
             bot.interrupt_code = was;   // this interrupt was only to end this practice run; the next practice run starts as this one did
             console.log(`[idle-practice] ${skill.name}: its code has returned`);
         };
-        const runPromise = (async () => {
-            try {
-                await Promise.race([
-                    mainP,
-                    new Promise((_, rej) => setTimeout(() => rej(new Error('practice timeout')), maxPracticeMs))
-                ]);
-                completed = true;
-            } catch (e) {
-                practiceError = e;
-                if (e.message !== 'practice timeout') {
-                    console.error(`[idle-practice] EXECUTION FAILED ${skill.name}: ${e.message}`);
-                } else {
-                    console.log(`[idle-practice] TIMEOUT ${skill.name}: exceeded ${maxPracticeMs}ms`);
-                }
-            }
-        })();
-        // wait for completion or abort
-        while (!completed && !practiceError && Date.now() - practiceStart < maxPracticeMs) {
-            if (this._idlePracticeAbort) {
-                console.log(`[idle-practice] ABORTED ${skill.name}: code-model call completed`);
-                await ended();
-                return null;
-            }
-            await new Promise(r => setTimeout(r, 200));
-        }
-        try { await runPromise; } catch (e) { /* already logged above */ }
-        if (!completed) await ended();
-        const after = this.observe();
-        const changed = this._practiceRunChanged(skill, stateBefore, after);
-        if (skill.stats) {
+        let timer = null;
+        const racers = [settled, this._idlePracticeAborted.then(() => ({ kind: 'aborted' }))];
+        if (bound !== null) racers.push(new Promise(resolve => { timer = setTimeout(() => resolve({ kind: 'cut' }), bound); }));
+        const outcome = await Promise.race(racers);
+        if (timer !== null) clearTimeout(timer);
+        const finish = (verdict) => {
+            const trace = bot.__psnTrace;
+            bot.__psnTrace = traceWas;
+            clearPreconditionUnmet(bot);   // fix76's marker belongs to this run; it must not reach the next task's verdict
             skill.stats.lastRun = Date.now();
-            skill.stats.practiceRuns = (skill.stats.practiceRuns || 0) + 1;
-            this._saveSkills();
+            skill.stats.practiceRuns = (Object.hasOwn(skill.stats, 'practiceRuns') ? skill.stats.practiceRuns : 0) + 1;
+            if (verdict.ok !== null) this._recordRun(skill, null, verdict.ok, false);
+            else this._saveSkills();
+            return { ...verdict, trace };
+        };
+        if (outcome.kind === 'aborted') {
+            console.log(`[idle-practice] ABORTED ${skill.name}: code-model call completed`);
+            await ended('code-model call completed');
+            finish({ ok: null, detail: 'aborted' });
+            return null;
         }
-        if (practiceError) {
-            return false;
+        if (outcome.kind === 'cut') {
+            console.log(`[idle-practice] TIMEOUT ${skill.name}: still running after ${bound}ms, the longest it has returned in (n=${skill.runMs.n}); interrupting`);
+            await ended(`cut at its learned bound ${bound}ms`);
+            return finish({ ok: false, detail: `cut at its learned bound ${bound}ms` });
         }
-        if (!changed.ok) {
-            console.log(`[idle-practice] NOT SUCCESS ${skill.name}: ${changed.detail} (no ranking bump)`);
-            return false;
+        const after = this.observe();
+        const trace = bot.__psnTrace;
+        if (!Array.isArray(trace)) throw new Error(`[idle-practice] ${skill.name}: the traced practice run left no trace`);
+        annotateTrace(trace, bot.__psnOut);
+        this._learnRunDurations(trace);
+        if (outcome.kind === 'threw') {
+            console.error(`[idle-practice] EXECUTION FAILED ${skill.name}: ${outcome.err.message}`);
+            const lib = this._libraryFault(trace, skill.name);
+            if (lib) return finish({ ok: null, detail: `threw in library code (${lib.fn} ${lib.loc}), not the skill's fault` });
+            const unmetT = this._classifyUnmetPrecondition(skill.name, stateBefore.food_value);
+            if (unmetT) return finish({ ok: null, detail: `unmet precondition (${unmetT}), not evidence about the skill` });
+            return finish({ ok: false, detail: `threw: ${outcome.err.message}` });
         }
-        return { message: `${changed.detail} in ${Date.now() - practiceStart}ms`, deltaChanged: changed.ok };
+        const verdict = this._practiceRunChanged(skill, stateBefore, after);
+        // fix76 semantics for practice: a failed run whose precondition was unmet (typed marker, or a learned food-raiser
+        //        started at the food cap) is no verdict on the skill, as in replay (_classifyUnmetPrecondition)
+        const unmet = verdict.ok === false && this._classifyUnmetPrecondition(skill.name, stateBefore.food_value);
+        if (unmet) return finish({ ok: null, detail: `${verdict.detail}; unmet precondition (${unmet}), not evidence about the skill` });
+        if (verdict.ok === true) this._learnEffects(skill, stateBefore, after, null);   // a verified run is a measured run
+        return finish({ ...verdict, detail: `${verdict.detail} in ${Date.now() - practiceStart}ms` });
     }
 
     // fix47: compute cheapest tool to break a block by recursing through recipes
@@ -3682,6 +3724,10 @@ current_health: ${Math.round(bot.health)}/${vmax.health}\ncurrent_food: ${bot.fo
         let deps = depsOf(code, name, new Set(this.skills.map(s => s.name)));
         const missing = missingCalls(code, name, names);
         if (missing.length) { gateLog(`REJECT ${name}: calls unknown skills ${missing.join(', ')}`); return false; }
+        // fix74: the unmet-precondition marker is for repo-owned seeded primitives only (it voids a run's stats, fix76); model
+        //        code (new, repaired, refactored) that names it is rejected. missingCalls cannot see it (camelCase calls only).
+        const reserved = reservedNamesUsed(code, [PRECONDITION_UNMET_BINDING]);
+        if (reserved.length) { gateLog(`REJECT ${name}: uses ${reserved.join(', ')}, reserved for seeded primitives (marks a failure as an unmet precondition)`); return false; }
         // fix39: seeded primitives must not depend on learned skills (prevents cycles like
         // ensureCraftingTable -> depositToChest -> ensureChest -> ensureCraftingTable)
         // If a repair tries to add learned deps to a seeded skill, strip them and warn
@@ -3872,6 +3918,7 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         bot.__psnTrace = null;
         if (!Array.isArray(trace) || !trace.length) { console.log('[psn] no execution trace recorded'); return; }
         annotateTrace(trace, bot.__psnOut || '');
+        this._learnRunDurations(trace);   // fix74: before the cut attribution below rewrites intr
         this._checkContracts(trace, ok);   // fix22: learned pre/postconditions against real state
         this._learnVitalsEffects(trace);   // fix58
         this._learnSlotEffects(trace);   // fix59
@@ -4122,7 +4169,7 @@ IMPORTANT: All functions use bare names. Do NOT write skills.goToPosition - writ
             }
             extra = `\n--- your previous reply was rejected ---\n${err}\n--- previous code ---\n${code || '(none)'}\nFix the error and write the fixed ${e.name} again:`;
         }
-        this._lastEffects = e.effects || [];
+        this._lastEffects = e.effects;
         this._noteProposal(e, { task: q.task, kind: q.kind, evidence: q.evidence.slice(0, 200), desc: desc.slice(0, 200) });
         const saved = await this.saveSkill(e.name, desc, body, `repair: ${q.task}`, { repair: true });
         if (!saved) {
@@ -4280,7 +4327,7 @@ IMPORTANT: All functions use bare names. Do NOT write skills.goToPosition - writ
         this.progress.refactors = { ...(this.progress.refactors || {}), [id]: { helper: null, skills: [e.name, pe.name], at: Date.now(), joint: true } }; this._saveProgress();
         // fix38: detailed logging when joint repair skills go through the gate
         for (const x of [e, pe]) {
-            this._lastEffects = x.effects || [];
+            this._lastEffects = x.effects;
             this._noteProposal(x, { task: q.task, kind: 'joint', evidence: String(q.evidence).slice(0, 200), desc: `joint with ${x === e ? pe.name : e.name}` });
             console.log(`[psn] joint repair ${id}: submitting ${x.name} to gate (deps check, cycle check, regression rerun if past tasks exist)`);
             const saved = await this.saveSkill(x.name, desc(fns[x.name], x.description), strip(fns[x.name]), `repair: ${q.task}`, { repair: true, refactor: id });
@@ -4349,7 +4396,7 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
         this._lastEffects = [];
         if (!(await this.saveSkill(helper[0], hdesc, helper[1], `refactor ${id}`))) { console.log(`[psn] refactor ${id} FAILED: helper rejected`); return false; }
         P.refactors = { ...(P.refactors || {}), [id]: { helper: helper[0], skills: rewrites.map(r => r[0]), at: Date.now() } }; this._saveProgress();
-        for (const [n, c] of rewrites) { const e = this.skills.find(s => s.name === n); this._lastEffects = e.effects || []; await this.saveSkill(n, e.description, c, `refactor ${id}`, { refactor: id }); }
+        for (const [n, c] of rewrites) { const e = this.skills.find(s => s.name === n); this._lastEffects = e.effects; await this.saveSkill(n, e.description, c, `refactor ${id}`, { refactor: id }); }
         console.log(`[psn] refactor ${id}: helper ${helper[0]} added; ${rewrites.length} rewritten skill(s) under verification (all rolled back if any is rejected)`);
         return true;
     }
@@ -4413,7 +4460,7 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
         this._lastEffects = [];
         if (!(await this.saveSkill(helper[0], hdesc, helper[1], `generalise ${id}`))) { console.log(`[psn] generalise ${id} FAILED: helper rejected`); return false; }
         this.progress.refactors = { ...(this.progress.refactors || {}), [id]: { helper: helper[0], skills: wrappers.map(r => r[0]), kind: 'generalise', at: Date.now() } }; this._saveProgress();
-        for (const [n, c] of wrappers) { const e = this.skills.find(s => s.name === n); this._lastEffects = e.effects || []; await this.saveSkill(n, e.description, c, `generalise ${id}`, { refactor: id }); }
+        for (const [n, c] of wrappers) { const e = this.skills.find(s => s.name === n); this._lastEffects = e.effects; await this.saveSkill(n, e.description, c, `generalise ${id}`, { refactor: id }); }
         console.log(`[psn] generalise ${id}: helper ${helper[0]} added; ${wrappers.length} wrapper(s) under verification`);
         return true;
     }
@@ -4454,7 +4501,7 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
             if (!(await this.saveSkill(n, desc, c, `split ${id}`))) { console.log(`[psn] split ${id} FAILED: sub-skill ${n} rejected`); return false; }
         }
         this.progress.refactors = { ...(this.progress.refactors || {}), [id]: { main: e.name, subs: subs.map(s => s[0]), kind: 'split', at: Date.now() } }; this._saveProgress();
-        this._lastEffects = e.effects || [];
+        this._lastEffects = e.effects;
         await this.saveSkill(e.name, e.description, main[1], `split ${id}`, { refactor: id });
         console.log(`[psn] split ${id}: ${subs.length} sub-skill(s) added; ${e.name} rewritten and under verification`);
         return true;
@@ -5218,7 +5265,7 @@ Voyager.SEEDED_PRIMITIVES = [
         const chest = getNearestBlock(bot, b => /chest|barrel|shulker/.test(b.name), 32);
         if (!chest) {
             if (depositList.length || (bot.inventory.emptySlotCount() < 2 && uncertainList.length)) {
-                bot.__unmetPrecondition = { kind: 'precondition' };
+                __mcPreconditionUnmet__(bot);
                 log(bot, \`PREREQUISITE FAILED: tossClutter needs chest within 32 blocks to deposit items (have \${depositList.length} deposit candidates, \${uncertainList.length} uncertain items). Place or find a chest first.\`);
                 return false;
             }
@@ -5349,7 +5396,7 @@ Voyager.SEEDED_PRIMITIVES = [
                 if (!crafted && shortfall > 0) {
                     // fix51: fail loud with structured prerequisite info for decomposition/needs-produces
                     bot.__prereqFail = { item: ingItem.name, need: shortfall + (inv[ingItem.name] || 0), have: inv[ingItem.name] || 0 };
-                    bot.__unmetPrecondition = { kind: 'precondition' };
+                    __mcPreconditionUnmet__(bot);
                     log(bot, \`PREREQUISITE FAILED: ensureCraftingTable needs \${shortfall} more \${ingItem.name} but cannot craft it (no 2x2 recipe or missing sub-ingredients). Decompose to obtain \${ingItem.name} first.\`);
                     return false;
                 }
@@ -5387,7 +5434,7 @@ Voyager.SEEDED_PRIMITIVES = [
                     }
                 }
             }
-            bot.__unmetPrecondition = { kind: 'precondition' };
+            __mcPreconditionUnmet__(bot);
             log(bot, \`PREREQUISITE FAILED: ensureCraftingTable cannot craft - missing: \${missingIngredients.join(', ')}. Decompose to obtain prerequisites.\`);
             return false;
         }

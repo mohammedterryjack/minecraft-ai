@@ -98,10 +98,11 @@ describe('fix73: a NEW skill carries a consumes record', () => {
     });
     it('learned effects are not capped (fix32 kept the first 12; a 13th real effect was dropped)', () => {
         const v = mkSaver();
-        const seen = Array.from({ length: 12 }, (_, i) => `item_${i}`);
-        const e = { name: 'x', effects: [...seen], consumes: {} };
-        v._learnEffects(e, { inventory: {} }, { inventory: { iron_ingot: 1 } });
-        assert.deepStrictEqual(e.effects, [...seen, 'iron_ingot']);
+        // fix74: effects are derived from run evidence; one measured run gaining 13 items keeps all 13
+        const made = Array.from({ length: 13 }, (_, i) => `item_${i}`);
+        const e = { name: 'x', effects: [], consumes: {} };
+        v._learnEffects(e, { inventory: {} }, { inventory: Object.fromEntries(made.map(k => [k, 1])) });
+        assert.deepStrictEqual(e.effects, made);
     });
     it('_learnEffects fails loudly on an entry without the record instead of comparing against a default', () => {
         const v = mkSaver();

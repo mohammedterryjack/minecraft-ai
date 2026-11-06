@@ -22,7 +22,8 @@
       "skill": "eatCookedMutton",
       "cause": { "fix": "#65", "commit": "5d378f9", "name": "consume-bug fails counted against incumbent" },
       "expect": { "stats.success": 1, "stats.fail": 2, "stats.streakFail": 2 },
-      "set": { "stats.fail": 0, "stats.streakFail": 0 }
+      "set": { "stats.fail": 0, "stats.streakFail": 0 },
+      "delete": []
     },
     {
       "id": "eatCookedMutton.consumes",
@@ -30,7 +31,8 @@
       "skill": "eatCookedMutton",
       "cause": { "fix": "#65", "commit": "5d378f9", "name": "fix70c dirt-effect task-window consumes" },
       "expect": { "consumes": { "cobblestone": 7, "dirt": 2, "andesite": 4, "raw_copper": 5 } },
-      "set": { "consumes": {} }
+      "set": { "consumes": {} },
+      "delete": []
     },
     {
       "id": "eatCookedMutton.candidate.note",
@@ -80,7 +82,8 @@
       "skill": "travelWestAvoidDeathHotspot",
       "cause": { "fix": "#65", "commit": "5d378f9", "name": "fix70c dirt-effect fake consumes on travel skill" },
       "expect": { "consumes": { "stone_pickaxe": 1, "oak_log": 1, "iron_pickaxe": 1 } },
-      "set": { "consumes": {} }
+      "set": { "consumes": {} },
+      "delete": []
     },
     {
       "id": "travelWestAvoidDeathHotspot.effects",
@@ -88,7 +91,8 @@
       "skill": "travelWestAvoidDeathHotspot",
       "cause": { "fix": "#65", "commit": "5d378f9", "name": "fix70c dirt-effect fake effects on travel skill" },
       "expect": { "effects": ["crafting_table", "cobblestone"] },
-      "set": { "effects": [] }
+      "set": { "effects": [] },
+      "delete": []
     },
     {
       "id": "scanForIronOreBlocks.demotion",
@@ -96,7 +100,8 @@
       "skill": "scanForIronOreBlocks",
       "cause": { "fix": "#66", "commit": "fceac94", "name": "__rawInventoryCounts missing after #64 until fix73" },
       "expect": { "demoted": true },
-      "set": { "demoted": false }
+      "set": { "demoted": false },
+      "delete": []
     },
     {
       "id": "scanForIronOreBlocks.stats.fails",
@@ -104,7 +109,8 @@
       "skill": "scanForIronOreBlocks",
       "cause": { "fix": "#66", "commit": "fceac94", "name": "__rawInventoryCounts TypeError fail storm" },
       "expect": { "stats.success": 1, "stats.fail": 75, "stats.streakFail": 75 },
-      "set": { "stats.fail": 0, "stats.streakFail": 0 }
+      "set": { "stats.fail": 0, "stats.streakFail": 0 },
+      "delete": []
     },
     {
       "id": "goalStats.Craft_1_iron_pickaxe.replay_failed",

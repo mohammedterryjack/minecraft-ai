@@ -1,0 +1,62 @@
+{
+ "_source": "iMac ~/MinecraftBot/mindcraft/bots/icefox2000/skills/index.json (deployed 5d378f9), read 2026-11-06 15:47 GMT; embedding omitted",
+ "_log": "logs/mindcraft.log: 336x 'top candidate: travelWestAvoidDeathHotspot', 188x 'NOT SUCCESS ... no gain for effects [crafting_table,cobblestone]', 86x 'TIMEOUT ... exceeded 10000ms'",
+ "record": {
+  "name": "travelWestAvoidDeathHotspot",
+  "description": "Multi-hop travel to -178,53,107 west of the death hotspot, checking each 32-block leg with isSafeTarget before moving.",
+  "task": "travelTo: Travel 32 blocks west to -178,53,107 to avoid death hotspot at -175,44,107 while staying within safe range and biome",
+  "code": "// DESCRIPTION: Multi-hop travel to -178,53,107 west of the death hotspot, checking each 32-block leg with isSafeTarget before moving.\nasync function travelWestAvoidDeathHotspot(bot) {\n    if (bot.interrupt_code) return;\n    const destX = -178, destY = 53, destZ = 107;\n    if (Math.hypot(destX - (-800), destZ - 500) <= 200) {\n        log(bot, 'FAILED: target too close to village; pick another x,z.');\n        return;\n    }\n    for (let leg = 0; leg < 40; leg++) {\n        if (bot.interrupt_code) return;\n        const p = bot.entity.position;\n        const dx = destX - p.x, dz = destZ - p.z, d = Math.hypot(dx, dz);\n        if (d <= 4) {\n            log(bot, 'Near target -178,53,107.');\n            return;\n        }\n        const step = Math.min(32, d);\n        let wx = Math.round(p.x + (dx / d) * step);\n        let wz = Math.round(p.z + (dz / d) * step);\n        if (!isSafeTarget(bot, wx, wz, 48)) {\n            const side = leg % 2 ? 1 : -1;\n            wx = Math.round(p.x + (dx / d) * step - (dz / d) * side * 8);\n            wz = Math.round(p.z + (dz / d) * step + (dx / d) * side * 8);\n            if (!isSafeTarget(bot, wx, wz, 48)) continue;\n        }\n        const ok = d <= 32\n            ? await goToPosition(bot, destX, destY, destZ, 3)\n            : await goToPosition(bot, wx, destY, wz, 3);\n        if (bot.interrupt_code) return;\n        if (!ok) await travelTo(bot, wx, destY, wz, 8);\n    }\n    if (bot.interrupt_code) return;\n    await travelTo(bot, destX, destY, destZ);\n}",
+  "deps": [
+   "isSafeTarget",
+   "travelTo"
+  ],
+  "effects": [
+   "crafting_table",
+   "cobblestone"
+  ],
+  "saved": "2026-11-06T02:47:40.161Z",
+  "stats": {
+   "success": 1,
+   "fail": 0,
+   "streakFail": 0,
+   "tasks": [
+    "travelTo: Travel 32 blocks west to -178,53,107 to avoid death hotspot at -175,44,107 while staying within safe range and biome"
+   ],
+   "lastRun": 1793979427593,
+   "practiceRuns": 311
+  },
+  "contractTried": 1793933273939,
+  "contract": {
+   "pre": "c => c.pre.alive",
+   "post": "c => (c.ret === false || c.ret === null) ? true : (c.post.alive && c.dist(c.post.pos, {x:-178,y:53,z:107}) <= 8 && Math.abs(c.post.pos.y - 53) <= 6)",
+   "text": "Pathfind in \u226432-block legs with safe waypoint checks until within ~8 blocks horizontally of (-178,53,107), staying alive.",
+   "learned": "2026-11-06T02:47:53.939Z",
+   "why": "saved"
+  },
+  "consumes": {
+   "stone_pickaxe": 1,
+   "oak_log": 1,
+   "iron_pickaxe": 1
+  },
+  "_embHash": "bbnluj",
+  "revalidate": "travelTo",
+  "repairHistory": [
+   {
+    "at": "2026-11-06T03:15:58.707Z",
+    "task": "travelTo: Travel to a known iron_ore deposit area (e.g., -175,44,107 or -178,66,110) within range, avoiding death hotspots",
+    "kind": "joint",
+    "evidence": "FAILED: STALLED: no progress (no new ground reached, inventory, window, lit furnace) for 60s at -25,69,70",
+    "desc": "joint with travelTo",
+    "outcome": "rejected 0/2"
+   },
+   {
+    "at": "2026-11-06T03:46:31.849Z",
+    "task": "travelTo: Travel to a known iron_ore deposit area (e.g., -175,44,107 or -178,66,110) within range, avoiding death hotspots",
+    "kind": "caller_fix",
+    "evidence": "FAILED: STALLED: no progress (no new ground reached, inventory, window, lit furnace) for 60s at -25,69,70",
+    "desc": "Multi-hop travel to -178,53,107 west of the death hotspot using goToPosition legs at current Y, avoiding travelTo stalls from pickup loops.",
+    "outcome": "rejected 0/2"
+   }
+  ]
+ }
+}

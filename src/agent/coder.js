@@ -12,6 +12,7 @@ import pf from 'mineflayer-pathfinder';
 import { logPromptBreakdown } from './prompt_utils.js';
 import { withStallPhase, pushStallPhase, popStallPhase } from '../utils/event_loop_guard.js';
 import { wrapBotForApiTiming } from '../utils/bot_api_timing.js';
+import { markPreconditionUnmet } from './precondition.js';
 
 // fix38: expose pathfinder goals to generated code (fail loud if missing)
 const pathfinderGoals = pf.goals;
@@ -46,6 +47,8 @@ function _trimLineAt(code, line1) {
 // Exported for voyager.js to build the unified signature list for prompts
 // fix41: Object.keys registration for every exported function even when extractSig regex misses
 let _bareAPICache = null;
+// fix74: internal sandbox binding of markPreconditionUnmet (see _stageCode endowments); seeded primitives call it by this name
+export const PRECONDITION_UNMET_BINDING = '__mcPreconditionUnmet__';
 export function getBareAPI() {
     if (_bareAPICache) return _bareAPICache;
     const extractSig = (fn, modName) => {
@@ -1000,7 +1003,7 @@ export class Coder {
         // been declared") and every bundle whose closure held one failed lint before it ran, replays of craftItem included.
         // fix61: names the exec sandbox endows besides skills./world. (pathfinder goals) are declared for lint from the same object,
         // so a seeded primitive copied from skills.js (travelTo uses GoalNearXZ) lints exactly as it runs
-        const endowedLint = ['goals', ...Object.keys(SANDBOX_GOALS)].map(k => `const ${k} = undefined; // sandbox endowment (no-undef)`).join('\n');
+        const endowedLint = ['goals', ...Object.keys(SANDBOX_GOALS), PRECONDITION_UNMET_BINDING].map(k => `const ${k} = undefined; // sandbox endowment (no-undef)`).join('\n');
         const boundBare = new Set([...skillKeysForLint, ...worldKeysForLint, 'goals', ...Object.keys(SANDBOX_GOALS)]);
         let learnedConstBlock = '';
         if (learnedNamesForLint && learnedNamesForLint.size > 0) {
@@ -1037,6 +1040,11 @@ export class Coder {
         endowments.__mcLog__ = skills.log;
         // fix64: one event-loop turn per loop iteration (see _injectLoopTurns); collision-safe like __mcLog__
         endowments.__loopTurn__ = () => new Promise(resolve => setImmediate(resolve));
+        // fix74: the unmet-precondition marker's one writer, for repo-owned seeded primitives only. Internal like __mcLog__: not a
+        //        skills.js export, so it is not in getBareAPI (the model never sees it), and generated code that calls it is
+        //        rejected (writeCode: _apiGate "not declared"; saveSkill/repair: missingCalls "calls unknown skills"). A model
+        //        that could mark its own failure "precondition unmet" would void its own stats (fix76 voids such runs).
+        endowments[PRECONDITION_UNMET_BINDING] = markPreconditionUnmet;
         const skillKeysExec = bareApiFilter ? skillKeysForLint : allSkillKeys;
         const worldKeysExec = bareApiFilter ? worldKeysForLint : allWorldKeys;
         // Inject skills.* / world.* used by this bundle only when narrowing (full library otherwise)
