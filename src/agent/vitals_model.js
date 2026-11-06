@@ -92,6 +92,33 @@ export class VitalsModel {
         if (!raisers.length) return 'none observed yet';
         return raisers.map(x => `${x.name} +${x.food.toFixed(1)} food/run (${x.n} runs)`).join(', ');
     }
+    // fix80: drive-reduction serve predicate. NOT hunger().urgent (true at 19/20 → thrash as a trigger).
+    // Only belowRegen triggers pre-emption: above the learned floor there is no HP-harm evidence in VitalsModel
+    // (no starvation-at-food-level samples, no food-drop rate×duration), so a fitsGain branch would be value 0 forever.
+    // HungerText / urgent stay prompt-only for soft hunger above the floor.
+    hungerServe(food, foodMax, hp, hpMax) {
+        VitalsModel._nums({ food, foodMax, hp, hpMax });
+        const raisers = this.foodRaisers();
+        const best = raisers.length > 0 ? raisers[0] : null;
+        const deficit = foodMax - food;
+        const rec = this.recovery(hp, hpMax, food);
+        const belowRegen = rec.firstRise !== null && food < rec.firstRise.f;
+        const K = best !== null ? best.food : null;
+        const servable = belowRegen;
+        let regenLossHp = 0;
+        if (belowRegen) {
+            // Below the learned floor, recovery is at stake: unrecovered HP if damaged, else the full observed max
+            // (the bar that would not regenerate after the next hit). hpMax comes from the bot, not a tuned threshold.
+            regenLossHp = hp < hpMax ? (hpMax - hp) : hpMax;
+        }
+        return {
+            servable, belowRegen, deficit,
+            best: best !== null ? { name: best.name, K, n: best.n } : null,
+            regenLossHp,
+            firstRise: rec.firstRise,
+        };
+    }
+
     // fix59: which part of the LEARNED recovery outlook changed between two recovery() results, or null if none did.
     // Replaces _planStale's fixed "hp/food dropped by 6": vitals only invalidate a plan when they cross a learned boundary.
     static outlookChange(a, b) {

@@ -12,6 +12,7 @@ import { NeedsProducesGraph } from './needs_produces.js';
 import { RepairMemory } from './repair_memory.js';
 import { IdlePractice } from './idle_practice.js';
 import { VitalsModel } from './vitals_model.js';   // fix58
+import { checkNeedSource, needInterruptSource, isUnblamedInterruptKind, sampleBeta, pickUrgentCandidate } from './urgent_need.js';   // fix80
 import { markPreconditionUnmet, peekPreconditionUnmet, clearPreconditionUnmet } from './precondition.js';   // fix76
 import { SlotEffects } from './slot_effects.js';   // fix59
 // fix14: crash-safe writes (tmp file + rename)
@@ -1205,6 +1206,163 @@ Use only c; no other globals.`;
     _recovery() { const bot = this.agent.bot; return this.vitals.recovery(bot.health, skills.getVitalsMax(bot).health, bot.food); }
     // fix76: learned hunger outlook (food vs regen floor / decay), including at full HP
     _hunger() { const bot = this.agent.bot, m = skills.getVitalsMax(bot); return this.vitals.hunger(bot.health, m.health, bot.food, m.food); }
+    // fix80: shared step-boundary urgent-need pre-emption (vitals hunger now; fix77 threat plugs into the same
+    // Thompson slot). Hunger is boundary-only until food-drop rate and per-skill durations are learned; mid-action
+    // cuts stay with fix77's threat path. Kind 'need' is never blamed on a skill or the goal backoff.
+    _playableFoodRaisers() {
+        const out = [];
+        for (const r of this.vitals.foodRaisers()) {
+            const e = this.skills.find(s => s.name === r.name);
+            if (!e) continue;
+            if (e.demoted) continue;
+            if (e.mergedInto) continue;
+            out.push({ entry: e, raiser: r });
+        }
+        return out;
+    }
+    _hungerServeState() {
+        const bot = this.agent.bot, m = skills.getVitalsMax(bot);
+        const raw = this.vitals.hungerServe(bot.food, m.food, bot.health, m.health);
+        // Re-evaluate fitsGain against the best PLAYABLE raiser (demoted/merged skipped).
+        const playable = this._playableFoodRaisers();
+        const best = playable.length > 0 ? playable[0] : null;
+        const K = best !== null ? best.raiser.food : null;
+        const fitsGain = best !== null && raw.deficit >= K;
+        const servable = raw.belowRegen ? true : fitsGain;
+        return {
+            servable, belowRegen: raw.belowRegen, fitsGain, deficit: raw.deficit,
+            best, K, regenLossHp: raw.regenLossHp, firstRise: raw.firstRise,
+            food: bot.food, foodMax: m.food, hp: bot.health, hpMax: m.health,
+        };
+    }
+    _hungerServeBy(st) {
+        const floor = st.firstRise !== null ? `learned regen food floor ${st.firstRise.f}` : 'no regen food floor learned yet';
+        const why = st.belowRegen
+            ? `food ${st.food}/${st.foodMax} below ${floor}`
+            : `deficit ${st.deficit} fits best raiser gain ${st.K}`;
+        const raiser = st.best !== null ? `${st.best.entry.name} +${st.K.toFixed(1)} food/run` : 'none playable';
+        return `hunger ${why}; raiser ${raiser}; regenLossHp ${st.regenLossHp}`;
+    }
+    // Thompson candidates in HP units. Hunger: raiser success posterior × regenLossHp. Task: goal backoff posterior.
+    // Threat seam (fix77): push { id:'threat', value: hitChance * learnedDamage, ... }. No fixed priority order.
+    _urgentCandidates(st) {
+        const candidates = [];
+        if (st.servable) {
+            let s = 0, f = 0;
+            if (st.best !== null && st.best.entry.stats) {
+                s = st.best.entry.stats.success;
+                f = st.best.entry.stats.fail;
+                if (typeof s !== 'number') throw new Error(`[fix80] raiser stats.success/fail must be numbers`);
+                if (typeof f !== 'number') throw new Error(`[fix80] raiser stats.success/fail must be numbers`);
+            }
+            const draw = sampleBeta(s + 1, f + 1);
+            candidates.push({
+                id: 'hunger', kind: 'need', value: draw * st.regenLossHp,
+                draw, st, by: this._hungerServeBy(st),
+            });
+        }
+        // Pending work peek (do NOT shift subgoals or clear _decomposeQueue — BT re-tick semantics).
+        let taskName = null;
+        if (Array.isArray(this.progress.subgoals) && this.progress.subgoals.length > 0) {
+            taskName = this.progress.subgoals[0].task;
+        } else if (this._decomposeQueue) {
+            taskName = this._decomposeQueue.task;
+        }
+        if (taskName !== null && taskName !== undefined) {
+            const { s, f } = this._goalOutcomes(taskName);
+            const draw = sampleBeta(s + 1, f + 1);
+            candidates.push({ id: 'task', kind: 'task', value: draw, draw, taskName });
+        } else {
+            candidates.push({ id: 'task', kind: 'task', value: 0, draw: 0, taskName: null });
+        }
+        // fix77: ThreatModel candidates append here, same value units (expected HP loss).
+        return candidates;
+    }
+    // One step-boundary serve. Returns true when this step was consumed serving a need.
+    async _serveUrgent() {
+        // A need:* label is excluded from pre-emption (Mindcraft mode.active analogue).
+        if (typeof this.currentTask === 'string' && this.currentTask.startsWith('need:')) return false;
+        // No learned vitals store / no numeric food+health yet → nothing drive-reduction can serve (unit-test stubs, boot).
+        if (this.vitals === null) return false;
+        if (this.vitals === undefined) return false;
+        if (this.agent === null) return false;
+        if (this.agent === undefined) return false;
+        const bot = this.agent.bot;
+        if (bot === null) return false;
+        if (bot === undefined) return false;
+        if (typeof bot.food !== 'number') return false;
+        if (typeof bot.health !== 'number') return false;
+        const st = this._hungerServeState();
+        if (!st.servable) return false;
+        const candidates = this._urgentCandidates(st);
+        const winner = pickUrgentCandidate(candidates);
+        if (winner.id !== 'hunger') return false;
+        if (!(winner.value > 0)) return false;   // no HP-harm evidence → leave the step to the task/curriculum
+
+        const nSub = Array.isArray(this.progress.subgoals) ? this.progress.subgoals.length : 0;
+        const hasDec = Boolean(this._decomposeQueue);
+        console.log(`[urgent-need] serving hunger (value=${winner.value.toFixed(3)}, by=${winner.by}); subgoals=${nSub} decompose=${hasDec} deferred untouched`);
+
+        const before = this.observe();
+        const label = 'need:hunger';
+        this.currentTask = label;
+        this._curSub = null;   // never attribute subgoal completion to a need serve
+
+        if (st.best !== null) {
+            const route = { name: st.best.entry.name, call: `await ${st.best.entry.name}(bot);` };
+            const rp = await this._replay(label, before, route);
+            // Do not _recordGoalOutcome for the deferred subgoal/curriculum task; kind 'need' is unblamed.
+            if (rp && rp.ok) {
+                console.log(`[urgent-need] served via learned raiser ${st.best.entry.name}`);
+                this._afterSuccess();
+            } else {
+                const why = rp && rp.reason ? rp.reason : (rp && rp.unmetPrecondition ? rp.unmetPrecondition : 'serve failed');
+                console.log(`[urgent-need] raiser serve failed: ${why}; queues remain deferred`);
+            }
+            // Queues intentionally untouched.
+            return true;
+        }
+
+        // Cold start: no playable raiser observed — surface the need to the model (no hard-coded eat).
+        const hun = this._hunger();
+        const hunText = this.vitals.hungerText(hun);
+        const fact = hunText !== null ? hunText : winner.by;
+        const note = `LEARNED vital need (pre-empts decompose/subgoal queues; they are deferred, not dropped): ${fact}. Propose ONE task that raises food using what the bot has.`;
+        const proposal = await this.proposeTask({ ...before, note });
+        if (proposal === null) {
+            throw new Error('[fix80] proposeTask returned nothing for a cold-start vital need');
+        }
+        if (proposal === undefined) {
+            throw new Error('[fix80] proposeTask returned nothing for a cold-start vital need');
+        }
+        if (typeof proposal !== 'object') {
+            throw new Error('[fix80] proposeTask returned nothing for a cold-start vital need');
+        }
+        console.log(`[urgent-need] cold-start model proposal: ${proposal.task} (${proposal.reasoning})`);
+        // Try a replay if the model named a known skill; otherwise the proposal is logged and the next step resumes the chain.
+        let taskRaw = proposal.task;
+        if (taskRaw === undefined) taskRaw = '';
+        if (taskRaw === null) taskRaw = '';
+        const task = String(taskRaw).trim();
+        if (task.length > 0) {
+            const g = this._resolveGoal(task);
+            if (g.kind === 'skill') {
+                const route = { name: g.skill.name, call: `await ${g.skill.name}(bot);` };
+                const rp = await this._replay(label, before, route);
+                if (rp && rp.ok) this._afterSuccess();
+            } else {
+                const route = this._findReplay(task);
+                if (route) {
+                    const rp = await this._replay(label, before, route);
+                    if (rp && rp.ok) this._afterSuccess();
+                } else {
+                    console.log(`[urgent-need] cold-start proposal "${task}" has no replay route this step; queues remain deferred for resume`);
+                }
+            }
+        }
+        return true;
+    }
+
     // fix76: structural unmet-precondition classification (no message-text matching).
     // (1) seeded code called markPreconditionUnmet(bot) (sandbox binding __mcPreconditionUnmet__, fix74) -> kind === 'precondition'
     // (2) skill's learned vitals effect raises food, and food was already at the observed food cap
@@ -1562,6 +1720,11 @@ Use only c; no other globals.`;
             if (!res.timedout) throw new Error(`_interruptReason: source is a timeout (${src.by}) but the result says timedout=${res.timedout}`);
             this._lastCutKind = 'timeout';
             return `timed out: ran past the ${src.by}${travelling ? ' while travelling' : ''}${under ? ` (underground: y=${Math.floor(p.y)}, surface y=${s})` : ''}`;
+        }
+        // fix80: kind 'need' (and fix77 'threat') are interrupts that must not be blamed on the skill or goal backoff
+        if (isUnblamedInterruptKind(src.kind)) {
+            this._lastCutKind = src.kind;
+            return `interrupted: cut off by ${src.kind} ${src.by}${travelling ? ' while travelling' : ''}${under ? ` (underground: y=${Math.floor(p.y)}, surface y=${s})` : ''}`;
         }
         const what = src.by === 'mode:unstuck' ? 'stuck' : `cut off by ${src.kind} ${src.by}`;
         this._lastCutKind = 'interrupt';
@@ -4579,6 +4742,9 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
         this._requeueDeferred();   // fix26
         if (this._apiLinted !== this._apiSignature()) { this._apiLinted = this._apiSignature(); await this._queueApiLintRepairs(); }   // fix67
         if (this._repairQueue?.length) { await this._repair(); return; }
+        // fix80: one shared pre-emption slot (hunger now; fix77 threat later). After repairs, BEFORE decompose/subgoals
+        // so a fresh decomposition cannot starve the need for a whole LLM call. Queues stay untouched (BT re-tick).
+        if (await this._serveUrgent()) return;
         if (this._decomposeQueue) { const dq = this._decomposeQueue; this._decomposeQueue = null; await this._decompose(dq.task, dq.reason); return; }
         if (!this.progress.fix25) this._fix25Migrate();
         if (await this._gateTrial()) return;   // fix28
@@ -4867,6 +5033,11 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             // _lastCutKind is set by _interruptReason when a cut occurs
             if (!this._lastCutKind) throw new Error('anyCut set but _lastCutKind missing (structured failure kind not recorded)');
             const failKind = this._lastCutKind;
+            // fix80: kind 'need' / 'threat' never feed skill or goal backoff
+            if (isUnblamedInterruptKind(failKind)) {
+                console.log(`[fix80] cut kind ${failKind}: not blamed on skill or goal backoff`);
+                this._lastCutKind = null;
+            } else {
             const trace = this.agent.bot.__psnTrace;
             if (!trace) throw new Error('__psnTrace missing when recording failure');
             const failingCalls = trace.filter(t => t.fail && !t.intr);
@@ -4883,6 +5054,7 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
                 gs.rate = rate;
             }
             this._lastCutKind = null;  // reset for next run
+            }
         }
         this._saveProgress();
 
