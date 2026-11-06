@@ -70,7 +70,7 @@ describe('fix73: a NEW skill carries a consumes record', () => {
     function mkSaver() {
         const v = Object.create(Voyager.prototype);
         v.dir = `./bots/${NAME}/skills`; mkdirSync(v.dir, { recursive: true }); v.skills = []; v.progress = {};
-        v.agent = { prompter: { code_model: { fallback: true } } };
+        v.agent = { prompter: { code_model: { fallback: true } }, coder: { _apiGate: () => null } };   // fix82: saveSkill runs the static API gate (tested in fix82-redeclare-apigate)
         v._saveSkills = () => {}; v._embed = async () => [0]; v._learnContracts = async () => 0; v._extractShared = () => {};
         return v;
     }
