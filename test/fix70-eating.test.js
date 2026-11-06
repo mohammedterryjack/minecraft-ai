@@ -12,7 +12,6 @@ import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert';
 import { readFileSync, rmSync } from 'node:fs';
 import { EventEmitter } from 'node:events';
-import { AsyncLocalStorage } from 'node:async_hooks';
 import { Vec3 } from 'vec3';
 import windows from 'prismarine-windows';
 import Item from 'prismarine-item';
@@ -20,7 +19,7 @@ import minecraftData from 'minecraft-data';
 import { plugin as autoEat } from 'mineflayer-auto-eat';
 import { Coder } from '../src/agent/coder.js';
 import { instrumentSrc, thrownIn } from '../src/agent/skill_graph.js';
-import { findCarried } from '../src/utils/carried.js';
+import { findCarried, carriedSlots, PLAYER_WINDOW as PW } from '../src/utils/carried.js';
 import * as world from '../src/agent/library/world.js';
 
 const V = '1.20.4', W = windows(V), I = Item(V), reg = minecraftData(V);
@@ -35,23 +34,23 @@ function liveWindow() {
     const inv = W.createWindow(0, 'minecraft:inventory', 'Inventory', 46);
     const st = LIVE.violated_13_39_19.pre;
     const put = (slot, name, n) => inv.updateSlot(slot, new I(reg.itemsByName[name].id, n));
-    put(36, 'iron_pickaxe', 1); put(5, 'iron_helmet', 1); put(45, 'cooked_mutton', 50);
-    let s = 9;
+    put(PW.hotbarStart, 'iron_pickaxe', 1); put(PW.armour.head, 'iron_helmet', 1); put(PW.offHand, 'cooked_mutton', 50);
+    let s = PW.mainStart;
     for (const [name, total] of Object.entries(st.inv)) {
         let left = total - (name === 'iron_pickaxe' ? 1 : name === 'iron_helmet' ? 1 : name === 'cooked_mutton' ? 50 : 0);
         const size = reg.itemsByName[name].stackSize;
-        while (left > 0) { if (s === 36) s = 37; const n = Math.min(size, left); put(s++, name, n); left -= n; }
+        while (left > 0) { if (s === PW.hotbarStart) s++; const n = Math.min(size, left); put(s++, name, n); left -= n; }
     }
     return inv;
 }
 /** A bot over that window whose equip/consume move and eat items the way mineflayer does (equip via the slot, eat the held item). */
 function liveBot(inv) {
-    const bot = { output: '', interrupt_code: false, __psnALS: new AsyncLocalStorage(), inventory: inv, currentWindow: null, quickBarSlot: 0,
+    const bot = { output: '', interrupt_code: false, inventory: inv, currentWindow: null, quickBarSlot: 0,
         health: 8.366666793823242, food: 15, oxygenLevel: 20, game: { dimension: 'overworld', gameMode: 'survival' }, entity: { position: new Vec3(-131.43, 47, 50.5) },
         blockAt: () => null, waitForTicks: async () => {}, closeWindow: async () => {},
-        get heldItem() { return inv.slots[36 + bot.quickBarSlot]; },
-        equip: async (item, dest) => { assert.strictEqual(dest, 'hand'); const src = item.slot, held = inv.slots[36]; inv.updateSlot(36, inv.slots[src]); inv.updateSlot(src, held); },
-        consume: async () => { const h = bot.heldItem; const f = reg.foodsByName[h.name]; bot.food = Math.min(20, bot.food + f.foodPoints); h.count--; inv.updateSlot(36, h.count ? h : null); } };
+        get heldItem() { return inv.slots[PW.hotbarStart + bot.quickBarSlot]; },
+        equip: async (item, dest) => { assert.strictEqual(dest, 'hand'); const src = item.slot, held = inv.slots[PW.hotbarStart]; inv.updateSlot(PW.hotbarStart, inv.slots[src]); inv.updateSlot(src, held); },
+        consume: async () => { const h = bot.heldItem; const f = reg.foodsByName[h.name]; bot.food = Math.min(20, bot.food + f.foodPoints); h.count--; inv.updateSlot(PW.hotbarStart, h.count ? h : null); } };
     return bot;
 }
 async function mkCoder() {
@@ -67,7 +66,7 @@ describe('fix70: the seeded consume eats what getInventoryCounts says the bot ha
         assert.strictEqual(LIVE.violated_13_39_19.pre.eq.offHand, 'cooked_mutton');
         assert.strictEqual(world.getInventoryCounts(bot).cooked_mutton, 50);
         assert.strictEqual(inv.findInventoryItem('cooked_mutton'), null, 'what consume searched before fix70 (slots 9-44)');
-        assert.strictEqual(findCarried(bot, 'cooked_mutton').slot, 45);
+        assert.strictEqual(findCarried(bot, 'cooked_mutton').slot, PW.offHand);
     });
     it('the live eatCookedMutton, staged and traced as replayed at 13:40Z, now eats from the off-hand stack', async () => {
         const inv = liveWindow(), bot = liveBot(inv);
@@ -84,29 +83,47 @@ describe('fix70: the seeded consume eats what getInventoryCounts says the bot ha
         assert.strictEqual(post({ ret: undefined, pre: rec.s0, post: rec.s1, delta: rec.delta }), true, 'its learned post-contract holds');
     });
     it('every carried slot (5-45) is found by name exactly where it is counted, crafting grid (0-4) by neither', () => {
-        for (let slot = 0; slot < 46; slot++) {
-            const inv = W.createWindow(0, 'minecraft:inventory', 'Inventory', 46);
+        for (let slot = 0; slot < PW.size; slot++) {
+            const inv = W.createWindow(0, 'minecraft:inventory', 'Inventory', PW.size);
             inv.updateSlot(slot, new I(reg.itemsByName.bread.id, 3));
             const bot = { inventory: inv };
             const counted = world.getInventoryCounts(bot).bread === 3, found = !!findCarried(bot, 'bread');
             assert.strictEqual(found, counted, `slot ${slot}`);
-            assert.strictEqual(counted, slot >= 5, `slot ${slot}`);
+            assert.strictEqual(counted, slot !== PW.craftingOutput && !PW.craftingInput.includes(slot), `slot ${slot}`);
         }
+    });
+});
+
+describe('fix70: PLAYER_WINDOW is the layout the libraries use', () => {
+    it('agrees with prismarine-windows (main, hotbar, end, size) and mineflayer (armour, off-hand dest slots)', async () => {
+        const inv = W.createWindow(0, 'minecraft:inventory', 'Inventory', PW.size);
+        assert.strictEqual(inv.slots.length, PW.size);
+        assert.strictEqual(inv.inventoryStart, PW.mainStart);
+        assert.strictEqual(inv.hotbarStart, PW.hotbarStart);
+        assert.strictEqual(inv.inventoryEnd, PW.offHand, 'the off-hand is the first slot after the window inventory range');
+        assert.strictEqual(inv.craftingResultSlot, PW.craftingOutput);
+        const { default: simpleInventory } = await import('mineflayer/lib/plugins/simple_inventory.js');
+        const bot = new EventEmitter(); bot.supportFeature = () => false; bot.inventory = inv; bot.quickBarSlot = 0;
+        simpleInventory(bot);
+        for (const [dest, slot] of Object.entries(PW.armour)) assert.strictEqual(bot.getEquipmentDestSlot(dest), slot, dest);
+        assert.strictEqual(bot.getEquipmentDestSlot('off-hand'), PW.offHand);
+        assert.strictEqual(bot.getEquipmentDestSlot('hand'), PW.hotbarStart);
+        assert.strictEqual(carriedSlots({ inventory: inv }).length, PW.size - 1 - PW.craftingInput.length);
     });
 });
 
 describe('fix70: the auto-eat reflex is gone', () => {
     it('with its defaults the plugin equips food to the OFF-HAND at food <= 16 and leaves it there (the live restarts at food 15)', async () => {
         const inv = W.createWindow(0, 'minecraft:inventory', 'Inventory', 46);
-        inv.updateSlot(36, new I(reg.itemsByName.iron_pickaxe.id, 1)); inv.updateSlot(20, new I(reg.itemsByName.cooked_mutton.id, 50));
+        inv.updateSlot(PW.hotbarStart, new I(reg.itemsByName.iron_pickaxe.id, 1)); inv.updateSlot(PW.mainStart, new I(reg.itemsByName.cooked_mutton.id, 50));
         const bot = new EventEmitter(); const dests = [];
         Object.assign(bot, { food: 15, inventory: inv, registry: reg, entity: { id: 1 }, _client: new EventEmitter(), supportFeature: () => false,
-            getEquipmentDestSlot: d => (d === 'off-hand' ? 45 : 36), deactivateItem() {}, activateItem() { setImmediate(() => bot._client.emit('entity_status', { entityId: 1, entityStatus: 9 })); },
+            getEquipmentDestSlot: d => (d === 'off-hand' ? PW.offHand : PW.hotbarStart), deactivateItem() {}, activateItem() { setImmediate(() => bot._client.emit('entity_status', { entityId: 1, entityStatus: 9 })); },
             equip: async (item, d) => { dests.push(d); const to = bot.getEquipmentDestSlot(d), from = item.slot; const was = inv.slots[to]; inv.updateSlot(to, inv.slots[from]); inv.updateSlot(from, was); } });
         autoEat(bot);
         assert.strictEqual(await bot.autoEat.eat(), true);
         assert.deepStrictEqual(dests, ['off-hand']);
-        assert.strictEqual(inv.slots[45].name, 'cooked_mutton');
+        assert.strictEqual(inv.slots[PW.offHand].name, 'cooked_mutton');
     });
     it('the plugin is not loaded and agent.js no longer touches it', () => {
         const mcdata = readFileSync(new URL('../src/utils/mcdata.js', import.meta.url), 'utf8');

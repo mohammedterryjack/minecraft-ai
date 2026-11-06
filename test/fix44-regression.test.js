@@ -12,6 +12,7 @@
 
 import { describe, it, mock, beforeEach } from 'node:test';
 import assert from 'node:assert';
+import { PLAYER_WINDOW as PW } from '../src/utils/carried.js';   // fix70: the protocol slot layout
 
 function createMockBot(options = {}) {
     const bot = {
@@ -23,10 +24,10 @@ function createMockBot(options = {}) {
         heldItem: null,
         inventory: {
             // fix70: the real player-window layout (46 slots; items from the hotbar, slot 36). The flat array put the item at
-            // slot 0 (crafting result) and findInventoryItem searched every slot, so the tests never met the real 9-44 search.
-            slots: (() => { const s = Array(46).fill(null); (options.inventorySlots || []).forEach((it, i) => { s[36 + i] = { ...it, slot: 36 + i }; }); return s; })(),
+            // slot 0 (crafting result) and findInventoryItem searched every slot, so the tests never met the real main+hotbar search.
+            slots: (() => { const s = Array(PW.size).fill(null); (options.inventorySlots || []).forEach((it, i) => { s[PW.hotbarStart + i] = { ...it, slot: PW.hotbarStart + i }; }); return s; })(),
             findInventoryItem: function(name) {
-                return this.slots.slice(9, 45).find(s => s && s.name === name);
+                return this.slots.slice(PW.mainStart, PW.offHand).find(s => s && s.name === name);
             },
             items: function() { return this.slots.filter(Boolean); },
             emptySlotCount: () => 10,
