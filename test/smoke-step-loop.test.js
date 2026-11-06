@@ -22,7 +22,8 @@
 
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert';
-import { mkdirSync, writeFileSync, rmSync, existsSync } from 'fs';
+import { mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from 'fs';
+import { fileURLToPath } from 'url';
 
 let DEPS_AVAILABLE = true;
 let DEPS_ERROR = null;
@@ -36,7 +37,19 @@ try {
 }
 import path from 'path';
 
+// fix57: mindserver.js JSON.parses this at import time — catch trailing commas / invalid JSON here too.
+describe('smoke: settings_spec.json (mindserver load path)', () => {
+    it('JSON.parse of src/mindcraft/public/settings_spec.json succeeds', () => {
+        const mindserverDir = path.join(path.dirname(fileURLToPath(import.meta.url)), '../src/mindcraft');
+        const settings_spec = JSON.parse(readFileSync(path.join(mindserverDir, 'public/settings_spec.json'), 'utf8'));
+        assert.equal(typeof settings_spec, 'object');
+        assert.ok(settings_spec !== null);
+        assert.ok('spawn_timeout' in settings_spec);
+    });
+});
+
 const TEST_BOT_NAME = '__smoke_test_bot__';
+
 const TEST_BOT_DIR = `./bots/${TEST_BOT_NAME}`;
 
 function createMockBot() {
