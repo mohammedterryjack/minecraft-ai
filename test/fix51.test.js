@@ -759,3 +759,71 @@ describe('fix51 issue 17: VIOLATED contract analysis', async () => {
             'VIOLATED jsonl should include analysis field');
     });
 });
+
+describe('fix51 issue 18: seeded/handwritten skill identifier validation', async () => {
+    it('seeded skills use only declared identifiers', () => {
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        
+        // Extract all seeded skill code blocks
+        const skillCodeBlocks = [...voyagerSrc.matchAll(/code:\s*`([^`]+)`/gs)];
+        const errors = [];
+        
+        // Known global identifiers that are injected or built-in
+        const knownGlobals = new Set([
+            'bot', 'log', 'sleep', 'console', 'Math', 'JSON', 'Object', 'Array', 'Date',
+            'getNearestBlock', 'getNearestFreeSpace', 'getInventoryCounts', 'world',
+            'Vec3', 'goToPosition', 'goToGoal', 'goToNearestBlock', 'breakBlockAt',
+            'collectBlock', 'placeBlock', 'equip', 'discard', 'craftRecipe',
+            'attackNearest', 'attackEntity', 'goToPlayer', 'followPlayer',
+            'moveAway', 'pickupNearbyItems', 'craftItem', 'craftItems',
+            'smeltItems', 'smeltWithFuel', 'killMob', 'harvestCrop',
+            'depositToChest', 'withdrawFromChest', 'ensureChest', 'ensureCraftingTable',
+            'mineOre', 'consume', 'equipBestTool', 'equipToolForBlock', 'tossItem',
+            'tossClutter', 'pf', 'Promise', 'await', 'async', 'return', 'if', 'else',
+            'for', 'while', 'let', 'const', 'var', 'function', 'try', 'catch', 'throw',
+            'true', 'false', 'null', 'undefined', 'typeof', 'instanceof', 'new'
+        ]);
+        
+        for (const match of skillCodeBlocks) {
+            const code = match[1];
+            // Extract function name
+            const fnMatch = code.match(/async function (\w+)/);
+            if (!fnMatch) continue;
+            const fnName = fnMatch[1];
+            
+            // Check for targetBlock (common mistake - should be 'block' in most cases)
+            if (code.includes('targetBlock')) {
+                // Check if targetBlock is declared in this function
+                if (!code.includes('const targetBlock') && !code.includes('let targetBlock')) {
+                    errors.push(`${fnName}: uses 'targetBlock' but doesn't declare it`);
+                }
+            }
+        }
+        
+        assert.strictEqual(errors.length, 0,
+            `Found undeclared identifiers in seeded skills:\n${errors.join('\n')}`);
+    });
+    
+    it('skills.js handwritten functions use only declared block variables', () => {
+        const skillsSrc = readFileSync('./src/agent/library/skills.js', 'utf8');
+        
+        // Find functions that use 'block' variable and ensure targetBlock is declared if used
+        const functions = [...skillsSrc.matchAll(/export async function (\w+)[^{]*\{[\s\S]*?^}/gm)];
+        const errors = [];
+        
+        for (const match of functions) {
+            const fnName = match[1];
+            const fnBody = match[0];
+            
+            // If function uses targetBlock, it must declare it
+            if (fnBody.includes('targetBlock') && 
+                !fnBody.includes('const targetBlock') && 
+                !fnBody.includes('let targetBlock')) {
+                errors.push(`${fnName}: uses 'targetBlock' but doesn't declare it`);
+            }
+        }
+        
+        assert.strictEqual(errors.length, 0,
+            `Found undeclared targetBlock in skills.js:\n${errors.join('\n')}`);
+    });
+});
