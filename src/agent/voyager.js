@@ -818,6 +818,54 @@ Use only c; no other globals.`;
         }
         return null;
     }
+    // fix51: analyze why a contract failed by evaluating sub-expressions
+    // Returns a string describing which part of the contract failed and why
+    _analyzeContractFailure(contractSrc, c, r) {
+        const src = String(contractSrc);
+        const parts = [];
+        
+        // Evaluate common sub-expressions and report their values
+        // c.delta.* checks
+        const deltaMatches = [...src.matchAll(/c\.delta\.(\w+)\s*(>=?|<=?|===?|!==?)\s*(\d+)/g)];
+        for (const m of deltaMatches) {
+            const item = m[1], op = m[2], expected = Number(m[3]);
+            const actual = c.delta[item];
+            const actualV = actual === undefined ? 'undefined' : actual;
+            parts.push(`c.delta.${item}=${actualV} (expected ${op}${expected})`);
+        }
+        // c.post.inv.* checks
+        const postInvMatches = [...src.matchAll(/c\.post\.inv\.(\w+)\s*(>=?|<=?|===?|!==?)\s*(\d+)/g)];
+        for (const m of postInvMatches) {
+            const item = m[1], op = m[2], expected = Number(m[3]);
+            const actual = c.post.inv?.[item];
+            const actualV = actual === undefined ? 'undefined' : actual;
+            parts.push(`c.post.inv.${item}=${actualV} (expected ${op}${expected})`);
+        }
+        // c.ret checks
+        if (/c\.ret\s*(===?|!==?)\s*(true|false)/.test(src)) {
+            parts.push(`c.ret=${c.ret}`);
+        }
+        // c.dist checks
+        if (/c\.dist\([^)]+\)\s*(<|<=)\s*\d+/.test(src)) {
+            const posDist = c.dist(c.pre.pos, c.post.pos).toFixed(1);
+            parts.push(`dist(pre.pos,post.pos)=${posDist}`);
+        }
+        // c.post.eq.* checks
+        const eqMatches = [...src.matchAll(/c\.post\.eq\.(\w+)\s*(===?|!==?)\s*['"]?(\w+)['"]?/g)];
+        for (const m of eqMatches) {
+            const slot = m[1], op = m[2], expected = m[3];
+            const actual = c.post.eq?.[slot];
+            parts.push(`c.post.eq.${slot}=${actual || 'null'} (expected ${op}'${expected}')`);
+        }
+        
+        if (parts.length === 0) {
+            // Fallback: show key state for manual analysis
+            const deltaKeys = Object.keys(c.delta || {});
+            const deltaStr = deltaKeys.length ? deltaKeys.map(k => `${k}:${c.delta[k]}`).join(',') : 'empty';
+            return `delta={${deltaStr}}, ret=${c.ret}, alive=${c.post.alive}`;
+        }
+        return parts.join('; ');
+    }
     // evaluate contracts on every traced library call; violations become contract failures in the trace
     _checkContracts(trace, taskOk) {
         const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
@@ -855,12 +903,15 @@ Use only c; no other globals.`;
                 }
                 r.ok = false; r.fail = true; if (k === 'pre') r.preFail = true;
                 r.ownFail = [...(r.ownFail || []), `${k === 'pre' ? 'PRECONDITION' : 'POSTCONDITION'} violated: ${e.contract.text || e.contract[k]} (post pos ${r.s1.pos ? [r.s1.pos.x, r.s1.pos.y, r.s1.pos.z].map(Math.round).join(',') : '?'}, sky ${r.s1.sky}, alive ${r.s1.alive})`];
-                // fix51: enhanced VIOLATED logging with exact context for debugging (full values, truncated in jsonl)
+                // fix51: enhanced VIOLATED logging with exact context for debugging
                 const stateInfo = `pre.inv=${JSON.stringify(r.s0.inv)}, post.inv=${JSON.stringify(r.s1.inv)}, delta=${JSON.stringify(r.delta)}`;
+                // fix51: analyze why the contract failed by evaluating sub-expressions
+                const analysis = this._analyzeContractFailure(e.contract[k], c, r);
                 console.log(`[contract] VIOLATED ${e.name}(${r.argv.join(',')}) ${k}condition: ${e.contract[k]}`);
+                console.log(`[contract] VIOLATED analysis: ${analysis}`);
                 console.log(`[contract] VIOLATED context: task=${this.currentTask}, ${stateInfo}`);
                 // Log to file for next run analysis
-                try { appendFileSync(`./bots/${this.agent.name}/violated_contracts.jsonl`, JSON.stringify({ at: new Date().toISOString(), skill: e.name, field: k, contract: e.contract[k], args: r.argv, task: this.currentTask, state: { pre: r.s0, post: r.s1, delta: r.delta } }) + '\n'); } catch (err) { void 0; }
+                try { appendFileSync(`./bots/${this.agent.name}/violated_contracts.jsonl`, JSON.stringify({ at: new Date().toISOString(), skill: e.name, field: k, contract: e.contract[k], args: r.argv, task: this.currentTask, analysis, state: { pre: r.s0, post: r.s1, delta: r.delta } }) + '\n'); } catch (err) { void 0; }
                 // the task outcome disagrees with the contract: the contract itself may be wrong -> it is repairable
                 if (taskOk && k === 'post' && r.parent < 0) this._queueContractFix(e, `postcondition failed but the task check passed`);
             }

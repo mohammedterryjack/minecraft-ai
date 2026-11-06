@@ -724,3 +724,38 @@ describe('fix51 issue 16: smelt goal uses exact count not producible', async () 
             'smelt goal should check iron_ingot count (36), not raw_iron count (77)');
     });
 });
+
+describe('fix51 issue 17: VIOLATED contract analysis', async () => {
+    it('_analyzeContractFailure function exists', () => {
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        assert.ok(voyagerSrc.includes('_analyzeContractFailure'),
+            'voyager.js should have _analyzeContractFailure function');
+    });
+
+    it('VIOLATED logging includes analysis', () => {
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        assert.ok(voyagerSrc.includes('VIOLATED analysis:'),
+            'VIOLATED logging should include analysis output');
+    });
+
+    it('_analyzeContractFailure extracts delta fields', () => {
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        const fnMatch = voyagerSrc.match(/_analyzeContractFailure\(contractSrc, c, r\)\s*\{[\s\S]*?^\s{4}\}/m);
+        assert.ok(fnMatch, '_analyzeContractFailure function should exist');
+        const fnBody = fnMatch[0];
+        assert.ok(fnBody.includes('c.delta.'),
+            '_analyzeContractFailure should extract delta field checks');
+        assert.ok(fnBody.includes('c.post.inv.'),
+            '_analyzeContractFailure should extract post.inv field checks');
+        assert.ok(fnBody.includes('c.post.eq.'),
+            '_analyzeContractFailure should extract post.eq field checks');
+    });
+
+    it('VIOLATED jsonl includes analysis field', () => {
+        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
+        const jsonlMatch = voyagerSrc.match(/appendFileSync.*violated_contracts\.jsonl[^}]+/);
+        assert.ok(jsonlMatch, 'VIOLATED should log to jsonl');
+        assert.ok(jsonlMatch[0].includes('analysis'),
+            'VIOLATED jsonl should include analysis field');
+    });
+});
