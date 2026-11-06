@@ -1,0 +1,178 @@
+{
+ "source": "icefox2000 bots/icefox2000/skills/index.json and violated_contracts.jsonl line 32 (2026-11-06T13:39:19.338Z), read on the iMac at 14:5x GMT",
+ "skills": [
+  {
+   "name": "checkInventoryForCookedMutton",
+   "code": "// DESCRIPTION: Confirm inventory holds at least one cooked_mutton using a fresh count immediately before returning success.\nasync function checkInventoryForCookedMutton(bot) {\n    if (bot.interrupt_code) return false;\n    await wait(bot, 1);\n    if (bot.interrupt_code) return false;\n\n    const inv = getInventoryCounts(bot);\n    if (inv == null) {\n        log(bot, 'FAILED: could not read inventory');\n        return false;\n    }\n\n    let count = Number(inv['cooked_mutton']) || 0;\n    if (count < 1) {\n        log(bot, 'FAILED: cooked_mutton missing or count is 0');\n        return false;\n    }\n\n    await wait(bot, 1);\n    if (bot.interrupt_code) return false;\n\n    const invFinal = getInventoryCounts(bot);\n    if (invFinal == null) {\n        log(bot, 'FAILED: could not re-read inventory before return');\n        return false;\n    }\n\n    count = Number(invFinal['cooked_mutton']) || 0;\n    if (count < 1) {\n        log(bot, 'FAILED: cooked_mutton not present at confirm (count < 1)');\n        return false;\n    }\n\n    log(bot, `cooked_mutton present: ${count} available (>= 1 confirmed)`);\n    return true;\n}",
+   "deps": []
+  },
+  {
+   "name": "eatCookedMutton",
+   "code": "// DESCRIPTION: Eat one cooked_mutton from inventory when available to restore hunger and enable healing at 1 HP.\nasync function eatCookedMutton(bot) {\n    if (bot.interrupt_code) return;\n    const hasMutton = await checkInventoryForCookedMutton(bot);\n    if (bot.interrupt_code) return;\n    if (!hasMutton) return;\n    await consume(bot, 'cooked_mutton');\n    if (bot.interrupt_code) return;\n}",
+   "deps": [
+    "checkInventoryForCookedMutton"
+   ],
+   "demoted": true,
+   "stats": {
+    "success": 1,
+    "fail": 2,
+    "streakFail": 2,
+    "tasks": [
+     "eatCookedMutton: If cooked_mutton is found, consume one item to update food value to at least 1/20"
+    ]
+   },
+   "contract": {
+    "pre": "c => c.pre.alive && (c.pre.inv['cooked_mutton'] ?? 0) > 0",
+    "post": "c => c.ret === false || c.ret === null || ((c.pre.inv['cooked_mutton'] ?? 0) === 0) ? true : (c.post.alive && (c.delta['cooked_mutton'] ?? 0) === -1 && c.post.food >= c.pre.food)",
+    "text": "When cooked mutton is in inventory, consume one to raise food (or hold food) and stay alive."
+   },
+   "candidate": {
+    "code": "// DESCRIPTION: Eat one cooked_mutton from inventory when available to restore hunger and enable healing at 1 HP.\nasync function eatCookedMutton(bot) {\n    if (bot.interrupt_code) return;\n    const hasMutton = await checkInventoryForCookedMutton(bot);\n    if (bot.interrupt_code) return;\n    if (!hasMutton) return;\n    try {\n        await consume(bot, 'cooked_mutton');\n        if (bot.interrupt_code) return;\n    } catch (e) {\n        log(bot, 'FAILED: eatCookedMutton threw ' + e.message);\n        return false;\n    }\n}",
+    "description": "Eat one cooked_mutton from inventory when available to restore hunger and enable healing at 1 HP.",
+    "deps": [
+     "checkInventoryForCookedMutton",
+     "consume"
+    ],
+    "task": "repair: eatCookedMutton",
+    "effects": [],
+    "stats": {
+     "success": 0,
+     "fail": 0,
+     "streakFail": 0,
+     "tasks": []
+    },
+    "trialTask": "eatCookedMutton"
+   }
+  },
+  {
+   "name": "equipBestArmor",
+   "code": "// DESCRIPTION: Wear the best helmet, chestplate, leggings and boots in the inventory; returns how many pieces were equipped.\nasync function equipBestArmor(bot) {\n    const tiers = ['netherite', 'diamond', 'iron', 'chainmail', 'golden', 'leather'];\n    const inv = getInventoryCounts(bot);\n    let n = 0;\n    for (const slot of ['helmet', 'chestplate', 'leggings', 'boots']) {\n        if (bot.interrupt_code) return n;\n        const t = tiers.find(t => inv[`${t}_${slot}`]);\n        if (t && await equip(bot, `${t}_${slot}`)) n++;\n    }\n    return n;\n}",
+   "deps": [],
+   "primitive": true,
+   "handwritten": true
+  },
+  {
+   "name": "craftArmorSet",
+   "code": "// DESCRIPTION: Craft and wear any missing helmet, chestplate, leggings and boots of material (iron, diamond, golden, leather); returns pieces worn.\nasync function craftArmorSet(bot, material = 'iron') {\n    if (!(await ensureCraftingTable(bot))) return 0;\n    for (const slot of ['helmet', 'chestplate', 'leggings', 'boots']) {\n        if (bot.interrupt_code) return 0;\n        if (!getInventoryCounts(bot)[`${material}_${slot}`]) await craftItem(bot, `${material}_${slot}`, 1);\n    }\n    return await equipBestArmor(bot);\n}",
+   "deps": [
+    "ensureCraftingTable",
+    "craftItem",
+    "equipBestArmor"
+   ],
+   "primitive": true,
+   "handwritten": true
+  }
+ ],
+ "violated_13_39_19": {
+  "pre": {
+   "hp": 8.366666793823242,
+   "food": 15,
+   "alive": true,
+   "inv": {
+    "iron_helmet": 7,
+    "cobblestone": 171,
+    "stick": 2,
+    "coal": 27,
+    "stone_shovel": 1,
+    "raw_copper": 7,
+    "shears": 1,
+    "torch": 79,
+    "stone_pickaxe": 3,
+    "wooden_axe": 1,
+    "iron_sword": 1,
+    "stone_sword": 1,
+    "stone_axe": 1,
+    "cobbled_deepslate": 71,
+    "iron_ingot": 30,
+    "granite": 1,
+    "andesite": 2,
+    "raw_iron": 129,
+    "oak_planks": 2,
+    "iron_pickaxe": 1,
+    "iron_shovel": 1,
+    "iron_axe": 1,
+    "cooked_mutton": 50
+   },
+   "free": 1,
+   "eq": {
+    "heldItem": "iron_pickaxe",
+    "offHand": "cooked_mutton",
+    "helmet": "iron_helmet",
+    "chestplate": null,
+    "leggings": null,
+    "boots": null
+   }
+  }
+ },
+ "dirt_effect_01_08": {
+  "source": "iMac logs/mindcraft.log.3 lines 198637-198915 (2026-11-06 01:07:52Z-01:08:4xZ) and bots/icefox2000/skills/index.json (eatCookedMutton, read 2026-11-06 15:0xZ)",
+  "index_record": {
+   "name": "eatCookedMutton",
+   "effects": [],
+   "consumes": {
+    "cobblestone": 7,
+    "dirt": 2,
+    "andesite": 4,
+    "raw_copper": 5
+   },
+   "stats": {
+    "success": 1,
+    "fail": 2,
+    "streakFail": 2
+   }
+  },
+  "task_start_census_01_07_52": "[toss] computed 2 deposit candidate(s): cobblestone(455), torch(79) | [toss] 5 item(s) have NO learned producer: shears(1), torch(79), copper_ingot(35), andesite(4), raw_copper(5)",
+  "previous_step_census_01_07_34": "[toss] computed 2 deposit candidate(s): cobblestone(448), torch(79) | [toss] 3 item(s) have NO learned producer: shears(1), torch(79), copper_ingot(35)",
+  "aborted_practice_01_07_52": "[idle-practice] ABORTED pickupNearbyItems: code-model call completed (printed after '[timing] 01:07:52Z step end')",
+  "other_skill_replay_output_01_08_16": "[voyager] replay checkInventoryForCookedMutton output: ... First outputs: | [toss] tossed 5 raw_copper (empty slots now 1) | [toss] tossed 4 andesite (empty slots now 2) | Found non-destructive path. | Moved away from (5, 16, 77) to (6, 16, 71).",
+  "task_window_before": {
+   "iron_helmet": 7,
+   "shears": 1,
+   "coal": 30,
+   "cobblestone": 455,
+   "stone_pickaxe": 2,
+   "stick": 8,
+   "torch": 79,
+   "raw_iron": 23,
+   "wooden_axe": 1,
+   "iron_sword": 1,
+   "stone_sword": 1,
+   "stone_axe": 1,
+   "copper_ingot": 35,
+   "iron_ingot": 24,
+   "cooked_mutton": 60,
+   "iron_axe": 1,
+   "furnace": 1,
+   "oak_log": 6,
+   "iron_pickaxe": 1,
+   "dirt": 2,
+   "andesite": 4,
+   "raw_copper": 5
+  },
+  "task_window_before_note": "the post-replay inventory plus the recorded delta; cobblestone/andesite/raw_copper match the 01:07:52Z census",
+  "after_other_skill_replay_01_08_16": {
+   "iron_helmet": 7,
+   "shears": 1,
+   "coal": 30,
+   "cobblestone": 448,
+   "stone_pickaxe": 2,
+   "stick": 8,
+   "torch": 79,
+   "raw_iron": 23,
+   "wooden_axe": 1,
+   "iron_sword": 1,
+   "stone_sword": 1,
+   "stone_axe": 1,
+   "copper_ingot": 35,
+   "iron_ingot": 24,
+   "cooked_mutton": 60,
+   "iron_axe": 1,
+   "furnace": 1,
+   "oak_log": 6,
+   "iron_pickaxe": 1
+  },
+  "eatCookedMutton_attempt": "[timing] game action attempt 1 took 1945ms (its code: checkInventoryForCookedMutton + consume)",
+  "recorded": "[needs/produces] recorded delta for \"eatCookedMutton\": -[cobblestone,dirt,andesite,raw_copper] +[]",
+  "practice_blocked": "[idle-practice] filtering out eatCookedMutton: would consume scarce dirt (have 2, need 2, pending goal needs it)  (current mindcraft.log, 40+ times)"
+ }
+}

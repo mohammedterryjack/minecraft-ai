@@ -24,12 +24,19 @@ import minecraftData from 'minecraft-data';
 import { Ollama } from '../models/ollama.js';
 import { setCallDurationStore } from '../models/call_durations.js';
 import { setMovementStore, learnedKinds, recordStep, recordCut, stepBound, noteUnbounded } from '../utils/movement_model.js';
-import { signatureOf, depsOf, missingCalls, findCycle, findAllCycles, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf } from './skill_graph.js';
+import { signatureOf, depsOf, missingCalls, findCycle, findAllCycles, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf, thrownIn, declaredNames } from './skill_graph.js';
 import { getBareAPI, collectBareApiUsedInSource } from './coder.js';   // fix40: unified bare-name API helper
 import { withStallPhase } from '../utils/event_loop_guard.js';
 import { watchdogEvidencePath } from '../utils/main_thread_watchdog.js';
 import { wrapBotForApiTiming } from '../utils/bot_api_timing.js';
 import { logPromptBreakdown, extractBareCalls } from './prompt_utils.js';   // fix47: shared prompt utilities
+import { recordConsumeEvidence, verifiedConsumes } from './consume_evidence.js';   // fix70
+// fix70: how much of a repair's evidence a [psn] log line shows (a log excerpt; the full evidence stays on the queue entry)
+const LOG_EVIDENCE_CHARS = 160;
+// fix70 (was fix71's inline .slice(0, 600) at both call sites): how much of an API-lint failure goes into the repair evidence
+// the code model sees. One definition for the startup re-lint and the repair-time re-lint, so both evidences are the same text.
+const API_LINT_EVIDENCE_CHARS = 600;
+const apiLintEvidence = (name, lint) => `${name} does not lint against the current built-in API, so it cannot run: ${String(lint).replace(/\s+/g, ' ').slice(0, API_LINT_EVIDENCE_CHARS)}`;
 const LOCAL = { model: 'qwen3:4b-instruct-2507-q4_K_M', url: 'http://192.168.1.215:11434', params: { format: 'json', options: { num_ctx: 8192, num_predict: 512 } } };   // fix38: raised from 150 to 512 - short JSON replies still need room for reasoning; truncation fails loudly (fix31)
 export const CALLS = { local: 0, code: 0, replay: 0 };
 
@@ -357,6 +364,7 @@ export class Voyager {
         this.indexFile = `${this.dir}/index.json`;
         this.progressFile = `${this.dir}/progress.json`;
         this.skills = existsSync(this.indexFile) ? JSON.parse(readFileSync(this.indexFile, 'utf8')) : [];
+        this._unverifiedConsumesNoted = new Set();   // fix70: skills whose evidence-less consumes was logged once (see _shouldSkipPractice)
         // fix49: ensure every skill has effects/consumes/stats (older skill files may not have them)
         for (const s of this.skills) {
             if (!s.effects) s.effects = [];
@@ -1278,7 +1286,7 @@ Use only c; no other globals.`;
             if (!lint) { clean[e.name] = h; continue; }
             delete clean[e.name];
             broken.push(e.name);
-            const evidence = `${e.name} does not lint against the current built-in API, so it cannot run: ${String(lint).replace(/\s+/g, ' ').slice(0, 600)}`;
+            const evidence = apiLintEvidence(e.name, lint);
             // fix71: the lint result rides on the queue entry (API hash + skill hash), so _repair can tell the maturity gate
             // that this version's track record was earned under an API it no longer runs on
             const apiLint = { api, hash: h };
@@ -1951,6 +1959,10 @@ Use only c; no other globals.`;
         const { lint, staged } = await this._stageLintExecTraced(libPart + call, full, replayClosure, `voyager:replay:${r.name}`);
         if (lint) { console.error(`[voyager] replay ${r.name}: lint failed before run: ${lint}`); return { ok: false, name: r.name, output: '', reason: `lint failed before run: ${lint}` }; }
         if (!staged) return { ok: false };
+        // fix70: what this skill did to the inventory is measured over ITS run only (runBefore -> after). `before` is the
+        //        task-start snapshot (goal gain is still measured from it); everything between it and this run (other replays,
+        //        backchaining, a practice run still finishing) is not this skill's doing
+        const runBefore = this.observe();
         this._runStart = Date.now();
         const closeJournal = this._openTrialJournal(Object.keys(over), r.name, task, replayClosure);
         let res;
@@ -1998,11 +2010,13 @@ Use only c; no other globals.`;
         else delete this.agent.bot.__prereqFail;
         // fix44: pass goal items to filter learned effects and produces (denoise)
         const goalItems = goal?.items || (goal?.item ? [goal.item] : null);
-        if (entry && ok && !trial) this._learnEffects(entry, before, after, goalItems);
+        if (entry && ok && !trial) this._learnEffects(entry, runBefore, after, goalItems);
         // fix56: an unverified open goal is neither a pass nor a failure of the skill: no run stats, no blame of the root for the goal
-        if (entry && !unverified) this._recordRun(entry, task, ok, trial);
+        // fix70: a run whose error was raised in library code is that code's fault, not a run of the learned skill
+        const libFault = !ok && this._libraryFault(this.agent.bot.__psnTrace, r.name);
+        if (entry && !unverified && !libFault) this._recordRun(entry, task, ok, trial);
         // ADAM-style: record inventory delta for needs/produces learning
-        if (ok) this.npGraph.recordDelta(r.name, before.inventory, after.inventory, goalItems);
+        if (ok) this.npGraph.recordDelta(r.name, runBefore.inventory, after.inventory, goalItems);   // fix70: this run only
         this._attribute(r.name, task, unverified ? true : ok, over);   // fix10: per-call trace -> contract results -> blame -> targeted repair
 
         // fix37 (D): detect and log inventory-full as a fact for learning
@@ -2093,9 +2107,14 @@ Use only c; no other globals.`;
         // fix73: no cap. fix32 (d1ea48e) kept the first 12 of the union: once 12 items had been seen (incidental ups count when
         // there is no goal hint), a real effect learned later was silently dropped. The set is bounded by the registry's item
         // names, and no reader of effects needs a bound (producers, practice skip, regression goal overlap, contract prompt).
-        const eff = [...new Set([...e.effects, ...up])], con = { ...e.consumes };
-        for (const k of down) con[k] = Math.max(con[k] || 0, (inv0[k] || 0) - (inv1[k] || 0));
-        if (JSON.stringify(eff) !== JSON.stringify(e.effects) || JSON.stringify(con) !== JSON.stringify(e.consumes)) { e.effects = eff; e.consumes = con; this._saveSkills(); }
+        const eff = [...new Set([...e.effects, ...up])];
+        // fix70: consumption carries its evidence (consume_evidence.js); before, consumes was a running max of every item that went
+        //        down in any success window and could never shrink, so one polluted window blocked practice for good
+        const con0 = JSON.stringify(e.consumes);
+        recordConsumeEvidence(e, inv0, inv1);
+        if (JSON.stringify(e.consumes) !== con0) console.log(`[psn] ${e.name} consumes (from ${e.consumeEvidence.runs} measured run(s)): ${JSON.stringify(e.consumes)}`);
+        e.effects = eff;
+        this._saveSkills();
     }
     // fix55: ONE goal resolver. Each kind comes from one rule over disjoint grammars (no fallback chain):
     //   item   - "Smelt N a into N b" / "<verb> N <item>" (smeltGoal / countGoal): verified by inventory gain
@@ -2115,7 +2134,10 @@ Use only c; no other globals.`;
         if (!isBareIdentifier(t)) return { kind: 'open' };
         const e = this.skills.find(s => s.name === t);
         if (!e) return { kind: 'invalid', why: `"${t}" is neither an item goal ("<verb> N <item>", "Smelt N <raw> into N <out>", "ensure <block>") nor the name of a known skill` };
-        if (e.demoted) return { kind: 'invalid', why: `skill ${t} is demoted` };
+        // fix70: a demoted skill with a repair candidate is still a valid goal: the candidate's trial runs are the learner's only way
+        // back for it (a promotion clears demoted). fix55 (#48) made every demoted skill goal invalid, so _gateTrial's dedicated
+        // trial of the eatCookedMutton candidate was refused ("not replaying ... skill eatCookedMutton is demoted") every 5 min
+        if (e.demoted && !e.candidate) return { kind: 'invalid', why: `skill ${t} is demoted` };
         if (e.mergedInto) return { kind: 'invalid', why: `skill ${t} was merged into ${e.mergedInto}; propose ${e.mergedInto}` };
         const need = requiredArgs(e);
         if (need.length) return { kind: 'invalid', why: `skill ${t} needs arguments (${need.join(', ')}); propose an item goal instead` };
@@ -2606,6 +2628,25 @@ Use only c; no other globals.`;
     _logPromptBreakdown(kind, sections) {
         return logPromptBreakdown(kind, sections);
     }
+    // fix70 (blame-aware accounting): when the traced call `name` threw and the error's top frame is outside the staged program
+    // (thrownIn: the seeded library, mineflayer, node), the fault is counted against THAT code in progress.libraryFaults
+    // ("<fn> <file:line>": n), loudly, and not against the learned skill's stats or gate (no fail, no streak, no demotion,
+    // no trial verdict). Where the frame lives is the only criterion: no name lists. An error raised in learned or
+    // generated code (its frames are the compartment's "<anonymous>:L:C") stays the skill's own failure.
+    // Returns the counted fault { fn, loc } or null.
+    _libraryFault(trace, name) {
+        if (!Array.isArray(trace)) return null;
+        const rec = trace.find(t => t.name === name && t.err !== undefined);
+        if (!rec || typeof rec.errTop !== 'string') return null;
+        const w = thrownIn(rec.errTop);
+        if (w.staged) return null;
+        const key = `${w.fn} ${w.loc}`;
+        const lf = (this.progress.libraryFaults ||= {});
+        lf[key] = (lf[key] || 0) + 1;
+        this._saveProgress();
+        console.log(`!!! [blame] LIBRARY FAULT in ${key} (x${lf[key]}): ${name} threw "${rec.err}" from library code; counted against that code, not against ${name}'s stats or gate`);
+        return w;
+    }
     _recordRun(entry, task, ok, trial) {
         if (trial) {
             const c = entry.candidate; recordRun(c.stats, task, ok);
@@ -2699,6 +2740,7 @@ Use only c; no other globals.`;
         const practicePromise = this._startIdlePractice(callNum);
         let r; try { r = await cm.sendRequest([{ role: 'user', content: user }], system); } finally {
             this._stopIdlePractice();
+            await practicePromise;   // fix70: no practice run outlives this call into the next action's window (see _runPracticeSkill)
             release();
             console.log(`[timing] ${new Date().toISOString().slice(11,19)}Z composer call #${callNum} took ${Date.now() - t0}ms (reply ${String(r ?? '').length} chars)`);
         }
@@ -2882,11 +2924,17 @@ Use only c; no other globals.`;
             }
         }
         // 2) Check if skill would consume scarce inputs needed by pending goals
-        const consumes = Object.keys(skill.consumes);
+        // fix70: only consumption re-verified by measured runs gates practice (verifiedConsumes); practice is how it gets measured
+        const verified = verifiedConsumes(skill);
+        if (!Object.hasOwn(skill, 'consumeEvidence') && Object.keys(skill.consumes).length && !this._unverifiedConsumesNoted.has(skill.name)) {
+            this._unverifiedConsumesNoted.add(skill.name);
+            console.log(`[idle-practice] ${skill.name}: learned consumes ${JSON.stringify(skill.consumes)} has no run evidence (never re-verified); not gating practice on it`);
+        }
+        const consumes = Object.keys(verified);
         if (consumes.length > 0) {
             for (const item of consumes) {
                 const have = inv[item] || 0;  // inventory lookup: missing item = 0
-                const need = skill.consumes[item];
+                const need = verified[item];
                 // if pending items include this consumable and we don't have much
                 if (pendingItems.has(item) && have < need * 3) {
                     return `would consume scarce ${item} (have ${have}, need ${need}, pending goal needs it)`;
@@ -3047,10 +3095,21 @@ Use only c; no other globals.`;
         const maxPracticeMs = 10000;
         let completed = false;
         let practiceError = null;
+        // fix70: the practice run is over only when the skill's own code has returned. Before, an abort returned at once and a
+        //        timeout only lost the race: the skill kept walking, picking up and tossing beside the NEXT action, whose
+        //        before/after inventory then held its changes (live 01:07:52Z: pickupNearbyItems ABORTED at step end, still running)
+        const mainP = staged.func.main(this._timedBotForSkillRun());
+        const ended = async () => {
+            const was = bot.interrupt_code;
+            bot.interrupt_code = true;
+            await mainP.then(() => {}, e => { if (e !== practiceError) console.error(`[idle-practice] ${skill.name} ended after interrupt with: ${e.message}`); });
+            bot.interrupt_code = was;   // this interrupt was only to end this practice run; the next practice run starts as this one did
+            console.log(`[idle-practice] ${skill.name}: its code has returned`);
+        };
         const runPromise = (async () => {
             try {
                 await Promise.race([
-                    staged.func.main(this._timedBotForSkillRun()),
+                    mainP,
                     new Promise((_, rej) => setTimeout(() => rej(new Error('practice timeout')), maxPracticeMs))
                 ]);
                 completed = true;
@@ -3066,13 +3125,14 @@ Use only c; no other globals.`;
         // wait for completion or abort
         while (!completed && !practiceError && Date.now() - practiceStart < maxPracticeMs) {
             if (this._idlePracticeAbort) {
-                bot.interrupt_code = true;
                 console.log(`[idle-practice] ABORTED ${skill.name}: code-model call completed`);
+                await ended();
                 return null;
             }
             await new Promise(r => setTimeout(r, 200));
         }
         try { await runPromise; } catch (e) { /* already logged above */ }
+        if (!completed) await ended();
         const after = this.observe();
         const changed = this._practiceRunChanged(skill, stateBefore, after);
         if (skill.stats) {
@@ -3764,7 +3824,7 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
             if (name === root) continue;
             const rec = trace.find(t => t.name === name);
             const e = this.skills.find(s => s.name === name);
-            if (rec && e?.candidate && !rec.intr) { gateLog(`trial run of candidate ${name} inside ${root}: contract ${rec.ok ? 'ok' : 'FAILED'}`); this._recordRun(e, task, rec.ok, true); }
+            if (rec && e?.candidate && !rec.intr && !(!rec.ok && this._libraryFault(trace, name))) { gateLog(`trial run of candidate ${name} inside ${root}: contract ${rec.ok ? 'ok' : 'FAILED'}`); this._recordRun(e, task, rec.ok, true); }   // fix70: not on a library fault
         }
         // fix27: no hotspot filter; deaths stay traced failures (above) and blame/repair learns avoidance
         // fix19 (5): an explicit FAILED line from a skill is a contract failure even if the task check passed (e.g. ensureChest inside a storage task)
@@ -3774,6 +3834,14 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         console.log(`[psn] execution trace of ${root} (${trace.length} calls):\n${traceText(trace)}`);
         const learned = n => !!this.skills.find(s => s.name === n);   // fix33: seeded primitives included   // fix24: includes hand-written (repairs become learned candidates)
         let bs = blameAll(trace, n => this._isLeaf(n), learned).slice(0, 3);   // at most 3 patches per failure (deepest first)
+        // fix70: a blamed skill that ran its CANDIDATE code in this run failed as that candidate: the gate already counted the
+        // trial against the candidate. Queuing a repair of the skill with that evidence repaired the INCUMBENT for an error its
+        // code never raised (13:40Z: the 13:39Z eatCookedMutton candidate's TypeError "reading 'food'" became the evidence of
+        // the 14:12Z repair of the incumbent, which only ever returned undefined).
+        const ranCandidate = bs.filter(b => Object.prototype.hasOwnProperty.call(over, b.target));
+        for (const b of ranCandidate) console.log(`[psn] blame of ${b.target} is its candidate's trial failure (counted by the gate); no repair of the incumbent from it: ${b.evidence.slice(0, LOG_EVIDENCE_CHARS)}`);
+        bs = bs.filter(b => !ranCandidate.includes(b));
+        if (!bs.length && ranCandidate.length) return;
         // fix19 (2): no learned skill on a failure path: the root's own composition is at fault
         if (!bs.length) {
             const b0 = blame(trace, n => this._isLeaf(n));
@@ -3884,7 +3952,7 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
                 this._saveProgress();
                 return false;
             }
-            q.evidence = `${e.name} does not lint against the current built-in API, so it cannot run: ${String(lint).replace(/\s+/g, ' ').slice(0, 600)}`;
+            q.evidence = apiLintEvidence(e.name, lint);
             const { V, n } = this._maturity(e);
             gateLog(`maturity ${e.name}: V=${V.toFixed(2)} (${n} runs) NOT CONSULTED: that record was earned by code that does not lint against the current API ${api} [repair after ${q.kind}]`);
         } else if (!this._updateAllowed(e, `repair after ${q.kind}`)) { console.log(`[psn] repair of ${e.name} skipped: maturity gate froze it`); return false; }
@@ -3903,7 +3971,7 @@ ${this.unifiedAPIList(relevantSkills)}
 IMPORTANT: All functions use bare names. Do NOT write skills.goToPosition - write goToPosition. Do NOT write world.getNearestBlock - write getNearestBlock.`;
         const user = `Blamed skill: ${e.name} (${q.kind === 'caller_fix' ? 'it calls the leaf ' + q.leaf + ' in a situation where the leaf cannot succeed: fix how/when it calls it, e.g. obtain the missing prerequisite first' : 'its own logic failed'})\nTask that failed: ${q.task}\nFailure path: ${q.path.join(' > ')}\nEvidence: ${q.evidence}\n--- execution trace (indent = call depth) ---\n${q.trace}\n${e.contract ? `--- learned contract of ${e.name} (must hold after your fix) ---\npre: ${e.contract.pre}\npost: ${e.contract.post}\n` : ''}--- current code of ${e.name} ---\n${e.code}\n--- skills it uses ---\n${kids.map(k => '// ' + k.description + '\n' + signatureOf(k.code, k.name)).join('\n')}\n${(e.repairHistory || []).length ? `\n--- your last ${e.repairHistory.length} repair proposal(s) for ${e.name} (do not repeat what failed) ---\n` + e.repairHistory.map((h, i) => `${i + 1}. [${h.outcome || 'pending'}] ${h.kind}: ${h.evidence}\n   change: ${h.desc}`).join('\n') : ''}${q.peers?.length > 1 ? `\nOther skills blamed on the same failure (repaired children-first): ${q.peers.join(', ')}` : ''}${awmHints ? `\n${awmHints}` : ''}\nWrite the fixed ${e.name}:`;
         console.log(`[psn] repair memory for ${e.name}: ${(e.repairHistory || []).length} past proposal(s) in the prompt${pastLessons.length ? `, ${pastLessons.length} AWM lesson(s)` : ''}`);
-        console.log(`[psn] REPAIR ${e.name} [${q.kind}] with the code model (evidence: ${q.evidence.slice(0, 160)})`);
+        console.log(`[psn] REPAIR ${e.name} [${q.kind}] with the code model (evidence: ${q.evidence.slice(0, LOG_EVIDENCE_CHARS)})`);
         let code, body, desc, extra = '';
         let _repairStaged = null;
         // fix37: duplicate-reply detection state for repair loop
@@ -4089,7 +4157,7 @@ ${this.unifiedAPIList(relevantSkills)}
 
 IMPORTANT: All functions use bare names. Do NOT write skills.goToPosition - write goToPosition. Do NOT write world.getNearestBlock - write getNearestBlock.`;
         const user = `Task that failed: ${q.task}\nEvidence: ${q.evidence}\n--- current bot state ---\n${this._stateText(this.observe())}\n--- execution trace ---\n${extractFeedback(q.trace || '', 2500)}\n--- child ${e.name} ---\n${e.code}\n--- caller ${pe.name} ---\n${pe.code}${e.contract ? `\n--- contract of ${e.name} ---\npre: ${e.contract.pre}\npost: ${e.contract.post}` : ''}${pe.contract ? `\n--- contract of ${pe.name} ---\npre: ${pe.contract.pre}\npost: ${pe.contract.post}` : ''}${awmHints ? `\n${awmHints}` : ''}\nWrite both fixed functions (${e.name} first, then ${pe.name}):`;
-        console.log(`[psn] REPAIR JOINT ${e.name} + ${pe.name} with the code model (evidence: ${String(q.evidence).slice(0, 160)})`);
+        console.log(`[psn] REPAIR JOINT ${e.name} + ${pe.name} with the code model (evidence: ${String(q.evidence).slice(0, LOG_EVIDENCE_CHARS)})`);
         let reply; try { reply = await this._ask(system, user); } catch (err) { console.log(`[psn] joint repair FAILED: ${err.message}`); return false; }
 
         // fix37 (C): improved extraction with better logging on failure
@@ -4547,7 +4615,10 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             const directLearnedCalls = new Set(depsOf(code, own, libraryNames));
             const stageNameSet = new Set([own, ...directLearnedCalls]);
             for (const d of directLearnedCalls) for (const n of this._closure(d)) stageNameSet.add(n);
-            const libSkills = this.skills.filter(s => stageNameSet.has(s.name) && s.name !== own);
+            // fix70: every name the generated code declares is defined by the code itself in this bundle (as `own` always was): a
+            // library skill of the same name, reached through a dep's closure, is not staged next to it (one scope, one definition)
+            const codeDeclares = declaredNames(code);
+            const libSkills = this.skills.filter(s => stageNameSet.has(s.name) && s.name !== own && !codeDeclares.has(s.name));
             const libSrc = libSkills.map(s => over[s.name] ?? s.code).join('\n\n');
             const traced = Voyager._tracedSkillNamesForInstrument(this, stageNameSet, over);
             const execBundle = libSrc + (libSrc ? '\n\n' : '') + instrumentSrc(traced) + '\n\n' + code;
@@ -4562,6 +4633,9 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             if (!lint && !staged) throw new Error('[psn] staging of traced generated code failed');
             if (lint) { console.log('[voyager] lint failed: ' + String(lint)); feedback = 'Lint error:\n' + lint; lastCode = code; continue; }
 
+            // fix70: this attempt's own window (see _replay): `before` is the task-start snapshot taken before the proposal, any
+            //        replay/backchain, every code-model call (with idle practice running beside it) and the earlier attempts
+            const runBefore = this.observe();
             this._runStart = Date.now();
             const closeJournal = this._openTrialJournal(Object.keys(over).filter(n => stageNameSet.has(n)), own, task);
             let res;
@@ -4594,7 +4668,7 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             if (this._decomposeQueue?.task === task && !lastTry) this._decomposeQueue = null;   // still iterating; decomposition decided after the last attempt
             if (verdict.success) {
                 // fix73: no cap of 8 (b2e2338); _learnEffects below unions the full observation into the same entry anyway
-                this._lastEffects = Object.keys(after.inventory).filter(k => (after.inventory[k] || 0) > (before.inventory[k] || 0));
+                this._lastEffects = Object.keys(after.inventory).filter(k => (after.inventory[k] || 0) > (runBefore.inventory[k] || 0));   // fix70: this attempt only
                 await this.saveSkill(fn[1], desc.trim(), code.replace(/\n\s*await\s+\w+\(bot\);\s*$/, '').trim(), task);
                 this.progress.completed.push(task);
                 this.progress.failed = this.progress.failed.filter(t => t !== task);
@@ -4605,9 +4679,9 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
                 this._subgoalDone(fn[1]);
                 // fix44: pass goal items to filter learned effects and produces (denoise)
                 const goalItems = goal?.items || (goal?.item ? [goal.item] : null);
-                { const e = this.skills.find(s => s.name === fn[1]); if (e && !e.candidate) this._learnEffects(e, before, after, goalItems); }
-                // ADAM-style: record inventory delta for needs/produces learning
-                this.npGraph.recordDelta(fn[1], before.inventory, after.inventory, goalItems);
+                { const e = this.skills.find(s => s.name === fn[1]); if (e && !e.candidate) this._learnEffects(e, runBefore, after, goalItems); }
+                // ADAM-style: record inventory delta for needs/produces learning (fix70: over this attempt's run only)
+                this.npGraph.recordDelta(fn[1], runBefore.inventory, after.inventory, goalItems);
                 // AWM-style: extract workflow from multi-step trace
                 const trace = this.agent.bot.__psnTrace;
                 if (Array.isArray(trace) && trace.length >= 2) {

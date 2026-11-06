@@ -298,6 +298,11 @@ export class Coder {
      * @returns {string|null}
      */
     userGeneratedCodeLintBlockers(code, knownNames = []) {
+        // fix70: code the model wrote that does not parse (13:42:41Z: its reply declared ensureFurnaceInRange twice) is lint
+        // feedback for the model, as in _lintCode and _apiGate; _forbiddenTimerLint threw instead and the whole step failed
+        // ("step failed: [coder] _forbiddenTimerLint: parse failed"), so the model never saw its own error
+        const parseErr = this._parseError(code);
+        if (parseErr) return `Syntax error (cannot parse): ${parseErr}`;
         const timerLint = this._forbiddenTimerLint(code, 0);
         if (timerLint.length > 0) {
             return 'setTimeout/setInterval are not available in the sandbox; use `await sleep(ms)`';
@@ -597,6 +602,12 @@ export class Coder {
         return out;
     }
 
+    /** fix70: the parser's message for code that does not parse, or null when it parses. */
+    _parseError(code) {
+        try { acorn.parse(code, { ecmaVersion: 'latest', sourceType: 'module', allowAwaitOutsideFunction: true }); }
+        catch (e) { if (!(e instanceof SyntaxError)) throw e; return e.message; }
+        return null;
+    }
     /**
      * Disallow setTimeout/setInterval in sandbox-bound code (AST; not string regex).
      */
