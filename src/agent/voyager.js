@@ -1515,17 +1515,16 @@ Use only c; no other globals.`;
         const inv = state.inventory || {};
         
         // fix49: for "ensure" goals, check observed state directly (is the block nearby?)
-        // This is the ground truth - no skill name pattern matching required
+        // Exact block-name match only - no substring matching
         if (goal.verb === 'ensure') {
-            const nearby = state.nearby || {};
-            const blocks = nearby.blocks || [];
-            // check if the goal item exists as a block nearby (within typical interaction range)
-            const found = blocks.some(b => b === goal.item || b.includes(goal.item));
+            if (!state.nearby) throw new Error('[fix49] state.nearby required for ensure goals');
+            const blocks = state.nearby.blocks;
+            if (!Array.isArray(blocks)) throw new Error('[fix49] state.nearby.blocks must be an array');
+            // exact match only - no includes()
+            const found = blocks.some(b => b === goal.item);
             if (found) {
                 return { satisfied: true, reason: `${goal.item} is already placed nearby (observed state)` };
             }
-            // also check if bot.findBlock would find it (if bot is available via observe())
-            // The state.nearby.blocks array should contain nearby block names from observe()
             return { satisfied: false, reason: `${goal.item} not found nearby (need to place it)`, goal };
         }
         
@@ -2071,38 +2070,34 @@ Use only c; no other globals.`;
             console.log(`[idle-practice] all ${candidates.length} candidate(s) filtered out`);
             return null;
         }
-        // fix49: rank by learning value from stats (derived, not hard-coded weights)
-        // Learning value: low success rate, high streakFail, few trials
-        // Plan relevance: produces items needed by pending goals
-        const now = Date.now();
+        // fix49: rank by Beta-posterior uncertainty * (1 + plan_relevance)
+        // Uncertainty = (s+1)(f+1) / ((n+2)^2 * (n+3)) where s=successes, f=failures, n=s+f
+        // Skills with n=0 get max variance naturally. No hand weights or recency constants.
+        const pendingSize = pending.size;
         const scored = filtered.map(s => {
             const stats = s.stats || {};
-            const trials = (stats.success || 0) + (stats.fail || 0);
-            const failRate = trials > 0 ? (stats.fail || 0) / trials : 0.5;  // unknown defaults to 0.5
-            const streakFail = stats.streakFail || 0;
-            const lastRun = stats.lastRun || 0;
-            const sinceRun = now - lastRun;
+            const successes = stats.success || 0;
+            const failures = stats.fail || 0;
+            const n = successes + failures;
             
-            // learning value: skills with low confidence, recent fails, few trials benefit most from practice
-            const lowConfidence = trials < 5 ? 0.4 : (trials < 10 ? 0.2 : 0);  // few trials
-            const recentFails = Math.min(1, streakFail / 3) * 0.3;  // consecutive failures
-            const lowRate = failRate * 0.2;  // low success rate
-            const recency = Math.min(1, sinceRun / (60 * 60 * 1000)) * 0.1;  // not run recently
+            // Beta-posterior variance: (s+1)(f+1) / ((n+2)^2 * (n+3))
+            const uncertainty = ((successes + 1) * (failures + 1)) / (Math.pow(n + 2, 2) * (n + 3));
             
-            // plan relevance: shares produces with pending goal items
+            // plan relevance = |effects ∩ pending needs| / |pending needs|
             const effects = s.effects || [];
-            const planRelevance = effects.some(eff => pending.has(eff)) ? 0.3 : 0;
+            const intersection = effects.filter(eff => pending.has(eff)).length;
+            const planRelevance = pendingSize > 0 ? intersection / pendingSize : 0;
             
-            const score = lowConfidence + recentFails + lowRate + recency + planRelevance;
-            return { s, score, reason: `trials=${trials} failRate=${failRate.toFixed(2)} streak=${streakFail} relevant=${planRelevance > 0}` };
+            // final score: uncertainty * (1 + plan_relevance)
+            const score = uncertainty * (1 + planRelevance);
+            return { s, score, reason: `n=${n} unc=${uncertainty.toFixed(4)} rel=${planRelevance.toFixed(2)}` };
         }).sort((a, b) => b.score - a.score);
         
         if (scored.length > 0) {
             console.log(`[idle-practice] top candidate: ${scored[0].s.name} (${scored[0].reason})`);
         }
-        // pick from top candidates with some randomization
-        const top = scored.slice(0, Math.min(5, scored.length));
-        return top[Math.floor(Math.random() * top.length)]?.s || null;
+        // pick the highest-scoring skill (no randomization - uncertainty is the tiebreaker)
+        return scored[0]?.s || null;
     }
     // fix42: get items needed by pending/failed tasks (from learned needs/produces, not hard-coded)
     // fix25: prefer smeltGoal so "Smelt X into Y" prioritizes Y (product), ingredients come from consumes
@@ -2579,133 +2574,51 @@ Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
         console.log(`[plan] overlapped proposal "${r?.task}" is stale (${why}); re-planning`);
         return this.proposeTask(before);
     }
-    // fix49: find food items in inventory based on learned consumes/effects (no hard-coded food list)
-    // Returns array of { item, count, foodValue } sorted by available food value
-    _findLearnedFoodItems(inv) {
-        const foods = [];
-        // skills that consume an item and have food-related effects (restore health/food)
-        for (const s of this.skills) {
-            if (s.demoted || s.mergedInto) continue;
-            const consumes = s.consumes || {};
-            // skills like "eat X" or "consume X" that restore health/food
-            for (const item of Object.keys(consumes)) {
-                const count = inv[item] || 0;
-                if (count <= 0) continue;
-                // check if skill has food/health restoration in its effects or description
-                const desc = (s.description || '').toLowerCase();
-                const task = (s.task || '').toLowerCase();
-                if (desc.includes('eat') || desc.includes('food') || desc.includes('health') || 
-                    task.includes('eat') || task.includes('consume')) {
-                    // estimate food value from stats (skills that work well are likely better food)
-                    const stats = s.stats || {};
-                    const rate = stats.success && (stats.success + (stats.fail || 0)) > 0 
-                        ? stats.success / (stats.success + (stats.fail || 0)) : 0.5;
-                    foods.push({ item, count, foodValue: rate, skill: s.name });
-                }
+    // fix49: get edible items in inventory using minecraft-data foods (game data, not a list)
+    // Returns array of { item, count, foodPoints, saturation } for items in inventory that are food
+    _getEdibleInventory(inv) {
+        if (!VERSION) throw new Error('[fix49] VERSION must be set to get edible inventory');
+        const md = minecraftData(VERSION);
+        const edible = [];
+        // md.foods is keyed by item ID; check each inventory item against it
+        for (const [itemName, count] of Object.entries(inv)) {
+            if (count <= 0) continue;
+            const item = md.itemsByName[itemName];
+            if (!item) continue;
+            const food = md.foods[item.id];
+            if (food) {
+                edible.push({
+                    item: itemName,
+                    count,
+                    foodPoints: food.foodPoints,
+                    saturation: food.saturation
+                });
             }
         }
-        // also check inventory for known consumable items (from effects learned on any skill)
-        for (const [item, count] of Object.entries(inv)) {
-            if (count <= 0 || foods.some(f => f.item === item)) continue;
-            // check if any skill produces this item with food-related naming
-            const producers = this.skills.filter(s => 
-                !s.demoted && !s.mergedInto && 
-                (s.effects || []).includes(item) &&
-                (item.includes('cooked') || item.includes('bread') || item.includes('apple') || 
-                 item.includes('steak') || item.includes('porkchop') || item.includes('mutton'))
-            );
-            if (producers.length > 0) {
-                foods.push({ item, count, foodValue: 0.7, skill: null });
-            }
-        }
-        return foods.sort((a, b) => b.foodValue - a.foodValue);
+        // sort by effective quality (foodPoints + saturation)
+        return edible.sort((a, b) => (b.foodPoints + b.saturation) - (a.foodPoints + a.saturation));
     }
     
-    // fix49: check if health recovery is needed based on learned state (no hard-coded threshold)
-    // Returns recovery hint if health is significantly below observed average, null otherwise
-    _healthRecoveryHint(state) {
-        const health = state.health_value || 20;
-        const healthMax = state.health_max || 20;
-        const food = state.food_value || 20;
-        
-        // learn average health from successful task completions (tracked in progress)
-        const avgHealth = this.progress.avgHealthOnSuccess || healthMax;
-        
-        // health is concerning when significantly below learned average
-        // the "significantly" threshold is derived from observed variance, not hard-coded
-        const variance = this.progress.healthVariance || 5;
-        if (health > avgHealth - variance) return null;
-        
-        // find food items we can eat (from learned effects)
-        const inv = state.inventory || {};
-        const foods = this._findLearnedFoodItems(inv);
-        
-        if (foods.length > 0 && food < 18) {  // food below 18 allows eating
-            return `HEALTH LOW (${health}/${healthMax}, avg was ${avgHealth.toFixed(0)}): eat ${foods[0].item} (have ${foods[0].count})`;
-        } else if (foods.length === 0 && health < avgHealth - variance * 2) {
-            return `HEALTH CRITICAL (${health}/${healthMax}): no food in inventory - prioritize getting food`;
-        }
-        return null;
+    // fix49: goal backoff multiplier = posterior mean success (s+1)/(n+2) per goal+reason
+    // Decay comes only from new evidence (new successes/failures), no time constants
+    _goalBackoffMultiplier(task, reason) {
+        const key = `${task}::${reason || ''}`;
+        const stats = (this.progress.goalStats || {})[key];
+        if (!stats) return 1;  // no evidence = no backoff
+        const s = stats.success;
+        const n = stats.success + stats.fail;
+        // posterior mean: (s+1)/(n+2) - Bayesian with uniform prior
+        return (s + 1) / (n + 2);
     }
     
-    // fix49: record health on task success (for learning average health level)
-    _recordHealthOnSuccess() {
-        const health = this.agent.bot?.health || 20;
-        const prev = this.progress.avgHealthOnSuccess || 20;
-        const n = this.progress.healthSamples || 0;
-        // exponential moving average
-        this.progress.avgHealthOnSuccess = n === 0 ? health : prev * 0.9 + health * 0.1;
-        this.progress.healthSamples = n + 1;
-        // update variance estimate
-        const diff = health - this.progress.avgHealthOnSuccess;
-        this.progress.healthVariance = n === 0 ? 5 : (this.progress.healthVariance || 5) * 0.9 + Math.abs(diff) * 0.1;
-    }
-    
-    // fix49: failure backoff - deprioritize goals that keep failing on unmet external preconditions
-    // Returns deprioritization factor (0-1) based on failure history and decay
-    _failureBackoff(task) {
-        const failures = this.progress.taskFailures || {};
-        const entry = failures[task];
-        if (!entry) return 0;  // no backoff
-        
-        const now = Date.now();
-        const age = now - entry.lastFail;
-        
-        // decay is derived from stats: faster decay for tasks that occasionally work
-        const decayRate = entry.successCount > 0 
-            ? Math.max(60000, 300000 / (entry.successCount + 1))  // faster if sometimes works
-            : 600000;  // 10 min base decay if never worked
-        
-        // backoff factor decays exponentially with time
-        const timeFactor = Math.exp(-age / decayRate);
-        const backoff = Math.min(1, entry.consecutiveFails * 0.2) * timeFactor;
-        
-        if (backoff > 0.3) {
-            console.log(`[backoff] task "${task}" deprioritized by ${(backoff * 100).toFixed(0)}% (${entry.consecutiveFails} consecutive fails, reason: ${entry.reason || 'unknown'})`);
-        }
-        return backoff;
-    }
-    
-    // fix49: record task failure with reason for backoff learning
-    _recordTaskFailure(task, reason) {
-        const failures = this.progress.taskFailures ||= {};
-        const entry = failures[task] ||= { consecutiveFails: 0, totalFails: 0, successCount: 0, lastFail: 0, reason: '' };
-        entry.consecutiveFails++;
-        entry.totalFails++;
-        entry.lastFail = Date.now();
-        entry.reason = String(reason || '').slice(0, 100);
+    // fix49: record goal outcome for backoff learning (keyed by goal + failure reason)
+    _recordGoalOutcome(task, success, reason) {
+        const key = `${task}::${reason || ''}`;
+        const goalStats = this.progress.goalStats ||= {};
+        const entry = goalStats[key] ||= { success: 0, fail: 0 };
+        if (success) entry.success++;
+        else entry.fail++;
         this._saveProgress();
-    }
-    
-    // fix49: reset consecutive failures on task success
-    _recordTaskSuccess(task) {
-        const failures = this.progress.taskFailures || {};
-        if (failures[task]) {
-            failures[task].consecutiveFails = 0;
-            failures[task].successCount = (failures[task].successCount || 0) + 1;
-            this._saveProgress();
-        }
-        this._recordHealthOnSuccess();
     }
     
     async proposeTask(state) {
@@ -2737,12 +2650,15 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "task": "...", "contex
         const blockerHint = blockers.length > 0 
             ? `\nBLOCKERS (prioritize these - failures need tools): ${blockers.map(b => `need ${b.tool} to break ${b.block}`).join('; ')}`
             : '';
-        // fix49: health recovery hint based on learned food effects
-        const healthHint = this._healthRecoveryHint(state);
+        // fix49: pass edible inventory (from minecraft-data foods) to curriculum - let the model rank
+        const edible = VERSION ? this._getEdibleInventory(inv) : [];
+        const edibleHint = edible.length > 0 
+            ? `\nedible_inventory: ${edible.map(e => `${e.item}(${e.count}, food=${e.foodPoints})`).join(', ')}`
+            : '';
         const user = `known_skills: ${JSON.stringify(knownSkillsFacts)}
 replayable_tasks (cheap, no new code needed): ${JSON.stringify(replayableTasks)} plus any "Mine N <block or ore>", "Collect N <log>", "Get N <item>", "Smelt N <raw> into N <out>", "Kill N <mob>", "Harvest N <crop>"
 completed_tasks: ${JSON.stringify(this.progress.completed.slice(-30))}
-failed_tasks: ${JSON.stringify(this.progress.failed.slice(-15))}${blockerHint}${healthHint ? '\n' + healthHint : ''}
+failed_tasks: ${JSON.stringify(this.progress.failed.slice(-15))}${blockerHint}${edibleHint}
 --- state (compact) ---
 ${compactStateText}
 current_health: ${Math.round(bot.health)}/20\ncurrent_food: ${bot.food}/20 (20/20 = full)${this._cursorLimited() ? '\nIMPORTANT: the code-writing model is unavailable right now, so ONLY propose a task from replayable_tasks or "Mine N <block>".' : ''}${workflowHints ? '\n' + workflowHints : ''}`;   // fix31: slow-changing lists first so Ollama reuses the cached prompt prefix
@@ -3648,7 +3564,7 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
             this.progress.failed = this.progress.failed.filter(t => t !== task);
             // fix47: clear blockers for this task when it passes
             this.progress.blockers = (this.progress.blockers || []).filter(b => b.task !== task);
-            this._recordTaskSuccess(task);  // fix49: backoff tracking
+            this._recordGoalOutcome(task, true, null);  // fix49: backoff tracking
             this._saveProgress();
             this.agent.openChat?.(`Done: ${task} (already satisfied: ${alreadySatisfied.reason}).`);
             this._afterSuccess();
@@ -3666,7 +3582,7 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
             this.progress.completed.push(task); this.progress.failed = this.progress.failed.filter(t => t !== task);
             // fix47: clear blockers for this task when it passes
             this.progress.blockers = (this.progress.blockers || []).filter(b => b.task !== task);
-            this._recordTaskSuccess(task);  // fix49: backoff tracking
+            this._recordGoalOutcome(task, true, null);  // fix49: backoff tracking
             this._saveProgress();
             this._subgoalDone(rp.name);
             this.agent.openChat?.(`Done: ${task} (replayed ${rp.name}).`);
@@ -3674,7 +3590,7 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
             return;
         }
         if (rp && !rp.ok && !rp.interrupted) { 
-            this._recordTaskFailure(task, rp.reason || 'replay failed');  // fix49: backoff tracking
+            this._recordGoalOutcome(task, false, rp.reason || 'replay failed');  // fix49: backoff tracking
             this.progress.failed.push(task); this._saveProgress(); this._windowCheck(false); 
         }
         if (this._cursorLimited()) { console.log(`[voyager] skipped "${task}": needs new code but Cursor is at its limit (replay-only mode)`); return; }
@@ -3821,7 +3737,7 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
                 this.progress.failed = this.progress.failed.filter(t => t !== task);
                 // fix47: clear blockers for this task when it passes
                 this.progress.blockers = (this.progress.blockers || []).filter(b => b.task !== task);
-                this._recordTaskSuccess(task);  // fix49: backoff tracking
+                this._recordGoalOutcome(task, true, null);  // fix49: backoff tracking
                 this._saveProgress();
                 this._subgoalDone(fn[1]);
                 // fix44: pass goal items to filter learned effects and produces (denoise)
@@ -3849,7 +3765,7 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             lastCode = code;
             if (lastTry) { if (i < MAX_ATTEMPTS) console.log(`[voyager] stopping after attempt ${i}: ${same ? 'critique unchanged from the previous attempt' : `${cut} (travel/death cut-off)`}`); break; }
         }
-        this._recordTaskFailure(task, anyCut || feedback || `failed ${MAX_ATTEMPTS}x`);  // fix49: backoff tracking
+        this._recordGoalOutcome(task, false, anyCut || `failed ${MAX_ATTEMPTS}x`);  // fix49: backoff tracking
         this.progress.failed.push(task);
         this._saveProgress(); this._windowCheck(false);
         console.log(`[voyager] task failed after ${MAX_ATTEMPTS} attempts: ${task}`);
