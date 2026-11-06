@@ -1553,14 +1553,14 @@ export async function goToGoal(bot, goal) {
                 const onInterrupt = () => {
                     if (!bot.interrupt_code) return;
                     done();
-                    try { bot.pathfinder.stop(); } catch (e) {}
+                    bot.pathfinder.stop();
                     reject(new Error('interrupted'));
                 };
                 bot.on('physicsTick', onInterrupt);
                 stopWatch = watchPathing(bot, (v) => {
                     progressTimedOut = v;
                     done();
-                    try { bot.pathfinder.stop(); } catch (e) {}
+                    bot.pathfinder.stop();
                     reject(new Error(`no progress (stalled): ${describeStall(v)}`));
                 }, (line) => console.log(line));
                 bot.pathfinder.goto(targetGoal)
@@ -1575,7 +1575,7 @@ export async function goToGoal(bot, goal) {
             // fix44: check for interrupt first
             if (bot.interrupt_code || /interrupted/i.test(String(err?.message))) {
                 clearInterval(doorCheckInterval);
-                try { bot.pathfinder.stop(); } catch (e) {}
+                bot.pathfinder.stop();
                 log(bot, `FAILED: navigation cancelled (interrupted).`);
                 return false;
             }
@@ -1596,7 +1596,7 @@ export async function goToGoal(bot, goal) {
             for (let hop = 0; hop < 3; hop++) {
                 if (bot.interrupt_code) {
                     clearInterval(doorCheckInterval);
-                    try { bot.pathfinder.stop(); } catch (e) {}
+                    bot.pathfinder.stop();
                     log(bot, `FAILED: navigation cancelled (interrupted).`);
                     return false;
                 }
@@ -1627,7 +1627,7 @@ export async function goToGoal(bot, goal) {
         return true;
     } catch (err) {
         clearInterval(doorCheckInterval);
-        try { bot.pathfinder.stop(); } catch (e) {}
+        bot.pathfinder.stop();
         
         // fix44: loud FAILED for all path failures
         if (bot.interrupt_code || /interrupted/i.test(String(err?.message))) {
