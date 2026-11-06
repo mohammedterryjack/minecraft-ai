@@ -474,12 +474,17 @@ describe('fix51 issue 11: nav stall loop per-goal::reason tracking', async () =>
 
 // Issue 13 (live run-2): Observation-based contract mismatch detection (no name patterns)
 describe('fix51 issue 13: observation-based contract mismatch detection', async () => {
-    it('_extractPostFields extracts fields from postcondition source', () => {
-        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
-        assert.ok(voyagerSrc.includes('_extractPostFields'),
-            'should have _extractPostFields method');
-        assert.ok(voyagerSrc.includes('c\\.delta\\.') && voyagerSrc.includes('c\\.(post|pre)\\.pos'),
-            'should extract delta and position field references');
+    it('_extractPostFields extracts fields from postcondition source via acorn AST', async () => {
+        const mod = await import('../src/agent/voyager.js');
+        const v = Object.create(mod.Voyager.prototype);
+        const f = v._extractPostFields('c => c.delta.stone >= 1 && c.delta["iron_ingot"] > 0 && c.delta[k] && c.dist(c.pre.pos, c.post.pos) < 3 && c.post.hp > 0 && c.post.inv.coal >= 1 && c.post.eq.heldItem === "x" && c.ret === true');
+        assert.deepStrictEqual(f.delta, ['stone', 'iron_ingot', '*']);
+        assert.deepStrictEqual(f.inv, ['coal']);
+        assert.deepStrictEqual(f.eq, ['heldItem']);
+        assert.strictEqual(f.pos, true); assert.strictEqual(f.dist, true); assert.strictEqual(f.hp, true); assert.strictEqual(f.ret, true); assert.strictEqual(f.food, false);
+        const src = readFileSync('./src/agent/voyager.js', 'utf8');
+        const body = src.slice(src.indexOf('    _extractPostFields(postSrc)'), src.indexOf('    // fix51: observation-based contract mismatch'));
+        assert.ok(!body.includes('matchAll') && !/\/c\\\./.test(body), '_extractPostFields must not use regexes over contract source');
     });
 
     it('_detectContractMismatch detects when post checks unchanged fields', () => {
@@ -754,17 +759,16 @@ describe('fix51 issue 17: VIOLATED contract analysis', async () => {
             'VIOLATED logging should include analysis output');
     });
 
-    it('_analyzeContractFailure extracts delta fields', () => {
-        const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
-        const fnMatch = voyagerSrc.match(/_analyzeContractFailure\(contractSrc, c, r\)\s*\{[\s\S]*?^\s{4}\}/m);
-        assert.ok(fnMatch, '_analyzeContractFailure function should exist');
-        const fnBody = fnMatch[0];
-        assert.ok(fnBody.includes('c.delta.'),
-            '_analyzeContractFailure should extract delta field checks');
-        assert.ok(fnBody.includes('c.post.inv.'),
-            '_analyzeContractFailure should extract post.inv field checks');
-        assert.ok(fnBody.includes('c.post.eq.'),
-            '_analyzeContractFailure should extract post.eq field checks');
+    it('_analyzeContractFailure reports actual vs expected for delta, post.inv, post.eq, ret, dist (acorn)', async () => {
+        const mod = await import('../src/agent/voyager.js');
+        const v = Object.create(mod.Voyager.prototype);
+        const c = { args: [], ret: false, pre: { pos: { x: 0, y: 0, z: 0 } }, post: { pos: { x: 5, y: 0, z: 0 }, inv: { stone: 2 }, eq: { heldItem: null }, alive: true }, delta: {}, dist: (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z) };
+        const out = v._analyzeContractFailure('c => c.delta.stone >= 1 && c.post.inv.stone >= 3 && c.post.eq.heldItem === "x" && c.ret === true && c.dist(c.pre.pos, c.post.pos) < 2', c, {});
+        assert.ok(out.includes('c.delta.stone=undefined (expected >=1)'), out);
+        assert.ok(out.includes('c.post.inv.stone=2 (expected >=3)'), out);
+        assert.ok(out.includes('c.post.eq.heldItem=null'), out);
+        assert.ok(out.includes('c.ret=false'), out);
+        assert.ok(out.includes('dist(pre.pos,post.pos)=5.0'), out);
     });
 
     it('VIOLATED jsonl includes analysis field', () => {
@@ -1010,8 +1014,10 @@ describe('fix51 issue 20: ensureCraftingTable dependency chain', async () => {
             equipment: { heldItem: null, offHand: null, helmet: null, chestplate: null, leggings: null, boots: null },
             pos: { x: 0, y: 64, z: 0 }
         });
-        const reason = 'PREREQUISITE FAILED: ensureCraftingTable cannot craft - missing: oak_planks (need 4, have 2). Decompose to obtain prerequisites.';
-        const ok = v._tryDecomposePrerequisiteFailure('craft one iron pickaxe', reason);
+        assert.strictEqual(v._tryDecomposePrerequisiteFailure('craft one iron pickaxe'), false, 'no structured prereq -> no decomposition');
+        mockBot.__prereqFail = { item: 'oak_planks', need: 4, have: 2 };
+        const ok = v._tryDecomposePrerequisiteFailure('craft one iron pickaxe');
+        assert.ok(!Object.hasOwn(mockBot, '__prereqFail'), 'decomposition clears __prereqFail');
         assert.strictEqual(ok, true);
         assert.ok(v.progress.subgoals.length >= 1);
         const sub = v.progress.subgoals[0].task.toLowerCase();
@@ -1046,11 +1052,11 @@ describe('fix51 issue 21: null dereference protection', async () => {
             'lint should warn about potential null dereference on findBlock/blockAt');
     });
 
-    it('__wrap converts TypeError on null deref to FAILED return (repair path, not crash)', () => {
+    it('__wrap records any thrown error as FAILED with full message (repair path, not crash)', () => {
         const sgSrc = readFileSync('./src/agent/skill_graph.js', 'utf8');
-        assert.ok(sgSrc.includes('Cannot read propert'), '__wrap should handle null property TypeError');
-        assert.ok(sgSrc.includes("bot.output = (bot.output || '') +"), '__wrap should log FAILED to bot output');
-        assert.ok(sgSrc.includes('return false'), '__wrap should return false instead of rethrowing TypeError');
+        assert.ok(!sgSrc.includes('Cannot read propert'), '__wrap must not special-case TypeError text');
+        assert.ok(sgSrc.includes("bot.output = bot.output + '\\nFAILED: ' + n + ' threw ' + msg"), '__wrap should log FAILED with full message to bot output');
+        assert.ok(sgSrc.includes('rec.err = msg;'), 'rec.err must not be truncated');
     });
 });
 
@@ -1073,5 +1079,21 @@ describe('fix51 issue 22: idle practice requires real effect change', async () =
         assert.ok(voyagerSrc.includes('_practiceRunChanged'), 'voyager should define _practiceRunChanged');
         assert.ok(voyagerSrc.includes('[idle-practice] NOT SUCCESS'),
             'idle practice should not count empty delta as SUCCESS');
+    });
+});
+
+describe('fix51 rule fixes: structured prereq + deposit without name regex', async () => {
+    it('seeded ensureCraftingTable sets bot.__prereqFail; decomposition does not parse text', () => {
+        const src = readFileSync('./src/agent/voyager.js', 'utf8');
+        assert.ok(src.includes('bot.__prereqFail = { item: ingItem.name'), 'ensureCraftingTable should set structured __prereqFail');
+        const body = src.slice(src.indexOf('    _tryDecomposePrerequisiteFailure(parentTask)'), src.indexOf('    _subgoalToObtainItem('));
+        assert.ok(!body.includes('match(') && !body.includes('could not parse'), 'decomposition must not parse text');
+    });
+    it('seeded depositToChest has no container name regex and logs each openContainer reject', () => {
+        const src = readFileSync('./src/agent/voyager.js', 'utf8');
+        const body = src.slice(src.indexOf('async function depositToChest'));
+        const fn = body.slice(0, body.indexOf('}`,'));
+        assert.ok(!fn.includes('chest|barrel'), 'no container name regex');
+        assert.ok(fn.includes('[deposit] reject \\${cand.key}: \\${err.message}'), 'openContainer failure logs reject with error and moves on');
     });
 });

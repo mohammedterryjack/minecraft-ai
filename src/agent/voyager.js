@@ -7,6 +7,7 @@ import settings from '../../settings.js';
 //   - AWM repair/workflow memory (https://arxiv.org/abs/2409.07429)
 //   - SkillWeaver-style idle practice (https://arxiv.org/abs/2504.07079)
 import { AsyncLocalStorage } from 'async_hooks';
+import * as acorn from 'acorn';
 import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, renameSync, statSync, copyFileSync, truncateSync, appendFileSync, readdirSync } from 'fs';
 import { NeedsProducesGraph } from './needs_produces.js';
 import { RepairMemory } from './repair_memory.js';
@@ -267,7 +268,8 @@ export function parseVerboseGoal(task) {
     if (candidates.length === 0) {
         // fix51: enhanced LOUD logging - include full goal text and log to file for analysis
         console.log(`[fix46] LOUD: parseVerboseGoal failed for "${task}": no valid item name found in registry`);
-        try { appendFileSync(`./bots/parseVerboseGoal_failures.jsonl`, JSON.stringify({ at: new Date().toISOString(), task, version: VERSION }) + '\n'); } catch (err) { void 0; }
+        mkdirSync('./bots', { recursive: true });
+        appendFileSync(`./bots/parseVerboseGoal_failures.jsonl`, JSON.stringify({ at: new Date().toISOString(), task, version: VERSION }) + '\n');
         return null;
     }
     
@@ -752,25 +754,59 @@ Use only c; no other globals.`;
         try { for (const k of ['pre', 'post']) { const r = this._compileContract(ct[k])(c); if (typeof r !== 'boolean') return `${k} returned ${typeof r}, not boolean`; } } catch (e) { return `throws: ${e.message}`; }
         return null;
     }
-    // fix51: extract fields the postcondition reads from its source (AST-like extraction)
-    // Returns { delta: ['stone', 'iron_ingot'], pos: true, hp: true, ... }
+    // fix51: parse a contract with acorn; returns { root, param, src } where root is the contract function node
+    _parseContract(contractSrc) {
+        const src = String(contractSrc);
+        const ast = acorn.parse(`(${src})`, { ecmaVersion: 'latest' });
+        const root = ast.body[0].expression;
+        if (!root.params) throw new Error(`contract is not a function: ${src}`);
+        const param = root.params.length ? root.params[0] : null;
+        if (param && param.type !== 'Identifier') throw new Error(`contract parameter is not an identifier: ${src}`);
+        return { root, param: param ? param.name : null, src: `(${src})` };
+    }
+    // fix51: member path rooted at the contract parameter, e.g. c.post.inv.stone -> ['post','inv','stone']; dynamic keys -> '*'
+    _contractPath(node, param) {
+        const keys = [];
+        let n = node;
+        while (n.type === 'MemberExpression') {
+            if (!n.computed) keys.unshift(n.property.name);
+            else if (n.property.type === 'Literal') keys.unshift(String(n.property.value));
+            else keys.unshift('*');
+            n = n.object;
+        }
+        if (n.type !== 'Identifier' || n.name !== param) return null;
+        return keys;
+    }
+    _walkAst(node, visit) {
+        if (!node || typeof node.type !== 'string') return;
+        visit(node);
+        for (const v of Object.values(node)) {
+            if (Array.isArray(v)) { for (const x of v) this._walkAst(x, visit); }
+            else if (v && typeof v === 'object' && typeof v.type === 'string') this._walkAst(v, visit);
+        }
+    }
+    // fix51: extract fields the postcondition reads (acorn AST over MemberExpressions on the contract parameter)
+    // Returns { delta: ['stone', '*'], pos, hp, food, inv: [...], eq: [...], dist, ret }
     _extractPostFields(postSrc) {
-        const src = String(postSrc);
-        const fields = { delta: [], pos: false, hp: false, food: false, inv: [], eq: [], dist: false };
-        // c.delta.item or c.delta['item'] or c.delta[var]
-        for (const m of src.matchAll(/c\.delta\.(\w+)/g)) fields.delta.push(m[1]);
-        for (const m of src.matchAll(/c\.delta\[['"](\w+)['"]\]/g)) fields.delta.push(m[1]);
-        if (/c\.delta\[/.test(src) && !/c\.delta\[['"]/.test(src)) fields.delta.push('*'); // dynamic access
-        // c.post.pos or c.pre.pos or c.dist
-        if (/c\.(post|pre)\.pos/.test(src)) fields.pos = true;
-        if (/c\.dist/.test(src)) fields.dist = true;
-        // c.post.hp or c.pre.hp
-        if (/c\.(post|pre)\.hp/.test(src)) fields.hp = true;
-        if (/c\.(post|pre)\.food/.test(src)) fields.food = true;
-        // c.post.inv.item or c.pre.inv.item
-        for (const m of src.matchAll(/c\.(post|pre)\.inv\.(\w+)/g)) fields.inv.push(m[2]);
-        // c.post.eq.slot or c.pre.eq.slot
-        for (const m of src.matchAll(/c\.(post|pre)\.eq\.(\w+)/g)) fields.eq.push(m[2]);
+        const fields = { delta: [], pos: false, hp: false, food: false, inv: [], eq: [], dist: false, ret: false };
+        const { root, param } = this._parseContract(postSrc);
+        if (param === null) return fields;
+        this._walkAst(root.body, node => {
+            if (node.type !== 'MemberExpression') return;
+            const p = this._contractPath(node, param);
+            if (!p) return;
+            if (p[0] === 'delta' && p.length === 2) fields.delta.push(p[1]);
+            else if (p[0] === 'dist' && p.length === 1) fields.dist = true;
+            else if (p[0] === 'ret' && p.length === 1) fields.ret = true;
+            else if ((p[0] === 'post' || p[0] === 'pre') && p.length >= 2) {
+                if (p[1] === 'pos') fields.pos = true;
+                else if (p[1] === 'hp') fields.hp = true;
+                else if (p[1] === 'food') fields.food = true;
+                else if (p[1] === 'inv' && p.length === 3) fields.inv.push(p[2]);
+                else if (p[1] === 'eq' && p.length === 3) fields.eq.push(p[2]);
+            }
+        });
+        fields.delta = [...new Set(fields.delta)]; fields.inv = [...new Set(fields.inv)]; fields.eq = [...new Set(fields.eq)];
         return fields;
     }
     // fix51: observation-based contract mismatch detection
@@ -818,48 +854,28 @@ Use only c; no other globals.`;
         }
         return null;
     }
-    // fix51: analyze why a contract failed by evaluating sub-expressions
-    // Returns a string describing which part of the contract failed and why
+    // fix51: analyze why a contract failed: walk comparison nodes (acorn) whose side reads the contract parameter and report actual values
     _analyzeContractFailure(contractSrc, c, r) {
-        const src = String(contractSrc);
+        const { root, param, src } = this._parseContract(contractSrc);
         const parts = [];
-        
-        // Evaluate common sub-expressions and report their values
-        // c.delta.* checks
-        const deltaMatches = [...src.matchAll(/c\.delta\.(\w+)\s*(>=?|<=?|===?|!==?)\s*(\d+)/g)];
-        for (const m of deltaMatches) {
-            const item = m[1], op = m[2], expected = Number(m[3]);
-            const actual = c.delta[item];
-            const actualV = actual === undefined ? 'undefined' : actual;
-            parts.push(`c.delta.${item}=${actualV} (expected ${op}${expected})`);
-        }
-        // c.post.inv.* checks
-        const postInvMatches = [...src.matchAll(/c\.post\.inv\.(\w+)\s*(>=?|<=?|===?|!==?)\s*(\d+)/g)];
-        for (const m of postInvMatches) {
-            const item = m[1], op = m[2], expected = Number(m[3]);
-            const actual = c.post.inv?.[item];
-            const actualV = actual === undefined ? 'undefined' : actual;
-            parts.push(`c.post.inv.${item}=${actualV} (expected ${op}${expected})`);
-        }
-        // c.ret checks
-        if (/c\.ret\s*(===?|!==?)\s*(true|false)/.test(src)) {
-            parts.push(`c.ret=${c.ret}`);
-        }
-        // c.dist checks
-        if (/c\.dist\([^)]+\)\s*(<|<=)\s*\d+/.test(src)) {
-            const posDist = c.dist(c.pre.pos, c.post.pos).toFixed(1);
-            parts.push(`dist(pre.pos,post.pos)=${posDist}`);
-        }
-        // c.post.eq.* checks
-        const eqMatches = [...src.matchAll(/c\.post\.eq\.(\w+)\s*(===?|!==?)\s*['"]?(\w+)['"]?/g)];
-        for (const m of eqMatches) {
-            const slot = m[1], op = m[2], expected = m[3];
-            const actual = c.post.eq?.[slot];
-            parts.push(`c.post.eq.${slot}=${actual} (expected ${op}'${expected}')`);
-        }
-        
+        const COMPARE = new Set(['<', '<=', '>', '>=', '==', '===', '!=', '!==']);
+        if (param !== null) this._walkAst(root.body, node => {
+            if (node.type !== 'BinaryExpression' || !COMPARE.has(node.operator)) return;
+            const expected = src.slice(node.right.start, node.right.end);
+            const lhs = node.left;
+            if (lhs.type === 'CallExpression') {
+                const cp = this._contractPath(lhs.callee, param);
+                if (cp && cp.length === 1 && cp[0] === 'dist') parts.push(`dist(pre.pos,post.pos)=${c.dist(c.pre.pos, c.post.pos).toFixed(1)} (expected ${node.operator}${expected})`);
+                return;
+            }
+            if (lhs.type !== 'MemberExpression') return;
+            const p = this._contractPath(lhs, param);
+            if (!p || p.includes('*')) return;
+            let v = c;
+            for (const k of p) { if (v === null || v === undefined) break; v = v[k]; }
+            parts.push(`c.${p.join('.')}=${v === undefined ? 'undefined' : JSON.stringify(v)} (expected ${node.operator}${expected})`);
+        });
         if (parts.length === 0) {
-            // No specific sub-expression matched; show key state for manual analysis
             const deltaKeys = Object.keys(c.delta);
             const deltaStr = deltaKeys.length ? deltaKeys.map(k => `${k}:${c.delta[k]}`).join(',') : 'empty';
             return `delta={${deltaStr}}, ret=${c.ret}, alive=${c.post.alive}`;
@@ -915,7 +931,8 @@ Use only c; no other globals.`;
                 console.log(`[contract] VIOLATED analysis: ${analysis}`);
                 console.log(`[contract] VIOLATED context: task=${this.currentTask}, ${stateInfo}`);
                 // Log to file for next run analysis
-                try { appendFileSync(`./bots/${this.agent.name}/violated_contracts.jsonl`, JSON.stringify({ at: new Date().toISOString(), skill: e.name, field: k, contract: e.contract[k], args: r.argv, task: this.currentTask, analysis, state: { pre: r.s0, post: r.s1, delta: r.delta } }) + '\n'); } catch (err) { void 0; }
+                mkdirSync(`./bots/${this.agent.name}`, { recursive: true });
+                appendFileSync(`./bots/${this.agent.name}/violated_contracts.jsonl`, JSON.stringify({ at: new Date().toISOString(), skill: e.name, field: k, contract: e.contract[k], args: r.argv, task: this.currentTask, analysis, state: { pre: r.s0, post: r.s1, delta: r.delta } }) + '\n');
                 // the task outcome disagrees with the contract: the contract itself may be wrong -> it is repairable
                 if (taskOk && k === 'post' && r.parent < 0) this._queueContractFix(e, `postcondition failed but the task check passed`);
             }
@@ -1469,7 +1486,7 @@ Use only c; no other globals.`;
         const cut = res.interrupted || this._diedInRun() || this._stalledInRun() ? this._interruptReason(res.message) : '';   // fix14: a cut-off replay is a failure
         if (this._diedInRun()) this._noteDeath(this._diedInRun(), task);
         if (cut) { ok = false; console.log(`[voyager] replay ${r.name} ${cut}; counting as a failure`); } else
-        if (!res.success) { ok = false; console.log(`[voyager] replay ${r.name} EXEC_FAILED: ${String(res.message).slice(0, 300)}`); } else
+        if (!res.success) { ok = false; console.log(`[voyager] replay ${r.name} EXEC_FAILED: ${String(res.message)}`); } else
         if (r.free) { const e = this.agent.bot.inventory.emptySlotCount(); ok = e >= r.free; console.log(`[voyager] inventory check: ${e} empty slots (need ${r.free})`); }
         else if (r.at) { const p = this.agent.bot.entity.position; ok = Math.hypot(p.x - r.at.x, p.z - r.at.z) <= 8; }
         else if (goal && ['mine','collect','gather','chop','craft','smelt','cook','get','obtain'].includes(goal.verb)) ok = gainedFor(goal, before, after) >= goal.count;
@@ -1487,7 +1504,8 @@ Use only c; no other globals.`;
                 console.log(`[psn] fix51 goal check: ${resolvedGoal.item} have=${haveNow} target=${targetCount} -> ${ok}`);
             }
         }
-        if (!ok) this._tryDecomposePrerequisiteFailure(task, String(res.message || '') + '\n' + String(this.agent.bot.output || ''));
+        if (!ok) this._tryDecomposePrerequisiteFailure(task);
+        else delete this.agent.bot.__prereqFail;
         // fix44: pass goal items to filter learned effects and produces (denoise)
         const goalItems = goal?.items || (goal?.item ? [goal.item] : null);
         if (entry && ok && !trial) this._learnEffects(entry, before, after, goalItems);
@@ -1569,23 +1587,14 @@ Use only c; no other globals.`;
         }
         return null;
     }
-    // fix51: parse PREREQUISITE FAILED output and queue producer subgoals via learned graph (not hard-coded chains)
-    _tryDecomposePrerequisiteFailure(parentTask, text) {
-        const blob = String(text);
-        if (!/PREREQUISITE FAILED/i.test(blob)) return false;
-        let item = null, shortfall = null;
-        const missing = blob.match(/(\w+)\s*\(need\s*(\d+),\s*have\s*(\d+)\)/);
-        if (missing) {
-            item = missing[1].toLowerCase();
-            shortfall = parseInt(missing[2], 10) - parseInt(missing[3], 10);
-        } else {
-            const more = blob.match(/needs\s*(\d+)\s*more\s*(\w+)/i);
-            if (more) { shortfall = parseInt(more[1], 10); item = more[2].toLowerCase(); }
-        }
-        if (!item || !shortfall || shortfall <= 0) {
-            console.log(`[psn] PREREQUISITE FAILED but could not parse missing item from: ${blob.slice(0, 200)}`);
-            return false;
-        }
+    // fix51: decompose a structured prerequisite failure (bot.__prereqFail = { item, need, have }) via learned graph
+    _tryDecomposePrerequisiteFailure(parentTask) {
+        const bot = this.agent.bot;
+        if (!Object.hasOwn(bot, '__prereqFail')) return false;
+        const { item, need, have } = bot.__prereqFail;
+        delete bot.__prereqFail;
+        const shortfall = need - have;
+        if (!(shortfall > 0)) throw new Error(`__prereqFail for ${item} has non-positive shortfall (need ${need}, have ${have})`);
         const inv = this.observe().inventory;
         const sub = this._subgoalToObtainItem(item, shortfall, inv);
         if (!sub) {
@@ -1606,7 +1615,8 @@ Use only c; no other globals.`;
         if (!producers.length) return null;
         const picked = this._boltzmann(producers);
         const skill = picked.s;
-        for (const [consumed, amt] of Object.entries(skill.consumes || {})) {
+        const consumes = Object.hasOwn(skill, 'consumes') ? skill.consumes : {};
+        for (const [consumed, amt] of Object.entries(consumes)) {
             const have = inv[consumed] || 0;
             if (have < amt) {
                 const sub = this._subgoalToObtainItem(consumed, amt - have, inv);
@@ -1618,7 +1628,7 @@ Use only c; no other globals.`;
     }
     // fix51: idle practice success requires real inventory/effect change (not empty delta / instant return)
     _practiceRunChanged(skill, before, after) {
-        const effects = skill.effects || [];
+        const effects = Object.hasOwn(skill, 'effects') ? skill.effects : [];
         if (effects.length) {
             const gained = effects.filter(it => (after.inventory[it] || 0) > (before.inventory[it] || 0));
             if (gained.length) return { ok: true, detail: `+${gained.join(',')}` };
@@ -3022,7 +3032,7 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
             for (const k of ix) if (trace[k].t1 <= cutT + 1500 && (i < 0 || trace[k].depth >= trace[i].depth)) i = k;
             if (i < 0) i = trace.length - 1; while (i >= 0 && trace[i].name.startsWith('skills.') && trace[i].parent >= 0) i = trace[i].parent;
             console.log(`[psn] timeout attributed to the call running at the cut: ${trace[i].name} (depth ${trace[i].depth})`);
-            trace[i].ownFail = [`FAILED: TIMED OUT while running (${String(trace[i].ownFail?.join(' | ')).slice(0, 200)})`]; for (; i >= 0; i = trace[i].parent) { trace[i].intr = false; trace[i].ok = false; trace[i].fail = true; } ok = false;
+            trace[i].ownFail = [`FAILED: TIMED OUT while running (${String(trace[i].ownFail?.join(' | '))})`]; for (; i >= 0; i = trace[i].parent) { trace[i].intr = false; trace[i].ok = false; trace[i].fail = true; } ok = false;
         }
         // fix27: no hotspot filter; deaths stay traced failures (above) and blame/repair learns avoidance
         // fix19 (5): an explicit FAILED line from a skill is a contract failure even if the task check passed (e.g. ensureChest inside a storage task)
@@ -4129,49 +4139,37 @@ Voyager.SEEDED_PRIMITIVES = [
         return false;
     }
     const botPos = bot.entity.position;
-    let nearest = null, nearestDist = Infinity;
+    const candidates = [];
     for (const key of chestKeys) {
         const parts = key.split(',');
-        if (parts.length !== 3) { console.log(\`[deposit] reject chest \${key}: invalid memory key\`); continue; }
+        if (parts.length !== 3) { console.log(\`[deposit] reject \${key}: invalid memory key\`); continue; }
         const cx = Number(parts[0]), cy = Number(parts[1]), cz = Number(parts[2]);
-        if (Number.isNaN(cx)) { console.log(\`[deposit] reject chest \${key}: non-numeric coordinates\`); continue; }
+        if (Number.isNaN(cx)) { console.log(\`[deposit] reject \${key}: non-numeric coordinates\`); continue; }
         const block = bot.blockAt(new Vec3(cx, cy, cz));
-        if (!block) { console.log(\`[deposit] reject chest \${key}: blockAt null (chunk unloaded or position invalid)\`); continue; }
-        if (!/chest|barrel|shulker/.test(block.name)) {
-            console.log(\`[deposit] reject chest \${key}: block is \${block.name}, not a container\`);
-            continue;
+        if (!block) { console.log(\`[deposit] reject \${key}: blockAt null (chunk unloaded or position invalid)\`); continue; }
+        candidates.push({ block, key, dist: Math.hypot(cx - botPos.x, cy - botPos.y, cz - botPos.z) });
+    }
+    candidates.sort((p, q) => p.dist - q.dist);
+    for (const cand of candidates) {
+        if (bot.entity.position.distanceTo(cand.block.position) > 4) {
+            const reached = await goToPosition(bot, cand.block.position.x, cand.block.position.y, cand.block.position.z, 3);
+            if (!reached) { console.log(\`[deposit] reject \${cand.key}: pathfinder could not reach\`); continue; }
         }
-        const dist = Math.hypot(cx - botPos.x, cy - botPos.y, cz - botPos.z);
-        if (dist < nearestDist) { nearestDist = dist; nearest = { block, dist, key }; }
+        let containerWindow;
+        try { containerWindow = await bot.openContainer(cand.block); }
+        catch (err) { console.log(\`[deposit] reject \${cand.key}: \${err.message}\`); continue; }
+        try {
+            const slot = bot.inventory.items().find(it => it.name === itemName);
+            if (!slot) throw new Error(\`depositToChest: \${itemName} not in inventory after opening \${cand.key}\`);
+            await containerWindow.deposit(slot.type, null, toDeposit);
+            log(bot, \`[chest] Deposited \${toDeposit} \${itemName} to known chest at \${cand.key}.\`);
+        } finally {
+            containerWindow.close();
+        }
+        return true;
     }
-    if (!nearest) {
-        log(bot, \`[deposit] reject all \${chestKeys.length} known chest candidate(s): none reachable/loaded as container\`);
-        return false;
-    }
-    if (nearest.dist > 32) {
-        log(bot, \`[deposit] reject nearest chest \${nearest.key}: distance \${nearest.dist.toFixed(1)} > 32\`);
-        return false;
-    }
-    if (bot.entity.position.distanceTo(nearest.block.position) > 4) {
-        const reached = await goToPosition(bot, nearest.block.position.x, nearest.block.position.y, nearest.block.position.z, 3);
-        if (!reached) { log(bot, \`[deposit] reject chest \${nearest.key}: pathfinder could not reach within 4 blocks\`); return false; }
-    }
-    let containerWindow;
-    try { containerWindow = await bot.openContainer(nearest.block); }
-    catch (err) { log(bot, \`[deposit] reject chest \${nearest.key}: openContainer failed: \${err.message}\`); return false; }
-    if (!containerWindow) { log(bot, \`[deposit] reject chest \${nearest.key}: openContainer returned null\`); return false; }
-    try {
-        const slot = bot.inventory.items().find(it => it.name === itemName);
-        if (!slot) { log(bot, \`[deposit] reject \${itemName}: not in inventory after opening chest\`); return false; }
-        await containerWindow.deposit(slot.type, null, toDeposit);
-        log(bot, \`[chest] Deposited \${toDeposit} \${itemName} to known chest at \${nearest.key}.\`);
-    } catch (err) {
-        log(bot, \`[deposit] reject chest \${nearest.key}: deposit failed: \${err.message}\`);
-        return false;
-    } finally {
-        containerWindow.close();
-    }
-    return true;
+    log(bot, \`[deposit] reject all \${chestKeys.length} known chest candidate(s): none opened\`);
+    return false;
 }`,
         deps: [],
     },
@@ -4378,7 +4376,8 @@ Voyager.SEEDED_PRIMITIVES = [
                 }
                 
                 if (!crafted && shortfall > 0) {
-                    // fix51: fail loud with prerequisite info for decomposition/needs-produces
+                    // fix51: fail loud with structured prerequisite info for decomposition/needs-produces
+                    bot.__prereqFail = { item: ingItem.name, need: shortfall + (inv[ingItem.name] || 0), have: inv[ingItem.name] || 0 };
                     log(bot, \`PREREQUISITE FAILED: ensureCraftingTable needs \${shortfall} more \${ingItem.name} but cannot craft it (no 2x2 recipe or missing sub-ingredients). Decompose to obtain \${ingItem.name} first.\`);
                     return false;
                 }
@@ -4411,11 +4410,12 @@ Voyager.SEEDED_PRIMITIVES = [
                     const have = inv[ingItem.name] || 0;
                     const need = Math.abs(ing.count);
                     if (have < need) {
+                        if (!bot.__prereqFail) bot.__prereqFail = { item: ingItem.name, need, have };
                         missingIngredients.push(\`\${ingItem.name} (need \${need}, have \${have})\`);
                     }
                 }
             }
-            log(bot, \`PREREQUISITE FAILED: ensureCraftingTable cannot craft - missing: \${missingIngredients.join(', ') || 'unknown'}. Decompose to obtain prerequisites.\`);
+            log(bot, \`PREREQUISITE FAILED: ensureCraftingTable cannot craft - missing: \${missingIngredients.join(', ')}. Decompose to obtain prerequisites.\`);
             return false;
         }
     }

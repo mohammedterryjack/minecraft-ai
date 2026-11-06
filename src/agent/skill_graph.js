@@ -181,13 +181,10 @@ const __wrap = (n, f) => async function (...a) {
     catch (e) {
         rec.fail = true;
         const msg = String(e?.message || e);
-        rec.err = msg.slice(0, 200);
-        if (e instanceof TypeError || /Cannot read propert(y|ies) of null/i.test(msg)) {
-            bot.output = (bot.output || '') + '\\nFAILED: ' + n + ' threw ' + msg + ' (check findBlock/blockAt result before .count/.name/.position)\\n';
-            rec.rv = false;
-            return false;
-        }
-        throw e;
+        rec.err = msg;
+        bot.output = bot.output + '\nFAILED: ' + n + ' threw ' + msg + '\n';
+        rec.rv = false;
+        return false;
     }
     finally { rec.t1 = Date.now(); if (!n.startsWith('skills.')) rec.s1 = __st(); rec.o1 = (bot.output || '').length; bot.__psnOut = bot.output; const post = __inv(); rec.delta = {}; for (const k of new Set([...Object.keys(rec.pre), ...Object.keys(post)])) { const d = (post[k] || 0) - (rec.pre[k] || 0); if (d) rec.delta[k] = d; } delete rec.pre; rec.intr = !!bot.interrupt_code; }
 };`;
