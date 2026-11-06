@@ -35,6 +35,7 @@
         "socket.io": "^4.7.2",
         "socket.io-client": "^4.7.2",
         "three": "^0.128.0",
+        "undici": "^7.30.1",
         "vec3": "^0.1.10",
         "words-to-numbers": "^1.5.1",
         "yargs": "^17.7.2"

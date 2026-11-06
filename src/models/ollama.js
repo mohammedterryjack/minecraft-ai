@@ -1,4 +1,12 @@
 import { strictFormat } from '../utils/text.js';
+import { Agent } from 'undici';
+import { recordCallDuration, callDurationBound } from './call_durations.js';
+
+// fix60: Ollama with stream:false sends its response headers only after the whole generation, so undici's implicit
+// 300 s headersTimeout/bodyTimeout (the global Agent installed when cheerio loads undici) killed long but healthy local
+// calls with UND_ERR_HEADERS_TIMEOUT. A dedicated dispatcher with those implicit timers disabled (0) lets the call end
+// on Ollama's own reply or error, or on the connection failing.
+const OLLAMA_DISPATCHER = new Agent({ headersTimeout: 0, bodyTimeout: 0 });
 
 export class Ollama {
     static prefix = 'ollama';
@@ -38,6 +46,7 @@ export class Ollama {
                     res = 'No response data.';
                 }
             } catch (err) {
+                if (err.code === 'OLLAMA_LEARNED_BOUND') throw err;   // fix60: a hang beyond the learned bound fails loud, never a canned reply
                 if (err.message.toLowerCase().includes('context length') && turns.length > 1) {
                     console.log('Context length exceeded, trying again with shorter context.');
                     return await this.sendRequest(turns.slice(1), systemMessage);
@@ -94,14 +103,30 @@ export class Ollama {
         let method = 'POST';
         let headers = new Headers();
         const request = new Request(url, { method, headers, body: JSON.stringify(body) });
-        const res = await fetch(request);
+        // fix60: the wait is bounded only by this model+endpoint's learned successful-call durations (see call_durations.js)
+        const key = `${this.model_name} ${endpoint}`;
+        const bound = callDurationBound(key);
+        if (!bound) console.log(`!!! [ollama] UNBOUNDED call ${key}: no learned duration distribution yet (needs two different successful durations); a hang here would not be cut`);
+        const t0 = Date.now();
+        let res;
+        try { res = await fetch(request, bound ? { dispatcher: OLLAMA_DISPATCHER, signal: AbortSignal.timeout(bound.ms) } : { dispatcher: OLLAMA_DISPATCHER }); }
+        catch (err) {
+            if (bound && err?.name === 'TimeoutError') {
+                const e = new Error(`[ollama] ${key} exceeded its learned bound ${bound.ms}ms (successful calls: n=${bound.stats.n}, min ${bound.stats.min}ms, max ${bound.stats.max}ms); aborted as a hang`);
+                recordCallDuration(key, Date.now() - t0);   // censored: it took at least this long; widens the next bound
+                e.code = 'OLLAMA_LEARNED_BOUND'; console.error('!!! ' + e.message); throw e;
+            }
+            throw err;
+        }
         if (!res.ok) {
             const errText = await res.text().catch(() => '');
             const errMsg = `Ollama ${res.status}: ${errText || res.statusText}`;
             console.error(`[ollama] ${this.model_name} request FAILED: ${errMsg}`);
             throw new Error(errMsg);
         }
-        return await res.json();
+        const json = await res.json();
+        recordCallDuration(key, Date.now() - t0);
+        return json;
     }
 
     async sendVisionRequest(messages, systemMessage, imageBuffer) {

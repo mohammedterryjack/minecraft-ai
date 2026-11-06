@@ -54,6 +54,28 @@ export function getBareAPI() {
     };
     return _bareAPICache;
 }
+// fix60: closest real member of the live bot object, reflected at runtime (own and inherited properties, no name list).
+// Members of the same kind (callable vs value, read from property descriptors so no getter runs) rank first, then the most
+// shared camelCase words (Jaccard overlap), then the smallest edit distance. Returns the closest few, best first.
+export function botMembers(bot) {
+    const out = new Map();
+    for (let o = bot; o && o !== Object.prototype; o = Object.getPrototypeOf(o))
+        for (const k of Object.getOwnPropertyNames(o)) {
+            if (out.has(k) || k === 'constructor' || k.startsWith('_')) continue;
+            const d = Object.getOwnPropertyDescriptor(o, k);
+            out.set(k, 'value' in d && typeof d.value === 'function');
+        }
+    return out;
+}
+export function nearestBotMember(bot, name, isCall) {
+    const words = s => s.split(/(?=[A-Z])/).map(w => w.toLowerCase());
+    const want = new Set(words(name));
+    const lev = (a, b) => { let prev = Array.from({ length: b.length + 1 }, (_, j) => j); for (let i = 1; i <= a.length; i++) { const cur = [i]; for (let j = 1; j <= b.length; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)); prev = cur; } return prev[b.length]; };
+    const scored = [...botMembers(bot)].map(([k, fn]) => ({ k, kind: fn === isCall ? 0 : 1, shared: -(() => { const w = new Set(words(k)); const n = [...w].filter(x => want.has(x)).length; return n / new Set([...w, ...want]).size; })(), d: lev(name.toLowerCase(), k.toLowerCase()) }));
+    if (!scored.length) throw new Error('nearestBotMember: the live bot exposes no members');
+    scored.sort((a, b) => a.kind - b.kind || a.shared - b.shared || a.d - b.d);
+    return scored.slice(0, 3).map(x => x.k);
+}
 // fix40: legacy getRealAPI for compatibility (returns both bare and prefixed forms)
 export function getRealAPI() {
     const bare = getBareAPI();
@@ -286,7 +308,7 @@ export class Coder {
         const nearMiss = s => allNames.find(x => lev(s, x) <= 2);   // only typo-like strings are flagged; free-form labels pass
         for (const n of nodes) {
             if (n.type === 'MemberExpression' && !n.computed && n.object.type === 'Identifier' && n.object.name === 'bot' && n.property.type === 'Identifier' && !(n.property.name in bot) && !assigned.has(n.property.name))
-                errs.add(`bot.${n.property.name} does not exist on the live bot`);
+                errs.add(`bot.${n.property.name} does not exist on the live bot (closest real members: ${nearestBotMember(bot, n.property.name, nodes.some(c => c.type === 'CallExpression' && c.callee === n)).map(k => 'bot.' + k).join(', ')})`);
             if (n.type === 'CallExpression') {
                 if (n.callee.type === 'Identifier' && !declared.has(n.callee.name) && !sandbox.has(n.callee.name) && !(n.callee.name in globalThis))
                     errs.add(`${n.callee.name}() is not defined (not a skill, not declared in the code)`);

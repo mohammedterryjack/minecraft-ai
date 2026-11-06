@@ -23,6 +23,7 @@ import { getAllItems, getAllBlocks, getItemCraftingRecipes, isHostile, isDatapac
 import { cosineSimilarity } from '../utils/math.js';
 import minecraftData from 'minecraft-data';
 import { Ollama } from '../models/ollama.js';
+import { setCallDurationStore } from '../models/call_durations.js';
 import { signatureOf, depsOf, missingCalls, findCycle, findAllCycles, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf } from './skill_graph.js';
 import { getBareAPI, collectBareApiUsedInSource } from './coder.js';   // fix40: unified bare-name API helper
 import { withStallPhase } from '../utils/event_loop_guard.js';
@@ -371,6 +372,9 @@ export class Voyager {
         // fix59: learned per-skill inventory-slot effect (replaces the fix39 free-space name regex/list)
         if (!this.progress.slots) this.progress.slots = { runs: {} };
         this.slotEffects = new SlotEffects(this.progress.slots);
+        // fix60: learned local-model call durations (bound a hung Ollama call), persisted with progress
+        if (!this.progress.callDurations) this.progress.callDurations = {};
+        setCallDurationStore(this.progress.callDurations);
         this.running = false;
         this.abort = false;
         this.lastPlayerMsg = 0;
@@ -1178,7 +1182,7 @@ Use only c; no other globals.`;
                 let ok;
                 try { ok = this._compileContract(e.contract[k])(c); }
                 catch (err) { console.log(`!!! [contract] ${e.name}.${k} THREW: ${err.message}; queued contract repair`); this._queueContractFix(e, `${k} threw: ${err.message}`); continue; }
-                if (ok !== false) continue;
+                if (ok !== false) { if (k === 'pre') r.preHeld = true; continue; }   // fix60: the callee's own precondition held in this state
                 if (k === 'pre' && !r.fail && r.rv !== false && r.rv !== null) { console.log(`[contract] ${e.name} precondition violated but the call succeeded -> precondition is wrong; queued contract repair`); this._queueContractFix(e, `precondition ${e.contract.pre} was false but the call succeeded (ret ${r.ret})`); continue; }
                 // fix45: when task passed and the skill's delta shows positive gain for its effects, don't attribute VIOLATED
                 // The delta is the ground truth; if the contract formula disagrees, the contract is wrong, not the skill
@@ -4558,13 +4562,10 @@ Voyager.SEEDED_PRIMITIVES = [
         if (craftingTable) recipes = bot.recipesFor(bot.registry.itemsByName[itemName]?.id, null, 1, craftingTable);
     }
     if (!recipes || !recipes.length) { log(bot, \`Cannot craft \${itemName}: missing ingredients.\`); if (placedTable) await collectBlock(bot, 'crafting_table', 1); return false; }
-    // fix51: navigate to within reach of the crafting table, verify reachability before crafting
+    // fix60: walk to a spot that sees and reaches a face of the table (GoalLookAtBlock, game reach), not just near it
     if (craftingTable) {
-        const reached = await goToPosition(bot, craftingTable.position.x, craftingTable.position.y, craftingTable.position.z, 3);
-        if (!reached) { log(bot, \`FAILED: craftRecipe(\${itemName}) could not reach crafting table\`); if (placedTable) await collectBlock(bot, 'crafting_table', 1); return false; }
-        const dist = bot.entity.position.distanceTo(craftingTable.position);
-        if (dist > 4) { log(bot, \`FAILED: craftRecipe(\${itemName}) crafting table out of reach at distance \${dist.toFixed(1)}\`); if (placedTable) await collectBlock(bot, 'crafting_table', 1); return false; }
-        if (!bot.canSeeBlock(craftingTable)) { log(bot, \`FAILED: craftRecipe(\${itemName}) no line of sight to crafting table at \${craftingTable.position}\`); if (placedTable) await collectBlock(bot, 'crafting_table', 1); return false; }
+        const reached = await goToReachBlock(bot, craftingTable);
+        if (!reached) { log(bot, \`FAILED: craftRecipe(\${itemName}) no reachable spot with line of sight to crafting table at \${craftingTable.position}\`); if (placedTable) await collectBlock(bot, 'crafting_table', 1); return false; }
     }
     const before = getInventoryCounts(bot)[itemName] || 0;
     try { await bot.craft(recipes[0], Math.min(num, 64), craftingTable); }

@@ -165,8 +165,9 @@ export async function craftRecipe(bot, itemName, num=1) {
         return false;
     }
     
-    if (craftingTable && (bot.entity.position.distanceTo(craftingTable.position) > 3.5 || !bot.canSeeBlock(craftingTable))) {
-        await _reachBlock(bot, craftingTable);
+    if (craftingTable && !(await goToReachBlock(bot, craftingTable))) {
+        if (placedTable) await collectBlock(bot, 'crafting_table', 1);
+        return false;
     }
 
     const recipe = recipes[0];
@@ -289,9 +290,7 @@ export async function smeltItem(bot, itemName, num=1) {
         log(bot, `There is no furnace nearby and you have no furnace.`)
         return false;
     }
-    if (bot.entity.position.distanceTo(furnaceBlock.position) > 3.5 || !bot.canSeeBlock(furnaceBlock)) {
-        await _reachBlock(bot, furnaceBlock);
-    }
+    if (!(await goToReachBlock(bot, furnaceBlock))) return false;
     bot.modes.pause('unstuck');
     await bot.lookAt(furnaceBlock.position);
 
@@ -400,9 +399,7 @@ export async function clearNearestFurnace(bot) {
         log(bot, `No furnace nearby to clear.`);
         return false;
     }
-    if (bot.entity.position.distanceTo(furnaceBlock.position) > 3.5 || !bot.canSeeBlock(furnaceBlock)) {
-        await _reachBlock(bot, furnaceBlock);
-    }
+    if (!(await goToReachBlock(bot, furnaceBlock))) return false;
 
     console.log('clearing furnace...');
     const furnace = await bot.openFurnace(furnaceBlock);
@@ -624,16 +621,55 @@ function _survivalMovements(bot, {dig = true} = {}) {
     return m;
 }
 
+// fix60: a block is usable when a ray from the bot's eye reaches one of its faces within the game's reach. The reach is
+// mineflayer-pathfinder's own GoalLookAtBlock survival reach; the eye height is the bot's own. The walk goal uses the same
+// test from each candidate node, so the path ends exactly where the final check passes (GoalLookAtBlock's own isEnd measures
+// reach from the node's feet to the block raised by the eye height, which rejects reachable spots below a block).
+function _faceInReach(world, eye, pos, reach) {
+    for (const [dx, dy, dz] of [[0.5, 0, 0], [-0.5, 0, 0], [0, 0.5, 0], [0, -0.5, 0], [0, 0, 0.5], [0, 0, -0.5]]) {
+        const face = pos.offset(0.5 + dx, 0.5 + dy, 0.5 + dz);
+        if (eye.distanceTo(face) > reach) continue;
+        const hit = world.raycast(eye, face.minus(eye).normalize(), reach);
+        if (hit && hit.position.equals(pos)) return true;
+    }
+    return false;
+}
+class GoalSeeAndReachBlock extends pf.goals.GoalLookAtBlock {
+    isEnd(node) { return _faceInReach(this.world, new Vec3(node.x + 0.5, node.y + this.entityHeight, node.z + 0.5), this.pos, this.reach); }
+}
+function _lookAtGoal(bot, block) {
+    return new GoalSeeAndReachBlock(block.position, bot.world, { entityHeight: bot.entity.eyeHeight });
+}
+export function canReachBlock(bot, block) {
+    /**
+     * True when the bot can see and reach a face of the block from where it stands (game reach, real eye position).
+     * @param {MinecraftBot} bot, reference to the minecraft bot.
+     * @param {Block} block, the block to check.
+     * @returns {boolean}
+     **/
+    return _faceInReach(bot.world, bot.entity.position.offset(0, bot.entity.eyeHeight, 0), block.position, _lookAtGoal(bot, block).reach);
+}
+export async function goToReachBlock(bot, block) {
+    /**
+     * Walk to a spot from which the bot can see and reach the block (to open, use, craft at, or place against it).
+     * Fails loudly (FAILED line, returns false) when no such spot is reachable.
+     * @param {MinecraftBot} bot, reference to the minecraft bot.
+     * @param {Block} block, the block to reach.
+     * @returns {Promise<boolean>} true when the block is in sight and reach.
+     * @example
+     * await skills.goToReachBlock(bot, world.getNearestBlock(bot, 'crafting_table', 16));
+     **/
+    if (!block) { log(bot, `FAILED: goToReachBlock: no block given`); return false; }
+    if (canReachBlock(bot, block)) return true;
+    const reached = await goToGoal(bot, _lookAtGoal(bot, block));
+    if (reached && canReachBlock(bot, block)) return true;
+    const pos = bot.entity.position;
+    log(bot, `FAILED: no reachable spot with line of sight to ${block.name} at ${block.position} (bot at ${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)}; path ${reached ? 'ended without sight' : 'not found'})`);
+    return false;
+}
+
 async function _reachBlock(bot, block) {
-    // walk to within ~3 blocks with line of sight before opening/using/placing (hut interior, doors)
-    if (!block) return false;
-    const p = block.position;
-    const ok = () => bot.entity.position.distanceTo(p.offset(0.5, 0.5, 0.5)) <= 3.5 && (!bot.canSeeBlock || bot.canSeeBlock(block));
-    if (ok()) return true;
-    bot.pathfinder.setMovements(_survivalMovements(bot));
-    try { await goToGoal(bot, new pf.goals.GoalLookAtBlock(p, bot.world, { reach: 3 })); } catch (e) {}
-    if (!ok()) { try { await goToGoal(bot, new pf.goals.GoalNear(p.x, p.y, p.z, 2)); } catch (e) {} }
-    return ok();
+    return goToReachBlock(bot, block);
 }
 
 export async function collectBlock(bot, blockType, num=1, exclude=null) {
@@ -1419,7 +1455,7 @@ export async function goToGoal(bot, goal) {
     const nonDestructiveMovements = _survivalMovements(bot);
     const dontBreakBlocks = ['glass', 'glass_pane'];
     for (let block of dontBreakBlocks) {
-        nonDestructiveMovements.blocksCantBreak.add(mc.getBlockId(block));
+        nonDestructiveMovements.blocksCantBreak.add(bot.registry.blocksByName[block].id);   // fix60: the bot's live registry
     }
     nonDestructiveMovements.placeCost = 2;
     nonDestructiveMovements.digCost = 10;
