@@ -13,6 +13,7 @@ import { VitalsModel } from '../src/agent/vitals_model.js';
 import { SlotEffects } from '../src/agent/slot_effects.js';
 import { instrumentSrc } from '../src/agent/skill_graph.js';
 import * as skills from '../src/agent/library/skills.js';
+import { fatalExit, runUpdateLoop } from '../src/agent/fatal.js';
 
 const HPMAX = skills.VITALS_MAX.health;
 // real icefox2000 vitals (same segments as fix58): eat 12 -> 18 then hp 1 -> 18 -> 19; hp 17.27 stuck at food 17
@@ -175,5 +176,61 @@ describe('fix59 (4): hp/food max from VITALS_MAX everywhere', () => {
             await v.proposeTask({ position: '0, 32, 0', biome: 'plains', time: 'day (1)', health_value: 17, health_max: 40, food_value: 12, food_max: 30, inventory_slots: '1/36', empty_inventory_slots: 35, threats: 'none', inventory: {}, equipment: { hand: 'empty' } });
             assert.match(prompt, /current_health: 17\/40\ncurrent_food: 12\/30 \(30\/30 = full\)/);
         } finally { Object.assign(skills.VITALS_MAX, saved); }
+    });
+});
+
+describe('fix59 (3b): a dead update loop exits the process non-zero (no silent stall)', () => {
+    // process.exit is stubbed to record the code and stop the caller, as a real exit would
+    const withExit = async (fn) => {
+        const realExit = process.exit, realErr = console.error, lines = []; let code = null;
+        process.exit = (c) => { code = c; throw new Error('__exit__'); };
+        console.error = (...a) => lines.push(a.join(' '));
+        try { await fn(); } catch (e) { if (e.message !== '__exit__') throw e; } finally { process.exit = realExit; console.error = realErr; }
+        return { code, lines };
+    };
+    it('runUpdateLoop rejects with the error update() threw (it does not swallow or keep looping)', async () => {
+        let n = 0;
+        await assert.rejects(runUpdateLoop(async () => { if (++n === 3) throw new Error('boom in update'); }, 0), /boom in update/);
+        assert.strictEqual(n, 3);
+    });
+    it('fatalExit logs the stack loudly and exits 1', async () => {
+        const { code, lines } = await withExit(async () => fatalExit('icefox2000', 'update loop', new Error('bot.food must be a number')));
+        assert.strictEqual(code, 1);
+        assert.ok(lines.some(l => /\[fatal\] update loop; agent cannot act, exiting 1: Error: bot\.food must be a number\n\s+at /.test(l)));
+    });
+    it('a _sample error inside the update loop ends in exit 1 (the flagged risk)', async () => {
+        const v = Object.create(Voyager.prototype);
+        v.agent = { bot: { health: 17, oxygenLevel: 300, game: {}, entity: { position: { x: 0, y: 64, z: 0 } } } };   // no bot.food
+        v.vitals = new VitalsModel({ regen: {}, runs: {} });
+        const { code, lines } = await withExit(() => runUpdateLoop(async () => v.update(), 0).catch(e => fatalExit('icefox2000', 'update loop', e)));
+        assert.strictEqual(code, 1);
+        assert.ok(lines.some(l => /\[fatal\] update loop;.*bot\.food must be a number/.test(l)));
+    });
+    it('agent.js wires the loop to the fatal exit; no inline swallowing loop', () => {
+        const a = strip(readFileSync(new URL('../src/agent/agent.js', import.meta.url), 'utf8'));
+        assert.match(a, /runUpdateLoop\(\(delta\) => this\.update\(delta\), INTERVAL\)\.catch\(e => this\.fatal\('update loop', e\)\)/);
+        assert.match(a, /fatal\(where, err\) \{ fatalExit\(this\.name, where, err\); \}/);
+        assert.ok(!/while \(true\)/.test(a));
+        const f = strip(readFileSync(new URL('../src/agent/fatal.js', import.meta.url), 'utf8'));
+        assert.ok(!/catch/.test(f) && /process\.exit\(1\)/.test(f));
+    });
+    it('uncaught error outside a task step is fatal; inside a step it fails and stops that step only', () => {
+        const calls = [];
+        const mk = (running) => { const v = Object.create(Voyager.prototype); v.running = running; v.currentTask = 'Mine 1 iron_ore'; v.progress = { failed: [] }; v._saveProgress = () => calls.push('save');
+            v.agent = { fatal: (w, e) => calls.push(`fatal:${w}:${e.message}`), bot: {}, actions: { stop: () => { calls.push('stop'); return Promise.resolve(); } } }; return v; };
+        mk(false)._onProcessError('UNHANDLED REJECTION', new Error('stray'));
+        assert.deepStrictEqual(calls, ['fatal:UNHANDLED REJECTION outside a task step:stray']);
+        calls.length = 0;
+        const v = mk(true), realErr = console.error; console.error = () => {};
+        try { v._onProcessError('UNCAUGHT EXCEPTION', new Error('skill code')); } finally { console.error = realErr; }
+        assert.deepStrictEqual(calls, ['save', 'stop']);
+        assert.deepStrictEqual(v.progress.failed, ['Mine 1 iron_ore']);
+        assert.strictEqual(v.agent.bot.interrupt_code, true);
+    });
+    it('the process guard has no empty catch and no optional-call on stop()', () => {
+        const g = method('_onProcessError');
+        assert.ok(!/catch/.test(g) && !/stop\?\./.test(g));
+        const i = VSRC.indexOf('if (!globalThis.__voyagerGuard)'), guard = VSRC.slice(i, VSRC.indexOf('\n        }\n', i));
+        assert.ok(/this\._onProcessError\(kind, err\)/.test(guard) && !/catch/.test(guard));
     });
 });

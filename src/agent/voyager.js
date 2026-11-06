@@ -392,12 +392,7 @@ export class Voyager {
         this._setupChestTracking();
         if (!globalThis.__voyagerGuard) {
             globalThis.__voyagerGuard = true;
-            const onErr = (kind) => (err) => {
-                const t = this.currentTask || '(no task)';
-                console.error(`[voyager] !!! ${kind} during task "${t}" - counted as FAILED, process kept alive: ${err?.stack || err}`);
-                if (this.currentTask) { this.progress.failed.push(this.currentTask); this._saveProgress(); }
-                try { this.agent.bot.interrupt_code = true; this.agent.actions.stop?.(); } catch (e) {}
-            };
+            const onErr = (kind) => (err) => this._onProcessError(kind, err);
             process.on('uncaughtException', onErr('UNCAUGHT EXCEPTION'));
             process.on('unhandledRejection', onErr('UNHANDLED REJECTION'));
         }
@@ -1346,6 +1341,17 @@ Use only c; no other globals.`;
         return `interrupted: ${what}${travelling ? ' while travelling' : ''}${under ? ` (underground: y=${Math.floor(p.y)}, surface y=${s})` : ''}`;
     }
 
+    // fix59: process-level uncaught error/rejection. Kept alive ONLY while a task step is running: the error is that step's
+    // (generated code), so the step is failed and stopped and the update loop keeps acting. Outside a step nothing owns the
+    // error and nothing will act on it, so it is fatal (agent.fatal: exit 1, launchd restarts) instead of a silent stall.
+    _onProcessError(kind, err) {
+        if (!this.running) return this.agent.fatal(`${kind} outside a task step`, err);
+        const t = this.currentTask;
+        console.error(`[voyager] !!! ${kind} during task step "${t}" - counted as FAILED, step stopped, process kept alive: ${err instanceof Error ? err.stack : String(err)}`);
+        if (t) { this.progress.failed.push(t); this._saveProgress(); }
+        this.agent.bot.interrupt_code = true;
+        this.agent.actions.stop();
+    }
     // a real player spoke: they take priority
     notePlayerMessage() {
         this.lastPlayerMsg = Date.now();

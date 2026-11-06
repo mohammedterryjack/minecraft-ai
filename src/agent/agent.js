@@ -20,6 +20,7 @@ import { speak } from './speak.js';
 import { log, validateNameFormat } from './connection_handler.js';
 import { startEventLoopStallGuard } from '../utils/event_loop_guard.js';
 import { inspect } from 'node:util';
+import { fatalExit, runUpdateLoop } from './fatal.js';   // fix59
 
 export class Agent {
     async start(load_mem=false, init_message=null, count_id=0) {
@@ -531,22 +532,15 @@ export class Agent {
         this.npc.init();
 
         // This update loop ensures that each update() is called one at a time, even if it takes longer than the interval
+        // fix59: an error in the loop means the agent can no longer act: fail loud and exit 1 (same path as #44 disconnects)
         const INTERVAL = 300;
-        let last = Date.now();
-        setTimeout(async () => {
-            while (true) {
-                let start = Date.now();
-                await this.update(start - last);
-                let remaining = INTERVAL - (Date.now() - start);
-                if (remaining > 0) {
-                    await new Promise((resolve) => setTimeout(resolve, remaining));
-                }
-                last = start;
-            }
-        }, INTERVAL);
+        setTimeout(() => { runUpdateLoop((delta) => this.update(delta), INTERVAL).catch(e => this.fatal('update loop', e)); }, INTERVAL);
 
         this.bot.emit('idle');
     }
+
+    // fix59: see fatal.js (same exit path as #44 disconnects)
+    fatal(where, err) { fatalExit(this.name, where, err); }
 
     async update(delta) {
         await this.bot.modes.update();
