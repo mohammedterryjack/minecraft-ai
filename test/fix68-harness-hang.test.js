@@ -21,15 +21,17 @@ import { instrumentSrc } from '../src/agent/skill_graph.js';
 const NAME = '__fix68_test__';
 after(() => rmSync(`./bots/${NAME}`, { recursive: true, force: true }));
 const CHILD = fileURLToPath(new URL('./fixtures/fix68-harness-child.mjs', import.meta.url));
+const CHILD_OVERFLOW = fileURLToPath(new URL('./fixtures/fix68b-overflow-child.mjs', import.meta.url));
 const LIVE = fileURLToPath(new URL('./fixtures/fix68-live-harness-103.js', import.meta.url));
 
-function runChild(arg, ms) {
+function runChild(arg, ms, script = CHILD) {
     return new Promise(resolve => {
-        const c = spawn(process.execPath, [CHILD, arg], { stdio: ['ignore', 'pipe', 'ignore'] });
+        const argv = arg == null ? [script] : [script, arg];
+        const c = spawn(process.execPath, argv, { stdio: ['ignore', 'pipe', 'ignore'] });
         let out = '';
         c.stdout.on('data', d => { out += d; });
         const t = setTimeout(() => c.kill('SIGKILL'), ms);
-        c.on('exit', (code, signal) => { clearTimeout(t); resolve({ out, signal }); });
+        c.on('exit', (code, signal) => { clearTimeout(t); resolve({ out, signal, code }); });
     });
 }
 async function mkCoder() {
@@ -37,6 +39,7 @@ async function mkCoder() {
     while (!coder.code_lint_template || !coder.code_template) await new Promise(r => setImmediate(r));
     return coder;
 }
+async function flushTrace() { await Promise.resolve(); await Promise.resolve(); }
 function mkBot() {
     return { output: '', interrupt_code: false, __psnALS: new AsyncLocalStorage(), inventory: { slots: Array(46).fill(null), emptySlotCount: () => 36 },
         waitForTicks: async () => {}, entity: { position: new Vec3(0, 64, 0) }, blockAt: () => null, health: 20, food: 20, oxygenLevel: 20, game: { dimension: 'overworld' }, quickBarSlot: 0 };
@@ -61,6 +64,7 @@ describe('fix68: the trace harness cannot re-enter itself', () => {
         const staged = await coder._stageCode(code, { lintOnly: false });
         const bot = mkBot();
         await staged.func.main(bot);
+        await flushTrace();
         assert.deepStrictEqual(bot.got, ['undefined', false]);
         assert.deepStrictEqual(bot.__psnTrace.map(r => [r.name, r.depth]), [['mineOne', 0], ['getInventoryCounts', 1], ['isSafeTarget', 1]]);
         assert.ok(bot.__psnTrace.every(r => r.delta && r.t1 >= r.t0), 'every record is finished');
@@ -74,9 +78,24 @@ describe('fix68: the trace harness cannot re-enter itself', () => {
         const slots = bot.inventory.slots;
         Object.defineProperty(bot.inventory, 'slots', { get() { seen.push(bot.__psnStackStr); return slots; } });
         await staged.func.main(bot);
+        await flushTrace();
         assert.strictEqual(bot.inSkill, 'outer <- inner');
         assert.ok(seen.length > 0 && seen.every(s => / <- \(psn trace\)$/.test(s)), seen.join(' | '));
         assert.ok(seen.includes('outer <- inner <- (psn trace)'));
+    });
+    it('a nested traced call after await still sees this frame as parent (__syncParent, no ALS)', async () => {
+        const coder = await mkCoder();
+        const code = 'async function inner(bot) { return 1; }\n'
+            + 'async function outer(bot) {\n    await Promise.resolve();\n    await inner(bot);\n    return 1;\n}\n'
+            + instrumentSrc(['outer', 'inner']) + '\nawait outer(bot);';
+        const staged = await coder._stageCode(code, { lintOnly: false });
+        const bot = mkBot();
+        await staged.func.main(bot);
+        await flushTrace();
+        assert.deepStrictEqual(
+            bot.__psnTrace.map(r => [r.name, r.parent, r.depth]),
+            [['outer', -1, 0], ['inner', 0, 1]],
+        );
     });
 });
 
@@ -89,19 +108,23 @@ describe('fix68b: an error inside traced code is never turned into a value', () 
         const bot = mkBot();
         let err = null;
         try { await staged.func.main(bot); } catch (e) { err = e; }
+        await flushTrace();
         return { bot, err };
     };
     const failedLines = (out) => out.split('\n').filter(l => l.startsWith('FAILED:'));
-    it('a stack overflow in async traced code propagates to the caller and is reported once, where it was thrown', async () => {
-        const { bot, err } = await run('async function deep(bot, n) {\n    return await deep(bot, n + 1);\n}\nasync function outer(bot) {\n    const r = await deep(bot, 0);\n    bot.reached = true;\n    return r;\n}', ['outer', 'deep'], 'await outer(bot);');
-        assert.ok(err instanceof RangeError, String(err));
-        assert.match(err.message, /Maximum call stack size exceeded/);
-        assert.strictEqual(bot.reached, undefined, 'the caller did not continue past the throw');
-        const lines = failedLines(bot.output);
-        assert.strictEqual(lines.length, 1, lines.join(' | '));
-        assert.match(lines[0], /^FAILED: deep threw Maximum call stack size exceeded/);
-        const outerRec = bot.__psnTrace.find(r => r.name === 'outer');
-        assert.strictEqual(outerRec.fail, true); assert.match(outerRec.err, /Maximum call stack/);
+    it('a stack overflow in async traced code propagates to the caller and is reported once, where it was thrown', { timeout: 20000 }, async () => {
+        // Child process: node --test's async_hooks make async stack overflow fatal on Node 20.19 even when the harness
+        // itself no longer calls user code under ALS.run (CVE-2025-59466). icefox does not enable those hooks.
+        const { out, signal, code } = await runChild(null, 15000, CHILD_OVERFLOW);
+        assert.strictEqual(signal, null, 'child must not be killed');
+        assert.strictEqual(code, 0, 'child must exit 0 (exit 7 was the node20 fatal uncaught RangeError)');
+        const got = JSON.parse(out.trim().split('\n').pop());
+        assert.strictEqual(got.name, 'RangeError', JSON.stringify(got));
+        assert.match(String(got.message), /Maximum call stack size exceeded/);
+        assert.strictEqual(got.reached, undefined, 'the caller did not continue past the throw');
+        assert.strictEqual(got.failed.length, 1, JSON.stringify(got.failed));
+        assert.match(got.failed[0], /^FAILED: deep threw Maximum call stack size exceeded/);
+        assert.strictEqual(got.outerFail, true);
     });
     it('a sync stack overflow and a sync throw propagate too (no false, no default)', async () => {
         const a = await run('function spin(bot) {\n    return spin(bot);\n}\nasync function outer(bot) {\n    const r = spin(bot);\n    bot.reached = r;\n    return r;\n}', ['outer', 'spin'], 'await outer(bot);');

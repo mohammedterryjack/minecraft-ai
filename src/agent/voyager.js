@@ -6,7 +6,6 @@ import settings from '../../settings.js';
 //   - ADAM-style needs/produces graph (https://arxiv.org/abs/2410.22194)
 //   - AWM repair/workflow memory (https://arxiv.org/abs/2409.07429)
 //   - SkillWeaver-style idle practice (https://arxiv.org/abs/2504.07079)
-import { AsyncLocalStorage } from 'async_hooks';
 import * as acorn from 'acorn';
 import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, renameSync, statSync, copyFileSync, truncateSync, appendFileSync, readdirSync } from 'fs';
 import { NeedsProducesGraph } from './needs_produces.js';
@@ -34,7 +33,7 @@ import { logPromptBreakdown, extractBareCalls } from './prompt_utils.js';   // f
 const LOCAL = { model: 'qwen3:4b-instruct-2507-q4_K_M', url: 'http://192.168.1.215:11434', params: { format: 'json', options: { num_ctx: 8192, num_predict: 512 } } };   // fix38: raised from 150 to 512 - short JSON replies still need room for reasoning; truncation fails loudly (fix31)
 export const CALLS = { local: 0, code: 0, replay: 0 };
 
-globalThis.__psnALS ||= new AsyncLocalStorage();   // fix11 (B6): call-parent tracking for PSN traces
+// fix68b: PSN parent is __syncParent inside instrumentSrc (no AsyncLocalStorage — CVE-2025-59466)
 
 // fix12: HOME is the single source of truth for the bot's base (town centre, hut, leash, red-zone teleport).
 // Moved from the old base to the grove where the bot ended up; the hut there is built by the home_hut milestone.
@@ -1958,7 +1957,6 @@ Use only c; no other globals.`;
         try {
             res = await this._run(`voyager:replay:${task}`, async () => {
                 const bot = this._timedBotForSkillRun();
-                bot.__psnALS = globalThis.__psnALS;
                 await staged.func.main(bot);
             }, 5);
         } finally { closeJournal(); }
@@ -2666,7 +2664,6 @@ Use only c; no other globals.`;
         try {
             res = await this._run(`voyager:gate:${entry.name}`, async () => {
                 const bot = this._timedBotForSkillRun();
-                bot.__psnALS = globalThis.__psnALS;
                 await staged.func.main(bot);
             }, 4);   // fix28: stall watchdog on gate runs
         } finally { closeJournal(); }
@@ -4555,8 +4552,7 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             try {
                 res = await this._run(`voyager:${task}`, async () => {
                     const bot = this._timedBotForSkillRun();
-                    bot.__psnALS = globalThis.__psnALS;
-                    await staged.func.main(bot);
+                        await staged.func.main(bot);
                 }, 5);
             } finally { closeJournal(); }
             console.log(`[timing] game action attempt ${i} took ${Date.now() - this._runStart}ms`);   // fix23: measurement
