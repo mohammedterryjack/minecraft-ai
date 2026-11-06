@@ -136,5 +136,20 @@
         "type": "number",
         "description": "Number of seconds allowed for the bot to spawn before throwing an error. Increase when spawning takes a while.",
         "default": 30
+    },
+    "check_timeout_interval_ms": {
+        "type": "number",
+        "description": "Mineflayer createBot checkTimeoutInterval (minecraft-protocol client keep-alive period in ms). The event-loop stall threshold equals this interval.",
+        "default": 60000
+    },
+    "event_loop_stall_poll_interval_ms": {
+        "type": "number",
+        "description": "How often to sample monitorEventLoopDelay for stall logging (ms). Must be set in settings.js; no code default.",
+        "default": 500
+    },
+    "world_scan_stall_warn_distance": {
+        "type": "number",
+        "description": "Lint warns when findBlock/findBlocks (or pathfinder goals) use maxDistance (or similar) numeric literal >= this value (large scans can block the event loop).",
+        "default": 128
     }
 }

@@ -17,7 +17,8 @@ import { serverProxy, sendOutputToServer } from './mindserver_proxy.js';
 import settings from './settings.js';
 import { Task } from './tasks/tasks.js';
 import { speak } from './speak.js';
-import { log, validateNameFormat, handleDisconnection } from './connection_handler.js';
+import { log, validateNameFormat } from './connection_handler.js';
+import { startEventLoopStallGuard, stallThresholdMs } from '../utils/event_loop_guard.js';
 
 export class Agent {
     async start(load_mem=false, init_message=null, count_id=0) {
@@ -67,33 +68,34 @@ export class Agent {
         console.log(this.name, 'logging into minecraft...');
         this.bot = initBot(this.name);
         
-        // Connection Handler
+        const verbatimReason = (reason) => {
+            if (reason === undefined || reason === null) return String(reason);
+            if (typeof reason === 'string') return reason;
+            try { return JSON.stringify(reason); } catch (e) { return String(reason); }
+        };
+
+        // Connection Handler: verbatim reason, then exit non-zero (launchd / parent restarts)
         const onDisconnect = (event, reason) => {
             if (this._disconnectHandled) return;
             this._disconnectHandled = true;
 
-            // Log and Analyze
-            // handleDisconnection handles logging to console and server
-            const { type } = handleDisconnection(this.name, reason);
-     
+            const raw = verbatimReason(reason);
+            console.error(`[connection] ${event}; reason verbatim: ${raw}`);
+            log(this.name, `[connection] ${event}; reason verbatim: ${raw}`);
             process.exit(1);
         };
         
         // Bind events
-        this.bot.once('kicked', (reason) => onDisconnect('Kicked', reason));
-        this.bot.once('end', (reason) => onDisconnect('Disconnected', reason));
-        this.bot.on('error', (err) => {
-            if (String(err).includes('Duplicate') || String(err).includes('ECONNREFUSED')) {
-                 onDisconnect('Error', err);
-            } else {
-                 log(this.name, `[LoginGuard] Connection Error: ${String(err)}`);
-            }
-        });
+        this.bot.once('kicked', (reason) => onDisconnect('kicked', reason));
+        this.bot.once('end', (reason) => onDisconnect('end', reason));
+        this.bot.on('error', (err) => onDisconnect('error', err));
 
         initModes(this);
 
         this.bot.on('login', () => {
             console.log(this.name, 'logged in!');
+            this.bot.__stallThresholdMs = stallThresholdMs(this.bot);
+            startEventLoopStallGuard(this.bot);
             serverProxy.login();
             
             // Set skin for profile, requires Fabric Tailor. (https://modrinth.com/mod/fabrictailor)
@@ -141,7 +143,7 @@ export class Agent {
 
             } catch (error) {
                 console.error('Error in spawn event:', error);
-                process.exit(0);
+                process.exit(1);
             }
         });
     }

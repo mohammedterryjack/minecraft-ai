@@ -28,29 +28,18 @@ export class AgentProcess {
             stderr: 'inherit',
         });
         
-        let last_restart = Date.now();
         agentProcess.on('exit', (code, signal) => {
             console.log(`Agent process exited with code ${code} and signal ${signal}`);
             this.running = false;
             logoutAgent(this.name);
-            
-            if (code > 1) {
-                console.log(`Ending task`);
-                process.exit(code);
+            // Parent must exit so launchd/supervisor restarts; do not keep a zombie main or respawn here.
+            if (signal === 'SIGINT' && (code === 0 || code === null)) {
+                process.exit(0);
+                return;
             }
-
-            if (code !== 0 && signal !== 'SIGINT') {
-                // agent must run for at least 10 seconds before restarting
-                if (Date.now() - last_restart < 10000) {
-                    console.error(`Agent process exited too quickly; exiting main so the container restarts it.`);
-                    process.exit(1);
-                }
-                console.log('Agent exited; exiting main so the container restarts it cleanly.');
-                process.exit(1);
-                console.log('Restarting agent...');
-                this.start(true, 'Agent process restarted.', count_id, this.port);
-                last_restart = Date.now();
-            }
+            const exitCode = typeof code === 'number' && code !== 0 ? code : 1;
+            console.error(`Main process exiting with ${exitCode} because agent child exited (signal=${signal})`);
+            process.exit(exitCode);
         });
     
         agentProcess.on('error', (err) => {
