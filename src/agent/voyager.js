@@ -3914,11 +3914,8 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
                 let unmetC = null;
                 if (!rec.ok && !libF) {
                     if (peekPreconditionUnmet(this.agent.bot)) unmetC = 'precondition';
-                    else {
-                        if (!rec.s0) throw new Error(`[fix76] candidate ${name} failed without s0.food snapshot`);
-                        if (typeof rec.s0.food !== 'number') throw new Error(`[fix76] candidate ${name} failed without s0.food snapshot`);
-                        unmetC = this._foodRaiseSaturated(name, rec.s0.food);
-                    }
+                    else if (rec.s0 && typeof rec.s0.food === 'number') unmetC = this._foodRaiseSaturated(name, rec.s0.food);
+                    // no s0 (hung/crash before snapshot): cannot claim food_saturated; count as a normal trial fail
                 }
                 if (unmetC) gateLog(`candidate ${name} unmet precondition (${unmetC}): not a trial fail`);
                 else if (!libF) { gateLog(`trial run of candidate ${name} inside ${root}: contract ${rec.ok ? 'ok' : 'FAILED'}`); this._recordRun(e, task, rec.ok, true); }   // fix70: not on a library fault; fix76: not on unmet precondition
