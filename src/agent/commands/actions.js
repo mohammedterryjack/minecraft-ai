@@ -55,7 +55,7 @@ export const actionsList = [
         name: '!stop',
         description: 'Force stop all actions and commands that are currently executing.',
         perform: async function (agent) {
-            await agent.actions.stop();
+            await agent.actions.stop({ kind: 'command', by: '!stop' });
             agent.clearBotLogs();
             agent.actions.cancelResume();
             agent.bot.emit('idle');

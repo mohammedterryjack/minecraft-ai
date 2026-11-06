@@ -356,6 +356,13 @@ function rotateLog(fp, max, keep) {
         truncateSync(fp, 0); console.log(`[log] rotated ${fp} (> ${Math.round(max / 1e6)} MB; keeping ${keep})`);
     } catch (e) { console.log('[log] rotation failed: ' + e.message); }
 }
+// fix75: what makes two step errors "the same": the error's class and message and the frame that raised it
+export function stepErrorSignature(e) {
+    if (!(e instanceof Error)) return `non-Error ${typeof e}: ${String(e)}`;
+    const top = String(e.stack).split('\n').find(l => l.trimStart().startsWith('at '));
+    return `${e.name}: ${e.message} @ ${top === undefined ? '(no stack frame)' : top.trim()}`;
+}
+
 export class Voyager {
     constructor(agent) {
         this.agent = agent;
@@ -364,7 +371,8 @@ export class Voyager {
         this.indexFile = `${this.dir}/index.json`;
         this.progressFile = `${this.dir}/progress.json`;
         this.skills = existsSync(this.indexFile) ? JSON.parse(readFileSync(this.indexFile, 'utf8')) : [];
-        this._unverifiedConsumesNoted = new Set();   // fix70: skills whose evidence-less consumes was logged once (see _shouldSkipPractice)
+        this._unverifiedConsumesNoted = new Set();
+        this._lastStepErrSig = null;   // fix75: signature of the previous step's error (null after a step that did not throw)   // fix70: skills whose evidence-less consumes was logged once (see _shouldSkipPractice)
         // fix49: ensure every skill has effects/consumes/stats (older skill files may not have them)
         for (const s of this.skills) {
             if (!s.effects) s.effects = [];
@@ -1408,11 +1416,11 @@ Use only c; no other globals.`;
             const p = bot.entity.position;
             this._stall = { t: Date.now(), pos: `${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}`, why: `${Math.round(gap)}ms, longer than all ${b.n} completed gaps learned (longest ${Math.round(b.max)}ms)` };
             console.log(`[stall] ${label}: no progress (no new ground reached, inventory, window, lit furnace) for ${this._stall.why} at ${this._stall.pos}; stopping the action`);
-            this.agent.actions.stop();
+            this.agent.actions.stop({ kind: 'stall', by: `no progress for ${this._stall.why}` });
         };
         bot.on('physicsTick', onTick);
-        this._lastRunMsg = '';
-        try { const r = await this.agent.actions.runAction(label, fn, { timeout }); this._lastRunMsg = String(r?.message || ''); return r; } finally { bot.removeListener('physicsTick', onTick); }
+        this._lastRunMsg = ''; this._lastRunTimedOut = null;
+        try { const r = await this.agent.actions.runAction(label, fn, { timeout }); this._lastRunMsg = String(r?.message || ''); this._lastRunTimedOut = r.timedout; return r; } finally { bot.removeListener('physicsTick', onTick); }
     }
     _stalledInRun() { const s = this._stall; return s && s.t >= (this._runStart || Infinity) ? s : null; }
     /** fix65: candidate code staged in place for a replay of `root`; `rootTrial` = the goal-overlap gate's verdict on root's own candidate */
@@ -1486,7 +1494,11 @@ Use only c; no other globals.`;
         this._recordRun(e, j.task, false, false);
     }
     _diedInRun() { const d = this.agent.lastDeath; return d && d.t >= (this._runStart || Infinity) ? d : null; }
-    _interruptReason(output = '') {
+    // fix75: takes the action result. Its interruptedBy is recorded where the interrupt fired (agent.requestInterrupt); a
+    // timeout is a normal failed attempt of kind 'timeout'
+    _interruptReason(res) {
+        if (!res || typeof res !== 'object') throw new Error(`_interruptReason needs the action result, got ${JSON.stringify(res)}`);
+        const output = String(res.message);
         const died = this._diedInRun();
         // fix51: set structured kind field (no text parsing needed later)
         if (died) {
@@ -1498,11 +1510,17 @@ Use only c; no other globals.`;
             this._lastCutKind = 'stall';
             return `stalled: no progress (no new ground reached, inventory, window, lit furnace) for ${st.why} at ${st.pos}`;
         }
-        const bot = this.agent.bot, p = bot.entity.position, by = this.agent.actions.lastInterruptBy;
-        if (!by) throw new Error('_interruptReason called but no interrupt source (lastInterruptBy missing)');
+        const src = res.interruptedBy;
+        if (!src) throw new Error(`_interruptReason: the action was interrupted but no source recorded itself (interruptedBy=${JSON.stringify(src)}); every interrupt must call agent.requestInterrupt({ kind, by })`);
+        const bot = this.agent.bot, p = bot.entity.position;
         const s = this._surfaceY(p.x, p.z), under = s !== null && p.y < s - 4;
-        const travelling = /travelTo|goToPosition|goToSurface|path|Moving|travell/i.test(String(output).slice(-800));
-        const what = by === 'mode:unstuck' ? 'stuck' : `cut off by ${by}`;
+        const travelling = /travelTo|goToPosition|goToSurface|path|Moving|travell/i.test(output.slice(-800));
+        if (src.kind === 'timeout') {
+            if (!res.timedout) throw new Error(`_interruptReason: source is a timeout (${src.by}) but the result says timedout=${res.timedout}`);
+            this._lastCutKind = 'timeout';
+            return `timed out: ran past the ${src.by}${travelling ? ' while travelling' : ''}${under ? ` (underground: y=${Math.floor(p.y)}, surface y=${s})` : ''}`;
+        }
+        const what = src.by === 'mode:unstuck' ? 'stuck' : `cut off by ${src.kind} ${src.by}`;
         this._lastCutKind = 'interrupt';
         return `interrupted: ${what}${travelling ? ' while travelling' : ''}${under ? ` (underground: y=${Math.floor(p.y)}, surface y=${s})` : ''}`;
     }
@@ -1516,8 +1534,9 @@ Use only c; no other globals.`;
         this._crash = { t: Date.now(), kind, message: err instanceof Error ? err.message : String(err) };   // fix65: attributed in _attribute
         console.error(`[voyager] !!! ${kind} during task step "${t}" - counted as FAILED, step stopped, process kept alive: ${err instanceof Error ? err.stack : String(err)}`);
         if (t) { this.progress.failed.push(t); this._saveProgress(); }
-        this.agent.bot.interrupt_code = true;
-        this.agent.actions.stop();
+        const src = { kind: 'process-error', by: kind };   // fix75: recorded like every other interrupt
+        this.agent.requestInterrupt(src);
+        this.agent.actions.stop(src);
     }
     // a real player spoke: they take priority
     notePlayerMessage() {
@@ -1526,7 +1545,7 @@ Use only c; no other globals.`;
     }
     interrupt() {
         this.abort = true;
-        if (this.running) this.agent.actions.stop().catch(() => {});
+        if (this.running) this.agent.actions.stop({ kind: 'player', by: 'a player spoke' }).catch(e => this.agent.fatal('voyager.interrupt: stopping the action', e));   // fix75: was an empty catch
     }
 
     // fix28: 1 Hz motion/health samples so a death carries fall height and the damage that preceded it
@@ -1579,9 +1598,9 @@ Use only c; no other globals.`;
             return;
         }
         const now = Date.now();
-        if (now - this.lastPlayerMsg < PLAYER_QUIET_MS || now < (this._backoffUntil || 0)) {
+        if (now - this.lastPlayerMsg < PLAYER_QUIET_MS) {
             this.idlePractice.markBusy();
-            return;   // fix31: no fixed task cooldown; only an error backoff
+            return;   // fix31: no fixed task cooldown (fix75: and no error backoff, see _onStepError)
         }
         if (!this.agent.isIdle() || this.agent.self_prompter.isActive() || this.agent.prompter.awaiting_coding) {
             this.idlePractice.markBusy();
@@ -1591,15 +1610,24 @@ Use only c; no other globals.`;
         this.idlePractice.markIdle();
         // fix33: quota check removed; CodeModel handles paid→free fallback internally
         this.running = true; this.abort = false;
-        const t0 = Date.now(), c0 = { ...CALLS };
-        this.step().then(() => { this._errStreak = 0; }, e => {
-            console.error('[voyager] step failed: ' + (e?.message ?? e));
-            if (e?.stack) console.error('[voyager] stack:', e.stack);  // fix41: log stack for debugging
-            // fix31 runaway guard: consecutive failing steps back off exponentially, scaled by the failing step's own duration
-            this._errStreak = (this._errStreak || 0) + 1; const ms = Math.max(Date.now() - t0, 1000) * 2 ** this._errStreak;
-            this._backoffUntil = Date.now() + ms; console.log(`[voyager] ${this._errStreak} failing step(s) in a row; next step in ${Math.round(ms / 1000)}s`);
-        }).finally(() => { this.running = false; this.lastTaskEnd = Date.now(); this.idlePractice.markBusy();
+        const c0 = { ...CALLS };
+        this.step().then(() => { this._lastStepErrSig = null; }, e => this._onStepError(e)).finally(() => { this.running = false; this.lastTaskEnd = Date.now(); this.idlePractice.markBusy();
             console.log(`[timing] step model calls: local ${CALLS.local - c0.local}, code ${CALLS.code - c0.code}, replay ${CALLS.replay - c0.replay}`); });
+    }
+
+    // fix75: a step that throws is our bug. fix31 (f850a88) answered it with an exponential backoff scaled by the failing step's
+    // duration, during which update() ran no step at all: the 14:25:37Z step (364 s, a 5-minute action timeout that
+    // _interruptReason could not explain) bought 728 s of nothing, and icefox was slain by Red Figure at (-161,7,-15) at
+    // 14:28Z with no step running (next step 14:37:45Z). Now: log it loudly and go on to the next step at once. The same
+    // signature on two consecutive steps is a repeat by definition (the step after the failure, on a fresh state, hit the
+    // same throw at the same place), so the loop cannot make progress past it: agent.fatal, and launchd restarts the
+    // process where the restart is visible.
+    _onStepError(e) {
+        const sig = stepErrorSignature(e);
+        console.error(`!!! [voyager] step failed: ${sig}`);
+        console.error('[voyager] stack:', e instanceof Error ? e.stack : `(non-Error thrown: ${typeof e})`);
+        if (sig === this._lastStepErrSig) return this.agent.fatal(`the same step error on two consecutive steps (${sig})`, e);
+        this._lastStepErrSig = sig;
     }
 
     observe() {
@@ -1975,7 +2003,7 @@ Use only c; no other globals.`;
         if (this.abort) return { ok: false, interrupted: true };
         const after = this.observe();
         let ok, unverified = false;
-        const cut = res.interrupted || this._diedInRun() || this._stalledInRun() ? this._interruptReason(res.message) : '';   // fix14: a cut-off replay is a failure
+        const cut = res.interrupted || this._diedInRun() || this._stalledInRun() ? this._interruptReason(res) : '';   // fix14: a cut-off replay is a failure
         if (this._diedInRun()) this._noteDeath(this._diedInRun(), task);
         if (cut) { ok = false; console.log(`[voyager] replay ${r.name} ${cut}; counting as a failure`); } else
         if (!res.success) { ok = false; console.log(`[voyager] replay ${r.name} EXEC_FAILED: ${String(res.message)}`); } else
@@ -3803,7 +3831,8 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         if (died) { let i = -1; for (let k = 0; k < trace.length; k++) if ((trace[k].t0 || 0) <= died.t && (trace[k].t1 ?? Infinity) >= died.t - 1500 && (i < 0 || trace[k].depth >= trace[i].depth)) i = k; if (i < 0) i = trace.length - 1; console.log(`[psn] death attributed to the call running at death time: ${trace[i].name} (depth ${trace[i].depth})`); trace[i].ownFail = [`DIED: ${died.message} at ${died.pos}${this._deathDetail(died, this._beforeRunInv)}`]; for (; i >= 0; i = trace[i].parent) { trace[i].intr = false; trace[i].ok = false; trace[i].fail = true; } ok = false; }
         const stalled = !died && this._stalledInRun();   // fix27: a stall is a failure of the deepest call open at stall time
         if (stalled) { let i = -1; for (let k = 0; k < trace.length; k++) if ((trace[k].t0 || 0) <= stalled.t && (trace[k].t1 ?? Infinity) >= stalled.t - 1500 && (i < 0 || trace[k].depth >= trace[i].depth)) i = k; if (i < 0) i = trace.length - 1; console.log(`[psn] stall attributed to the call running at stall time: ${trace[i].name} (depth ${trace[i].depth})`); trace[i].ownFail = [`FAILED: STALLED: no progress (no new ground reached, inventory, window, lit furnace) for ${stalled.why} at ${stalled.pos}`]; for (; i >= 0; i = trace[i].parent) { trace[i].intr = false; trace[i].ok = false; trace[i].fail = true; } ok = false; }
-        const timedOut = !died && !stalled && /timed out/i.test(this._lastRunMsg);   // fix33: a timeout is a failure of the deepest call running at the cut
+        // fix75: from the action result (was /timed out/ on the action output; the timeout notice goes to history, so the output has it only if the skill logged those words)
+        const timedOut = !died && !stalled && this._lastRunTimedOut === true;   // fix33: a timeout is a failure of the deepest call running at the cut
         if (timedOut) {
             this._lastCutKind = 'timeout';  // fix51: set structured kind field
             const ix = trace.map((r, k) => k).filter(k => trace[k].intr && trace[k].t1); const cutT = Math.min(...ix.map(k => trace[k].t1)); let i = -1;
@@ -4647,7 +4676,7 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             } finally { closeJournal(); }
             console.log(`[timing] game action attempt ${i} took ${Date.now() - this._runStart}ms`);   // fix23: measurement
             if (this.abort) { console.log('[voyager] task interrupted'); return; }
-            const cut = res.interrupted || this._diedInRun() || this._stalledInRun() ? this._interruptReason(res.message) : '';   // fix14: cut-off code counts as a failed attempt
+            const cut = res.interrupted || this._diedInRun() || this._stalledInRun() ? this._interruptReason(res) : '';   // fix14: cut-off code counts as a failed attempt
             if (this._diedInRun()) this._noteDeath(this._diedInRun(), task);
             if (cut) anyCut = cut;
             if (cut) console.log(`[voyager] attempt ${i} ${cut}; counting as a failure`);

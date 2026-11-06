@@ -233,7 +233,9 @@ export class Agent {
         }
     }
 
-    requestInterrupt() {
+    // fix75: every interrupt names its source; it is recorded on the running action (ActionManager.noteInterrupt)
+    requestInterrupt(source) {
+        this.actions.noteInterrupt(source);
         this.bot.interrupt_code = true;
         this.bot.stopDigging();
         this.bot.collectBlock.cancelTask();
@@ -490,7 +492,7 @@ export class Agent {
         });
         this.bot.on('death', () => {
             this.actions.cancelResume();
-            this.actions.stop();
+            this.actions.stop({ kind: 'death', by: 'bot death event' });
         });
         this.bot.on('kicked', (reason) => {
             if (!this._disconnectHandled) {

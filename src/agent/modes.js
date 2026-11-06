@@ -130,7 +130,7 @@ const modes_list = [
                 this.stuck_time = 0;
                 execute(this, agent, async () => {
                     // after 10 s stop the unstuck move cleanly; only kill if it ignores the stop for 20 s more
-                    const stopTimer = setTimeout(() => { console.log('[unstuck] moveAway over 10 s, interrupting it'); agent.requestInterrupt(); }, 10000);
+                    const stopTimer = setTimeout(() => { console.log('[unstuck] moveAway over 10 s, interrupting it'); agent.requestInterrupt({ kind: 'mode', by: 'mode:unstuck (moveAway over 10 s)' }); }, 10000);
                     const crashTimeout = setTimeout(() => { agent.cleanKill("Got stuck and couldn't get unstuck") }, 30000);
                     try { await skills.moveAway(bot, 5); }
                     finally { clearTimeout(stopTimer); clearTimeout(crashTimeout); }
