@@ -1,6 +1,6 @@
 import { strictFormat } from '../utils/text.js';
 import { Agent } from 'undici';
-import { recordCallDuration, callDurationBound } from './call_durations.js';
+import { recordCallDuration, callDurationBound, noteUnboundedCall, takeLearnedBound } from './call_durations.js';
 
 // fix60: Ollama with stream:false sends its response headers only after the whole generation, so undici's implicit
 // 300 s headersTimeout/bodyTimeout (the global Agent installed when cheerio loads undici) killed long but healthy local
@@ -106,7 +106,7 @@ export class Ollama {
         // fix60: the wait is bounded only by this model+endpoint's learned successful-call durations (see call_durations.js)
         const key = `${this.model_name} ${endpoint}`;
         const bound = callDurationBound(key);
-        if (!bound) console.log(`!!! [ollama] UNBOUNDED call ${key}: no learned duration distribution yet (needs two different successful durations); a hang here would not be cut`);
+        if (!bound && noteUnboundedCall(key)) console.log(`!!! [ollama] UNBOUNDED calls ${key}: no learned duration distribution yet (needs two different successful durations); a hang here would not be cut (logged once per model+endpoint until a bound is learned)`);
         const t0 = Date.now();
         let res;
         try { res = await fetch(request, bound ? { dispatcher: OLLAMA_DISPATCHER, signal: AbortSignal.timeout(bound.ms) } : { dispatcher: OLLAMA_DISPATCHER }); }
@@ -126,6 +126,8 @@ export class Ollama {
         }
         const json = await res.json();
         recordCallDuration(key, Date.now() - t0);
+        const learned = takeLearnedBound(key);
+        if (learned) console.log(`[ollama] ${key} now bounded at ${learned.bound.ms}ms (learned from n=${learned.bound.stats.n} successful calls; ${learned.calls} call(s) ran unbounded)`);
         return json;
     }
 
