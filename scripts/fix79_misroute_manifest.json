@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "bot": "icefox2000",
+  "inventory": "fix79 PR: scanForIronOreBlocks charged for the dedicated-trial misroute to \"Mine 1 diamond_ore\". Apply ONLY after fix79 is deployed (until then every misroute adds 1 to fail/streakFail and the expect below refuses). Re-count before applying: 7 + count of 'replay scanForIronOreBlocks: failed (+0 diamond_ore/diamond)' after logs/mindcraft.log line 254213 (the 17:17 restart after the 17:16:26 reset).",
+  "files": {
+    "index": "skills/index.json",
+    "progress": "skills/progress.json"
+  },
+  "records": [
+    {
+      "id": "scanForIronOreBlocks.misroute.stats",
+      "file": "index",
+      "skill": "scanForIronOreBlocks",
+      "cause": { "fix": "fix79", "commit": "c3025b8", "name": "fix28 dedicated trial on the caller's task + #30 (094b9db) gate ran the incumbent; incumbent charged +0 diamond_ore/diamond" },
+      "evidence": "backup-bug-poisoned-20261106T171626Z: fail 82 = 75 (reset by scanForIronOreBlocks.stats.fails) + 7 misroutes (mindcraft.log 241221, 243057, 245091, 247151, 248929, 252181, 253560; 250398 was UNMET PRECONDITION, not counted); after the reset: 3 misroutes (255392, 256986, 258153). Index at 17:40: success 1, fail 10, streakFail 10. No other scanForIronOreBlocks run was counted (no PASSED, practice or hang lines).",
+      "expect": { "stats.success": 1, "stats.fail": 10, "stats.streakFail": 10 },
+      "set": { "stats.fail": 0, "stats.streakFail": 0 },
+      "delete": []
+    },
+    {
+      "id": "scanForIronOreBlocks.misroute.demotion",
+      "file": "index",
+      "skill": "scanForIronOreBlocks",
+      "cause": { "fix": "fix79", "commit": "c3025b8", "name": "DEMOTE 'failed 3 times in a row' (log 255386) from the misroute streak" },
+      "expect": { "demoted": true },
+      "set": { "demoted": false },
+      "delete": []
+    }
+  ]
+}

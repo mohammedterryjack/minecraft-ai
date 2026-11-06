@@ -7,6 +7,9 @@ import { writeAtomic } from './voyager.js';
 
 const CONFIRM_THRESHOLD = 3;
 
+// the key recordDelta files a skill/task under (fix79: shared with confirmedProduces)
+export const npKey = skillOrTask => skillOrTask.toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 80);
+
 export class NeedsProducesGraph {
     constructor(botName) {
         this.botName = botName;
@@ -54,7 +57,7 @@ export class NeedsProducesGraph {
     // When goalItems absent: keep ALL observed ups (no hard-coded incidental/junk tables)
     recordDelta(skillOrTask, beforeInv, afterInv, goalItems = null) {
         if (!skillOrTask || typeof skillOrTask !== 'string') return;
-        const key = skillOrTask.toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 80);
+        const key = npKey(skillOrTask);
         
         const consumed = [];
         const produced = [];
@@ -127,6 +130,12 @@ export class NeedsProducesGraph {
         return changed;
     }
 
+    // fix79: items a skill/task is confirmed to produce (no confirmed link = no evidence = [])
+    confirmedProduces(skillOrTask) {
+        const key = npKey(skillOrTask);
+        return Object.hasOwn(this.confirmed, key) ? [...this.confirmed[key].produces] : [];
+    }
+
     getConfirmedLinks() {
         return this.confirmed;
     }
@@ -161,7 +170,7 @@ export class NeedsProducesGraph {
     }
 
     getRequirementsOf(skillOrTask) {
-        const key = skillOrTask.toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 80);
+        const key = npKey(skillOrTask);
         return this.confirmed[key]?.needs || [];
     }
 }

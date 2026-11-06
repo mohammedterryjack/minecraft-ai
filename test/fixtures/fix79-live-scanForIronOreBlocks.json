@@ -1,0 +1,55 @@
+{
+ "_source": "iMac bots/icefox2000/skills/index.json scanForIronOreBlocks at 2026-11-06 17:38 (embedding dropped; candidate code elided: never runs in these tests)",
+ "name": "scanForIronOreBlocks",
+ "description": "When no ore is visible nearby, travel to an exploratory offset and pick up dropped items.",
+ "task": "split sp1793907995811",
+ "deps": [],
+ "effects": [],
+ "code": "async function scanForIronOreBlocks(bot) {\n    if (bot.interrupt_code) return [];\n    const blocks = getNearestBlocks(bot, ['iron_ore', 'deepslate_iron_ore'], 128, 20);\n    return blocks && blocks.length ? blocks : [];\n}\n\n// DESCRIPTION: When no ore is visible nearby, travel to an exploratory offset and pick up dropped items.",
+ "saved": "2026-11-05T19:46:49.679Z",
+ "stats": {
+  "success": 1,
+  "fail": 10,
+  "streakFail": 10,
+  "tasks": [
+   "split sp1793907995811"
+  ],
+  "lastRun": 1793938544220,
+  "practiceRuns": 554
+ },
+ "contract": {
+  "pre": "c => c.pre.alive",
+  "post": "c => c.post.alive && c.dist(c.pre.pos, c.post.pos) < 0.5 && (!c.delta || !Object.keys(c.delta).some(k => c.delta[k] !== 0))",
+  "text": "Scan up to 128 blocks for iron or deepslate iron ore without moving or changing inventory; yields block hits or an empty result."
+ },
+ "repairHistory": [
+  {
+   "at": "2026-11-06T04:17:40.230Z",
+   "task": "Mine 1 diamond_ore",
+   "kind": "callee_fix",
+   "evidence": "returned null"
+  }
+ ],
+ "candidate": {
+  "description": "When no ore is visible nearby, travel to an exploratory offset and pick up dropped items.",
+  "deps": [
+   "getNearestBlocks",
+   "getPosition",
+   "travelTo",
+   "pickupNearbyItems"
+  ],
+  "task": "repair: Mine 1 diamond_ore",
+  "effects": [],
+  "code": "async function scanForIronOreBlocks(bot) { return false; }",
+  "stats": {
+   "success": 0,
+   "fail": 0,
+   "streakFail": 0,
+   "tasks": []
+  },
+  "trialTask": "Mine 1 diamond_ore",
+  "trialAfter": 1793986732880
+ },
+ "demoted": true,
+ "consumes": {}
+}

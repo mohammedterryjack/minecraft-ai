@@ -35,6 +35,9 @@ import { logPromptBreakdown, extractBareCalls } from './prompt_utils.js';   // f
 import { recordConsumeEvidence, verifiedConsumes, recordEffectEvidence, verifiedEffects, count as invCount } from './consume_evidence.js';   // fix70, fix74
 // fix70: how much of a repair's evidence a [psn] log line shows (a log excerpt; the full evidence stays on the queue entry)
 const LOG_EVIDENCE_CHARS = 160;
+// fix79: _attribute's verdict when the run met every contract and the goal failed only because the route sent it to a skill with no
+//        learned evidence of producing the goal items: the route is blamed, not the skill
+export const MISROUTED = 'misrouted';
 // fix70 (was fix71's inline .slice(0, 600) at both call sites): how much of an API-lint failure goes into the repair evidence
 // the code model sees. One definition for the startup re-lint and the repair-time re-lint, so both evidences are the same text.
 const API_LINT_EVIDENCE_CHARS = 600;
@@ -2166,6 +2169,27 @@ Use only c; no other globals.`;
         } catch (e) { return { ok: false, why: `precheck error ${e.message}` }; }
         return { ok: true };
     }
+    // fix79: what a skill is learned to produce: its measured effects (recordEffectEvidence, fix74), its candidate's, and the
+    //        needs/produces links confirmed for it. Absent from all three = no evidence it produces the item.
+    _learnedProduces(e) {
+        if (!Array.isArray(e.effects)) throw new Error(`[fix79] _learnedProduces: skill ${e.name} has no effects record (${JSON.stringify(e.effects)})`);
+        if (e.candidate && !Array.isArray(e.candidate.effects)) throw new Error(`[fix79] _learnedProduces: candidate of ${e.name} has no effects record`);
+        return [...new Set([...e.effects, ...(e.candidate ? e.candidate.effects : []), ...this.npGraph.confirmedProduces(e.name)])];
+    }
+    // fix79: route evidence for an item goal on a route that is not parametrised by the goal (a bare `name(bot)` call; a
+    //        parsed-contract route such as mineOre(bot, item, n) carries its item in its own contract). fits = the skill is
+    //        learned to produce one of the goal items.
+    _routeFit(e, goalItems) {
+        if (!Array.isArray(goalItems) || !goalItems.length) throw new Error(`[fix79] _routeFit needs goal items, got ${JSON.stringify(goalItems)}`);
+        const produces = this._learnedProduces(e);
+        return { skill: e.name, items: goalItems, produces, fits: produces.some(i => goalItems.includes(i)) };
+    }
+    // fix44 gate as one predicate (used by _replay and by _gateTrial's route choice, fix79): a candidate is trialled on a goal
+    // only if its learned effects overlap the goal items (any non-item goal: no items to overlap, so it runs)
+    _candidateFitsGoal(entry, goalItems) {
+        if (!Array.isArray(entry.candidate.effects)) throw new Error(`[fix79] candidate of ${entry.name} has no effects record`);
+        return goalItems.length === 0 || entry.candidate.effects.some(eff => goalItems.includes(eff));
+    }
     async _replay(task, before, forced) {
         let r = forced || this._findReplay(task);
         if (!r) return null;
@@ -2191,7 +2215,7 @@ Use only c; no other globals.`;
         if (entry?.candidate) {
             const candidateEffects = entry.candidate.effects;   // fix74: every candidate is created with effects (saveSkill HOLD, fix25 migrate; checked at load)
             const goalItems = goal?.items || (goal?.item ? [goal.item] : []);
-            const effectsOverlap = goalItems.length === 0 || candidateEffects.some(eff => goalItems.includes(eff));
+            const effectsOverlap = this._candidateFitsGoal(entry, goalItems);
             if (effectsOverlap) {
                 trial = true;
                 gateLog(`trial run of candidate ${r.name} (candidate ${entry.candidate.stats.success}/${entry.candidate.stats.success + entry.candidate.stats.fail}, current ${entry.stats?.success || 0}/${(entry.stats?.success || 0) + (entry.stats?.fail || 0)})`);
@@ -2199,6 +2223,15 @@ Use only c; no other globals.`;
                 gateLog(`SKIP trial of candidate ${r.name}: effects [${candidateEffects.join(', ')}] do not overlap goal [${goalItems.join(', ')}]`);
             }
         }
+        // fix79: a dedicated gate trial exists only to run the candidate. #30's gate above used to fall through to the INCUMBENT
+        //        when the candidate did not fit, and the incumbent took the run's stats and blame (live: scanForIronOreBlocks on
+        //        "Mine 1 diamond_ore", 85x). _gateTrial now checks the same predicate first, so reaching here is a bug.
+        if (forced?.dedicatedTrial && !trial) throw new Error(`[fix79] dedicated trial of ${r.name} on "${task}" would run the incumbent: candidate does not fit the goal`);
+        // fix79: route evidence for an item goal verified by gain on a bare-call route
+        const bareRoute = g.kind === 'item' && !r.free && !r.at && !this._contract(r);
+        if (bareRoute && !entry) throw new Error(`[fix79] item goal "${task}" routed to ${r.name}, which is not in the skill library`);
+        const routeFit = bareRoute ? this._routeFit(entry, goal.items) : null;
+        if (routeFit && !routeFit.fits) console.log(`!!! [route] ${r.name} routed to "${task}" with no learned evidence it produces [${routeFit.items.join(', ')}] (learned produces [${routeFit.produces.join(', ')}])`);
         // fix65: the goal-overlap gate above (#30) decides the ROOT's own candidate only. #30 also AND-ed it into the children,
         // so a child candidate ran only when the replayed root had a candidate of its own: replays (the common path) never
         // ran the 09:37Z collectBlock candidate, its 0/0 record never moved, and every repair of collectBlock was deferred
@@ -2279,10 +2312,13 @@ Use only c; no other globals.`;
         const libFault = !ok && this._libraryFault(this.agent.bot.__psnTrace, r.name);
         const unmet = !ok && !libFault && this._classifyUnmetPrecondition(r.name, runBefore.food_value);
         if (unmet) console.log(`!!! [blame] UNMET PRECONDITION (${unmet}): ${r.name} — not counted against stats or gate`);
-        if (entry && !unverified && !libFault && !unmet) this._recordRun(entry, task, ok, trial);
+        // fix10: per-call trace -> contract results -> blame -> targeted repair. fix79: runs before the stats so a misroute
+        //        (every call met its contract; the route had no learned evidence for the goal) is not a failure of the skill
+        const verdict = this._attribute(r.name, task, unverified ? true : ok, over, routeFit);
+        const misrouted = verdict === MISROUTED;
+        if (entry && !unverified && !libFault && !unmet && !misrouted) this._recordRun(entry, task, ok, trial);
         // ADAM-style: record inventory delta for needs/produces learning
         if (ok) this.npGraph.recordDelta(r.name, runBefore.inventory, after.inventory, goalItems);   // fix70: this run only
-        this._attribute(r.name, task, unverified ? true : ok, over);   // fix10: per-call trace -> contract results -> blame -> targeted repair
 
         // fix37 (D): detect and log inventory-full as a fact for learning
         const invFullFact = !ok ? this._detectInventoryFullFailure(task, before, after, String(res.message || '')) : null;
@@ -2295,7 +2331,10 @@ Use only c; no other globals.`;
             if (invFullFact) console.log(`[voyager] replay ${r.name} INVENTORY FULL DETECTED: ${invFullFact}`);
         }
         if (!ok) console.log(`[voyager] replay ${r.name} output: ${String(res.message || '(none)').slice(-600).replace(/\n+/g, ' | ')}`);
-        return { ok, name: r.name, output: String(res.message || ''), cut, invFullFact, unverified };
+        const out = { ok, name: r.name, output: String(res.message || ''), cut, invFullFact, unverified };
+        // fix79: the route takes the blame: ok stays false (goal outcome, learned embedding threshold) and the reason names the route
+        if (misrouted) return { ...out, misrouted: routeFit, reason: `misrouted: ${r.name} has no learned evidence it produces ${routeFit.items.join('/')}` };
+        return out;
     }
     // library source with optional per-name code overrides (candidates under test)
     _libSrc(over = {}) { return this.skills.map(s => over[s.name] ?? s.code).join('\n\n'); }
@@ -4101,7 +4140,9 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
     // Names outside the library (freshly generated code) are not leaves.
     _isLeaf(name) { if (name.startsWith('skills.')) return true;   // fix21: traced primitives are fixed leaves
         return false; }   // fix33: seeded primitives are library skills: blamed and repaired like learned ones (e.g. travelTo learns to leave water)   // fix24: hand-written skills are repairable
-    _attribute(root, task, ok, over) {
+    // fix79: route is the replay's route evidence for an item goal (_routeFit) or null when the run was not routed by it
+    _attribute(root, task, ok, over, route) {
+        if (route !== null && (typeof route !== 'object' || typeof route.fits !== 'boolean')) throw new Error(`[fix79] _attribute needs route evidence (a _routeFit result) or null, got ${JSON.stringify(route)}`);
         const bot = this.agent.bot, trace = bot.__psnTrace;
         bot.__psnTrace = null;
         if (!Array.isArray(trace) || !trace.length) { console.log('[psn] no execution trace recorded'); return; }
@@ -4179,6 +4220,12 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         if (!bs.length) {
             const b0 = blame(trace, n => this._isLeaf(n));
             const why = b0 ? (b0.target ? `failure only in non-library code ${b0.target} (${b0.evidence})` : `only the fixed leaf ${b0.leaf} failed (${b0.evidence})`) : 'every call met its contract but the task outcome failed';
+            // fix79: every call met its contract and the route had no learned evidence that the root produces the goal: the
+            //        skill did what it does; the route that sent it here is wrong. No root blame, no repair, no decomposition.
+            if (!b0 && !ok && route !== null && !route.fits) {
+                console.log(`!!! [blame] MISROUTE: ${root} met its own contract on "${task}"; it has no learned evidence it produces [${route.items.join(', ')}] (learned produces [${route.produces.join(', ')}]); the route is blamed, not ${root}`);
+                return MISROUTED;
+            }
             if (learned(root)) { bs = [{ target: root, leaf: root, path: [root], kind: 'callee_fix', swallowed: false, evidence: why }]; console.log(`[psn] blame: root learned skill ${root} [callee_fix]: ${why}`); }
             else { console.log(`[psn] blame: ${why}; root ${root} is ${this.skills.some(s => s.name === root) ? 'primitive/hand-written' : 'freshly generated'} -> goal goes to decomposition`); this._decomposeQueue ||= { task, reason: why }; return; }
         } else console.log(`[psn] blame (top-down over ${bs.length} responsible skill(s), patched bottom-up): ${bs.map(b => `${b.target} [${b.kind}${b.swallowed ? ', swallowed' : ''}]`).join(', ')}; path ${bs[0].path.join(' > ')}; deepest failure ${bs[0].leaf}: ${bs[0].evidence}`);
@@ -4369,7 +4416,7 @@ IMPORTANT: All functions use bare names. Do NOT write skills.goToPosition - writ
         }
         // AWM-style: record successful repair submission
         await this.repairMemory.recordRepair({ errorSignature: q.evidence, fixSnippet: desc?.slice(0, 200), outcome: true, taskHint: q.task, skillName: e.name });
-        if (e.candidate) { e.candidate.trialTask = q.task; e.candidate.trialAfter = Date.now(); this._saveSkills(); }   // fix28: dedicated trial run next step
+        if (e.candidate) this._setTrialTask(e, q);   // fix28: dedicated trial run next step (fix79: only on a task it was routed to)
         console.log(`[psn] repaired ${e.name}: submitted to the gate (parents are re-validated once it is promoted)`);
         return true;
     }
@@ -4526,11 +4573,20 @@ IMPORTANT: All functions use bare names. Do NOT write skills.goToPosition - writ
                 return false;
             }
         }
-        if (pe.candidate) { pe.candidate.trialTask = q.task; pe.candidate.trialAfter = Date.now(); this._saveSkills(); }
+        if (pe.candidate) this._setTrialTask(pe, q);
         console.log(`[psn] joint repair ${id}: ${e.name} + ${pe.name} both passed gate checks and submitted as candidates (both rolled back if either fails trial runs)`);
         return true;
     }
 
+    // fix79: a dedicated trial replays the repaired skill AS THE ROUTE of q.task, so it is set only when the skill was the root of
+    //        the failed run (blame path starts at it). c3025b8 (fix28) set it to q.task for every repair, so a callee repaired
+    //        from a caller's failure (scanForIronOreBlocks inside mineOneDiamondOre, path mineOneDiamondOre > scanForIronOreBlocks)
+    //        was replayed alone on the caller's goal "Mine 1 diamond_ore" every 5 min. Its trials come from that caller instead.
+    _setTrialTask(e, q) {
+        if (!Array.isArray(q.path) || !q.path.length) throw new Error(`[fix79] repair record of ${e.name} has no blame path: ${JSON.stringify(q.path)}`);
+        if (q.path[0] !== e.name) { gateLog(`no dedicated trial of ${e.name} on "${q.task}": it ran inside ${q.path[0]} (path ${q.path.join(' > ')}), not as the route of that task; its trials come from callers`); return; }
+        e.candidate.trialTask = q.task; e.candidate.trialAfter = Date.now(); this._saveSkills();
+    }
     // fix28: a repaired candidate gets its trial runs in a short dedicated run on the task that failed, instead of waiting for a caller
     async _gateTrial() {
         const e = this.skills.find(s => s.candidate?.trialTask && Date.now() >= (s.candidate.trialAfter || 0)); if (!e) return false;
@@ -4538,10 +4594,17 @@ IMPORTANT: All functions use bare names. Do NOT write skills.goToPosition - writ
         const sig = (c.code.match(new RegExp(`async\\s+function\\s+${e.name}\\s*\\(([^)]*)\\)`)) || [])[1] || 'bot';
         const extra = sig.split(',').slice(1).map(x => x.trim()).filter(Boolean);
         if (extra.some(x => !x.includes('='))) { gateLog(`dedicated trial of ${e.name} not possible: required parameters (${extra.join(', ')}); its trials come from callers`); delete c.trialTask; this._saveSkills(); return false; }
+        // fix79: the route of a dedicated trial is chosen from learned evidence: the candidate must be learned to produce the goal
+        //        (the fix44 predicate _replay uses to decide whether the candidate runs at all)
+        const g = this._resolveGoal(task);
+        if (g.kind === 'item' && !this._candidateFitsGoal(e, g.items)) {
+            gateLog(`LOUD: no dedicated trial of ${e.name} on "${task}": candidate learned effects [${c.effects.join(', ')}] (skill learned produces [${this._learnedProduces(e).join(', ')}]) do not include [${g.items.join(', ')}]; that route would run the incumbent and charge it the goal. Its trials come from callers`);
+            delete c.trialTask; this._saveSkills(); return false;
+        }
         c.trialAfter = Date.now() + 5 * 60e3; this._saveSkills();
         gateLog(`dedicated trial run of candidate ${e.name} on "${task}" (candidate ${c.stats.success}/${c.stats.success + c.stats.fail})`);
         const before = this.observe();
-        const rp = await this._replay(task, before, { name: e.name, call: `await ${e.name}(bot);` });
+        const rp = await this._replay(task, before, { name: e.name, call: `await ${e.name}(bot);`, dedicatedTrial: true });
         if (rp?.interrupted) return true;
         if (!this.skills.find(s => s.name === e.name)?.candidate) gateLog(`candidate ${e.name} resolved after dedicated trial (${rp?.ok ? 'passed' : 'failed'})`);
         return true;
@@ -4962,7 +5025,7 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
                 : await this.critique(task, before, after, output, goal ? false : undefined);   // count goal not met by inventory -> ground truth false
             if (goal && gained >= goal.count) console.log(`[voyager] verified from inventory (+${gained} ${goal.item}), critic skipped`);
             console.log(`[voyager] attempt ${i} critic: success=${verdict.success} ${verdict.critique || ''}`);
-            this._attribute(own, task, !!verdict.success, over);   // fix11 (B7)
+            this._attribute(own, task, !!verdict.success, over, null);   // fix11 (B7); fix79: generated code is not a route
             if (this._repairQueue?.some(x => x.target === own)) { console.log(`[psn] blame lands on the generated ${own} itself; the critic feedback loop fixes it (no library repair)`); this._repairQueue = this._repairQueue.filter(x => x.target !== own); }
             const same = !verdict.success && i >= 2 && prevCrit !== null && String(verdict.critique || '').trim() === prevCrit; prevCrit = String(verdict.critique || '').trim();   // fix32
             const lastTry = i >= MAX_ATTEMPTS || same || (!verdict.success && /travel|underground|died/.test(cut) && i >= 2);   // fix23: repeated travel cut-offs -> stop at 2 and decompose; fix32: unchanged critique -> stop
