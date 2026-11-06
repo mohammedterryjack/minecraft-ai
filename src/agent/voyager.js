@@ -1198,6 +1198,27 @@ Use only c; no other globals.`;
         for (const r of trace) { if (r.intr || !r.s0 || !r.s1 || !r.s0.alive || !r.s1.alive) continue; this.slotEffects.noteRun(r.name, r.s0, r.s1); }
     }
     _recovery() { const bot = this.agent.bot; return this.vitals.recovery(bot.health, skills.getVitalsMax(bot).health, bot.food); }
+    // fix76: learned hunger outlook (food vs regen floor / decay), including at full HP
+    _hunger() { const bot = this.agent.bot, m = skills.getVitalsMax(bot); return this.vitals.hunger(bot.health, m.health, bot.food, m.food); }
+    // fix76: unmet world/library preconditions are not skill evidence (no fail/streak/demote/REJECT).
+    // Detected from the run output and trace FAIL lines — "Food is full" (mineflayer consume) and "PREREQUISITE FAILED"
+    // (seeded skills). Not a hard-coded eat-at-N threshold.
+    _unmetPrecondition(trace, name, output) {
+        const out = String(output || '');
+        const lines = [];
+        if (Array.isArray(trace)) {
+            for (const r of trace) {
+                if (name && r.name !== name && r.name !== 'consume') continue;
+                if (r.err) lines.push(String(r.err));
+                for (const l of (r.ownFail || [])) lines.push(String(l));
+            }
+        }
+        lines.push(out);
+        const blob = lines.join('\n');
+        if (/Food is full/i.test(blob)) return 'Food is full';
+        if (/PREREQUISITE FAILED/i.test(blob)) return 'PREREQUISITE FAILED';
+        return null;
+    }
     // evaluate contracts on every traced library call; violations become contract failures in the trace
     _checkContracts(trace, taskOk) {
         const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
@@ -1656,6 +1677,9 @@ Use only c; no other globals.`;
             health_max: skills.VITALS_MAX.health,
             // fix58: learned: hp below max and not recovering at the current food level (from the bot's own vitals history)
             health_recovery_blocked: this._recovery().blocked,
+            // fix76: learned hunger (food vs regen floor / decay) — fires at full HP; not a hard-coded eat threshold
+            hunger_urgent: this._hunger().urgent,
+            food_below_regen_floor: this._hunger().belowRegen,
             // fix51: oxygen level as protocol value (300 = full breath, decreases when submerged, 0 = drowning damage)
             oxygen_level: bot.oxygenLevel,
             inventory: world.getInventoryCounts(bot),  // fix41: host code uses world. prefix
@@ -2044,8 +2068,11 @@ Use only c; no other globals.`;
         if (entry && ok && !trial) this._learnEffects(entry, runBefore, after, goalItems);
         // fix56: an unverified open goal is neither a pass nor a failure of the skill: no run stats, no blame of the root for the goal
         // fix70: a run whose error was raised in library code is that code's fault, not a run of the learned skill
+        // fix76: unmet preconditions (Food is full, PREREQUISITE FAILED) are not skill/candidate evidence
         const libFault = !ok && this._libraryFault(this.agent.bot.__psnTrace, r.name);
-        if (entry && !unverified && !libFault) this._recordRun(entry, task, ok, trial);
+        const unmet = !ok && !libFault && this._unmetPrecondition(this.agent.bot.__psnTrace, r.name, res.message);
+        if (unmet) console.log(`!!! [blame] UNMET PRECONDITION (${unmet}): ${r.name} — not counted against stats or gate`);
+        if (entry && !unverified && !libFault && !unmet) this._recordRun(entry, task, ok, trial);
         // ADAM-style: record inventory delta for needs/produces learning
         if (ok) this.npGraph.recordDelta(r.name, runBefore.inventory, after.inventory, goalItems);   // fix70: this run only
         this._attribute(r.name, task, unverified ? true : ok, over);   // fix10: per-call trace -> contract results -> blame -> targeted repair
@@ -2972,6 +2999,14 @@ Use only c; no other globals.`;
                 }
             }
         }
+        // fix76: a learned food-raiser at full food is an unmet eat precondition — do not practice it into Food-is-full REJECT
+        const bot = this.agent?.bot;
+        if (bot && typeof bot.food === 'number') {
+            const foodMax = skills.getVitalsMax(bot).food;
+            if (bot.food >= foodMax && this.vitals.foodRaisers().some(x => x.name === skill.name)) {
+                return `food already full (${bot.food}/${foodMax}); ${skill.name} is a learned food-raiser`;
+            }
+        }
         return null;
     }
     // fix43: compute safe-to-toss and deposit-candidate items based on POSITIVE learned signals only
@@ -3526,14 +3561,18 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "task": "...", "contex
             ? `\nedible_inventory: ${edible.map(e => `${e.item}(${e.count}, food=${e.foodPoints})`).join(', ')}`
             : '';
         // fix58: learned recovery facts (food level -> hp regen, skills' observed food change) so the ranking can weigh recovery
+        // fix76: hunger facts even when hp is full (recoveryText is null at max HP)
         const rec = this._recovery(), recText = this.vitals.recoveryText(rec);
+        const hun = this._hunger(), hunText = this.vitals.hungerText(hun);
         const vmax = skills.getVitalsMax(bot);   // fix59: one source for hp/food max (was literal /20)
         if (rec.blocked) console.log(`[vitals] ${recText}`);
+        if (hunText) console.log(`[vitals] ${hunText}`);
         const recoveryHint = recText ? `\n${recText}` : '';
+        const hungerHint = hunText ? `\n${hunText}` : '';
         const user = `known_skills: ${JSON.stringify(knownSkillsFacts)}
 replayable_tasks (cheap, no new code needed): ${JSON.stringify(replayableTasks)} plus any "Mine N <block or ore>", "Collect N <log>", "Get N <item>", "Smelt N <raw> into N <out>", "Kill N <mob>", "Harvest N <crop>"
 completed_tasks: ${JSON.stringify(this.progress.completed.slice(-30))}
-failed_tasks: ${JSON.stringify(this.progress.failed.slice(-15))}${blockerHint}${edibleHint}${recoveryHint}
+failed_tasks: ${JSON.stringify(this.progress.failed.slice(-15))}${blockerHint}${edibleHint}${recoveryHint}${hungerHint}
 --- state (compact) ---
 ${compactStateText}
 current_health: ${Math.round(bot.health)}/${vmax.health}\ncurrent_food: ${bot.food}/${vmax.food} (${vmax.food}/${vmax.food} = full)${this._cursorLimited() ? '\nIMPORTANT: the code-writing model is unavailable right now, so ONLY propose a task from replayable_tasks or "Mine N <block>".' : ''}${workflowHints ? '\n' + workflowHints : ''}`;   // fix31: slow-changing lists first so Ollama reuses the cached prompt prefix
@@ -3856,7 +3895,8 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
             if (name === root) continue;
             const rec = trace.find(t => t.name === name);
             const e = this.skills.find(s => s.name === name);
-            if (rec && e?.candidate && !rec.intr && !(!rec.ok && this._libraryFault(trace, name))) { gateLog(`trial run of candidate ${name} inside ${root}: contract ${rec.ok ? 'ok' : 'FAILED'}`); this._recordRun(e, task, rec.ok, true); }   // fix70: not on a library fault
+            if (rec && e?.candidate && !rec.intr && !(!rec.ok && this._libraryFault(trace, name)) && !(!rec.ok && this._unmetPrecondition(trace, name, this.agent.bot.output))) { gateLog(`trial run of candidate ${name} inside ${root}: contract ${rec.ok ? 'ok' : 'FAILED'}`); this._recordRun(e, task, rec.ok, true); }   // fix70: not on a library fault; fix76: not on unmet precondition
+            else if (rec && e?.candidate && !rec.intr && !rec.ok && this._unmetPrecondition(trace, name, this.agent.bot.output)) { const u = this._unmetPrecondition(trace, name, this.agent.bot.output); gateLog(`candidate ${name} unmet precondition (${u}): not a trial fail`); }
         }
         // fix27: no hotspot filter; deaths stay traced failures (above) and blame/repair learns avoidance
         // fix19 (5): an explicit FAILED line from a skill is a contract failure even if the task check passed (e.g. ensureChest inside a storage task)

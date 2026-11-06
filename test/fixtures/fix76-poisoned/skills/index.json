@@ -1,0 +1,88 @@
+[
+  {
+    "name": "eatCookedMutton",
+    "demoted": true,
+    "prunedAt": 1793973522204,
+    "candidate": null,
+    "stats": {
+      "success": 1,
+      "fail": 2,
+      "streakFail": 2,
+      "tasks": [
+        "eatCookedMutton: If cooked_mutton is found, consume one item to update food value to at least 1/20"
+      ],
+      "lastRun": 1793961008633,
+      "practiceRuns": 178
+    },
+    "consumes": {
+      "cobblestone": 7,
+      "dirt": 2,
+      "andesite": 4,
+      "raw_copper": 5
+    },
+    "effects": [],
+    "code": "async function eatCookedMutton(bot) {}",
+    "description": "eat"
+  },
+  {
+    "name": "travelWestAvoidDeathHotspot",
+    "stats": {
+      "success": 1,
+      "fail": 0,
+      "streakFail": 0,
+      "tasks": [
+        "travel"
+      ],
+      "practiceRuns": 316
+    },
+    "consumes": {
+      "stone_pickaxe": 1,
+      "oak_log": 1,
+      "iron_pickaxe": 1
+    },
+    "effects": [
+      "crafting_table",
+      "cobblestone"
+    ],
+    "code": "async function travelWestAvoidDeathHotspot(bot) {}",
+    "description": "travel"
+  },
+  {
+    "name": "scanForIronOreBlocks",
+    "demoted": true,
+    "stats": {
+      "success": 1,
+      "fail": 75,
+      "streakFail": 75,
+      "tasks": [
+        "split sp1793907995811"
+      ],
+      "lastRun": 1793938544220,
+      "practiceRuns": 554
+    },
+    "consumes": {},
+    "effects": [],
+    "code": "async function scanForIronOreBlocks(bot) {}",
+    "description": "scan"
+  },
+  {
+    "name": "untouchedSkill",
+    "demoted": false,
+    "stats": {
+      "success": 9,
+      "fail": 1,
+      "streakFail": 0,
+      "tasks": [
+        "x"
+      ]
+    },
+    "consumes": {
+      "oak_log": 1
+    },
+    "effects": [
+      "oak_planks"
+    ],
+    "code": "async function untouchedSkill(bot) {}",
+    "description": "keep"
+  }
+]
