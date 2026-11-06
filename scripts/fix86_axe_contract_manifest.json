@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "bot": "icefox2000",
+  "inventory": "fix86: equipBestToolForAxe returns the string iron_axe. Its learned post reads heldItem.type, which the snapshot does not have (heldItem is that string). Delete contract and contractTried so the next backfill relearns the post against the snapshot shape and the observed return. Apply fails loud when the stored contract is not this one.",
+  "files": {
+    "index": "skills/index.json",
+    "progress": "skills/progress.json"
+  },
+  "records": [
+    {
+      "id": "equipBestToolForAxe.heldItemType",
+      "file": "index",
+      "skill": "equipBestToolForAxe",
+      "cause": {
+        "fix": "fix86",
+        "name": "post reads heldItem.type; the skill returns the item name"
+      },
+      "evidence": "live contract post checks c.post.eq.heldItem.type === 'iron_axe' while the skill returns the string 'iron_axe'",
+      "expect": {
+        "contract": {
+          "pre": "c => true",
+          "post": "c => c.ret === false || c.ret === null || c.post.eq.heldItem.type === 'iron_axe'",
+          "text": "returns iron_axe and the held item's type is iron_axe"
+        }
+      },
+      "set": {},
+      "delete": ["contract", "contractTried"]
+    }
+  ]
+}

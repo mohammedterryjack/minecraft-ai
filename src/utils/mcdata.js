@@ -513,7 +513,8 @@ function isBaseItem(item) {
     return loopingItems.has(item) || getItemCraftingRecipes(item) === null;
 }
 
-function craftItem(item, count, inventory, leftovers, crafted = { required: {}, steps: [], leftovers: {} }) {
+function craftItem(item, count, inventory, leftovers, crafted = { required: {}, steps: [], leftovers: {} }, path = []) {
+    if (path.includes(item)) throw new Error(`[fix86] recipe cycle: ${[...path, item].join(' -> ')}`);
     // Check available inventory and leftovers first
     const availableInv = inventory[item] || 0;
     const availableLeft = leftovers[item] || 0;
@@ -560,7 +561,7 @@ function craftItem(item, count, inventory, leftovers, crafted = { required: {}, 
     // Process each ingredient
     for (const [ingredientName, ingredientCount] of Object.entries(ingredients)) {
         const totalIngredientNeeded = ingredientCount * batchCount;
-        craftItem(ingredientName, totalIngredientNeeded, inventory, leftovers, crafted);
+        craftItem(ingredientName, totalIngredientNeeded, inventory, leftovers, crafted, [...path, item]);
     }
 
     // Add crafting step

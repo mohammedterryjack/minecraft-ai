@@ -171,7 +171,9 @@ describe('fix85 (D): collectBlock\'s search and the reach observation see the sa
         assert.strictEqual(getNearestBlock(bot, pred, 64), null);
         assert.strictEqual(getNearestBlocksWhere(bot, pred, 64, 1)[0].name, 'oak_planks');
         const src = Voyager.SEEDED_PRIMITIVES.find(p => p.name === 'collectBlock').code;
-        assert.match(src, /getNearestBlocksWhere\(bot, b => types\.includes\(b\.name\) && !excluded\.has\(posKey\(b\.position\)\), 64, 1\)/);
+        assert.match(src, /if \(b\.position === null\) return true/);
+        assert.match(src, /!excluded\.has\(posKey\(b\.position\)\)/);
+        assert.match(src, /getNearestBlocksWhere\(bot, b =>/);
         assert.ok(!src.includes('getNearestBlock(bot, b =>'));
         assert.match(src, /drops nothing in the game data; a reach need cannot obtain it/);
         assert.match(src, /reason: 'slot'/);

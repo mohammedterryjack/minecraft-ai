@@ -736,6 +736,8 @@ export async function collectBlock(bot, blockType, num=1, exclude=null) {
 
     for (let i=0; i<num; i++) {
         let blocks = world.getNearestBlocksWhere(bot, block => {
+            // fix86: the same palette probe as the seeded collectBlock. position is null until the block is placed.
+            if (block.position === null) return blocktypes.includes(block.name);
             if (!blocktypes.includes(block.name)) {
                 return false;
             }

@@ -1070,6 +1070,8 @@ export class Voyager {
   c.args  = the call's arguments after bot (numbers/strings; objects are null)
   c.ret   = the call's return value (primitive, or null for objects)
   c.pre / c.post = bot state before / after the call: { pos:{x,y,z}, hp (0-${skills.VITALS_MAX.health}), food (0-${skills.VITALS_MAX.food}), sky (sky light 0-15 at head height; 0 = underground or enclosed), alive (bool), dim (dimension string), inv:{item:count}, free (empty inventory slots), eq:{heldItem,offHand,helmet,chestplate,leggings,boots} }
+  pos is a plain {x,y,z}. It is not a Vec3 and has no methods. Distance is c.dist(a, b), never c.post.pos.dist(...).
+  eq.heldItem is the item's name (a string) or null, the same shape as a skill that returns that name. It is not an item object and has no .type.
   c.delta = inventory change {item: +n/-n}
   c.dist(a, b) = euclidean distance between two {x,y,z}
   c.game.item(name) / c.game.block(name) = true when name is an item / a block in the game data; c.game.drops(block) = names of the items that block drops; c.game.harvestTools(block) = the tools that block drops with, or null when the game data lists none
@@ -1121,7 +1123,79 @@ Use only c; no other globals.`;
     }
     _contractCtx(fields) { return { ...fields, dist: (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z), game: this._contractGame() }; }
     _compileContract(src) { const f = makeCompartment(this._getContractEndowments()).evaluate(`(${src})`); if (typeof f !== 'function') throw new Error('not a function'); return f; }
-    _validContract(ct) {
+    // fix86: a learned contract is checked against the real snapshot shape (plain pos, string heldItem, c.dist).
+    //        c.post.pos.dist and c.post.eq.heldItem.type are not on that shape, so they cannot be learned.
+    _contractShapeProblem(src) {
+        const { root, param } = this._parseContract(src);
+        if (param === null) return null;
+        const pos = { x: 0, y: 64, z: 0 };
+        const eq = { heldItem: 'iron_axe', offHand: null, helmet: null, chestplate: null, leggings: null, boots: null };
+        const state = { pos, hp: skills.VITALS_MAX.health, food: skills.VITALS_MAX.food, oxygen: skills.VITALS_MAX.health, sky: 15, alive: true, dim: 'overworld', inv: {}, free: 0, eq };
+        const sample = { args: [0, 'oak_log', 1], ret: true, pre: state, post: state, delta: {}, dist: (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z), game: { item: () => true, block: () => true, drops: () => [], harvestTools: () => null } };
+        const problems = [];
+        const unwrap = n => (n && n.type === 'ChainExpression' ? n.expression : n);
+        const check = (node, calling) => {
+            const path = this._contractPath(unwrap(node), param);
+            if (!path || path.includes('*')) return;
+            let cur = sample, map = false;
+            for (let i = 0; i < path.length; i++) {
+                const key = path[i], last = i === path.length - 1;
+                if (map) {
+                    if (!last || calling) problems.push(`c.${path.join('.')} is not on the contract state (a count is a number)`);
+                    return;
+                }
+                if (Array.isArray(cur)) {
+                    const idx = Number(key), numeric = String(idx) === key && Number.isInteger(idx);
+                    if (key !== 'length' && !numeric) { problems.push(`c.${path.join('.')} is not on the contract state`); return; }
+                    if (!last || calling) { problems.push(`c.${path.join('.')} is not on the contract state (an argument is a primitive)`); return; }
+                    return;
+                }
+                const missing = cur === null || cur === undefined || (typeof cur !== 'object' ? !(key in Object(cur)) : !Object.hasOwn(cur, key) && !(key in cur));
+                if (missing) {
+                    const where = path.slice(0, i).join('.');
+                    const kind = cur === null ? 'null' : typeof cur;
+                    problems.push(`c.${path.join('.')} is not on the contract state shape (${where ? `c.${where} is a ${kind}` : 'c'} has no ${key})`);
+                    return;
+                }
+                const next = cur[key];
+                if (last) {
+                    if (calling && typeof next !== 'function') problems.push(`c.${path.join('.')} is not a function on the contract state shape`);
+                    return;
+                }
+                map = key === 'inv' || key === 'delta';
+                cur = next;
+            }
+        };
+        this._walkAst(root.body, node => {
+            if (node.type === 'CallExpression') { const callee = unwrap(node.callee); if (callee.type === 'MemberExpression') check(callee, true); }
+            else if (node.type === 'MemberExpression') check(node, false);
+        });
+        return [...new Set(problems)].join('; ') || null;
+    }
+    // fix86: string returns in the skill body, used as probes when no traced run has been recorded yet
+    static returnedLiterals(code) {
+        let ast;
+        try { ast = acorn.parse(code, { ecmaVersion: 'latest', allowReturnOutsideFunction: true, allowAwaitOutsideFunction: true }); }
+        catch (e) { throw new Error(`[fix86] cannot parse skill code for return values: ${e.message}`); }
+        const out = [];
+        const walk = node => {
+            if (!node || typeof node.type !== 'string') return;
+            if (node.type === 'ReturnStatement' && node.argument && node.argument.type === 'Literal' && typeof node.argument.value === 'string') out.push(node.argument.value);
+            for (const v of Object.values(node)) {
+                if (Array.isArray(v)) { for (const x of v) walk(x); }
+                else if (v && typeof v === 'object' && typeof v.type === 'string') walk(v);
+            }
+        };
+        walk(ast);
+        return out;
+    }
+    _returnProbes(skill) {
+        if (!skill) return [];
+        if (Array.isArray(skill.observedRuns) && skill.observedRuns.length) return skill.observedRuns;
+        if (typeof skill.code !== 'string') return [];
+        return Voyager.returnedLiterals(skill.code).map(rv => ({ rv, heldItem: rv }));
+    }
+    _validContract(ct, skill) {
         if (!ct || typeof ct.post !== 'string' || typeof ct.pre !== 'string') return 'missing pre/post string';
         // fix43: include eq (equipment state) in test state for contract validation
         const eq = { heldItem: null, offHand: null, helmet: null, chestplate: null, leggings: null, boots: null };
@@ -1137,8 +1211,22 @@ Use only c; no other globals.`;
         if (tools !== null) return tools;
         const postRead = Voyager.contractPreReadsPost(ct.pre);
         if (postRead !== null) return `pre reads c.${postRead} (state after the call); a precondition may read c.pre and c.args only`;
+        for (const k of ['pre', 'post']) { const shape = this._contractShapeProblem(ct[k]); if (shape) return `${k}: ${shape}`; }
         const c = this._contractCtx({ args: [0, 64, 0, 'x', 1], ret: true, pre: s, post: s, delta: {} });
         try { for (const k of ['pre', 'post']) { const r = this._compileContract(ct[k])(c); if (typeof r !== 'boolean') return `${k} returned ${r === undefined ? 'undefined' : JSON.stringify(r)} (${typeof r}), not a boolean`; } } catch (e) { return `throws: ${e.message}`; }
+        // fix86: an equip post is checked against the skill's traced successful returns (or a string it returns).
+        //        heldItem is that string, not an item with .type. Posts that also read delta/inv are about the inventory, not this probe.
+        const fields = this._extractPostFields(ct.post);
+        const probes = fields.eq.includes('heldItem') && !fields.delta.length && !fields.inv.length ? this._returnProbes(skill) : [];
+        for (const p of probes) {
+            if (!p || !Object.hasOwn(p, 'rv') || !Object.hasOwn(p, 'heldItem')) throw new Error(`[fix86] return probe for ${skill.name} is missing rv or heldItem`);
+            const post = { ...s, eq: { ...eq, heldItem: p.heldItem } };
+            const ctx = this._contractCtx({ args: [0, 64, 0, 'x', 1], ret: p.rv, pre: s, post, delta: {} });
+            let r;
+            try { r = this._compileContract(ct.post)(ctx); }
+            catch (e) { return `post throws on the skill's return ${JSON.stringify(p.rv)}: ${e.message}`; }
+            if (r !== true) return `post is ${r === undefined ? 'undefined' : JSON.stringify(r)} for the skill's return ${JSON.stringify(p.rv)}; heldItem is ${JSON.stringify(p.heldItem)} (the item name, a string, the same shape as that return)`;
+        }
         return null;
     }
     // fix83: what a violated contract was given, for the model's feedback: the call with its real arguments (NaN, not JSON's
@@ -1601,6 +1689,12 @@ Use only c; no other globals.`;
         for (const r of trace) {
             if (r.intr || !r.s0 || !r.s1) continue;
             const e = this.skills.find(s => s.name === r.name);
+            // fix86: a string return is the equipped item name. The next contract for this skill is checked against it.
+            if (e && typeof r.rv === 'string') {
+                if (!r.s1.eq || !Object.hasOwn(r.s1.eq, 'heldItem')) throw new Error(`[fix86] trace of ${e.name} has no eq.heldItem`);
+                if (!Array.isArray(e.observedRuns)) e.observedRuns = [];
+                if (!e.observedRuns.some(p => p.rv === r.rv && p.heldItem === r.s1.eq.heldItem)) e.observedRuns.push({ rv: r.rv, heldItem: r.s1.eq.heldItem });
+            }
             if (!e?.contract) continue;
             const c = this._contractCtx({ args: r.argv, ret: r.rv, pre: r.s0, post: r.s1, delta: r.delta });
             for (const k of ['pre', 'post']) {
@@ -1610,7 +1704,19 @@ Use only c; no other globals.`;
                 if (k === 'post' && r.rv === false) continue;
                 let ok;
                 try { ok = this._compileContract(e.contract[k])(c); }
-                catch (err) { console.log(`!!! [contract] ${e.name}.${k} THREW: ${err.message}; queued contract repair`); this._queueContractFix(e, `${k} threw: ${err.message}`); continue; }
+                catch (err) {
+                    // fix86: c.post.pos.dist / similar throw TypeError. The contract is not the state shape; drop it.
+                    if (err instanceof TypeError && err.message.includes('is not a function')) {
+                        console.error(`[fix86] LOUD: ${e.name}.${k} calls a method the contract state does not have (${err.message}); deleting the contract`);
+                        delete e.contract;
+                        delete e.contractTried;
+                        this._saveSkills();
+                        break;
+                    }
+                    console.log(`!!! [contract] ${e.name}.${k} THREW: ${err.message}; queued contract repair`);
+                    this._queueContractFix(e, `${k} threw: ${err.message}`);
+                    continue;
+                }
                 if (ok !== false) { if (k === 'pre') r.preHeld = true; continue; }   // fix60: the callee's own precondition held in this state
                 if (k === 'pre' && !r.fail && r.rv !== false && r.rv !== null) { console.log(`[contract] ${e.name} precondition violated but the call succeeded -> precondition is wrong; queued contract repair`); this._queueContractFix(e, `precondition ${e.contract.pre} was false but the call succeeded (ret ${r.ret})`); continue; }
                 // fix45: when task passed and the skill's delta shows positive gain for its effects, don't attribute VIOLATED
@@ -1737,7 +1843,7 @@ Use only c; no other globals.`;
         let out; try { out = parseJSON(await this._ask(system, user)); } catch (err) { console.log(`[contract] learning FAILED: ${err.message}`); return 0; }
         let n = 0;
         for (const e of learnable) {
-            const ct = out?.[e.name], bad = this._validContract(ct);
+            const ct = out?.[e.name], bad = this._validContract(ct, e);
             e.contractTried = Date.now();
             if (bad) { e.contractFail = bad; console.log(`[contract] FAILED for ${e.name}: ${bad}`); continue; }
             delete e.contractFail;
@@ -1846,6 +1952,9 @@ Use only c; no other globals.`;
             const trial = e !== undefined && Boolean(e.candidate) && (n === root ? rootTrial : true);
             if (trial) {
                 if (!Array.isArray(e.candidate.deps)) throw new Error(`[fix81] candidate of ${n} has no deps array`);
+                // fix86: a trial that drops the unmet-need marker returns 0 with no reach need (live collectBlock repair)
+                const dropped = markerCallsMissing(e.code, e.candidate.code, PRECONDITION_UNMET_BINDING);
+                if (typeof dropped === 'string' && dropped.includes('repair dropped')) throw new Error(`[fix86] LOUD: trial of ${n} would drop the reported need: ${dropped}`);
                 over[n] = e.candidate.code;
                 st.push(...e.candidate.deps);
             } else if (Object.hasOwn(g, n)) st.push(...g[n]);
@@ -2261,9 +2370,12 @@ Use only c; no other globals.`;
         for (const s of this.skills) {
             if (s.demoted || s.mergedInto) continue;
             // exact name match (case-insensitive)
-            if (s.name.toLowerCase() === taskLower) return { name: s.name, call: `await ${s.name}(bot);` };
-            // exact task match (case-insensitive)
-            if (s.task && s.task.toLowerCase().trim() === taskLower) return { name: s.name, call: `await ${s.name}(bot);` };
+            if (s.name.toLowerCase() === taskLower || (s.task && s.task.toLowerCase().trim() === taskLower)) {
+                // fix86: a bare `await craftItem(bot)` leaves the item undefined ("Craft N of an item"). Skip it;
+                //        a parsed route supplies the arguments, and a bare call that still lacks them throws in _replay.
+                if (requiredArgs(s).length) continue;
+                return { name: s.name, call: `await ${s.name}(bot);` };
+            }
         }
         const goal = countGoal(task);
         const has = n => this.skills.some(s => s.name === n && !s.demoted);
@@ -2275,9 +2387,9 @@ Use only c; no other globals.`;
             return { name: 'mineOre', call: `await mineOre(bot, ${JSON.stringify(goal.item)}, ${goal.count});` };
         if (goal && ['mine', 'collect', 'gather', 'chop'].includes(goal.verb) && goal.item.endsWith('_log') && has('collectLogs'))
             return { name: 'collectLogs', call: `await collectLogs(bot, ${goal.count}, ${JSON.stringify(goal.item)});` };
-        if (goal && ['get', 'obtain'].includes(goal.verb) && has('obtainItem'))
+        if (goal && ['get', 'obtain'].includes(goal.verb) && has('obtainItem') && this._routeProducesFit('obtainItem', [goal.item]))
             return { name: 'obtainItem', call: `await obtainItem(bot, ${JSON.stringify(goal.item)}, ${goal.count});` };
-        if (goal && ['mine', 'collect', 'gather', 'chop'].includes(goal.verb) && this.skills.some(s => s.name === 'mineBlocks'))
+        if (goal && ['mine', 'collect', 'gather', 'chop'].includes(goal.verb) && this.skills.some(s => s.name === 'mineBlocks') && this._routeProducesFit('mineBlocks', [goal.item]))
             return { name: 'mineBlocks', call: `await mineBlocks(bot, ${JSON.stringify(goal.item)}, ${goal.count});` };
         if (goal && ['craft', 'get', 'make'].includes(goal.verb) && goal.item === 'torch' && has('craftTorches'))
             return { name: 'craftTorches', call: `await craftTorches(bot, ${goal.count});` };
@@ -2316,11 +2428,14 @@ Use only c; no other globals.`;
         const th = this.progress.replayThreshold ??= 0.85;
         const q = await this._embed(task);
         let best = null, bs = -1;
+        const g = this._resolveGoal(task);
+        const goalItems = g.kind === 'item' ? (g.items || [g.item]) : g.kind === 'ensure' || g.kind === 'reach' ? [g.item] : [];
         const IMPORTANT_PRIMITIVES = new Set(['tossClutter', 'tossItem', 'depositToChest']);
         for (const s of this.skills) {
             // fix41: allow important primitives (inventory freeing skills) even if s.primitive is true
             if (s.demoted || s.mergedInto || !s.task || /^(repair|refactor)\b/.test(s.task)) continue;
             if (s.primitive && !IMPORTANT_PRIMITIVES.has(s.name)) continue;
+            if (goalItems.length && !this._routeProducesFit(s.name, goalItems)) continue;
             const extra = (signatureOf(s.code, s.name).match(/\(([^)]*)\)/)?.[1] || '').split(',').slice(1).map(x => x.trim()).filter(Boolean);
             if (extra.some(x => !x.includes('='))) continue;   // needs arguments it cannot get from the task text
             if (!s.embedding || s.embedding.length !== q.length) continue;
@@ -2355,6 +2470,7 @@ Use only c; no other globals.`;
         const bot = this.agent.bot, inv = this.observe().inventory;
         try {
             if (c.pre === 'recipe') {
+                if (typeof c.item !== 'string' || c.item === '') throw new Error(`[fix86] LOUD: ${r.name} routed with no item (${r.call}); a subgoal cannot call a skill with an undefined item`);
                 const md = minecraftData(VERSION); const it = md.itemsByName[c.item];
                 if (!it) return { ok: false, why: `unknown item ${c.item}` };
                 const table = bot.findBlock({ matching: md.blocksByName.crafting_table.id, maxDistance: 32 });
@@ -2383,6 +2499,19 @@ Use only c; no other globals.`;
     // fix79: route evidence for an item goal on a route that is not parametrised by the goal (a bare `name(bot)` call; a
     //        parsed-contract route such as mineOre(bot, item, n) carries its item in its own contract). fits = the skill is
     //        learned to produce one of the goal items.
+    // fix86: a route to an item goal is a misroute when the skill's learned produces are non-empty and disjoint.
+    //        Empty produces is no evidence (the route may still be right). obtainItem and mineBlocks were routed on the verb alone.
+    _routeProducesFit(name, items) {
+        const e = this.skills.find(s => s.name === name && !s.demoted);
+        if (!e || !Array.isArray(e.effects)) return true;
+        const fromGraph = this.npGraph ? this.npGraph.confirmedProduces(e.name) : [];
+        const extra = e.candidate && Array.isArray(e.candidate.effects) ? e.candidate.effects : [];
+        const produces = [...new Set([...e.effects, ...extra, ...fromGraph])];
+        if (!produces.length) return true;
+        if (items.some(i => produces.includes(i))) return true;
+        console.log(`[fix86] ${name} learned produces [${produces.join(', ')}] do not include [${items.join(', ')}]`);
+        return false;
+    }
     _routeFit(e, goalItems) {
         if (!Array.isArray(goalItems) || !goalItems.length) throw new Error(`[fix79] _routeFit needs goal items, got ${JSON.stringify(goalItems)}`);
         const produces = this._learnedProduces(e);
@@ -2413,6 +2542,11 @@ Use only c; no other globals.`;
         CALLS.replay++;
         console.log(`[voyager] REPLAY skill ${r.name} for "${task}" (no code model)`);
         const entry = this.skills.find(s => s.name === r.name);
+        if (entry) {
+            const supplied = Voyager._callArgs(r.call);
+            const req = requiredArgs(entry);
+            if (supplied.length < req.length) throw new Error(`[fix86] LOUD: ${entry.name} requires ${req.join(', ')} after bot but ${r.call} passes ${supplied.length}`);
+        }
         // fix44: gate trials only when candidate effects overlap with task goal
         // Prevents trialing e.g. craftIronHelmet on an iron_pickaxe goal (wastes ingots, wrong outcome)
         let trial = false;
@@ -2432,9 +2566,11 @@ Use only c; no other globals.`;
         //        "Mine 1 diamond_ore", 85x). _gateTrial now checks the same predicate first, so reaching here is a bug.
         if (forced?.dedicatedTrial && !trial) throw new Error(`[fix79] dedicated trial of ${r.name} on "${task}" would run the incumbent: candidate does not fit the goal`);
         // fix79: route evidence for an item goal verified by gain on a bare-call route
-        const bareRoute = g.kind === 'item' && !r.free && !r.at && !this._contract(r);
+        // fix86: ensure and reach goals are the same kind of bare route (ensureFurnaceWithinSixteen on a collect path)
+        const routeItems = g.kind === 'item' ? goal.items : (g.kind === 'ensure' || g.kind === 'reach' ? [g.item] : []);
+        const bareRoute = routeItems.length > 0 && !r.free && !r.at && !this._contract(r);
         if (bareRoute && !entry) throw new Error(`[fix79] item goal "${task}" routed to ${r.name}, which is not in the skill library`);
-        const routeFit = bareRoute ? this._routeFit(entry, goal.items) : null;
+        const routeFit = bareRoute ? this._routeFit(entry, routeItems) : null;
         if (routeFit && !routeFit.fits) console.log(`!!! [route] ${r.name} routed to "${task}" with no learned evidence it produces [${routeFit.items.join(', ')}] (learned produces [${routeFit.produces.join(', ')}])`);
         // fix65: the goal-overlap gate above (#30) decides the ROOT's own candidate only. #30 also AND-ed it into the children,
         // so a child candidate ran only when the replayed root had a candidate of its own: replays (the common path) never
@@ -2472,6 +2608,7 @@ Use only c; no other globals.`;
         } finally { closeJournal(); }
         if (this.abort) return { ok: false, interrupted: true };
         const after = this.observe();
+        this._noteBroughtNear(entry, runBefore, after);
         let ok, unverified = false;
         const cut = res.interrupted || this._diedInRun() || this._stalledInRun() ? this._interruptReason(res) : '';   // fix14: a cut-off replay is a failure
         if (this._diedInRun()) this._noteDeath(this._diedInRun(), task);
@@ -2673,6 +2810,42 @@ Use only c; no other globals.`;
         if (!Array.isArray(state.nearby_blocks)) throw new Error('[fix83] state.nearby_blocks (array) required for reach goals');
         return state.nearby_blocks.includes(goal.item);
     }
+    // fix86: a run that made a block appear in nearby_blocks is evidence that skill can bring that block into range
+    _noteBroughtNear(entry, before, after) {
+        if (!entry) return;
+        if (!Array.isArray(before.nearby_blocks) || !Array.isArray(after.nearby_blocks)) return;
+        const had = new Set(before.nearby_blocks);
+        const gained = [];
+        for (const b of after.nearby_blocks) if (!had.has(b) && !gained.includes(b)) gained.push(b);
+        if (!gained.length) return;
+        if (!Array.isArray(entry.broughtNear)) entry.broughtNear = [];
+        let changed = false;
+        for (const b of gained) if (!entry.broughtNear.includes(b)) { entry.broughtNear.push(b); changed = true; }
+        if (changed) { console.log(`[fix86] ${entry.name} brought into range: ${gained.join(', ')}`); this._saveSkills(); }
+    }
+    // fix86: the learned skill (no required args) whose runs brought this block into nearby. Name order, no random pick.
+    _reachBringer(block) {
+        const fits = [];
+        for (const s of this.skills) {
+            if (s.demoted || s.mergedInto) continue;
+            if (!Array.isArray(s.broughtNear) || !s.broughtNear.includes(block)) continue;
+            if (requiredArgs(s).length) continue;
+            fits.push(s);
+        }
+        fits.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+        return fits.length ? fits[0] : null;
+    }
+    // fix86: arguments after bot, parsed the same way a contract sees them. A call that cannot be parsed fails loudly.
+    static _callArgs(call) {
+        const m = String(call).match(/\(bot(?:,\s*(.*))?\);?$/);
+        if (!m) throw new Error(`[fix86] LOUD: cannot read arguments of ${JSON.stringify(call)}`);
+        if (m[1] === undefined) return [];
+        let args;
+        try { args = JSON.parse(`[${m[1]}]`); }
+        catch (e) { throw new Error(`[fix86] LOUD: cannot parse arguments of ${JSON.stringify(call)}: ${e.message}`); }
+        if (!Array.isArray(args)) throw new Error(`[fix86] LOUD: arguments of ${JSON.stringify(call)} are not a list`);
+        return args;
+    }
     // fix81: the items being sought by the subgoal entry's ancestors (root first); a fresh task has none
     _prereqChain(entry) {
         if (entry === null) return [];
@@ -2769,6 +2942,17 @@ Use only c; no other globals.`;
                 for (const t of ch.ties) console.log(`[backchain] cost tie broken (proven edges, then name): ${t}`);
                 item = ch.item;
             }
+            // fix86: a contract that names one harvest tool (iron_pickaxe) is not the block's harvestTools.
+            //        The game data lists every tool that drops the goal; the cheapest of that set is the need.
+            if (n.reason === 'contract' && goal.kind === 'item' && item !== goal.item) {
+                const tools = this._obtainPlanner(state).toolsNeeded(goal.item, inv);
+                if (Array.isArray(tools) && tools.includes(item)) {
+                    const ch = this._obtainPlanner(state).cheapest(tools, n.count, inv);
+                    for (const t of ch.ties) console.log(`[backchain] cost tie broken (proven edges, then name): ${t}`);
+                    console.log(`[fix86] contract named ${item} for "${task}"; harvestTools choose ${ch.item} from [${tools.join(', ')}]`);
+                    item = ch.item;
+                }
+            }
             const need = { item, count: n.count, reason: n.reason, source: n.source };
             // fix84: a slot need names the drop that will not fit. That item IS the collect goal, and expanding it
             //        into the goal's own prerequisites would ask for the same item again instead of a free slot.
@@ -2801,6 +2985,9 @@ Use only c; no other globals.`;
                 continue;
             }
             subs.push(this._subgoalForNeed(n, state));
+        }
+        for (const sb of subs) {
+            if (sb.task === task) throw new Error(`[fix86] LOUD: subgoal cycle: "${task}" decomposes into itself`);
         }
         const edges = this.progress.recipeEdges;
         for (const sb of subs) if (sb.edge !== null && !Object.hasOwn(edges, sb.edge)) edges[sb.edge] = { task: sb.task, status: 'untried', runs: 0, fails: 0 };
@@ -2880,7 +3067,12 @@ Use only c; no other globals.`;
                 if (sub) return sub;
             }
         }
-        if (skill.task) return skill.task;
+        if (skill.task) {
+            const named = skill.task.split(/[^A-Za-z0-9_]+/).includes(item);
+            const g = this._resolveGoal(skill.task);
+            if ((g.kind === 'item' && g.item === item) || named) return skill.task;
+            throw new Error(`[fix86] LOUD: skill ${skill.name} produces ${item} but its task ${JSON.stringify(skill.task)} does not name ${item}; a subgoal cannot be built from a generic description`);
+        }
         return null;
     }
     // fix84: one need, one subgoal. proximity and reach are placement/search; a slot is a learned skill that has freed
@@ -4476,6 +4668,24 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         const ranCandidate = bs.filter(b => Object.prototype.hasOwnProperty.call(over, b.target));
         for (const b of ranCandidate) console.log(`[psn] blame of ${b.target} is its candidate's trial failure (counted by the gate); no repair of the incumbent from it: ${b.evidence.slice(0, LOG_EVIDENCE_CHARS)}`);
         bs = bs.filter(b => !ranCandidate.includes(b));
+        // fix86: a callee that did not throw, whose learned produces are non-empty and disjoint from the goal, is not
+        //        the failure (ensureFurnaceWithinSixteen on collectOakLog). A throw is still that skill's failure.
+        if (bs.length) {
+            const blamedGoal = this._resolveGoal(task);
+            const blamedItems = blamedGoal.kind === 'item' ? (blamedGoal.items || [blamedGoal.item]) : blamedGoal.kind === 'ensure' || blamedGoal.kind === 'reach' ? [blamedGoal.item] : [];
+            if (blamedItems.length) {
+                bs = bs.filter(b => {
+                    const e = this.skills.find(s => s.name === b.target);
+                    const rec = trace.find(t => t.name === b.target);
+                    if (!e || !rec || rec.err) return true;
+                    if (!this._routeProducesFit(b.target, blamedItems)) {
+                        console.log(`!!! [blame] MISROUTE: ${b.target} did not throw on "${task}" and its learned produces do not include [${blamedItems.join(', ')}]; not blamed`);
+                        return false;
+                    }
+                    return true;
+                });
+            }
+        }
         if (!bs.length && ranCandidate.length) return;
         // fix19 (2): no learned skill on a failure path: the root's own composition is at fault
         if (!bs.length) {
@@ -5132,9 +5342,14 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
         const goalKind = this._resolveGoal(task);
         // fix56: an open goal is routed only by identity/parsed routes or by the embedding match (nearest skill among all candidates AND above
         // the learned replay threshold); never by lexical word overlap, which picks unrelated well-rated skills
-        const route = goalKind.kind === 'skill' ? { name: goalKind.skill.name, call: `await ${goalKind.skill.name}(bot);` }
-            : goalKind.kind === 'open' ? this._structuredReplay(task) || await this._embedReplay(task)
-            : this._findReplay(task) || await this._embedReplay(task);   // fix28 (D): replay a matching learned skill before any code-model call
+        let route;
+        if (goalKind.kind === 'skill') route = { name: goalKind.skill.name, call: `await ${goalKind.skill.name}(bot);` };
+        else if (goalKind.kind === 'reach') {
+            // fix86: a learned skill whose traced runs brought this block into nearby is the search. No surface or wood special case.
+            const bringer = this._reachBringer(goalKind.item);
+            route = bringer ? { name: bringer.name, call: `await ${bringer.name}(bot);` } : (this._findReplay(task) || await this._embedReplay(task));
+        } else if (goalKind.kind === 'open') route = this._structuredReplay(task) || await this._embedReplay(task);
+        else route = this._findReplay(task) || await this._embedReplay(task);   // fix28 (D): replay a matching learned skill before any code-model call
         let rp = route ? await this._replay(task, before, route) : null;
         if (route?.embed) this._learnReplayThreshold(rp);
         if (!rp?.ok && !rp?.interrupted) { const bc = await this._backchain(task, rp ? this.observe() : before, rp ? rp.needs : null); if (bc) rp = { ...bc, needs: rp ? rp.needs : null }; }   // fix32 PSN backward chaining (fix81: on the missing item too)
@@ -5203,7 +5418,7 @@ Interrupts: the bot may be interrupted at any time (danger, getting stuck, a pla
         // fix37 (D): include inventory-full fact from replay failure in feedback for code gen
         // fix38: use extractFeedback to preserve FAILED lines
         let feedback = rp?.cut ? `Replay of ${rp.name} failed: ${rp.cut}\nExecution output:\n${extractFeedback(rp.output, 800)}${rp.invFullFact ? `\nInventory fact: ${rp.invFullFact}` : ''}` : '';
-        let lastCode = '', anyCut = rp?.cut || '', prevCrit = null;
+        let lastCode = '', anyCut = rp?.cut || '', prevCrit = null, lastTrace = null, duplicateStuck = false;
         // fix37: duplicate-reply detection state
         let prevReplyHash = null, consecutiveDupes = 0;
         for (let i = 1; i <= MAX_ATTEMPTS; i++) {
@@ -5244,10 +5459,11 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
                 consecutiveDupes++;
                 console.log(`[duplicate] DETECTED: code model reply #${i} is identical to reply #${i - 1} (hash ${replyHash}, consecutive dupes: ${consecutiveDupes})`);
                 if (consecutiveDupes >= 2) {
-                    console.error(`[duplicate] ABORT: 2 consecutive duplicate replies; task "${task}" FAILED LOUDLY (code model is stuck)`);
-                    this.progress.failed.push(`${task} (ABORTED: code model returned identical replies ${consecutiveDupes + 1} times)`);
-                    this._saveProgress();
-                    return;
+                    // fix86: returning here skipped the failure chain, so "reach oak_log" died on duplicate replies
+                    //        and never decomposed or retried. The post-loop records the failure and continues.
+                    console.error(`[duplicate] ABORT: 2 consecutive duplicate replies; task "${task}" failed (code model is stuck). Continuing to the failure chain.`);
+                    duplicateStuck = true;
+                    break;
                 }
                 // don't lint/exec, just reprompt with stronger feedback
                 feedback = `ERROR: Your reply was IDENTICAL to your previous attempt. The code model returned the exact same response twice. This is not acceptable. You MUST change your approach.\n\nPrevious code that failed:\n${lastCode}\n\nDo NOT repeat this code. Try a completely different strategy.`;
@@ -5330,6 +5546,10 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
                 : await this.critique(task, before, after, output, goal ? false : undefined);   // count goal not met by inventory -> ground truth false
             if (goal && gained >= goal.count) console.log(`[voyager] verified from inventory (+${gained} ${goal.item}), critic skipped`);
             console.log(`[voyager] attempt ${i} critic: success=${verdict.success} ${verdict.critique || ''}`);
+            // fix86: _attribute nulls bot.__psnTrace. The success workflow and the post-loop failure record read the snapshot.
+            const attemptTrace = this.agent.bot.__psnTrace;
+            if (!Array.isArray(attemptTrace)) throw new Error(`[fix86] attempt ${i} of "${task}" ran and left no __psnTrace`);
+            lastTrace = attemptTrace;
             this._attribute(own, task, !!verdict.success, over, null);   // fix11 (B7); fix79: generated code is not a route
             if (this._repairQueue?.some(x => x.target === own)) { console.log(`[psn] blame lands on the generated ${own} itself; the critic feedback loop fixes it (no library repair)`); this._repairQueue = this._repairQueue.filter(x => x.target !== own); }
             const same = !verdict.success && i >= 2 && prevCrit !== null && String(verdict.critique || '').trim() === prevCrit; prevCrit = String(verdict.critique || '').trim();   // fix32
@@ -5352,7 +5572,7 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
                 // ADAM-style: record inventory delta for needs/produces learning (fix70: over this attempt's run only)
                 this.npGraph.recordDelta(fn[1], runBefore.inventory, after.inventory, goalItems);
                 // AWM-style: extract workflow from multi-step trace
-                const trace = this.agent.bot.__psnTrace;
+                const trace = attemptTrace;
                 if (Array.isArray(trace) && trace.length >= 2) {
                     const steps = trace.filter(t => !t.name.startsWith('skills.')).map(t => t.name).slice(0, 8);
                     if (steps.length >= 2) {
@@ -5394,8 +5614,8 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
                 console.log(`[fix80] cut kind ${failKind}: not blamed on skill or goal backoff`);
                 this._lastCutKind = null;
             } else {
-            const trace = this.agent.bot.__psnTrace;
-            if (!trace) throw new Error('__psnTrace missing when recording failure');
+            const trace = lastTrace;
+            if (!Array.isArray(trace)) throw new Error(`[fix86] __psnTrace missing when recording failure of "${task}"`);
             const failingCalls = trace.filter(t => t.fail && !t.intr);
             // Only record backoff if there's a failing skill to attribute
             if (failingCalls.length > 0) {
@@ -5418,13 +5638,13 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
         if (!anyCut) {
             const bot = this.agent.bot, reported = peekPreconditionUnmet(bot);
             clearPreconditionUnmet(bot);
-            const needs = this._failureNeeds(task, reported, bot.__psnTrace, this.observe());
+            const needs = this._failureNeeds(task, reported, lastTrace, this.observe());
             this._noteEdgeOutcome(task, false);
             if (needs !== null && this._chainNeeds(task, needs, this.observe())) return;
         }
         // fix19 (1): failed twice (recently) or cut off -> decompose
         const fails = this.progress.failed.slice(-20).filter(t => t === task).length;
-        if (fails >= 2 || anyCut || this._decomposeQueue?.task === task) { if (this._decomposeQueue?.task === task) this._decomposeQueue = null; await this._decompose(task, anyCut || `failed ${fails}x; last critic: ${String(feedback).slice(-300)}${invFullReason}`); }
+        if (fails >= 2 || anyCut || duplicateStuck || this._decomposeQueue?.task === task) { if (this._decomposeQueue?.task === task) this._decomposeQueue = null; await this._decompose(task, duplicateStuck ? 'duplicate replies' : (anyCut || `failed ${fails}x; last critic: ${String(feedback).slice(-300)}${invFullReason}`)); }
         else if (this._curSub?.parent) console.log(`[psn] subgoal "${task}" failed; moving on`);
     }
 
@@ -5519,7 +5739,13 @@ Voyager.SEEDED_PRIMITIVES = [
     const posKey = p => \`\${Math.floor(p.x)},\${Math.floor(p.y)},\${Math.floor(p.z)}\`;
     for (let i = 0; i < num; i++) {
         if (bot.interrupt_code) break;
-        const found = getNearestBlocksWhere(bot, b => types.includes(b.name) && !excluded.has(posKey(b.position)), 64, 1);
+        // fix86: findBlocks calls the matcher on palette blocks (Block.fromStateId, position null) before a block is placed.
+        //        A matching type with no position means the section is scanned. posKey runs only on a placed block.
+        const found = getNearestBlocksWhere(bot, b => {
+            if (!types.includes(b.name)) return false;
+            if (b.position === null) return true;
+            return !excluded.has(posKey(b.position));
+        }, 64, 1);
         const block = found.length ? found[0] : null;
         if (!block) {
             if (excluded.size) log(bot, \`FAILED: no reachable \${blockType} nearby (\${excluded.size} unreachable block(s) excluded)\`);
@@ -5608,6 +5834,13 @@ Voyager.SEEDED_PRIMITIVES = [
         const closest = all.map(r => ({ r, missing: shortOf(r) })).sort((a, b) => units(a.missing) - units(b.missing))[0];
         const missing = closest.missing;
         if (!missing.length) { log(bot, \`FAILED: craftRecipe(\${itemName}): no recipe is makeable now, yet every ingredient of the closest one is held\`); return false; }
+        // fix86: num equal to the count already held is that total, not a shortfall of crafts. Reporting num * yield
+        //        and then adding the held count turned a torch craft of 79 (79 already held) into Craft 316 torch.
+        const haveOut = Object.hasOwn(inv, itemName) ? inv[itemName] : 0;
+        if (haveOut === num) {
+            log(bot, \`FAILED: craftRecipe(\${itemName}, \${num}): \${num} is already held. That count is the total on hand, not a shortfall of crafts.\`);
+            return false;
+        }
         // the need is the item itself: which ingredient variant to get (oak or birch planks ...) is the planner's choice
         __mcPreconditionUnmet__(bot, { need: { item: itemName, count: num * closest.r.result.count, reason: 'ingredients' }, missing });
         log(bot, \`Cannot craft \${itemName}: missing ingredients \${missing.map(m => \`\${m.item} (need \${m.need}, have \${m.have})\`).join(', ')}.\`);
