@@ -404,9 +404,13 @@ export class Voyager {
             if (s.candidate && !Array.isArray(s.candidate.effects)) throw new Error(`[psn] skill ${s.name}: candidate has no effects array (${JSON.stringify(s.candidate.effects)})`);
         }
         this.progress = existsSync(this.progressFile) ? JSON.parse(readFileSync(this.progressFile, 'utf8'))
-            : { completed: [], failed: [], enabled: true, goalStats: {} };
+            : { completed: [], failed: [], enabled: true, goalStats: {}, goalFailStates: [] };
         // fix49: ensure goalStats exists (older progress files may not have it)
         if (!this.progress.goalStats) this.progress.goalStats = {};
+        // fix90: each goal outcome tagged with the state it was observed in (inventory + nearby blocks).
+        // Older progress files do not have the array; it starts empty.
+        if (!Object.hasOwn(this.progress, 'goalFailStates')) this.progress.goalFailStates = [];
+        if (!Array.isArray(this.progress.goalFailStates)) throw new Error(`[fix90] progress.goalFailStates must be an array, got ${JSON.stringify(this.progress.goalFailStates)}`);
         // fix81: structured needs of failed goals (curriculum BLOCKERS) and game-data producer edges (untried until a run proves them).
         //        A blocker in the old fix47 { tool, block } shape cannot be resolved by item: refuse it loudly (the live file has none).
         if (!Object.hasOwn(this.progress, 'blockers')) this.progress.blockers = [];
@@ -1686,6 +1690,7 @@ Use only c; no other globals.`;
             // Failure is evidence: _replay → _attribute → skill stats. Reason is required (no silent 'serve failed').
             // The outcome also feeds the need's learned posterior (_goalBackoffMultiplier), so a task with HP stake can outrank it.
             if (typeof rp.reason === 'string' && rp.reason.length > 0) {
+                this._noteGoalState(label, false, rp.reason, before);
                 this._recordGoalOutcome(label, false, rp.reason);
                 console.log(`[urgent-need] raiser serve failed: ${rp.reason}; queues remain deferred`);
                 return true;
@@ -1703,14 +1708,23 @@ Use only c; no other globals.`;
         const hunText = this.vitals.hungerText(hun);
         const fact = hunText !== null ? hunText : winner.by;
         const note = `LEARNED vital need (pre-empts decompose/subgoal queues; they are deferred, not dropped): ${fact}. Propose ONE task that raises food using what the bot has.`;
-        const proposal = await this.proposeTask({ ...before, note });
+        let proposal = await this.proposeTask({ ...before, note });
         if (proposal === null) throw new Error('[fix80] proposeTask returned nothing for a cold-start vital need');
         if (proposal === undefined) throw new Error('[fix80] proposeTask returned nothing for a cold-start vital need');
         if (typeof proposal !== 'object') throw new Error('[fix80] proposeTask returned nothing for a cold-start vital need');
         if (proposal.task === null) throw new Error('[fix80] cold-start proposeTask.task is null');
         if (proposal.task === undefined) throw new Error('[fix80] cold-start proposeTask.task is undefined');
-        const task = String(proposal.task).trim();
-        if (task.length === 0) throw new Error('[fix80] cold-start proposeTask.task is empty');
+        if (typeof proposal.task !== 'string') throw new Error(`[fix80] cold-start proposeTask.task must be a string, got ${JSON.stringify(proposal.task)}`);
+        if (proposal.task.trim().length === 0) throw new Error('[fix80] cold-start proposeTask.task is empty');
+        // fix90: the same gate the curriculum step uses. A goal that just failed in this state is backed off
+        // by its posterior and the failure (goal, reason, state) is handed back to the next proposal.
+        const accepted = await this._acceptPlannerTask(proposal, before);
+        if (accepted === null) {
+            console.log('[urgent-need] cold-start proposal rejected by the learned posterior in this state; not pursued');
+            return true;
+        }
+        const task = accepted.task;
+        proposal = accepted.proposal;
         console.log(`[urgent-need] cold-start model proposal: ${task} (${proposal.reasoning}); pursuing via normal path under ${label}`);
         await this._pursueProposedTask(task, proposal, before);
         return true;
@@ -3070,7 +3084,149 @@ Use only c; no other globals.`;
     //   2. a violated learned pre-contract: the inventory items it read and the bot has none of (_checkContracts r.need)
     //   3. the goal's own prerequisites in the game data (recipe_plan.js): an item goal's missing harvest tool or
     //      ingredients; an ensure goal whose block is not in the inventory to place
+    //   4. fix90: a failure that means "no item of kind X" (the run said so, or every item the skill named is a member
+    //      of one game-data collection and the bot holds none of that collection). The satisfying set is the whole
+    //      collection (minecraft-data), an anyOf need, so _chainNeeds obtains one member. Not a per-kind branch:
+    //      the collections are read off the game data.
     //   null when none of them names anything (an open goal whose code reported nothing): the model decomposes it.
+    // fix90: why fix89's "lacked an input; backchained" did not run on the live hunger loop. That log is only in the
+    // raiser branch of _serveUrgentBody, and only when the replay already returned needs. Live, the food raiser was
+    // `consume` (a built-in, not a library skill), so the serve was "raiser none playable" and cold-started the
+    // curriculum. The curriculum replayed the skill goal eatFood. _failureNeeds returned null for that skill goal
+    // (no marker, no pre-contract inventory read, not an item goal), so _pursueProposedTask never called _chainNeeds.
+    // Both paths call _failureNeeds; a kind need returned from here is chained by the raiser branch and by
+    // _pursueProposedTask (on the need label while a need serve is current, so the next step yields to the subgoals).
+    _itemKinds(md) {
+        if (!md || !md.itemsByName) throw new Error('[fix90] _itemKinds: minecraft-data items required');
+        const itemCount = Object.keys(md.itemsByName).length;
+        if (itemCount < 2) throw new Error('[fix90] minecraft-data has no items');
+        const kinds = [];
+        for (const key of Object.keys(md)) {
+            if (key.endsWith('Array') || key.endsWith('ByName')) continue;
+            const items = this._collectionItems(md, md[key]);
+            if (items === null) continue;
+            if (items.length < 2 || items.length >= itemCount) continue;
+            kinds.push({ key, items, aliases: this._kindAliases(key) });
+        }
+        if (kinds.length === 0) throw new Error('[fix90] minecraft-data has no item-kind collection');
+        return kinds;
+    }
+    // A collection whose every record is an item (its name is an item), a proper subset of every item.
+    // ByName/Array copies of the same collection are skipped by the caller.
+    _collectionItems(md, val) {
+        if (!val || typeof val !== 'object' || typeof val === 'function') return null;
+        const entries = Array.isArray(val) ? val : Object.values(val);
+        if (entries.length < 2) return null;
+        const names = [];
+        for (const rec of entries) {
+            if (!rec || typeof rec !== 'object' || typeof rec.name !== 'string') return null;
+            // the record is an item when its name is an item. Numeric ids are not identity: they collide across
+            // game-data tables, and a later version's copy of an item table does not reuse the item id.
+            if (!Object.hasOwn(md.itemsByName, rec.name)) return null;
+            if (!names.includes(rec.name)) names.push(rec.name);
+        }
+        return names;
+    }
+    _kindAliases(key) {
+        if (typeof key !== 'string' || !/^[A-Za-z0-9_]+$/.test(key)) throw new Error(`[fix90] game-data kind key is not a name: ${JSON.stringify(key)}`);
+        const aliases = [key];
+        if (key.endsWith('s') && key.length > 1) aliases.push(key.slice(0, -1));
+        return aliases;
+    }
+    _kindsNamedIn(line, kinds) {
+        const hit = [];
+        for (const k of kinds) {
+            for (const alias of k.aliases) {
+                const re = new RegExp(`\\b(?:no|without|missing|lacks)\\s+${alias}\\b|\\b${alias}\\s+missing\\b`, 'i');
+                if (re.test(line)) { hit.push(k); break; }
+            }
+        }
+        return hit;
+    }
+    _ownFailLines(trace) {
+        if (!Array.isArray(trace)) return [];
+        const lines = [];
+        for (const r of trace) {
+            if (!Array.isArray(r.ownFail)) continue;
+            for (const line of r.ownFail) if (typeof line === 'string' && line.length > 0) lines.push(line);
+        }
+        return lines;
+    }
+    _quotedItemNames(code, itemsByName) {
+        if (typeof code !== 'string') throw new Error('[fix90] skill code must be a string');
+        const names = [];
+        const re = /['"]([a-z0-9_]+)['"]/g;
+        let m;
+        while ((m = re.exec(code)) !== null) {
+            if (Object.hasOwn(itemsByName, m[1]) && !names.includes(m[1])) names.push(m[1]);
+        }
+        return names;
+    }
+    _failureSkillCodes(task, trace, goal) {
+        const codes = [];
+        const push = (e) => {
+            if (!e || typeof e.code !== 'string') return;
+            if (!codes.includes(e.code)) codes.push(e.code);
+        };
+        if (goal.kind === 'skill') push(goal.skill);
+        if (typeof task === 'string') push(this.skills.find(s => s.name === task.trim()));
+        if (Array.isArray(trace)) {
+            for (const r of trace) {
+                if (typeof r.name !== 'string') continue;
+                push(this.skills.find(s => s.name === r.name));
+            }
+        }
+        return codes;
+    }
+    _holdsKind(inv, items) {
+        for (const name of items) {
+            if (Object.hasOwn(inv, name) && typeof inv[name] === 'number' && inv[name] > 0) return true;
+        }
+        return false;
+    }
+    _kindsCovering(kinds, names) {
+        const hit = [];
+        for (const k of kinds) {
+            let all = true;
+            for (const n of names) if (!k.items.includes(n)) { all = false; break; }
+            if (all) hit.push(k);
+        }
+        return hit;
+    }
+    _needsForKinds(kinds) {
+        return kinds.map(k => this._checkNeed({ anyOf: [...k.items].sort(), count: 1, reason: 'input' }, `no item of kind ${k.key}`));
+    }
+    // null when this failure is not "no item of kind X". One need per kind the bot does not hold.
+    _kindInputNeeds(task, trace, state, goal) {
+        if (!state || typeof state.inventory !== 'object' || state.inventory === null) throw new Error('[fix90] _kindInputNeeds: state.inventory required');
+        if (!VERSION) throw new Error('[fix90] _kindInputNeeds: VERSION required');
+        const md = minecraftData(VERSION);
+        if (!md || !md.itemsByName) throw new Error(`[fix90] no minecraft-data items for ${JSON.stringify(VERSION)}`);
+        const kinds = this._itemKinds(md);
+        const inv = state.inventory;
+        const named = [];
+        for (const line of this._ownFailLines(trace)) {
+            for (const k of this._kindsNamedIn(line, kinds)) if (!named.includes(k)) named.push(k);
+        }
+        if (named.length > 0) {
+            const missing = named.filter(k => !this._holdsKind(inv, k.items));
+            if (missing.length === 0) return null;
+            console.log(`[fix90] "${task}": failure names kind ${missing.map(k => k.key).join(', ')}; anyOf ${missing.map(k => k.items.length).join(', ')} item(s) from game data`);
+            return this._needsForKinds(missing);
+        }
+        const names = [];
+        for (const code of this._failureSkillCodes(task, trace, goal)) {
+            for (const n of this._quotedItemNames(code, md.itemsByName)) if (!names.includes(n)) names.push(n);
+        }
+        // one quoted item is that item (a contract read already reports it). A set of them that share one kind is the kind.
+        if (names.length < 2) return null;
+        const cover = this._kindsCovering(kinds, names);
+        if (cover.length > 1) throw new Error(`[fix90] LOUD: items [${names.join(', ')}] belong to more than one game-data kind (${cover.map(k => k.key).join(', ')})`);
+        if (cover.length === 0) return null;
+        if (this._holdsKind(inv, cover[0].items)) return null;
+        console.log(`[fix90] "${task}": skill names only items of kind ${cover[0].key} and the bot holds none; anyOf ${cover[0].items.length} from game data`);
+        return this._needsForKinds(cover);
+    }
     _failureNeeds(task, reported, trace, state) {
         // fix85: a need stamped on the root frame of this run is this task's. A need stamped only on a nested frame
         // (an iron_pickaxe craft inside "Collect 4 oak_planks") is that call's, and the global marker is the last write
@@ -3094,8 +3250,13 @@ Use only c; no other globals.`;
         }
         // fix83: nothing in the game data says where a block is: a reach goal that fails is decomposed / written by the model
         if (goal.kind === 'reach') return null;
-        // smelt goals ("Smelt N <raw> into N <out>") are furnace work the crafting recipes do not describe
-        if (goal.kind !== 'item' || Object.hasOwn(goal, 'input')) return null;
+        // smelt goals ("Smelt N <raw> into N <out>") are furnace work the crafting recipes do not describe.
+        // fix90: a skill/open goal (and a smelt goal) can still lack an item of a kind. Item goals keep the recipe plan below.
+        if (goal.kind !== 'item' || Object.hasOwn(goal, 'input')) {
+            const kind = this._kindInputNeeds(task, trace, state, goal);
+            if (kind !== null) return kind;
+            return null;
+        }
         const pre = this._obtainPlanner(state).prerequisites(goal.item, goal.count, state.inventory);
         for (const t of pre.ties) console.log(`[backchain] cost tie broken (proven edges, then name) planning ${goal.item}: ${t}`);
         if (pre.cycles.length) console.log(`[backchain] LOUD: ${pre.cycles.length} recipe cycle(s) in the game data excluded while planning ${goal.item}, through: ${[...new Set(pre.cycles.flatMap(c => c.split(' -> ')))].join(', ')}`);
@@ -3146,6 +3307,12 @@ Use only c; no other globals.`;
     //        (stone_pickaxe -> stick -> oak_planks -> oak_log). anyOf is resolved by the game-data cost (recipe_plan.js).
     //        A subgoal chain that comes back to something an ancestor seeks throws; a prereq retry that still lacks it is a
     //        failed goal, not re-run and not re-queued. Returns true when it handled the goal.
+    // fix90: a curriculum replay that happens inside a need serve (currentTask need:hunger) chains for that need,
+    // so _needServePending yields the next step to the subgoals. A raiser replay already passes the need label.
+    _chainOwner(task) {
+        if (typeof this.currentTask === 'string' && this.currentTask.startsWith('need:')) return this.currentTask;
+        return task;
+    }
     _chainNeeds(task, needs, state) {
         const cur = this._curSub !== null && this._curSub !== undefined && this._curSub.task === task ? this._curSub : null;
         const chain = this._prereqChain(cur);
@@ -4457,12 +4624,16 @@ Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
         for (const [k, v] of Object.entries(this.progress.goalStats)) if (k.startsWith(prefix)) { s += v.success; f += v.fail; }
         return { s, f };
     }
-    _goalBackoffMultiplier(task) {
-        const { s, f } = this._goalOutcomes(task);
+    // posterior mean (s+1)/(n+2), uniform prior. f === 0 → 1 (nothing to back off from).
+    _posteriorMean(s, f) {
+        if (typeof s !== 'number' || typeof f !== 'number' || Number.isNaN(s) || Number.isNaN(f)) throw new Error(`[fix90] posterior counts must be numbers, got ${JSON.stringify(s)}, ${JSON.stringify(f)}`);
         if (f === 0) return 1;
         const n = s + f;
-        // posterior mean: (s+1)/(n+2) - Bayesian with uniform prior
         return (s + 1) / (n + 2);
+    }
+    _goalBackoffMultiplier(task) {
+        const { s, f } = this._goalOutcomes(task);
+        return this._posteriorMean(s, f);
     }
     // fix55: a proposed goal runs with probability = its posterior success; otherwise it is backed off to the planner.
     // No constants: the odds come only from learned outcomes, and a backed-off goal still gets retried at that rate.
@@ -4472,14 +4643,106 @@ Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
         const { s, f } = this._goalOutcomes(task);
         return `backed off: it succeeded ${s} of ${s + f} tries (posterior success ${m.toFixed(2)}); propose something else`;
     }
-    // fix55: gate for a proposed task: syntax check, one goal resolver, learned backoff (planner proposals only)
-    _rejectTask(task, fromPlanner) {
+    _goalFailStates() {
+        if (!Object.hasOwn(this.progress, 'goalFailStates')) this.progress.goalFailStates = [];
+        if (!Array.isArray(this.progress.goalFailStates)) throw new Error(`[fix90] progress.goalFailStates must be an array, got ${JSON.stringify(this.progress.goalFailStates)}`);
+        return this.progress.goalFailStates;
+    }
+    // The state a "would this goal fail again" question is about: inventory counts and nearby blocks.
+    // Time, position and the food number are not part of it (hunger ticking is not a new state).
+    _goalStateKey(state) {
+        if (!state || typeof state !== 'object') throw new Error('[fix90] goal state required');
+        if (!state.inventory || typeof state.inventory !== 'object') throw new Error('[fix90] goal state.inventory required');
+        if (!Array.isArray(state.nearby_blocks)) throw new Error('[fix90] goal state.nearby_blocks required');
+        const inv = Object.keys(state.inventory).sort().map(k => `${k}:${state.inventory[k]}`).join(',');
+        const near = [...state.nearby_blocks].sort().join(',');
+        return `inv:${inv};near:${near}`;
+    }
+    _noteGoalState(task, ok, reason, state) {
+        if (typeof task !== 'string' || task.length === 0) throw new Error(`[fix90] goal state outcome needs a task, got ${JSON.stringify(task)}`);
+        if (typeof ok !== 'boolean') throw new Error(`[fix90] goal state outcome needs a boolean ok, got ${JSON.stringify(ok)}`);
+        if (ok === false && (typeof reason !== 'string' || reason.length === 0)) throw new Error('[fix90] a failed goal needs a reason');
+        if (ok === true && reason !== null) throw new Error('[fix90] a success has no failure reason');
+        this._goalFailStates().push({ task, ok, reason, state: this._goalStateKey(state) });
+    }
+    _stateCounts(task, key) {
+        let s = 0, f = 0;
+        for (const g of this._goalFailStates()) {
+            if (g.task !== task || g.state !== key) continue;
+            if (g.ok === true) s++;
+            else f++;
+        }
+        return { s, f };
+    }
+    // fix90: posterior of this goal in this state. Outcomes tagged to other states are not evidence here.
+    // A goal with no tagged outcomes at all still uses the global posterior (_goalBackoffMultiplier).
+    _goalStateBackedOff(task, state) {
+        const tagged = this._goalFailStates().filter(g => g.task === task);
+        if (tagged.length === 0) return this._goalBackedOff(task);
+        const key = this._goalStateKey(state);
+        const { s, f } = this._stateCounts(task, key);
+        if (f === 0) return null;
+        const m = this._posteriorMean(s, f);
+        if (Math.random() < m) return null;
+        let last = null;
+        for (const g of tagged) if (g.state === key && g.ok !== true) last = g;
+        if (last === null) throw new Error(`[fix90] ${task} counts ${f} failure(s) in this state but none are recorded`);
+        return `backed off: "${task}" failed in this state (${last.reason}; state ${key}; posterior success ${m.toFixed(2)}); propose something else`;
+    }
+    // Failures recorded in the state the curriculum is looking at, for the prompt.
+    _sameStateFailureHint(state) {
+        const rows = this._goalFailStates().filter(g => g.ok !== true);
+        if (rows.length === 0) return '';
+        if (!state || typeof state.inventory !== 'object' || state.inventory === null || !Array.isArray(state.nearby_blocks)) {
+            throw new Error('[fix90] curriculum state.inventory and state.nearby_blocks required to match recorded failures');
+        }
+        const key = this._goalStateKey(state);
+        const here = rows.filter(g => g.state === key);
+        if (here.length === 0) return '';
+        const byTask = new Map();
+        for (const g of here) byTask.set(g.task, g);
+        const parts = [];
+        for (const [task, g] of byTask) {
+            const { s, f } = this._stateCounts(task, key);
+            parts.push(`"${task}" failed because ${g.reason} (state ${key}; posterior success ${this._posteriorMean(s, f).toFixed(2)})`);
+        }
+        return `\nfailed_in_this_state (the state has not changed — propose a different task): ${parts.join('; ')}`;
+    }
+    // fix55: gate for a proposed task: syntax check, one goal resolver, learned backoff (planner proposals only).
+    // fix90: when the caller passes the state, backoff is the posterior in that state.
+    _rejectTask(task, fromPlanner, state) {
         if (!task) return 'empty task';
         const bad = validateTask(task);
         if (bad) return bad;
         const g = this._resolveGoal(task);
         if (g.kind === 'invalid') return g.why;
-        return fromPlanner ? this._goalBackedOff(task) : null;
+        if (!fromPlanner) return null;
+        if (state !== undefined && state !== null) return this._goalStateBackedOff(task, state);
+        return this._goalBackedOff(task);
+    }
+    // fix90: one planner proposal. A rejection is fed back (goal, reason, state) and the model is asked once more.
+    // null when the second proposal is rejected too — the caller does not run it.
+    async _acceptPlannerTask(proposal, state) {
+        if (proposal === null || proposal === undefined || typeof proposal !== 'object') throw new Error('[fix90] proposal required');
+        if (typeof proposal.task !== 'string') throw new Error(`[fix90] proposal.task must be a string, got ${JSON.stringify(proposal.task)}`);
+        let task = proposal.task.trim();
+        let why = this._rejectTask(task, true, state);
+        if (why === null) return { proposal, task };
+        console.log(`[voyager] rejected task "${task}": ${why}`);
+        this.progress.failed.push(`${task} (invalid: ${why})`);
+        const prev = typeof state.note === 'string' && state.note.length > 0 ? `${state.note}\n` : '';
+        const next = await this.proposeTask({ ...state, note: `${prev}Your last proposal "${task}" was rejected: ${why}` });
+        if (next === null || next === undefined || typeof next !== 'object') throw new Error('[fix90] proposeTask returned nothing after a rejection');
+        if (typeof next.task !== 'string') throw new Error(`[fix90] proposal.task must be a string, got ${JSON.stringify(next.task)}`);
+        task = next.task.trim();
+        why = this._rejectTask(task, true, state);
+        if (why !== null) {
+            console.log(`[voyager] rejected again "${task}": ${why}; skipping`);
+            this.progress.failed.push(`${task} (invalid: ${why})`);
+            this._saveProgress();
+            return null;
+        }
+        return { proposal: next, task };
     }
     
     // fix49: record goal outcome for backoff learning (keyed by goal + failure reason)
@@ -4503,6 +4766,7 @@ Rules:
 - NEVER go near the players' village around x=${VILLAGE.x}, z=${VILLAGE.z}; never take or break player builds.
 - Propose ONE concrete, verifiable task achievable in a few minutes with the current inventory and surroundings (e.g. "Mine 5 birch_log", "Craft 1 stone_pickaxe", "Smelt 3 iron_ingot", "Build a 5x5 cobblestone floor next to the hut").
 - Do not repeat completed tasks unless needed for progress; avoid tasks that failed recently unless prerequisites are now met.
+- Do not propose a task listed under failed_in_this_state. It already failed for the reason given and the state has not changed.
 - The bot must survive: dying loses its inventory. Nothing keeps it alive automatically (no eating, fleeing, fighting or sheltering reflexes), so survival is your job too: read time, health, food, threats and inventory space in the state and decide.
 - A task is either an item goal ("<verb> N <item>", "Smelt N <raw> into N <out>", "ensure <block>"), the bare name of a known skill that takes no arguments besides bot (it is verified by that skill's learned postcondition), or a short free-text task.
 Reply ONLY with JSON: {"reasoning": "ONE short sentence", "task": "...", "context": "short hint how to do it"}`;
@@ -4534,10 +4798,11 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "task": "...", "contex
         if (hunText) console.log(`[vitals] ${hunText}`);
         const recoveryHint = recText ? `\n${recText}` : '';
         const hungerHint = hunText ? `\n${hunText}` : '';
+        const failStateHint = this._sameStateFailureHint(state);   // fix90: goal, reason, state of failures in this state
         const user = `known_skills: ${JSON.stringify(knownSkillsFacts)}
 replayable_tasks (cheap, no new code needed): ${JSON.stringify(replayableTasks)} plus any "Mine N <block or ore>", "Collect N <log>", "Get N <item>", "Smelt N <raw> into N <out>", "Kill N <mob>", "Harvest N <crop>"
 completed_tasks: ${JSON.stringify(this.progress.completed.slice(-30))}
-failed_tasks: ${JSON.stringify(this.progress.failed.slice(-15))}${blockerHint}${edibleHint}${recoveryHint}${hungerHint}
+failed_tasks: ${JSON.stringify(this.progress.failed.slice(-15))}${blockerHint}${edibleHint}${recoveryHint}${hungerHint}${failStateHint}
 --- state (compact) ---
 ${compactStateText}
 current_health: ${Math.round(bot.health)}/${vmax.health}\ncurrent_food: ${bot.food}/${vmax.food} (${vmax.food}/${vmax.food} = full)${this._cursorLimited() ? '\nIMPORTANT: the code-writing model is unavailable right now, so ONLY propose a task from replayable_tasks or "Mine N <block>".' : ''}${workflowHints ? '\n' + workflowHints : ''}`;   // fix31: slow-changing lists first so Ollama reuses the cached prompt prefix
@@ -5591,6 +5856,7 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
             this.progress.completed.push(task); this.progress.failed = this.progress.failed.filter(t => t !== task);
             // fix47: clear blockers for this task when it passes
             this.progress.blockers = (this.progress.blockers || []).filter(b => b.task !== task);
+            this._noteGoalState(task, true, null, before);   // fix90
             this._recordGoalOutcome(task, true, null);  // fix49: backoff tracking
             this._saveProgress();
             this._subgoalDone(rp.name);
@@ -5598,13 +5864,17 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
             this._afterSuccess();
             return;
         }
-        if (rp && !rp.ok && !rp.interrupted && !rp.unmetPrecondition) { 
-            this._recordGoalOutcome(task, false, rp.reason || 'replay failed');  // fix49: backoff tracking
-            this.progress.failed.push(task); this._saveProgress(); this._windowCheck(false); 
+        if (rp && !rp.ok && !rp.interrupted && !rp.unmetPrecondition) {
+            const why = typeof rp.reason === 'string' && rp.reason.length > 0 ? rp.reason : 'replay failed';
+            this._noteGoalState(task, false, why, before);   // fix90: same-state posterior
+            this._recordGoalOutcome(task, false, why);  // fix49: backoff tracking
+            this.progress.failed.push(task); this._saveProgress(); this._windowCheck(false);
         }
         // fix81: the run said what it lacks: chain on that (subgoals) instead of writing new code for a goal that cannot pass yet
+        // fix90: while a need serve is current, the chain belongs to that need (need:hunger), not the skill name.
+        //        fix89 chained only in the raiser branch; a curriculum replay of the skill left the serve free to cold-start again.
         if (rp && !rp.ok && !rp.interrupted) this._noteEdgeOutcome(task, false);
-        if (rp && !rp.ok && Array.isArray(rp.needs)) { if (this._chainNeeds(task, rp.needs, this.observe())) return; }
+        if (rp && !rp.ok && Array.isArray(rp.needs)) { if (this._chainNeeds(this._chainOwner(task), rp.needs, this.observe())) return; }
         // fix55: a skill goal is that skill; its failure is already blamed/queued for repair by _attribute, so no new code is written for it
         if (goalKind.kind === 'skill') { console.log(`[voyager] skill goal ${task} failed its learned post-contract; repair of the skill handles it (no code generation)`); return; }
         if (this._cursorLimited()) { console.log(`[voyager] skipped "${task}": needs new code but Cursor is at its limit (replay-only mode)`); return; }
@@ -5884,7 +6154,7 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             clearPreconditionUnmet(bot);
             const needs = this._failureNeeds(task, reported, lastTrace, this.observe());
             this._noteEdgeOutcome(task, false);
-            if (needs !== null && this._chainNeeds(task, needs, this.observe())) return;
+            if (needs !== null && this._chainNeeds(this._chainOwner(task), needs, this.observe())) return;
         }
         // fix19 (1): failed twice (recently) or cut off -> decompose
         const fails = this.progress.failed.slice(-20).filter(t => t === task).length;
@@ -5920,15 +6190,24 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
         this._curSub = null;
         const sub = this._subgoalTask(), ms = null, fromCurr = !sub && !ms;
         let proposal = sub || ms || await this._takePlan(before);
-        let task = String(proposal.task || '').trim();
-        let invalid = this._rejectTask(task, fromCurr);   // fix55: invalid goals and learned backoff go back to the planner
-        if (invalid) {
-            console.log(`[voyager] rejected task "${task}": ${invalid}`);
-            this.progress.failed.push(`${task} (invalid: ${invalid})`);
-            proposal = await this.proposeTask({ ...before, note: `Your last proposal "${task}" was rejected: ${invalid}` });
+        let task;
+        if (fromCurr) {
+            // fix90: planner proposals are accepted or backed off in this state; the failure goes back into the next prompt
+            const accepted = await this._acceptPlannerTask(proposal, before);
+            if (accepted === null) return;
+            proposal = accepted.proposal;
+            task = accepted.task;
+        } else {
             task = String(proposal.task || '').trim();
-            invalid = this._rejectTask(task, true);
-            if (invalid) { console.log(`[voyager] rejected again "${task}": ${invalid}; skipping`); this._saveProgress(); return; }
+            const invalid = this._rejectTask(task, false);
+            if (invalid) {
+                console.log(`[voyager] rejected task "${task}": ${invalid}`);
+                this.progress.failed.push(`${task} (invalid: ${invalid})`);
+                proposal = await this.proposeTask({ ...before, note: `Your last proposal "${task}" was rejected: ${invalid}` });
+                task = String(proposal.task || '').trim();
+                const again = this._rejectTask(task, true, before);
+                if (again) { console.log(`[voyager] rejected again "${task}": ${again}; skipping`); this._saveProgress(); return; }
+            }
         }
         console.log(`[voyager] new task: ${task} (${proposal.reasoning})`);
         this.currentTask = task;

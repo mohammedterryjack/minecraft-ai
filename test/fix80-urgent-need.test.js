@@ -14,6 +14,7 @@ import {
     sampleBeta, pickUrgentCandidate,
 } from '../src/agent/urgent_need.js';
 import { stepErrorSignature } from '../src/agent/voyager.js';
+import { _setVersionForTest as loadMcData } from '../src/utils/mcdata.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, '..');
@@ -24,6 +25,7 @@ before(async () => {
     const mod = await import('../src/agent/voyager.js');
     Voyager = mod.Voyager;
     mod._setVersionForTest('1.21.4');
+    loadMcData('1.21.4');
 });
 
 function liveRegen(runs = {}) {
@@ -87,7 +89,7 @@ function mkV({ vitals, food = 10, health = 20, skillsList, proposeTask, decompos
         if (e) return { kind: 'skill', skill: e };
         return { kind: 'open' };
     };
-    v.observe = () => ({ inventory: {}, position: '0,64,0', time: 'day 0' });
+    v.observe = () => ({ inventory: {}, nearby_blocks: [], position: '0,64,0', time: 'day 0' });
     return v;
 }
 
