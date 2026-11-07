@@ -382,6 +382,34 @@ export function stepErrorSignature(e) {
     return `${e.name}: ${e.message} @ ${top === undefined ? '(no stack frame)' : top.trim()}`;
 }
 
+// fix91b: a blocker names exactly one of item (string) or anyOf (a non-empty array of non-empty strings).
+//         recipe_plan cheapest() plans `count` of one member; it does not add the members together.
+function readBlockerNames(entry, msg) {
+    const hasItem = typeof entry.item === 'string';
+    const hasAny = Object.hasOwn(entry, 'anyOf');
+    if (hasItem === hasAny) throw new Error(msg);
+    if (hasItem) return { item: entry.item };
+    if (!Array.isArray(entry.anyOf)) throw new Error(msg);
+    if (entry.anyOf.length === 0) throw new Error(msg);
+    const anyOf = [];
+    for (const name of entry.anyOf) {
+        if (typeof name !== 'string') throw new Error(msg);
+        if (name.length === 0) throw new Error(msg);
+        anyOf.push(name);
+    }
+    return { anyOf };
+}
+
+// fix81 boot check. fix91b: item XOR anyOf. A stored anyOf need has no item key (JSON drops undefined).
+export function assertProgressBlocker(b) {
+    const msg = `[fix81] progress.blockers entry is not a structured need { item | anyOf, count, reason, task }: ${JSON.stringify(b)}`;
+    if (b === null) throw new Error(msg);
+    if (typeof b !== 'object') throw new Error(msg);
+    if (!Number.isInteger(b.count)) throw new Error(msg);
+    if (typeof b.reason !== 'string') throw new Error(msg);
+    readBlockerNames(b, msg);
+}
+
 export class Voyager {
     constructor(agent) {
         this.agent = agent;
@@ -413,8 +441,10 @@ export class Voyager {
         if (!Array.isArray(this.progress.goalFailStates)) throw new Error(`[fix90] progress.goalFailStates must be an array, got ${JSON.stringify(this.progress.goalFailStates)}`);
         // fix81: structured needs of failed goals (curriculum BLOCKERS) and game-data producer edges (untried until a run proves them).
         //        A blocker in the old fix47 { tool, block } shape cannot be resolved by item: refuse it loudly (the live file has none).
+        //        fix91b: an anyOf need has no item. Writing { item: undefined } drops the key in JSON and the next boot exits.
+        //        Accept item XOR anyOf; anything else still throws.
         if (!Object.hasOwn(this.progress, 'blockers')) this.progress.blockers = [];
-        for (const b of this.progress.blockers) if (typeof b.item !== 'string' || !Number.isInteger(b.count) || typeof b.reason !== 'string') throw new Error(`[fix81] progress.blockers entry is not a structured need { item, count, reason, task }: ${JSON.stringify(b)}`);
+        for (const b of this.progress.blockers) assertProgressBlocker(b);
         if (!Object.hasOwn(this.progress, 'recipeEdges')) this.progress.recipeEdges = {};
         // fix58: learned vitals relations (food level -> hp regen, skill -> food/hp change), persisted with progress
         if (!this.progress.vitals) this.progress.vitals = { regen: {}, runs: {}, foodSamples: { drop: { n: 0, sum: 0 }, rise: { n: 0, sum: 0 } } };
@@ -3321,6 +3351,34 @@ Use only c; no other globals.`;
         if (typeof this.currentTask === 'string' && this.currentTask.startsWith('need:')) return this.currentTask;
         return task;
     }
+    // fix91b: the subgoal still pursues one item (cheapest of an anyOf). The blocker keeps the need's own shape:
+    // item XOR anyOf, anyOf copied. A need with neither is not written.
+    _resolveChainedNeed(n, inv, state, goal, task) {
+        const selector = readBlockerNames(n, `[fix91b] need must name exactly one of item / anyOf: ${JSON.stringify(n)}`);
+        let item;
+        if (Object.hasOwn(selector, 'anyOf')) {
+            const ch = this._obtainPlanner(state).cheapest(selector.anyOf, n.count, inv);
+            for (const t of ch.ties) console.log(`[backchain] cost tie broken (proven edges, then name): ${t}`);
+            item = ch.item;
+        } else {
+            item = selector.item;
+        }
+        // fix86: a contract that names one harvest tool (iron_pickaxe) is not the block's harvestTools.
+        //        The game data lists every tool that drops the goal; the cheapest of that set is the need.
+        if (n.reason === 'contract' && goal.kind === 'item' && item !== goal.item) {
+            const tools = this._obtainPlanner(state).toolsNeeded(goal.item, inv);
+            if (Array.isArray(tools) && tools.includes(item)) {
+                const ch = this._obtainPlanner(state).cheapest(tools, n.count, inv);
+                for (const t of ch.ties) console.log(`[backchain] cost tie broken (proven edges, then name): ${t}`);
+                console.log(`[fix86] contract named ${item} for "${task}"; harvestTools choose ${ch.item} from [${tools.join(', ')}]`);
+                item = ch.item;
+                if (Object.hasOwn(selector, 'item')) selector.item = item;
+            }
+        }
+        if (typeof item !== 'string') throw new Error(`[fix91b] need resolved to no item: ${JSON.stringify(n)}`);
+        if (item.length === 0) throw new Error(`[fix91b] need resolved to no item: ${JSON.stringify(n)}`);
+        return { item, count: n.count, reason: n.reason, source: n.source, selector };
+    }
     _chainNeeds(task, needs, state) {
         const cur = this._curSub !== null && this._curSub !== undefined && this._curSub.task === task ? this._curSub : null;
         const chain = this._prereqChain(cur);
@@ -3328,34 +3386,17 @@ Use only c; no other globals.`;
         const inv = state.inventory;
         const resolved = [];
         for (const n of needs) {
-            let item = n.item;
-            if (Object.hasOwn(n, 'anyOf')) {
-                const ch = this._obtainPlanner(state).cheapest(n.anyOf, n.count, inv);
-                for (const t of ch.ties) console.log(`[backchain] cost tie broken (proven edges, then name): ${t}`);
-                item = ch.item;
-            }
-            // fix86: a contract that names one harvest tool (iron_pickaxe) is not the block's harvestTools.
-            //        The game data lists every tool that drops the goal; the cheapest of that set is the need.
-            if (n.reason === 'contract' && goal.kind === 'item' && item !== goal.item) {
-                const tools = this._obtainPlanner(state).toolsNeeded(goal.item, inv);
-                if (Array.isArray(tools) && tools.includes(item)) {
-                    const ch = this._obtainPlanner(state).cheapest(tools, n.count, inv);
-                    for (const t of ch.ties) console.log(`[backchain] cost tie broken (proven edges, then name): ${t}`);
-                    console.log(`[fix86] contract named ${item} for "${task}"; harvestTools choose ${ch.item} from [${tools.join(', ')}]`);
-                    item = ch.item;
-                }
-            }
-            const need = { item, count: n.count, reason: n.reason, source: n.source };
+            const picked = this._resolveChainedNeed(n, inv, state, goal, task);
             // fix84: a slot need names the drop that will not fit. That item IS the collect goal, and expanding it
             //        into the goal's own prerequisites would ask for the same item again instead of a free slot.
-            if (goal.kind === 'item' && item === goal.item && n.reason !== 'proximity' && n.reason !== 'reach' && n.reason !== 'slot') {
+            if (goal.kind === 'item' && picked.item === goal.item && n.reason !== 'proximity' && n.reason !== 'reach' && n.reason !== 'slot') {
                 // the goal's own item could not be made: what it lacks is its own game-data prerequisites
                 const own = this._failureNeeds(task, null, null, state);
-                if (own === null) { console.log(`[backchain] "${task}": ${item} reported missing, but the game data shows nothing it lacks`); continue; }
-                resolved.push(...own.map(o => ({ item: o.item, count: o.count, reason: o.reason, source: o.source })));
+                if (own === null) { console.log(`[backchain] "${task}": ${picked.item} reported missing, but the game data shows nothing it lacks`); continue; }
+                for (const o of own) resolved.push(this._resolveChainedNeed(o, inv, state, goal, task));
                 continue;
             }
-            resolved.push(need);
+            resolved.push(picked);
         }
         if (!resolved.length) return false;
         const desc = resolved.map(n => `${n.count} ${n.item} (${n.reason}, ${n.source})`).join(', ');
@@ -3408,23 +3449,51 @@ Use only c; no other globals.`;
         // fix47's curriculum blockers, now from the structured needs (was the "Cannot break X" critic text); fix83: resolved once
         //        the bot HOLDS what the goal needs (held at the failure + shortfall), not once it holds the shortfall.
         //        fix84: a slot's count is how many more will not fit, not an absolute stack to hold.
+        //        fix91b: an anyOf need is stored as anyOf (copied), not as item: undefined. Its count is the need's count
+        //        of any one member (cheapest plans that many of one item; members are not summed). A single item still
+        //        stores held + shortfall, except proximity / reach / slot.
         this.progress.blockers = this.progress.blockers.filter(b => b.task !== task);
         const shortfallOnly = new Set(['proximity', 'reach', 'slot']);
         for (const n of resolved) {
-            const held = Object.hasOwn(inv, n.item) ? inv[n.item] : 0;
-            this.progress.blockers.push({ item: n.item, count: shortfallOnly.has(n.reason) ? n.count : held + n.count, reason: n.reason, task, at: Date.now() });
+            const sel = n.selector;
+            let count = n.count;
+            if (!shortfallOnly.has(n.reason) && Object.hasOwn(sel, 'item')) {
+                const held = Object.hasOwn(inv, sel.item) ? inv[sel.item] : 0;
+                count = held + n.count;
+            }
+            const row = { count, reason: n.reason, task, at: Date.now() };
+            if (Object.hasOwn(sel, 'anyOf')) row.anyOf = sel.anyOf;
+            else row.item = sel.item;
+            this.progress.blockers.push(row);
         }
         this._saveProgress();
         console.log(`[psn] DECOMPOSE (needs) "${task}" -> ${subs.map(sb => sb.task).join(', ')}; lacks ${desc}`);
         return true;
     }
-    // fix81: the curriculum's BLOCKERS line, from the structured needs of failed goals (_chainNeeds); a need is resolved once held
+    // fix91b: an anyOf blocker is met when one member is held at >= count. Not the sum: cheapest() plans `count` of one item.
+    _blockerSatisfied(b, inv) {
+        assertProgressBlocker(b);
+        if (Object.hasOwn(b, 'anyOf')) {
+            for (const name of b.anyOf) {
+                if (Object.hasOwn(inv, name) && inv[name] >= b.count) return true;
+            }
+            return false;
+        }
+        return Object.hasOwn(inv, b.item) && inv[b.item] >= b.count;
+    }
+    _blockerLabel(b) {
+        assertProgressBlocker(b);
+        if (Object.hasOwn(b, 'anyOf')) return `one of ${b.anyOf.join(', ')}`;
+        return b.item;
+    }
+    // fix81: the curriculum's BLOCKERS line, from the structured needs of failed goals (_chainNeeds); a need is resolved once held.
+    //        fix91b: anyOf renders as "one of a, b, c" (the full list; other anyOf text joins every name, it does not truncate).
     _blockerHint(inv) {
-        this.progress.blockers = this.progress.blockers.filter(b => !(Object.hasOwn(inv, b.item) && inv[b.item] >= b.count));
+        this.progress.blockers = this.progress.blockers.filter(b => !this._blockerSatisfied(b, inv));
         if (this.progress.blockers.length > 0) this._saveProgress();
         const blockers = this.progress.blockers;
         return blockers.length > 0
-            ? `\nBLOCKERS (prioritize these - what failed goals lack): ${blockers.map(b => `"${b.task}" needs ${b.count} ${b.item} (${b.reason})`).join('; ')}`
+            ? `\nBLOCKERS (prioritize these - what failed goals lack): ${blockers.map(b => `"${b.task}" needs ${b.count} ${this._blockerLabel(b)} (${b.reason})`).join('; ')}`
             : '';
     }
     // fix81: a game-data producer edge (progress.recipeEdges[item] = { task, status }) is a fact only once a run of its task proves it
@@ -4877,7 +4946,8 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "task": "...", "contex
         const knownSkillsFacts = this._knownSkillsFacts();
         const replayableTasks = this.skills.filter(s => s.task && !s.primitive).map(s => s.task.split(/\s+(?:within|at|using|from)\b/i)[0]).slice(-25);
         // fix47: include active blockers so curriculum prioritizes unblocking goals
-        // fix81: blockers are structured needs { item, count, reason, task } (from _chainNeeds); resolved once held
+        // fix81: blockers are structured needs { item | anyOf, count, reason, task } (from _chainNeeds); resolved once held
+        // fix91b: an anyOf blocker clears when any one member is held, and the line names every member
         const inv = state.inventory || {};
         const blockerHint = this._blockerHint(inv);
         // fix49: pass edible inventory (from minecraft-data foods) to curriculum - let the model rank

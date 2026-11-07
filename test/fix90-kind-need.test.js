@@ -167,10 +167,10 @@ describe('fix90: curriculum replay of eatFood chains the need onto the hunger se
         await v._pursueProposedTask('eatFood', { task: 'eatFood', reasoning: 'r', context: '' }, v.observe());
         const foods = new Set(foodNames());
         assert.ok(Object.hasOwn(v.progress.decomposed, 'need:hunger'), JSON.stringify(Object.keys(v.progress.decomposed)));
-        const blocker = v.progress.blockers.find(b => foods.has(b.item));
+        const blocker = v.progress.blockers.find(b => Array.isArray(b.anyOf) && b.anyOf.some(n => foods.has(n)));
         assert.ok(blocker, JSON.stringify(v.progress.blockers));
         assert.strictEqual(blocker.reason, 'input');
-        assert.ok(v.progress.subgoals.some(s => typeof s.task === 'string' && s.task.includes(blocker.item)), JSON.stringify(v.progress.subgoals));
+        assert.ok(v.progress.subgoals.some(s => typeof s.task === 'string' && blocker.anyOf.some(n => s.task.endsWith(' ' + n))), JSON.stringify(v.progress.subgoals));
     });
 
     it('cold start (raiser none playable) chains once; the next serve does not replay eatFood', async () => {
@@ -209,7 +209,7 @@ describe('fix90: curriculum replay of eatFood chains the need onto the hunger se
         assert.deepStrictEqual(calls, ['need:hunger']);
         assert.ok(Object.hasOwn(v.progress.decomposed, 'need:hunger'));
         const foods = new Set(foodNames());
-        assert.ok(v.progress.blockers.some(b => foods.has(b.item)));
+        assert.ok(v.progress.blockers.some(b => Array.isArray(b.anyOf) && b.anyOf.some(n => foods.has(n))));
         assert.strictEqual(await v._serveUrgent(), false);
         assert.deepStrictEqual(calls, ['need:hunger']);
     });
