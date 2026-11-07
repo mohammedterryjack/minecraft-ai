@@ -330,6 +330,66 @@ export function findAllCycles(graph) {
     return cycles;
 }
 
+// The function calls itself, inside its own body, with its own parameters unchanged.
+// A call with different arguments (bounded recursion) and a call after the function are not this.
+// Returns the function name, or null when the source has no such call. Same predicate _relink used to inline.
+function unconditionalSelfForward(code) {
+    const fnMatch = code.match(/(?:async\s+)?function\s+([A-Za-z_]\w*)\s*\(([^)]*)\)\s*\{/);
+    if (fnMatch === null) return null;
+    const fnName = fnMatch[1];
+    const params = fnMatch[2].split(',').map(p => p.split('=')[0].trim()).filter(Boolean);
+    let bi = fnMatch.index + fnMatch[0].length, depth = 1;
+    const bstart = bi;
+    while (bi < code.length && depth) { const ch = code[bi]; if (ch === '{') depth++; else if (ch === '}') depth--; bi++; }
+    const body = code.slice(bstart, bi - 1);
+    for (const m of body.matchAll(new RegExp(`(?<![.\\w])${fnName}\\s*\\(([^)]*)\\)`, 'g'))) {
+        const args = m[1].split(',').map(a => a.trim()).filter(Boolean);
+        if (args.length === params.length && args.every((a, k) => a === params[k])) return fnName;
+    }
+    return null;
+}
+
+// fix88: one check for installing `candidate` into `skills`.
+// A violation is a self-call (unconditional self-forward) or a dependency cycle the candidate would join.
+// Other learned skills' edges are read from their code with the candidate's name in the set, so a skill that
+// already calls the candidate is visible even when its stored deps were computed before the candidate existed.
+// Seeded skills keep their stored deps (fix39: _relink does not recompute them).
+// `candidate.deps` is the edge list that would be installed (saveSkill's library deps, after the seeded strip).
+// Returns [] when the candidate may be installed. Callers reject before any write, and _relink throws.
+export function installViolations(candidate, skills) {
+    if (candidate === null || typeof candidate !== 'object') throw new Error('[fix88] installViolations: candidate skill required');
+    if (typeof candidate.name !== 'string' || candidate.name.length === 0) throw new Error('[fix88] installViolations: candidate name required');
+    if (typeof candidate.code !== 'string') throw new Error(`[fix88] installViolations: ${candidate.name} code must be a string`);
+    if (!Array.isArray(candidate.deps)) throw new Error(`[fix88] installViolations: ${candidate.name} deps must be an array`);
+    if (!Array.isArray(skills)) throw new Error('[fix88] installViolations: skills must be an array');
+    const violations = [];
+    const self = unconditionalSelfForward(candidate.code);
+    if (self !== null) violations.push({ kind: 'self', name: candidate.name, fn: self });
+    const names = new Set();
+    for (const s of skills) {
+        if (typeof s.name !== 'string' || s.name.length === 0) throw new Error('[fix88] installViolations: skill set entry missing name');
+        names.add(s.name);
+    }
+    names.add(candidate.name);
+    const graph = {};
+    for (const s of skills) {
+        if (s.name === candidate.name) continue;
+        if (s.seeded === true) {
+            if (!Array.isArray(s.deps)) throw new Error(`[fix88] installViolations: seeded skill ${s.name} has no deps array`);
+            graph[s.name] = s.deps;
+        } else {
+            if (typeof s.code !== 'string') throw new Error(`[fix88] installViolations: skill ${s.name} has no code`);
+            graph[s.name] = depsOf(s.code, s.name, names);
+        }
+    }
+    graph[candidate.name] = candidate.deps;
+    for (const path of findAllCycles(graph)) {
+        if (!path.includes(candidate.name)) continue;
+        violations.push({ kind: 'cycle', path });
+    }
+    return violations;
+}
+
 export function newStats() { return { success: 0, fail: 0, streakFail: 0, tasks: [] }; }
 export function recordRun(stats, task, ok) {
     if (ok) { stats.success++; stats.streakFail = 0; if (task && !stats.tasks.includes(task)) { stats.tasks.push(task); stats.tasks = stats.tasks.slice(-10); } }
