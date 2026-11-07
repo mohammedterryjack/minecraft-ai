@@ -1720,14 +1720,22 @@ Use only c; no other globals.`;
         // by its posterior and the failure (goal, reason, state) is handed back to the next proposal.
         const accepted = await this._acceptPlannerTask(proposal, before);
         if (accepted === null) {
-            console.log('[urgent-need] cold-start proposal rejected by the learned posterior in this state; not pursued');
-            return true;
+            // fix91: a rejection is not a serve. The step continues to whatever is queued.
+            const n = this._queuedSubgoalCount();
+            console.log(`[urgent-need] cold-start proposal rejected by the learned posterior in this state; not pursued; leaving the step to ${n} queued subgoal(s)`);
+            return false;
         }
         const task = accepted.task;
         proposal = accepted.proposal;
         console.log(`[urgent-need] cold-start model proposal: ${task} (${proposal.reasoning}); pursuing via normal path under ${label}`);
-        await this._pursueProposedTask(task, proposal, before);
-        return true;
+        const acted = await this._pursueProposedTask(task, proposal, before);
+        if (acted === true) return true;
+        if (acted === false) {
+            const n = this._queuedSubgoalCount();
+            console.log(`[urgent-need] cold-start proposal "${task}" produced no action; leaving the step to ${n} queued subgoal(s)`);
+            return false;
+        }
+        throw new Error(`[fix91] _pursueProposedTask returned ${JSON.stringify(acted)} for "${task}"; expected true or false`);
     }
 
     // fix76: structural unmet-precondition classification (no message-text matching).
@@ -4539,6 +4547,94 @@ Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
         console.log(`[psn] DECOMPOSE "${task}" (${String(reason).slice(0, 120)}) -> ${subs.map((t, i) => `${i + 1}) ${t}`).join(' ')}; then retry the parent with the learned skills`);
         return true;
     }
+    // fix91: missing queue is empty. A non-array is a corrupt progress file.
+    _queuedSubgoalCount() {
+        const q = this.progress.subgoals;
+        if (q === undefined || q === null) return 0;
+        if (!Array.isArray(q)) throw new Error(`[fix91] progress.subgoals must be an array, got ${typeof q}`);
+        return q.length;
+    }
+    // fix91: why this head cannot run, from the task text and the recorded state. null means it can run.
+    // A child of a backed-off parent is not stale: the child is the decomposition. Only a retry of the
+    // parent itself is removed, and only when the learned posterior backs that goal off in this state.
+    _staleSubgoal(it, state) {
+        if (it === null || typeof it !== 'object') throw new Error(`[fix91] subgoal entry must be an object, got ${JSON.stringify(it)}`);
+        if (typeof it.task !== 'string' || it.task.length === 0) return 'empty task';
+        const task = it.task;
+        const bad = validateTask(task);
+        if (bad !== null) return bad;
+        const g = this._resolveGoal(task);
+        if (g.kind === 'invalid') return g.why;
+        const retry = it.retry === true;
+        if (!retry && typeof it.parent === 'string' && it.parent.length > 0) {
+            const parent = it.parent;
+            const done = this.progress.completed;
+            if (!Array.isArray(done)) throw new Error('[fix91] progress.completed must be an array');
+            if (done.includes(parent)) return `parent "${parent}" is already completed`;
+            const d = this.progress.decomposed;
+            if (d === null || d === undefined || typeof d !== 'object' || !Object.hasOwn(d, parent)) return `parent "${parent}" has no decomposition`;
+            const rec = d[parent];
+            if (rec === null || typeof rec !== 'object') throw new Error(`[fix91] decomposed[${JSON.stringify(parent)}] must be an object`);
+            if (!Array.isArray(rec.subs)) throw new Error(`[fix91] decomposed[${JSON.stringify(parent)}].subs must be an array`);
+            if (!rec.subs.includes(task)) return `parent "${parent}" no longer lists "${task}"`;
+        }
+        if (retry) {
+            const why = this._goalStateBackedOff(task, state);
+            if (why !== null) return why;
+        }
+        return null;
+    }
+    _dropSubgoal(it, why) {
+        const q = this.progress.subgoals;
+        if (!Array.isArray(q) || q.length === 0 || q[0] !== it) throw new Error(`[fix91] cannot drop subgoal ${JSON.stringify(it && it.task)}: it is not the queue head`);
+        q.shift();
+        if (!Array.isArray(this.progress.failed)) throw new Error('[fix91] progress.failed must be an array');
+        this.progress.failed.push(`${it.task} (stale: ${why})`);
+        this._saveProgress();
+        console.log(`[psn] LOUD: subgoal "${it.task}" removed (${why})`);
+    }
+    // Same record a pursue makes when the goal already holds: success, not a fake failure.
+    _noteSatisfiedSubgoal(task, reason) {
+        console.log(`[voyager] goal already satisfied: ${task} (${reason})`);
+        if (!Array.isArray(this.progress.completed)) throw new Error('[fix91] progress.completed must be an array');
+        this.progress.completed.push(task);
+        if (!Array.isArray(this.progress.failed)) throw new Error('[fix91] progress.failed must be an array');
+        this.progress.failed = this.progress.failed.filter(t => t !== task);
+        if (Array.isArray(this.progress.blockers)) this.progress.blockers = this.progress.blockers.filter(b => b.task !== task);
+        this._recordGoalOutcome(task, true, null);
+        this._saveProgress();
+        if (typeof this.agent.openChat === 'function') this.agent.openChat(`Done: ${task} (already satisfied: ${reason}).`);
+        this._afterSuccess();
+    }
+    // fix91: the next subgoal that the state still supports. Dead heads are removed here, in this step,
+    // until one can run or the queue is empty. An empty or missing queue returns null and does not call
+    // _subgoalTask (callers that stub _subgoalTask still reach the planner).
+    _nextSubgoal(state) {
+        const q = this.progress.subgoals;
+        if (q === undefined || q === null) return null;
+        if (!Array.isArray(q)) throw new Error(`[fix91] progress.subgoals must be an array, got ${typeof q}`);
+        while (q.length > 0) {
+            const it = q[0];
+            const why = this._staleSubgoal(it, state);
+            if (why !== null) {
+                this._dropSubgoal(it, why);
+                continue;
+            }
+            const prev = this._curSub;
+            this._curSub = it;
+            let sat;
+            try { sat = this._goalAlreadySatisfied(it.task, state); }
+            finally { this._curSub = prev; }
+            if (sat.satisfied !== true && sat.satisfied !== false) throw new Error(`[fix91] _goalAlreadySatisfied("${it.task}") returned no boolean satisfied`);
+            if (sat.satisfied === true) {
+                q.shift();
+                this._noteSatisfiedSubgoal(it.task, sat.reason);
+                continue;
+            }
+            return this._subgoalTask();
+        }
+        return null;
+    }
     _subgoalTask() {
         const q = this.progress.subgoals || []; if (!q.length) return null;
         const it = q.shift(); this._saveProgress(); this._curSub = it;
@@ -5831,7 +5927,7 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
             this._saveProgress();
             this.agent.openChat?.(`Done: ${task} (already satisfied: ${alreadySatisfied.reason}).`);
             this._afterSuccess();
-            return;
+            return false;   // fix91: nothing ran; the caller may take the next queued subgoal
         }
         console.log(`[voyager] goal "${task}" not yet satisfied: ${alreadySatisfied.reason}`);
 
@@ -5850,7 +5946,7 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
         let rp = route ? await this._replay(task, before, route) : null;
         if (route?.embed) this._learnReplayThreshold(rp);
         if (!rp?.ok && !rp?.interrupted) { const bc = await this._backchain(task, rp ? this.observe() : before, rp ? rp.needs : null); if (bc) rp = { ...bc, needs: rp ? rp.needs : null }; }   // fix32 PSN backward chaining (fix81: on the missing item too)
-        if (rp?.interrupted) { console.log('[voyager] task interrupted'); return; }
+        if (rp?.interrupted) { console.log('[voyager] task interrupted'); return true; }
         if (rp?.ok) {
             this._noteEdgeOutcome(task, true);   // fix81
             this.progress.completed.push(task); this.progress.failed = this.progress.failed.filter(t => t !== task);
@@ -5862,7 +5958,7 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
             this._subgoalDone(rp.name);
             this.agent.openChat?.(`Done: ${task} (replayed ${rp.name}).`);
             this._afterSuccess();
-            return;
+            return true;
         }
         if (rp && !rp.ok && !rp.interrupted && !rp.unmetPrecondition) {
             const why = typeof rp.reason === 'string' && rp.reason.length > 0 ? rp.reason : 'replay failed';
@@ -5874,10 +5970,15 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
         // fix90: while a need serve is current, the chain belongs to that need (need:hunger), not the skill name.
         //        fix89 chained only in the raiser branch; a curriculum replay of the skill left the serve free to cold-start again.
         if (rp && !rp.ok && !rp.interrupted) this._noteEdgeOutcome(task, false);
-        if (rp && !rp.ok && Array.isArray(rp.needs)) { if (this._chainNeeds(this._chainOwner(task), rp.needs, this.observe())) return; }
+        if (rp && !rp.ok && Array.isArray(rp.needs)) { if (this._chainNeeds(this._chainOwner(task), rp.needs, this.observe())) return true; }
         // fix55: a skill goal is that skill; its failure is already blamed/queued for repair by _attribute, so no new code is written for it
-        if (goalKind.kind === 'skill') { console.log(`[voyager] skill goal ${task} failed its learned post-contract; repair of the skill handles it (no code generation)`); return; }
-        if (this._cursorLimited()) { console.log(`[voyager] skipped "${task}": needs new code but Cursor is at its limit (replay-only mode)`); return; }
+        if (goalKind.kind === 'skill') { console.log(`[voyager] skill goal ${task} failed its learned post-contract; repair of the skill handles it (no code generation)`); return true; }
+        if (this._cursorLimited()) {
+            console.log(`[voyager] skipped "${task}": needs new code but Cursor is at its limit (replay-only mode)`);
+            // fix91: a replay that already ran used the step. No route and no replay means nothing ran.
+            if (rp === null) return false;
+            return true;
+        }
         this.agent.openChat?.(`New goal: ${task}`);
         // fix28 (B): the prompt carries only the skills nomic-embed-text ranks relevant, plus their dependency closures (all skills stay defined in scope)
         // fix47: use configurable skill_topk and api_topk from settings (no fallback - must be set)
@@ -5924,7 +6025,7 @@ Interrupts: the bot may be interrupted at any time (danger, getting stuck, a pla
         // fix37: duplicate-reply detection state
         let prevReplyHash = null, consecutiveDupes = 0;
         for (let i = 1; i <= MAX_ATTEMPTS; i++) {
-            if (this.abort) { console.log('[voyager] aborted for player'); return; }
+            if (this.abort) { console.log('[voyager] aborted for player'); return true; }
             // fix37: escalating duplicate feedback (changes each time to nudge the model)
             const dupeEscalation = consecutiveDupes > 0 ? `\n\n!!! CRITICAL: Your previous ${consecutiveDupes} reply(ies) were IDENTICAL to the one before. You MUST write DIFFERENT code this time. The previous code did not work. Change your approach, use different skills, or try a simpler strategy. Repeating the same code will cause this task to fail. !!!` : '';
             // fix47: use compact state for efficient prompts (verbose state is available via _stateText if needed)
@@ -6034,7 +6135,7 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
                 }, 5);
             } finally { closeJournal(); }
             console.log(`[timing] game action attempt ${i} took ${Date.now() - this._runStart}ms`);   // fix23: measurement
-            if (this.abort) { console.log('[voyager] task interrupted'); return; }
+            if (this.abort) { console.log('[voyager] task interrupted'); return true; }
             const cut = res.interrupted || this._diedInRun() || this._stalledInRun() ? this._interruptReason(res) : '';   // fix14: cut-off code counts as a failed attempt
             if (this._diedInRun()) this._noteDeath(this._diedInRun(), task);
             if (cut) anyCut = cut;
@@ -6095,7 +6196,7 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
                 }
                 this.agent.openChat?.(`Done: ${task}. Learned skill ${fn[1]}.`);
                 this._afterSuccess();
-                return;
+                return true;
             }
             // fix37 (D): detect inventory-full when code gen fails
             const invFullFact = !verdict.success ? this._detectInventoryFullFailure(task, before, after, output) : null;
@@ -6154,12 +6255,13 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             clearPreconditionUnmet(bot);
             const needs = this._failureNeeds(task, reported, lastTrace, this.observe());
             this._noteEdgeOutcome(task, false);
-            if (needs !== null && this._chainNeeds(this._chainOwner(task), needs, this.observe())) return;
+            if (needs !== null && this._chainNeeds(this._chainOwner(task), needs, this.observe())) return true;
         }
         // fix19 (1): failed twice (recently) or cut off -> decompose
         const fails = this.progress.failed.slice(-20).filter(t => t === task).length;
         if (fails >= 2 || anyCut || duplicateStuck || this._decomposeQueue?.task === task) { if (this._decomposeQueue?.task === task) this._decomposeQueue = null; await this._decompose(task, duplicateStuck ? 'duplicate replies' : (anyCut || `failed ${fails}x; last critic: ${String(feedback).slice(-300)}${invFullReason}`)); }
         else if (this._curSub?.parent) console.log(`[psn] subgoal "${task}" failed; moving on`);
+        return true;
     }
 
     async _step() {
@@ -6171,11 +6273,23 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
         // fix18: no hard-coded survival/housekeeping policy; the curriculum proposes it and the PSN learns it
         this._requeueDeferred();   // fix26
         if (this._apiLinted !== this._apiSignature()) { this._apiLinted = this._apiSignature(); await this._queueApiLintRepairs(); }   // fix67
-        if (this._repairQueue?.length) { await this._repair(); return; }
+        if (this._repairQueue?.length) {
+            const repaired = await this._repair();
+            if (repaired === true) return;
+            if (repaired !== false) throw new Error(`[fix91] _repair returned ${JSON.stringify(repaired)}; expected true or false`);
+            console.log('[fix91] repair produced nothing; the step continues');
+        }
         // fix80: one shared pre-emption slot (hunger now; fix77 threat later). After repairs, BEFORE decompose/subgoals
         // so a fresh decomposition cannot starve the need for a whole LLM call. Queues stay untouched (BT re-tick).
+        // fix91: a serve that did not act returns false and the step continues to the queued subgoals.
         if (await this._serveUrgent()) return;
-        if (this._decomposeQueue) { const dq = this._decomposeQueue; this._decomposeQueue = null; await this._decompose(dq.task, dq.reason); return; }
+        if (this._decomposeQueue) {
+            const dq = this._decomposeQueue; this._decomposeQueue = null;
+            const decomposed = await this._decompose(dq.task, dq.reason);
+            if (decomposed === true) return;
+            if (decomposed !== false) throw new Error(`[fix91] _decompose returned ${JSON.stringify(decomposed)}; expected true or false`);
+            console.log(`[fix91] decompose of "${dq.task}" produced nothing; the step continues`);
+        }
         if (!this.progress.fix25) this._fix25Migrate();
         if (await this._gateTrial()) return;   // fix28
         if (await this._backfillContracts()) return;   // fix22
@@ -6188,7 +6302,7 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
         if (await this._idlePractice()) return;
         const before = this.observe();
         this._curSub = null;
-        const sub = this._subgoalTask(), ms = null, fromCurr = !sub && !ms;
+        const sub = this._nextSubgoal(before), ms = null, fromCurr = sub === null && ms === null;
         let proposal = sub || ms || await this._takePlan(before);
         let task;
         if (fromCurr) {
@@ -6198,16 +6312,12 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             proposal = accepted.proposal;
             task = accepted.task;
         } else {
-            task = String(proposal.task || '').trim();
+            if (typeof proposal.task !== 'string' || proposal.task.trim().length === 0) throw new Error(`[fix91] taken subgoal has no task string: ${JSON.stringify(proposal)}`);
+            task = proposal.task.trim();
+            // fix91: _nextSubgoal already dropped invalid heads. A taken subgoal that still fails the gate is a bug,
+            // and asking the planner here used to end the step while the rest of the queue sat there.
             const invalid = this._rejectTask(task, false);
-            if (invalid) {
-                console.log(`[voyager] rejected task "${task}": ${invalid}`);
-                this.progress.failed.push(`${task} (invalid: ${invalid})`);
-                proposal = await this.proposeTask({ ...before, note: `Your last proposal "${task}" was rejected: ${invalid}` });
-                task = String(proposal.task || '').trim();
-                const again = this._rejectTask(task, true, before);
-                if (again) { console.log(`[voyager] rejected again "${task}": ${again}; skipping`); this._saveProgress(); return; }
-            }
+            if (invalid !== null) throw new Error(`[fix91] queued subgoal "${task}" failed the task gate after it was taken: ${invalid}`);
         }
         console.log(`[voyager] new task: ${task} (${proposal.reasoning})`);
         this.currentTask = task;
