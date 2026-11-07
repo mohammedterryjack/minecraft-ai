@@ -39,10 +39,19 @@ export class VitalsModel {
         const e = this.s.runs[name]; e.n++; e.food += s1.food - s0.food; e.hp += s1.hp - s0.hp;
         return e;
     }
-    // skills whose observed mean food change per run is positive, best first
+    // fix89: the per-run food effect this model publishes (raisersText, the serve log). Selection uses the
+    //        same measurement: a mean the report prints as +0.0 is not a learned raise.
+    static reportedFoodPerRun(mean) {
+        if (typeof mean !== 'number' || Number.isNaN(mean)) throw new Error(`[fix89] food/run must be a number, got ${JSON.stringify(mean)}`);
+        return mean.toFixed(1);
+    }
+    static raisesFood(mean) {
+        return Number(VitalsModel.reportedFoodPerRun(mean)) > 0;
+    }
+    // skills whose published per-run food effect is a raise, best first
     foodRaisers() {
         return Object.entries(this.s.runs).map(([name, e]) => ({ name, n: e.n, food: e.food / e.n, hp: e.hp / e.n }))
-            .filter(x => x.food > 0).sort((a, b) => b.food - a.food);
+            .filter(x => VitalsModel.raisesFood(x.food)).sort((a, b) => b.food - a.food);
     }
     // learned recovery outlook at the current vitals.
     // blocked: hp below max, every food level <= current has 0 rises, a higher level has rises, and at that level's observed rise
@@ -90,7 +99,7 @@ export class VitalsModel {
     static raisersText(raisers) {
         if (!Array.isArray(raisers)) throw new Error(`[fix74] raisersText needs the foodRaisers() list, got ${JSON.stringify(raisers)}`);
         if (!raisers.length) return 'none observed yet';
-        return raisers.map(x => `${x.name} +${x.food.toFixed(1)} food/run (${x.n} runs)`).join(', ');
+        return raisers.map(x => `${x.name} +${VitalsModel.reportedFoodPerRun(x.food)} food/run (${x.n} runs)`).join(', ');
     }
     // fix80: drive-reduction serve predicate. NOT hunger().urgent (true at 19/20 → thrash as a trigger).
     // Only belowRegen triggers pre-emption: above the learned floor there is no HP-harm evidence in VitalsModel

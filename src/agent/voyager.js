@@ -1528,7 +1528,7 @@ Use only c; no other globals.`;
     _hungerServeBy(st) {
         const floor = st.firstRise !== null ? `learned regen food floor ${st.firstRise.f}` : 'no regen food floor learned yet';
         const why = `food ${st.food}/${st.foodMax} below ${floor}`;
-        const raiser = st.best !== null ? `${st.best.entry.name} +${st.K.toFixed(1)} food/run` : 'none playable';
+        const raiser = st.best !== null ? `${st.best.entry.name} +${VitalsModel.reportedFoodPerRun(st.K)} food/run` : 'none playable';
         return `hunger ${why}; raiser ${raiser}; regenLossHp ${st.regenLossHp}`;
     }
     // Learned HP at stake if we continue `taskName`, from death evidence on that task (deathSpots.tasks).
@@ -1569,8 +1569,11 @@ Use only c; no other globals.`;
                 if (typeof f !== 'number') throw new Error(`[fix80] raiser stats.success/fail must be numbers`);
             }
             const draw = sampleBeta(s + 1, f + 1);
+            // fix89: a need that has failed is worth its Thompson draw times its learned posterior success
+            // (the same (s+1)/(n+2) a goal's backoff uses). Fresh needs (no failures) keep multiplier 1.
+            const needPosterior = this._goalBackoffMultiplier('need:hunger');
             candidates.push({
-                id: 'hunger', kind: 'need', value: draw * st.regenLossHp,
+                id: 'hunger', kind: 'need', value: draw * st.regenLossHp * needPosterior,
                 draw, st, by: this._hungerServeBy(st),
             });
         }
@@ -1590,6 +1593,26 @@ Use only c; no other globals.`;
         }
         // fix77: ThreatModel candidates append here, same value units (expected HP loss).
         return candidates;
+    }
+    // fix89: a need serve that already chained subgoals for what it lacks. Those subgoals ARE the serve;
+    //        replaying the raiser again would starve them. True while any of that chain is still queued.
+    _needServePending(label) {
+        const d = this.progress.decomposed;
+        if (d === null) return false;
+        if (d === undefined) return false;
+        if (!Object.hasOwn(d, label)) return false;
+        const rec = d[label];
+        if (rec === null) throw new Error(`[fix89] decomposed[${JSON.stringify(label)}] must be an object`);
+        if (typeof rec !== 'object') throw new Error(`[fix89] decomposed[${JSON.stringify(label)}] must be an object`);
+        if (!Array.isArray(rec.subs)) throw new Error(`[fix89] decomposed[${JSON.stringify(label)}].subs must be an array`);
+        const q = this.progress.subgoals;
+        if (!Array.isArray(q)) return false;
+        for (const t of rec.subs) {
+            for (const s of q) {
+                if (s.task === t) return true;
+            }
+        }
+        return false;
     }
     // One step-boundary serve. Returns true when this step was consumed serving a need.
     async _serveUrgent() {
@@ -1621,6 +1644,17 @@ Use only c; no other globals.`;
         const winner = pickUrgentCandidate(candidates);
         if (winner.id !== 'hunger') return false;
         if (!(winner.value > 0)) return false;   // no HP-harm evidence → leave the step to the task/curriculum
+        // fix89: the backchain from the last failed serve is the work that obtains the missing input
+        if (this._needServePending('need:hunger')) {
+            console.log('[urgent-need] hunger backchain still queued; leaving the step to that work');
+            return false;
+        }
+        // fix89: runs were measured and none of them publish a food raise. That is learned, not "no raiser yet",
+        //        so this is not a cold start: other work runs.
+        if (st.best === null && Object.keys(this.vitals.s.runs).length > 0 && this.vitals.foodRaisers().length === 0) {
+            console.log('[urgent-need] measured skill runs do not raise food; leaving the step to other work');
+            return false;
+        }
 
         const nSub = Array.isArray(this.progress.subgoals) ? this.progress.subgoals.length : 0;
         const hasDec = Boolean(this._decomposeQueue);
@@ -1641,8 +1675,18 @@ Use only c; no other globals.`;
                 this._afterSuccess();
                 return true;
             }
+            // fix89: a missing input is a structured need. Chain it (the same path a failed goal uses) instead of
+            //        replaying the raiser. The next step leaves the step to that chain (_needServePending).
+            if (Array.isArray(rp.needs) && rp.needs.length > 0) {
+                if (this._chainNeeds(label, rp.needs, this.observe())) {
+                    console.log(`[urgent-need] ${st.best.entry.name} lacked an input; backchained`);
+                    return true;
+                }
+            }
             // Failure is evidence: _replay → _attribute → skill stats. Reason is required (no silent 'serve failed').
+            // The outcome also feeds the need's learned posterior (_goalBackoffMultiplier), so a task with HP stake can outrank it.
             if (typeof rp.reason === 'string' && rp.reason.length > 0) {
+                this._recordGoalOutcome(label, false, rp.reason);
                 console.log(`[urgent-need] raiser serve failed: ${rp.reason}; queues remain deferred`);
                 return true;
             }
@@ -1744,7 +1788,10 @@ Use only c; no other globals.`;
                     continue;
                 }
                 if (ok !== false) { if (k === 'pre') r.preHeld = true; continue; }   // fix60: the callee's own precondition held in this state
-                if (k === 'pre' && !r.fail && r.rv !== false && r.rv !== null) { console.log(`[contract] ${e.name} precondition violated but the call succeeded -> precondition is wrong; queued contract repair`); this._queueContractFix(e, `precondition ${e.contract.pre} was false but the call succeeded (ret ${r.ret})`); continue; }
+                // fix89: undefined is the default return, not a success. A violated pre is "the contract is wrong" only
+                //        when the call returned an explicit success (true, a string, a number other than 0). Otherwise
+                //        the pre names a real lack and _contractNeed turns the inventory reads into a structured need.
+                if (k === 'pre' && !r.fail && r.rv !== undefined && r.rv !== false && r.rv !== null) { console.log(`[contract] ${e.name} precondition violated but the call succeeded -> precondition is wrong; queued contract repair`); this._queueContractFix(e, `precondition ${e.contract.pre} was false but the call succeeded (ret ${r.ret})`); continue; }
                 // fix45: when task passed and the skill's delta shows positive gain for its effects, don't attribute VIOLATED
                 // The delta is the ground truth; if the contract formula disagrees, the contract is wrong, not the skill
                 if (taskOk && k === 'post') {
@@ -2747,6 +2794,7 @@ Use only c; no other globals.`;
         if (ok) this.npGraph.recordDelta(r.name, runBefore.inventory, after.inventory, goalItems);   // fix70: this run only
         // fix81: what the failed run lacked (not for a misroute: the wrong skill's needs are not the goal's)
         const needs = !ok && !libFault && !cut && !misrouted ? this._failureNeeds(task, reported, failTrace, after) : null;
+        const reason = !ok ? this._failureReason(failTrace) : null;   // fix89: FAILED lines already on the trace
 
         // fix37 (D): detect and log inventory-full as a fact for learning
         const invFullFact = !ok ? this._detectInventoryFullFailure(task, before, after, String(res.message || '')) : null;
@@ -2762,6 +2810,7 @@ Use only c; no other globals.`;
         const out = { ok, name: r.name, output: String(res.message || ''), cut, invFullFact, unverified, needs };
         // fix79: the route takes the blame: ok stays false (goal outcome, learned embedding threshold) and the reason names the route
         if (misrouted) return { ...out, misrouted: routeFit, reason: `misrouted: ${r.name} has no learned evidence it produces ${routeFit.items.join('/')}` };
+        if (typeof reason === 'string') return { ...out, reason };   // fix89
         return out;
     }
     // library source with optional per-name code overrides (candidates under test)
@@ -3070,6 +3119,25 @@ Use only c; no other globals.`;
             return null;
         }
         return pre.steps.map(st => this._checkNeed({ item: st.item, count: st.count, reason: pre.tool === null ? 'ingredients' : 'tool' }, 'game data'));
+    }
+    // fix89: the deepest failure line annotateTrace already pulled out of the run's own output (ownFail).
+    //        _replay copies it onto the result so a serve failure is not "without a reason" while the output holds the evidence.
+    _failureReason(trace) {
+        if (!Array.isArray(trace)) return null;
+        let best = null;
+        for (const r of trace) {
+            if (!Array.isArray(r.ownFail)) continue;
+            const depth = r.depth;
+            if (typeof depth !== 'number') throw new Error(`[fix89] trace frame ${JSON.stringify(r.name)} has no numeric depth`);
+            for (const line of r.ownFail) {
+                if (typeof line !== 'string') continue;
+                if (line.length === 0) continue;
+                if (best === null) best = { depth, name: r.name, line };
+                else if (depth > best.depth) best = { depth, name: r.name, line };
+            }
+        }
+        if (best === null) return null;
+        return `${best.name}: ${best.line}`;
     }
     _checkNeed(need, source) { return { ...checkNeed(need, source), source }; }
     // fix81: chain on what the failed goal lacks (not only on the goal item). Each need becomes a subgoal in
