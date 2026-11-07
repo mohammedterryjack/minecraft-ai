@@ -83,13 +83,14 @@ async function test(bot) {
 
 // Issue 2: Deposit should use ONLY known chest memory
 describe('fix51 issue 2: deposit uses only known chest memory', async () => {
-    it('_freeInventory fails loud when __knownChests not initialized', async () => {
+    it('_freeInventory takes the slot deficit and a capacity plan', async () => {
         const skillsSrc = readFileSync('./src/agent/library/skills.js', 'utf8');
-        // Should check if bot.__knownChests exists
-        assert.ok(skillsSrc.includes('if (!bot.__knownChests)'),
-            'should check if __knownChests is initialized');
-        assert.ok(skillsSrc.includes('not initialized'),
-            'should fail loud if __knownChests not initialized');
+        assert.ok(skillsSrc.includes('async function _freeInventory(bot, slotsNeeded, plan)'),
+            'the helper takes the deficit and the plan as arguments');
+        assert.ok(skillsSrc.includes('[slot] verified empty_before='),
+            'success is the measured empty-slot change');
+        assert.ok(skillsSrc.includes("throw new Error('[_freeInventory] plan must list removals"),
+            'a missing plan fails loud');
     });
 
     it('_freeInventory uses __knownChests directly (no fallback)', async () => {
@@ -358,16 +359,24 @@ describe('fix51 issue 8: satisfaction check uses exact inventory count', async (
 
 // Issue 9 (live run-2): TypeError reading 'length' in tossSurplusClutter
 describe('fix51 issue 9: tossClutter fail-loud checks', async () => {
-    it('tossClutter checks Array.isArray(bot.__safeToToss)', () => {
+    it('tossClutter requires the slot deficit and the plan', () => {
         const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
-        assert.ok(voyagerSrc.includes('Array.isArray(bot.__safeToToss)'),
-            'should check if __safeToToss is an array');
+        const start = voyagerSrc.indexOf("name: 'tossClutter'");
+        const section = voyagerSrc.slice(start, voyagerSrc.indexOf('deps:', start));
+        assert.ok(section.includes('async function tossClutter(bot, slotsNeeded, plan)'),
+            'the deficit and the plan are explicit arguments');
+        assert.ok(!section.includes('__slotsNeeded'),
+            'the seeded toss does not read bot.__slotsNeeded');
     });
 
-    it('tossClutter fails loud if __safeToToss not initialized', () => {
+    it('tossClutter fails loud when the plan is missing or stale', () => {
         const voyagerSrc = readFileSync('./src/agent/voyager.js', 'utf8');
-        assert.ok(voyagerSrc.includes('FAIL LOUD') && voyagerSrc.includes('__safeToToss'),
-            'should log FAIL LOUD if __safeToToss not initialized');
+        const start = voyagerSrc.indexOf("name: 'tossClutter'");
+        const section = voyagerSrc.slice(start, voyagerSrc.indexOf('deps:', start));
+        assert.ok(section.includes('[fix92] tossClutter: plan must list removals'),
+            'a missing plan throws a named error');
+        assert.ok(section.includes('stale plan'),
+            'a plan the inventory no longer matches throws');
     });
 
     it('_prepareTossSignals sets __safeToToss', () => {
@@ -789,8 +798,8 @@ describe('fix51 issue 17b: tossClutter return value fix', async () => {
             'tossClutter should NOT return emptySlotCount on failure');
         assert.ok(section.includes('return false;'),
             'tossClutter should return false on failure');
-        assert.ok(section.includes('return tossed + depositedTotal;'),
-            'tossClutter should return stacks removed on success (truthy only when inventory shrank)');
+        assert.ok(section.includes('return actual;'),
+            'tossClutter should return the measured slots freed, which is truthy only when empty slots increased');
     });
 
     it('tossClutter does not use magic sleep timer', async () => {

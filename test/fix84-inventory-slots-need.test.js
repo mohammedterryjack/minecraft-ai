@@ -14,7 +14,7 @@ import { join } from 'node:path';
 import { parsesAsScript } from '../src/agent/skill_graph.js';
 import { loadManifest, applyManifest } from '../scripts/reset_bug_poisoned.js';
 import { SlotEffects } from '../src/agent/slot_effects.js';
-import { roomFor, placeCounts, stackableCounts, bestSlotFreeingCraft, surplusFromConsumption, slotsOccupied } from '../src/agent/slot_room.js';
+import { roomFor, placeCounts, bestSlotFreeingCraft, surplusFromConsumption } from '../src/agent/slot_room.js';
 import { roomForItem } from '../src/agent/library/world.js';
 
 const require = createRequire(import.meta.url);
@@ -38,6 +38,17 @@ function sync(bot, inv) {
 }
 
 function applyTask(task, inv, nearby, v) {
+    if (task === 'tossClutter') {
+        const req = v._curSub && v._curSub.slotRequest;
+        if (!req || !Array.isArray(req.removals)) throw new Error('test world: tossClutter without a slot plan');
+        for (const row of req.removals) {
+            if (!Object.hasOwn(inv, row.item) || inv[row.item] < row.remove) throw new Error(`test world: cannot toss ${row.remove} ${row.item}`);
+            inv[row.item] -= row.remove;
+            if (inv[row.item] === 0) delete inv[row.item];
+        }
+        sync(v.agent.bot, inv);
+        return { ok: true };
+    }
     if (task === 'depositSurplus') {
         if (!nearby.includes('chest')) return { ok: false, reported: { kind: 'precondition', need: { item: 'chest', count: 1, reason: 'proximity' } } };
         const ss = registry.itemsByName.dragon_egg.stackSize;
@@ -148,61 +159,77 @@ async function drive(v, task) {
 }
 const quiet = async f => { const o = console.log; console.log = () => {}; try { return await f(); } finally { console.log = o; } };
 
-const depositor = () => skill('depositSurplus');
-const freed = name => ({ [name]: { n: 1, freed: 1 } });
+function evidence(items = {}) { return { runs: 1, items }; }
 
-describe('fix84: a full inventory collecting a log chains through deposit, and a craft frees the slot', () => {
+describe('fix84: a full inventory whose held kinds are reserved is broken by a slot-freeing craft', () => {
     const full = () => ({ coal: 1, stick: 1, dragon_egg: 34 * registry.itemsByName.dragon_egg.stackSize });
-    it('deposit asks for a chest, collecting that chest hits the slot again, and the torch craft (stack sizes) breaks it', async () => {
+    it('reserved eggs, coal and sticks stay, and the torch craft (stack sizes) frees the slot for the log', async () => {
         const inv = full();
         const freeing = bestSlotFreeingCraft(registry, id => Recipe.find(id), inv);
         assert.ok(freeing && freeing.freed >= 1, 'the held coal and stick craft into one slot');
-        const v = mkV({ inv, nearby: [], skills: [depositor()], runs: freed('depositSurplus') });
+        const holder = skill('holds', {
+            consumeEvidence: evidence(),
+            useEvidence: evidence({
+                dragon_egg: { runs: 1, max: inv.dragon_egg },
+                coal: { runs: 1, max: 1 },
+                stick: { runs: 1, max: 1 },
+            }),
+        });
+        const v = mkV({ inv, nearby: [], skills: [holder], runs: {} });
         await quiet(() => drive(v, 'Collect 1 oak_log'));
-        assert.ok(v.ran.includes('depositSurplus'), v.ran.join(' -> '));
-        assert.ok(v.ran.includes('ensure chest'), v.ran.join(' -> '));
         assert.ok(v.ran.includes(freeing.task), v.ran.join(' -> '));
+        assert.strictEqual(inv.dragon_egg, 34 * registry.itemsByName.dragon_egg.stackSize);
         assert.ok(has(inv, 'oak_log') >= 1);
         assert.ok(v.progress.completed.includes('Collect 1 oak_log'));
     });
-    it('with no learned slot-freeing skill the need is an open task for code-gen, and the blocker count is the shortfall', async () => {
+    it('a plan that frees a slot but has no tossClutter throws instead of inventing an open task', async () => {
         const ss = registry.itemsByName.oak_log.stackSize;
         const inv = { oak_log: ss, dragon_egg: 35 * registry.itemsByName.dragon_egg.stackSize };
         const v = mkV({ inv, nearby: [], skills: [], runs: {} });
-        await quiet(() => v._pursueProposedTask('Collect 65 oak_log', { task: 'Collect 65 oak_log' }, v.observe()));
-        assert.strictEqual(v.progress.subgoals[0].task, 'free a slot for oak_log');
-        assert.ok(v.progress.subgoals[0].chain.includes('slot'));
-        assert.deepStrictEqual(v.progress.blockers.map(({ at, ...b }) => b), [{ item: 'oak_log', count: 65, reason: 'slot', task: 'Collect 65 oak_log' }]);
+        await assert.rejects(
+            quiet(() => v._pursueProposedTask('Collect 65 oak_log', { task: 'Collect 65 oak_log' }, v.observe())),
+            /\[fix92\] LOUD: capacity plan frees \d+ slot\(s\) for oak_log but tossClutter is not in the library/,
+        );
     });
 });
 
-describe('fix84: surplus is verified consumption, and tossing it is what frees the slot', () => {
-    it('cobblestone spent in every measured run is surplus above that amount; diamonds with no evidence are kept', async () => {
+describe('fix84: surplus counts are not a slot plan; the smaller emptyable stack is the one tossed', () => {
+    it('verified cobblestone surplus stays in the old helper, and the slot plan tosses the smaller zero-reserve stack', async () => {
         const keep = 8;
         const inv = { cobblestone: 35 * registry.itemsByName.cobblestone.stackSize, diamond: 10 };
-        const consumer = skill('useCobble', { consumeEvidence: { runs: 2, items: { cobblestone: { runs: 2, max: keep } } } });
-        const toss = skill('tossSurplus');
+        const consumer = skill('useCobble', {
+            consumeEvidence: { runs: 2, items: { cobblestone: { runs: 2, max: keep } } },
+            useEvidence: evidence(),
+        });
+        const toss = skill('tossClutter', {
+            code: 'async function tossClutter(bot) { return true; }',
+            consumeEvidence: evidence(),
+            useEvidence: evidence(),
+            contract: { pre: 'c => true', post: 'c => c.post.free > c.pre.free', text: 'empty slots increase' },
+        });
         const surplus = surplusFromConsumption([consumer, toss], inv);
         assert.deepStrictEqual(surplus.map(s => s.item), ['cobblestone']);
         assert.strictEqual(surplus[0].count, inv.cobblestone - keep);
-        assert.ok(slotsOccupied(registry, inv) - slotsOccupied(registry, { cobblestone: keep, diamond: 10 }) >= 1);
-        const v = mkV({ inv, nearby: [], skills: [consumer, toss], runs: freed('tossSurplus') });
+        const v = mkV({ inv, nearby: ['oak_log'], skills: [consumer, toss], runs: {} });
         await quiet(() => drive(v, 'Collect 1 oak_log'));
-        assert.ok(v.ran.includes('tossSurplus'), v.ran.join(' -> '));
-        assert.strictEqual(inv.cobblestone, keep);
-        assert.strictEqual(inv.diamond, 10);
+        assert.ok(v.ran.includes('tossClutter'), v.ran.join(' -> '));
+        assert.strictEqual(inv.cobblestone, 35 * registry.itemsByName.cobblestone.stackSize);
+        assert.strictEqual(has(inv, 'diamond'), 0);
         assert.ok(has(inv, 'oak_log') >= 1);
         assert.ok(v.progress.completed.includes('Collect 1 oak_log'));
     });
 });
 
-describe('fix84: a slot cycle with no slot-freeing craft and no learned surplus throws, naming the cycle', () => {
-    it('36 stacks of dragon egg (no recipe, no consumption) cannot collect a log to make the chest the deposit needs', async () => {
+describe('fix84: a full inventory with nothing that frees a whole slot throws', () => {
+    it('36 reserved dragon eggs (no recipe) cannot collect a log', async () => {
         const inv = { dragon_egg: 36 * registry.itemsByName.dragon_egg.stackSize };
         assert.strictEqual(bestSlotFreeingCraft(registry, id => Recipe.find(id), inv), null);
-        assert.deepStrictEqual(surplusFromConsumption([depositor()], inv), []);
-        const v = mkV({ inv, nearby: [], skills: [depositor()], runs: freed('depositSurplus') });
-        await assert.rejects(quiet(() => drive(v, 'Collect 1 oak_log')), /\[fix84\] LOUD: subgoal cycle [\w\s>-]+slot \(need of "[^"]+"\); no slot-freeing craft \(net slot change from stack sizes\) and no learned surplus toss frees a slot/);
+        const holder = skill('holds', {
+            consumeEvidence: evidence(),
+            useEvidence: evidence({ dragon_egg: { runs: 1, max: inv.dragon_egg } }),
+        });
+        const v = mkV({ inv, nearby: [], skills: [holder], runs: {} });
+        await assert.rejects(quiet(() => drive(v, 'Collect 1 oak_log')), /\[fix92\] LOUD: no whole-slot plan frees 1 slot\(s\) for 1 oak_log/);
     });
 });
 
