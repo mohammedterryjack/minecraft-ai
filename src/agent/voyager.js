@@ -28,7 +28,7 @@ import minecraftData from 'minecraft-data';
 import { Ollama } from '../models/ollama.js';
 import { setCallDurationStore } from '../models/call_durations.js';
 import { setMovementStore, learnedKinds, recordStep, recordCut, stepBound, noteUnbounded } from '../utils/movement_model.js';
-import { signatureOf, depsOf, missingCalls, findCycle, findAllCycles, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf, thrownIn, declaredNames, skillSourceViolations, splitGeneratedCode, oneFunctionFeedback, entryCallFeedback, markerCallsMissing, parsesAsScript, pastedLibrarySkills } from './skill_graph.js';
+import { signatureOf, depsOf, missingCalls, installViolations, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf, thrownIn, declaredNames, skillSourceViolations, splitGeneratedCode, oneFunctionFeedback, entryCallFeedback, markerCallsMissing, parsesAsScript, pastedLibrarySkills } from './skill_graph.js';
 import { getBareAPI, collectBareApiUsedInSource, PRECONDITION_UNMET_BINDING } from './coder.js';   // fix40: unified bare-name API helper
 import { withStallPhase } from '../utils/event_loop_guard.js';
 import { watchdogEvidencePath } from '../utils/main_thread_watchdog.js';
@@ -393,6 +393,8 @@ export class Voyager {
         this._unverifiedConsumesNoted = new Set();   // fix70: skills whose evidence-less consumes was logged once (see _shouldSkipPractice)
         this._unjudgeableNoted = new Set();   // fix74: skills logged once as not practisable (nothing can judge their run)
         this._lastStepErrSig = null;   // fix75: signature of the previous step's error (null after a step that did not throw)
+        this.installRejections = [];   // fix88: rejection records for a skill that is not in the library yet (no entry to hang repairHistory on)
+        this._installRejection = null;   // fix88: evidence from the saveSkill call in progress, so the code loop can feed it back
         // fix49: ensure every skill has effects/consumes/stats (older skill files may not have them)
         for (const s of this.skills) {
             if (!s.effects) s.effects = [];
@@ -905,42 +907,21 @@ export class Voyager {
             if (s.seeded) continue;
             const d = depsOf(s.code, s.name, names);
             if (JSON.stringify([...d].sort()) !== JSON.stringify([...(s.deps || [])].sort())) { console.log(`[psn] relink ${s.name}: deps [${(s.deps || []).join(', ')}] -> [${d.join(', ')}]`); s.deps = d; n++; }
+            if (!Array.isArray(s.deps)) s.deps = d;
         }
-        // fix47: comprehensive cycle check over ALL skills (seeded + stored)
-        // Detect self-recursion (skill calls itself) and mutual recursion (A->B->A)
-        const selfRecursive = [];
-        for (const s of this.skills) {
-            if (!s.code) continue;
-            // hotfix: only flag an unconditional self-forward (calls itself with its own params unchanged, inside its own body)
-            // - bounded recursion with different args (obtainItem(bot, smelt[x], need)) and top-level invocations are not loops
-            const fnMatch = s.code.match(/(?:async\s+)?function\s+([A-Za-z_]\w*)\s*\(([^)]*)\)\s*\{/);
-            if (!fnMatch) continue;
-            const fnName = fnMatch[1];
-            const params = fnMatch[2].split(',').map(p => p.split('=')[0].trim()).filter(Boolean);
-            let bi = fnMatch.index + fnMatch[0].length, depth = 1; const bstart = bi;
-            while (bi < s.code.length && depth) { const ch = s.code[bi]; if (ch === '{') depth++; else if (ch === '}') depth--; bi++; }
-            const body = s.code.slice(bstart, bi - 1);
-            let callsItself = false;
-            for (const m of body.matchAll(new RegExp(`(?<![.\\w])${fnName}\\s*\\(([^)]*)\\)`, 'g'))) {
-                const args = m[1].split(',').map(a => a.trim()).filter(Boolean);
-                if (args.length === params.length && args.every((a, k) => a === params[k])) { callsItself = true; break; }
-            }
-            if (callsItself) {
-                selfRecursive.push(s.name);
-            }
-        }
-        if (selfRecursive.length > 0) {
-            const msg = `[psn] SELF-RECURSION DETECTED in ${selfRecursive.length} skill(s): ${selfRecursive.join(', ')} - these will cause stack overflow at runtime`;
+        // fix47/fix88: self-recursion and dependency cycles, the same installViolations the save gate uses. No skip.
+        const failSelf = (self) => {
+            if (self.length === 0) return;
+            const msg = `[psn] SELF-RECURSION DETECTED in ${self.length} skill(s): ${self.join(', ')} - these will cause stack overflow at runtime`;
             console.error(msg);
             throw new Error(msg);
-        }
-        // Check for mutual recursion cycles in the dependency graph
-        const graph = this._graph();
-        const allCycles = findAllCycles(graph);
-        if (allCycles.length > 0) {
+        };
+        let found = this._libraryViolations();
+        failSelf(found.self);
+        if (found.cycles.length > 0) {
             // fix51: one-time data migration - demote promoted skills that create cycles back to prev/handwritten_original
             let demoted = 0;
-            for (const cycle of allCycles) {
+            for (const cycle of found.cycles) {
                 for (const skillName of cycle) {
                     const s = this.skills.find(x => x.name === skillName);
                     if (!s || s.seeded || s.primitive) continue;
@@ -965,27 +946,51 @@ export class Voyager {
                     const d = depsOf(s.code, s.name, names);
                     s.deps = d;
                 }
-                const graphAfter = this._graph();
-                const cyclesAfter = findAllCycles(graphAfter);
-                if (cyclesAfter.length === 0) {
+                found = this._libraryViolations();
+                failSelf(found.self);
+                if (found.cycles.length === 0) {
                     console.log(`[fix51] demoted ${demoted} skill(s), cycles resolved`);
                 } else {
-                    const cycleStrs = cyclesAfter.map(c => c.join(' -> ')).join('; ');
+                    const cycleStrs = found.cycles.map(c => c.join(' -> ')).join('; ');
                     const msg = `[psn] DEPENDENCY CYCLES PERSIST after demoting ${demoted} skill(s): ${cycleStrs}`;
                     console.error(msg);
                     throw new Error(msg);
                 }
             } else {
-                const cycleStrs = allCycles.map(c => c.join(' -> ')).join('; ');
+                const cycleStrs = found.cycles.map(c => c.join(' -> ')).join('; ');
                 const msg = `[psn] DEPENDENCY CYCLES DETECTED: ${cycleStrs}`;
                 console.error(msg);
                 throw new Error(msg);
             }
         }
-        // Original per-skill cycle check (kept for completeness)
-        for (const s of this.skills) { const c = findCycle(s.name, s.deps, this._graph(s.name)); if (c) throw new Error(`[psn] relink: dependency cycle ${c.join(' -> ')}`); }
         console.log(`[psn] relink: ${this.skills.length} skills, ${n} edge set(s) changed`);
         if (n) this._saveSkills();
+    }
+    // fix88: every stored skill as a candidate against the library. Self-calls and cycles come from installViolations.
+    _libraryViolations() {
+        const self = [];
+        const cycles = [];
+        const seen = new Set();
+        // the same cycle is found once per member, starting at whichever node was visited first; rotate to one key
+        const canon = (path) => {
+            const nodes = path.slice(0, -1);
+            if (nodes.length === 0) throw new Error('[fix88] cycle path is empty');
+            let min = 0;
+            for (let i = 1; i < nodes.length; i++) if (nodes[i] < nodes[min]) min = i;
+            return [...nodes.slice(min), ...nodes.slice(0, min), nodes[min]];
+        };
+        for (const s of this.skills) {
+            if (typeof s.code !== 'string') throw new Error(`[psn] relink: skill ${s.name} has no code`);
+            if (!Array.isArray(s.deps)) throw new Error(`[psn] relink: skill ${s.name} has no deps array`);
+            for (const v of installViolations({ name: s.name, code: s.code, deps: s.deps }, this.skills)) {
+                if (v.kind === 'self') self.push(s.name);
+                else if (v.kind === 'cycle') {
+                    const key = canon(v.path).join(' -> ');
+                    if (!seen.has(key)) { seen.add(key); cycles.push(canon(v.path)); }
+                } else throw new Error(`[fix88] unknown violation kind ${JSON.stringify(v.kind)}`);
+            }
+        }
+        return { self, cycles };
     }
     // PolySkill-style: a learned skill whose task is covered by a parameterised skill becomes a variant of it
     // (code kept on disk for rollback; hidden from the catalogue/fuzzy replay so the parameterised one is used)
@@ -1037,7 +1042,12 @@ export class Voyager {
     _maturity(e) { const s = e.stats || newStats(), n = s.success + s.fail, a = s.success + 1, b = s.fail + 1; const m = a / (a + b), u = Math.sqrt(a * b / ((a + b) ** 2 * (a + b + 1))); const V = m - u; const p = (1 - 0.1) / (1 + Math.exp(-5 * (0.6 - V))) + 0.1; return { V, p, n, u }; }
     _updateAllowed(e, why) { const { V, p, n } = this._maturity(e), r = Math.random(), ok = r < p; gateLog(`maturity ${e.name}: V=${V.toFixed(2)} (u=${this._maturity(e).u.toFixed(2)}, ${n} runs) P(update)=${p.toFixed(2)} draw=${r.toFixed(2)} -> ${ok ? 'UPDATE ALLOWED' : 'FROZEN (mature skill kept)'} [${why}]`); return ok; }
     // fix20 (PSN repair memory): rolling buffer of the last 5 repair proposals per skill
-    _noteProposal(e, p) { e.repairHistory = [...(e.repairHistory || []), { at: new Date().toISOString(), ...p }].slice(-5); this._saveSkills(); }
+    _pushRepair(e, p) {
+        if (e.repairHistory === undefined) e.repairHistory = [];
+        else if (!Array.isArray(e.repairHistory)) throw new Error(`[psn] ${e.name}.repairHistory is not an array`);
+        e.repairHistory = [...e.repairHistory, { at: new Date().toISOString(), ...p }].slice(-5);
+    }
+    _noteProposal(e, p) { this._pushRepair(e, p); this._saveSkills(); }
     // fix47: simple hash for skill deduplication - changes when code or contract changes
     _skillHash(skill) {
         if (!skill) return 'null';
@@ -2795,14 +2805,64 @@ Use only c; no other globals.`;
     }
     _graph(exclude) { const g = {}; for (const s of this.skills) if (s.name !== exclude) g[s.name] = s.deps || []; return g; }
     
-    // fix49: check if code would create a dependency cycle - returns error message or null
-    // This is for lint feedback so the model knows which deps to avoid BEFORE the gate rejects
+    // fix49/fix88: self-call and dependency-cycle feedback for a repair, before the gate. null when the code may be installed.
     _cycleLint(skillName, code) {
-        const allNames = new Set(this.skills.map(s => s.name));
-        const deps = depsOf(code, skillName, allNames);
-        const cyc = findCycle(skillName, deps, this._graph(skillName));
-        if (!cyc) return null;
-        return `DEPENDENCY CYCLE would be created: ${cyc.join(' -> ')}\nThe skill "${skillName}" cannot call ${deps.filter(d => cyc.includes(d)).join(', ')} because they transitively depend on "${skillName}".`;
+        const deps = this._candidateDeps(skillName, code);
+        const violations = installViolations({ name: skillName, code, deps }, this.skills);
+        if (violations.length === 0) return null;
+        return this._installViolationText(violations);
+    }
+    // deps that would be stored for this code: library skills only, with learned deps stripped from a seeded skill (fix39)
+    _candidateDeps(name, code) {
+        let deps = depsOf(code, name, new Set(this.skills.map(s => s.name)));
+        const existing = this.skills.find(s => s.name === name);
+        if (existing !== undefined && existing.seeded === true) {
+            const learnedDeps = deps.filter(d => {
+                const dep = this.skills.find(s => s.name === d);
+                return dep !== undefined && dep.seeded !== true && dep.primitive !== true && dep.handwritten !== true;
+            });
+            if (learnedDeps.length > 0) {
+                gateLog(`WARN ${name} (seeded): stripping learned deps [${learnedDeps.join(', ')}] to prevent cycles`);
+                deps = deps.filter(d => !learnedDeps.includes(d));
+            }
+        }
+        return deps;
+    }
+    _installViolationText(violations) {
+        if (!Array.isArray(violations) || violations.length === 0) throw new Error('[fix88] _installViolationText: violations required');
+        const lines = [];
+        for (const v of violations) {
+            if (v.kind === 'self') lines.push(`SELF-RECURSION: ${v.name} calls itself with its own parameters unchanged. That overflows the stack at runtime. Do not call ${v.name} from inside itself.`);
+            else if (v.kind === 'cycle') {
+                const via = v.path.filter((n, i) => i > 0);
+                lines.push(`DEPENDENCY CYCLE would be created: ${v.path.join(' -> ')}\nThe skill "${v.path[0]}" cannot take part in this cycle (${via.join(' -> ')}).`);
+            } else throw new Error(`[fix88] unknown violation kind ${JSON.stringify(v.kind)}`);
+        }
+        return lines.join('\n');
+    }
+    // Record a rejected install where the learner will read it. Does not write the skill file or index.
+    _recordInstallRejection(name, violations) {
+        const evidence = this._installViolationText(violations);
+        console.error(`[psn] REJECT ${name} before save:\n${evidence}`);
+        gateLog(`REJECT ${name}: ${evidence}`);
+        const entry = this.skills.find(s => s.name === name);
+        if (entry) {
+            if (entry.repairHistory === undefined) entry.repairHistory = [];
+            else if (!Array.isArray(entry.repairHistory)) throw new Error(`[psn] ${name}.repairHistory is not an array`);
+            const last = entry.repairHistory.length > 0 ? entry.repairHistory[entry.repairHistory.length - 1] : null;
+            if (last !== null && !Object.hasOwn(last, 'outcome')) {
+                last.evidence = evidence;
+                last.outcome = 'rejected';
+            } else {
+                this._pushRepair(entry, { kind: 'install', evidence, desc: evidence, outcome: 'rejected' });
+            }
+            this._proposalOutcome(entry, 'rejected');
+        } else {
+            if (!Array.isArray(this.installRejections)) throw new Error('[fix88] installRejections is not initialized');
+            this.installRejections.push({ name, at: new Date().toISOString(), kind: 'install', evidence, desc: evidence, outcome: 'rejected' });
+            console.log(`[repair-outcome] ${name}: rejected`);
+        }
+        return evidence;
     }
 
     // fix32: learned effects / consumption of a skill from its successful runs - feeds backward chaining (fix70/fix74: both carry run evidence)
@@ -3769,7 +3829,7 @@ Use only c; no other globals.`;
                     this._rollbackRefactor(rf, `${entry.name} failed ${c.stats.fail} trial runs`);
                 }
             }
-            else if (c.stats.success >= 2 && rate(c.stats) >= rate(entry.stats || newStats())) { gateLog(`PROMOTE candidate ${entry.name}${jointCtx}: ${c.stats.success} passes, trial ${c.stats.success}/${n} >= current rate ${rate(entry.stats || newStats()).toFixed(2)}`); this._promote(entry, c); }
+            else if (c.stats.success >= 2 && rate(c.stats) >= rate(entry.stats || newStats())) { if (this._promote(entry, c) !== false) gateLog(`PROMOTE candidate ${entry.name}${jointCtx}: ${c.stats.success} passes, trial ${c.stats.success}/${n} >= current rate ${rate(entry.stats || newStats()).toFixed(2)}`); }
             else gateLog(`candidate ${entry.name}${jointCtx} trial ${ok ? 'passed' : 'failed'} (${c.stats.success}/${n})${invCtx}; waiting for more runs`);
         } else {
             entry.stats = recordRun(entry.stats || newStats(), task, ok);
@@ -3779,6 +3839,15 @@ Use only c; no other globals.`;
         this._saveSkills();
     }
     _promote(entry, c) {
+        // fix88: a candidate that calls itself or closes a cycle is not installed (the same check as save and boot)
+        if (typeof c.code !== 'string') throw new Error(`[fix88] promote ${entry.name}: candidate has no code`);
+        if (!Array.isArray(c.deps)) throw new Error(`[fix88] promote ${entry.name}: candidate deps must be an array`);
+        const violations = installViolations({ name: entry.name, code: c.code, deps: c.deps }, this.skills);
+        if (violations.length > 0) {
+            this._installRejection = this._recordInstallRejection(entry.name, violations);
+            delete entry.candidate;
+            return false;
+        }
         this._proposalOutcome(entry, 'promoted');
         entry.prev = { code: entry.code, description: entry.description, deps: entry.deps, stats: entry.stats, saved: entry.saved };
         Object.assign(entry, { code: c.code, description: c.description, deps: c.deps, effects: c.effects, embedding: c.embedding, saved: new Date().toISOString(), stats: c.stats, demoted: false });
@@ -3791,6 +3860,7 @@ Use only c; no other globals.`;
         for (const p of parents) { const pe = this.skills.find(s => s.name === p); if (pe) pe.revalidate = entry.name; }
         if (parents.length) console.log(`[psn] promoted ${entry.name}; marked ${parents.length} parent(s) for re-validation: ${parents.join(', ')}`);
         this._saveSkills();
+        return true;
     }
     // Skill-V style regression check: rerun a candidate on one recorded past task that has a deterministic inventory check
     async _regressionRun(entry, code) {
@@ -4481,6 +4551,7 @@ current_health: ${Math.round(bot.health)}/${vmax.health}\ncurrent_food: ${bot.fo
         // forgot it throws instead of saving the previous save's effects (the field used to persist across calls) or a default
         const observedEffects = this._lastEffects;
         this._lastEffects = null;
+        this._installRejection = null;
         if (!Array.isArray(observedEffects)) throw new Error(`[psn] saveSkill ${name}: no observed effects set by the caller (this._lastEffects=${JSON.stringify(observedEffects)})`);
         // fix26: names must include BOTH learned skills AND built-in bare API (skills.*/world.* exports)
         // so missingCalls doesn't reject repairs that call getNearestBlock, getInventoryCounts, etc.
@@ -4489,7 +4560,6 @@ current_health: ${Math.round(bot.health)}/${vmax.health}\ncurrent_food: ${bot.fo
         // fix68: deps are LIBRARY skills only, as _relink computes them on every start. fix26 (89b03dd) widened the name set
         // for missingCalls and deps with it, so a saved/promoted skill carried built-ins (getInventoryCounts...) in its deps
         // until the next restart; those entered replay closures and were traced (see skill_graph instrumentSrc fix68)
-        let deps = depsOf(code, name, new Set(this.skills.map(s => s.name)));
         const missing = missingCalls(code, name, names);
         if (missing.length) { gateLog(`REJECT ${name}: calls unknown skills ${missing.join(', ')}`); return false; }
         // fix74: the unmet-precondition marker is for repo-owned seeded primitives only (it voids a run's stats, fix76); model
@@ -4509,21 +4579,11 @@ current_health: ${Math.round(bot.health)}/${vmax.health}\ncurrent_food: ${bot.fo
         const apiErr = this.agent.coder._apiGate(code, [...names]);
         if (apiErr) { gateLog(`REJECT ${name}: ${apiErr}`); return false; }
         // fix39: seeded primitives must not depend on learned skills (prevents cycles like
-        // ensureCraftingTable -> depositToChest -> ensureChest -> ensureCraftingTable)
-        // If a repair tries to add learned deps to a seeded skill, strip them and warn
-        const existingSkill = this.skills.find(s => s.name === name);
-        if (existingSkill?.seeded) {
-            const learnedDeps = deps.filter(d => {
-                const dep = this.skills.find(s => s.name === d);
-                return dep && !dep.seeded && !dep.primitive && !dep.handwritten;
-            });
-            if (learnedDeps.length) {
-                gateLog(`WARN ${name} (seeded): stripping learned deps [${learnedDeps.join(', ')}] to prevent cycles`);
-                deps = deps.filter(d => !learnedDeps.includes(d));
-            }
-        }
-        const cyc = findCycle(name, deps, this._graph(name));
-        if (cyc) { gateLog(`REJECT ${name}: dependency cycle ${cyc.join(' -> ')}`); return false; }
+        // ensureCraftingTable -> depositToChest -> ensureChest -> ensureCraftingTable).
+        // fix88: the same self-call and cycle check _relink throws on at boot. A violating candidate is not written.
+        const deps = this._candidateDeps(name, code);
+        const violations = installViolations({ name, code, deps }, this.skills);
+        if (violations.length > 0) { this._installRejection = this._recordInstallRejection(name, violations); return false; }
         const embedding = await this._embed(description);
         const idx = this.skills.findIndex(s => s.name === name);
         if (idx < 0) {
@@ -4548,10 +4608,10 @@ current_health: ${Math.round(bot.health)}/${vmax.health}\ncurrent_food: ${bot.fo
         if (!opts.repair && !opts.refactor && !this._updateAllowed(entry, 'new version from a task')) return false;
         if (opts.refactor) cand.refactor = opts.refactor;
         const reg = await this._regressionRun(entry, code);
-        if (reg === true) { gateLog(`PROMOTE ${name}: passed regression rerun on a past task`); this._promote(entry, cand); }
+        if (reg === true) { if (this._promote(entry, cand) === false) return false; gateLog(`PROMOTE ${name}: passed regression rerun on a past task`); }
         else if (reg === false) { gateLog(`REJECT update to ${name}: failed regression rerun on a past task; keeping current version`); this._proposalOutcome(entry, 'failed regression rerun'); if (opts.refactor) this._rollbackRefactor(opts.refactor, name); }
         else if (opts.repair) { entry.candidate = cand; gateLog(`HOLD repair of ${name}: kept as candidate; needs 2+ trial runs with success rate >= current ${rate(entry.stats || newStats()).toFixed(2)}`); }   // fix11 (B3)
-        else if (!entry.handwritten && !(entry.stats?.success)) { gateLog(`PROMOTE ${name}: current version has no recorded successes`); this._promote(entry, cand); }
+        else if (!entry.handwritten && !(entry.stats?.success)) { if (this._promote(entry, cand) === false) return false; gateLog(`PROMOTE ${name}: current version has no recorded successes`); }
         else { entry.candidate = cand; gateLog(`HOLD ${name}: new version kept as candidate (1/1); needs 2+ trial runs with success rate >= current ${rate(entry.stats).toFixed(2)}`); }
         this._saveSkills();
         return true;
@@ -5511,7 +5571,7 @@ ${apiList}
 
 IMPORTANT: All functions use bare names. Do NOT write skills.goToBlock or skills.goToPosition - write goToPosition(bot, x, y, z) directly. Do NOT write world.getNearestBlock - write getNearestBlock(bot, ...) directly.
 
-COMPOSE: build your function out of these skills (they can take arguments). Your new skill may take extra parameters with defaults, e.g. \`async function makeIronTools(bot, count = 1)\`. Do not create call cycles between skills.${this.sharedHints?.length ? `
+COMPOSE: build your function out of these skills (they can take arguments). Your new skill may take extra parameters with defaults, e.g. \`async function makeIronTools(bot, count = 1)\`. Do not create call cycles between skills, and do not call a skill from inside itself with the same parameters.${this.sharedHints?.length ? `
 SHARED CODE: these fragments are repeated in several skills; if you need this logic, put it in its own small reusable async function skill (named, with parameters) and call it, instead of inlining it again:
 ${this.sharedHints.map(h => '// used in ' + h.skills.join(', ') + '\n' + h.fragment).join('\n')}` : ''}
 Interrupts: the bot may be interrupted at any time (danger, getting stuck, a player talking). Every loop must start with \`if (bot.interrupt_code) return;\` and you must return immediately after any await when bot.interrupt_code is true. Every async function must contain an await. Never catch an error and keep looping; no unbounded loops (always cap attempts). There is no setTimeout/setInterval in scope; to wait use \`await sleep(ms)\`. findBlock/findBlocks/nearestEntity/bot.entities/blockAt results can be null or empty: always null-check them before reading .position/.x or calling methods on them.`;
@@ -5607,6 +5667,11 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             // fix85: the executed reply must call the new function. The saved skill source still has the call cut off.
             if (lint === null && !split.entry) lint = entryCallFeedback(own);
             if (lint === null) { const introduced = markerCallsMissing('', code, PRECONDITION_UNMET_BINDING); if (introduced) lint = introduced; }
+            // fix88: the saved source is checked before it runs. A self-call or a cycle is lint feedback, and saveSkill rejects it again.
+            if (lint === null) {
+                const recur = installViolations({ name: own, code: split.skillSource, deps: this._candidateDeps(own, split.skillSource) }, this.skills);
+                if (recur.length > 0) lint = this._installViolationText(recur);
+            }
             let staged = null;
             if (!lint) {
                 const { lint: lint2, staged: st } = await this._stageLintExecTraced(libSrc + (libSrc ? '\n\n' : '') + code, execBundle, stageNameSet, `voyager:writeCode:${task}:att${i}`);
@@ -5662,7 +5727,14 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             if (verdict.success) {
                 // fix73: no cap of 8 (b2e2338); _learnEffects below unions the full observation into the same entry anyway
                 this._lastEffects = Object.keys(after.inventory).filter(k => (after.inventory[k] || 0) > (runBefore.inventory[k] || 0));   // fix70: this attempt only
-                await this.saveSkill(own, desc.trim(), split.skillSource, task);   // fix82: the call cut by AST position
+                const saved = await this.saveSkill(own, desc.trim(), split.skillSource, task);   // fix82: the call cut by AST position
+                // fix88: a self-call or a cycle is not a learned skill. The violation goes back to the model; the task is not done.
+                if (saved === false && typeof this._installRejection === 'string') {
+                    console.error(`[voyager] ${own} rejected before it was saved:\n${this._installRejection}`);
+                    feedback = this._installRejection;
+                    lastCode = code;
+                    continue;
+                }
                 this.progress.completed.push(task);
                 this.progress.failed = this.progress.failed.filter(t => t !== task);
                 // fix47: clear blockers for this task when it passes
