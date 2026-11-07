@@ -87,7 +87,7 @@ export function obtainPlanner({ registry, recipesOf, known, proven }) {
         const have = gain ? 0 : Math.min(has(inv, item), need);
         if (have) inv[item] -= have;
         const rem = need - have;
-        if (rem === 0) return { cost: [0, 0, 0, 0], inv, steps: [], how: 'inventory' };
+        if (rem === 0) return { cost: [0, 0, 0, 0], inv, steps: [], how: 'inventory', ingredients: [] };
         const onPath = [...path, item];
         const crafts = [];
         for (const r of recipes(item)) {
@@ -106,7 +106,7 @@ export function obtainPlanner({ registry, recipesOf, known, proven }) {
             if (!ok) continue;
             sim[item] = has(sim, item) + times * r.yield - rem;
             steps.push({ verb: 'craft', item, count: rem });
-            crafts.push({ cost, inv: sim, steps, how: 'craft', missing });
+            crafts.push({ cost, inv: sim, steps, how: 'craft', missing, ingredients: r.ingredients.map(ing => ({ item: ing.item, count: ing.count * times })) });
         }
         // raw: collected from a source block (its harvest tool planned the same way), or obtained some other way when no
         // block yields it — the latter only when the game data has no acyclic recipe or the item is known (learned/observed)
@@ -116,19 +116,19 @@ export function obtainPlanner({ registry, recipesOf, known, proven }) {
         const opts = [...crafts];
         if (src.length) {
             const tools = toolsNeeded(item, inv);
-            if (!tools) opts.push({ cost: [0, unknown, rem, 1], inv, steps: [{ verb: 'collect', item, count: rem }], how: 'collect', missing: [] });
+            if (!tools) opts.push({ cost: [0, unknown, rem, 1], inv, steps: [{ verb: 'collect', item, count: rem }], how: 'collect', missing: [], ingredients: [] });
             else {
                 const withTool = [];
                 for (const t of tools) {
                     const sub = plan(t, 1, { ...inv }, onPath, ctx, false);
                     if (!sub) continue;
                     sub.inv[t] = has(sub.inv, t) + 1;   // a tool is kept, not consumed
-                    withTool.push({ cost: add(sub.cost, [0, unknown, rem, 1]), inv: sub.inv, steps: [...sub.steps, { verb: 'collect', item, count: rem }], how: 'collect', tool: t, missing: [{ item: t, count: 1, how: sub.how }] });
+                    withTool.push({ cost: add(sub.cost, [0, unknown, rem, 1]), inv: sub.inv, steps: [...sub.steps, { verb: 'collect', item, count: rem }], how: 'collect', tool: t, missing: [{ item: t, count: 1, how: sub.how }], ingredients: [] });
                 }
                 if (!withTool.length) ctx.unobtainable.add(`${item} from ${src.join('/')} (needs one of ${tools.join(', ')}; none obtainable without a cycle)`);
                 opts.push(...withTool);
             }
-        } else if (!crafts.length || isKnown) opts.push({ cost: [isKnown ? 0 : 1, unknown, rem, 1], inv, steps: [{ verb: 'obtain', item, count: rem }], how: 'obtain', missing: [] });
+        } else if (!crafts.length || isKnown) opts.push({ cost: [isKnown ? 0 : 1, unknown, rem, 1], inv, steps: [{ verb: 'obtain', item, count: rem }], how: 'obtain', missing: [], ingredients: [] });
         return pick(opts, ctx, item);
     }
 
@@ -151,10 +151,12 @@ export function obtainPlanner({ registry, recipesOf, known, proven }) {
             const best = plan(item, count, { ...inv }, [], ctx, true);
             const list = set => (set.size ? [...set].join('; ') : 'none');
             if (!best) throw new Error(`[fix81] LOUD: no acyclic way to obtain ${count} ${item} from the game data (cycles: ${list(ctx.cycles)}; unobtainable: ${list(ctx.unobtainable)})`);
+            if (!Array.isArray(best.ingredients)) throw new Error(`[fix92] plan for ${item} has no direct ingredient list`);
             return {
                 how: best.how,
                 task: taskFor(best.how, item, count),
                 tool: Object.hasOwn(best, 'tool') ? best.tool : null,
+                ingredients: best.ingredients,
                 steps: best.missing.map(m => ({ item: m.item, count: m.count, task: taskFor(m.how, m.item, m.count) })),
                 plan: best.steps.map(s => taskFor(s.verb, s.item, s.count)),
                 cycles: [...ctx.cycles],

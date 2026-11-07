@@ -9,15 +9,23 @@ describe('fix51 watcher 09:22', () => {
         assert.deepStrictEqual(missingCalls(code, 'mineBlocks', new Set()), []);
         assert.deepStrictEqual(missingCalls('async function a(bot){ await notARealSkill(bot); }', 'a', new Set()), ['notARealSkill']);
     });
-    it('tossClutter with space already free returns 0 (no stacks removed) so seeded post holds', async () => {
+    it('tossClutter that drops items without freeing a slot returns false, and the seeded post does not hold', async () => {
         const prim = Voyager.SEEDED_PRIMITIVES.find(p => p.name === 'tossClutter');
-        const fn = new Function('log', 'getInventoryCounts', 'moveAway', 'depositToChest', 'getNearestBlock', `return (${prim.code});`)(() => {}, () => ({}), async () => {}, async () => false, () => null);
-        const bot = { entity: { position: { clone: () => ({}) } }, inventory: { emptySlotCount: () => 4, items: () => [] }, __safeToToss: [], __depositCandidates: ['cobblestone'], __uncertainItems: [] };
-        const ret = await fn(bot, 4);
-        assert.strictEqual(ret, 0);
-        // learned live contract (09:17 log): c => !c.ret || Object.keys(c.delta).some(k => (c.delta[k]||0) < 0)
-        const post = c => !c.ret || Object.keys(c.delta).some(k => (c.delta[k]||0) < 0);
-        assert.strictEqual(post({ ret, delta: {} }), true);
+        const fn = new Function(`return (${prim.code});`)();
+        let count = 24;
+        const bot = {
+            interrupt_code: false,
+            currentWindow: null,
+            registry: { itemsByName: { dirt: { id: 1, stackSize: 64 } } },
+            inventory: { emptySlotCount: () => 0, items: () => [{ name: 'dirt', type: 1, count }] },
+            async toss(_type, _meta, n) { count -= n; },
+        };
+        const ret = await fn(bot, 1, [{ item: 'dirt', remove: 20, keep: 4 }]);
+        assert.strictEqual(ret, false);
+        assert.strictEqual(count, 4);
+        const post = new Function('c', `return (${prim.contract.post})(c);`);
+        assert.strictEqual(post({ pre: { free: 0 }, post: { free: 0 } }), false);
+        assert.strictEqual(post({ pre: { free: 0 }, post: { free: 1 } }), true);
     });
     it('regression rerun skips past tasks whose goal is not among the skill learned effects (callee inherits caller task)', async () => {
         _setVersionForTest('1.20.4');

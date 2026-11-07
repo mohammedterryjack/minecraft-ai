@@ -180,3 +180,203 @@ export function slotsFreedBy(registry, counts, surplus) {
     }
     return slotsOccupied(registry, counts) - slotsOccupied(registry, next);
 }
+
+// fix92: one stack in the player window. metadata is kept when the slot has it, so two damaged tools are two slots.
+export function inventoryStacks(bot) {
+    if (!bot || !bot.inventory || !Array.isArray(bot.inventory.slots)) throw new Error('[fix92] inventoryStacks: bot.inventory.slots required');
+    const start = bot.inventory.inventoryStart, end = bot.inventory.inventoryEnd;
+    if (!Number.isInteger(start) || !Number.isInteger(end) || end <= start) throw new Error(`[fix92] inventory window range required, got ${JSON.stringify(start)}..${JSON.stringify(end)}`);
+    const out = [];
+    for (let i = start; i < end; i++) {
+        const s = bot.inventory.slots[i];
+        if (s == null) continue;
+        if (typeof s.name !== 'string' || !Number.isInteger(s.count) || s.count < 1) throw new Error(`[fix92] slot ${i} is not an item stack: ${JSON.stringify(s)}`);
+        let metadata = null;
+        if (Object.hasOwn(s, 'metadata')) metadata = s.metadata;
+        out.push({ slot: i, name: s.name, count: s.count, metadata });
+    }
+    return out;
+}
+
+const PROVENANCE = ['learned', 'goal', 'game-data'];
+
+function analysedSkills(skills) {
+    if (!Array.isArray(skills)) throw new Error('[fix92] capacityPlan: skills array required');
+    const out = [];
+    for (const s of skills) {
+        if (s === null || typeof s !== 'object' || typeof s.name !== 'string' || s.name.length === 0) throw new Error(`[fix92] capacityPlan: skill entry has no name: ${JSON.stringify(s)}`);
+        if (s.demoted) continue;
+        if (typeof s.mergedInto === 'string' && s.mergedInto.length > 0) continue;
+        out.push(s);
+    }
+    return out;
+}
+
+// verified max only when the item was seen on every measured run. Missing or malformed evidence throws:
+// a kind is reserve 0 only after a completed analysis found no use.
+function readEvidence(skill, field) {
+    if (!Object.hasOwn(skill, field)) throw new Error(`[fix92] LOUD: incomplete ${field} for ${skill.name}: missing`);
+    const ev = skill[field];
+    if (ev === null || typeof ev !== 'object' || Array.isArray(ev)) throw new Error(`[fix92] LOUD: incomplete ${field} for ${skill.name}: ${JSON.stringify(ev)}`);
+    if (!Number.isInteger(ev.runs) || ev.runs < 1) throw new Error(`[fix92] LOUD: incomplete ${field} for ${skill.name}: runs ${JSON.stringify(ev.runs)}`);
+    if (ev.items === null || typeof ev.items !== 'object' || Array.isArray(ev.items)) throw new Error(`[fix92] LOUD: incomplete ${field} for ${skill.name}: items ${JSON.stringify(ev.items)}`);
+    const out = {};
+    for (const [k, it] of Object.entries(ev.items)) {
+        if (it === null || typeof it !== 'object' || Array.isArray(it)) throw new Error(`[fix92] LOUD: incomplete ${field} for ${skill.name} item ${k}: ${JSON.stringify(it)}`);
+        if (!Number.isInteger(it.runs) || it.runs < 0 || it.runs > ev.runs) throw new Error(`[fix92] LOUD: incomplete ${field} for ${skill.name} item ${k}: runs ${JSON.stringify(it.runs)}`);
+        if (!Number.isInteger(it.max) || it.max < 1) throw new Error(`[fix92] LOUD: incomplete ${field} for ${skill.name} item ${k}: max ${JSON.stringify(it.max)}`);
+        if (it.runs === ev.runs) out[k] = it.max;
+    }
+    return out;
+}
+
+function bumpReserve(keep, item, count, prov) {
+    if (!Number.isInteger(count) || count < 0) throw new Error(`[fix92] reserve of ${item} is not a non-negative integer: ${JSON.stringify(count)}`);
+    if (count === 0) return;
+    const cur = keep.get(item);
+    if (!cur || count > cur.count) keep.set(item, { count, prov: new Set([prov]) });
+    else if (count === cur.count) cur.prov.add(prov);
+}
+
+function provenanceText(set) {
+    const parts = [];
+    for (const p of PROVENANCE) if (set.has(p)) parts.push(p);
+    if (!parts.length) throw new Error('[fix92] reserve has no provenance');
+    return parts.join('+');
+}
+
+function countsOf(stacks) {
+    const counts = {};
+    for (const s of stacks) {
+        if (!Object.hasOwn(counts, s.name)) counts[s.name] = 0;
+        counts[s.name] += s.count;
+    }
+    return counts;
+}
+
+// Whole-slot capacity plan. A stack can be emptied only when the rest of that kind still covers its reserve
+// (tossing does not compact other stacks). Zero slot-gain is not a candidate. Ties: fewer items, then registry
+// item id, then slot index.
+export function capacityPlan({ registry, skills, stacks, slotsNeeded, goalItem, goalCount, needItem, prerequisites, toolsNeeded, recipesOf }) {
+    if (!registry || !registry.itemsByName) throw new Error('[fix92] capacityPlan: registry required');
+    if (!Number.isInteger(slotsNeeded) || slotsNeeded < 0) throw new Error(`[fix92] capacityPlan: slotsNeeded must be a non-negative integer, got ${JSON.stringify(slotsNeeded)}`);
+    if (typeof goalItem !== 'string' || goalItem.length === 0) throw new Error(`[fix92] capacityPlan: goalItem required, got ${JSON.stringify(goalItem)}`);
+    if (!Number.isInteger(goalCount) || goalCount < 1) throw new Error(`[fix92] capacityPlan: goalCount must be a positive integer, got ${JSON.stringify(goalCount)}`);
+    if (typeof needItem !== 'string' || needItem.length === 0) throw new Error(`[fix92] capacityPlan: needItem required, got ${JSON.stringify(needItem)}`);
+    if (typeof prerequisites !== 'function') throw new Error('[fix92] capacityPlan: prerequisites(item, count, inv) required');
+    if (typeof toolsNeeded !== 'function') throw new Error('[fix92] capacityPlan: toolsNeeded(item) required');
+    if (typeof recipesOf !== 'function') throw new Error('[fix92] capacityPlan: recipesOf(itemId) required');
+    if (!Array.isArray(stacks)) throw new Error('[fix92] capacityPlan: stacks required');
+    for (const s of stacks) {
+        if (s === null || typeof s !== 'object' || typeof s.name !== 'string' || !Number.isInteger(s.count) || s.count < 1 || !Number.isInteger(s.slot)) {
+            throw new Error(`[fix92] capacityPlan: stack is not { slot, name, count }: ${JSON.stringify(s)}`);
+        }
+        stackSizeOf(registry, s.name);
+    }
+    const counts = countsOf(stacks);
+    const keep = new Map();
+    for (const s of analysedSkills(skills)) {
+        const consumed = readEvidence(s, 'consumeEvidence');
+        const used = readEvidence(s, 'useEvidence');
+        for (const [item, max] of Object.entries(consumed)) bumpReserve(keep, item, max, 'learned');
+        for (const [item, max] of Object.entries(used)) bumpReserve(keep, item, max, 'learned');
+    }
+    const pre = prerequisites(goalItem, goalCount, { ...counts });
+    if (!pre || !Array.isArray(pre.ingredients)) throw new Error(`[fix92] prerequisites(${goalItem}) returned no ingredient list`);
+    for (const ing of pre.ingredients) {
+        if (!ing || typeof ing.item !== 'string' || !Number.isInteger(ing.count) || ing.count < 1) throw new Error(`[fix92] ingredient of ${goalItem} is malformed: ${JSON.stringify(ing)}`);
+        const have = Object.hasOwn(counts, ing.item) ? counts[ing.item] : 0;
+        const reserve = have < ing.count ? have : ing.count;
+        bumpReserve(keep, ing.item, reserve, 'game-data');
+    }
+    const tools = toolsNeeded(goalItem);
+    if (tools !== null) {
+        if (!Array.isArray(tools)) throw new Error(`[fix92] toolsNeeded(${goalItem}) returned ${JSON.stringify(tools)}`);
+        for (const t of tools) {
+            if (typeof t !== 'string') throw new Error(`[fix92] toolsNeeded(${goalItem}) entry is not a name: ${JSON.stringify(t)}`);
+            if (!Object.hasOwn(counts, t)) continue;
+            bumpReserve(keep, t, counts[t], 'game-data');
+        }
+    }
+    if (Object.hasOwn(counts, goalItem)) bumpReserve(keep, goalItem, counts[goalItem], 'goal');
+    if (needItem !== goalItem && Object.hasOwn(counts, needItem)) bumpReserve(keep, needItem, counts[needItem], 'goal');
+
+    const byName = new Map();
+    for (const s of stacks) {
+        let list = byName.get(s.name);
+        if (!list) { list = []; byName.set(s.name, list); }
+        list.push(s);
+    }
+    const names = [...byName.keys()];
+    names.sort((a, b) => registry.itemsByName[a].id - registry.itemsByName[b].id);
+    const candidates = [];
+    const pool = [];
+    for (const name of names) {
+        const held = counts[name];
+        const rec = keep.get(name);
+        const keepN = rec ? rec.count : 0;
+        const prov = rec ? provenanceText(rec.prov) : 'learned';
+        const surplus = held > keepN ? held - keepN : 0;
+        const id = registry.itemsByName[name].id;
+        const kindStacks = byName.get(name).slice();
+        kindStacks.sort((a, b) => {
+            if (a.count !== b.count) return a.count - b.count;
+            return a.slot - b.slot;
+        });
+        let potential = 0;
+        let removed = 0;
+        for (const st of kindStacks) {
+            if (removed + st.count <= surplus) {
+                potential += 1;
+                removed += st.count;
+                pool.push({ name, count: st.count, slot: st.slot, id, keep: keepN, provenance: prov });
+            }
+        }
+        candidates.push({ item: name, held, keep: keepN, provenance: prov, surplus, potential });
+    }
+    pool.sort((a, b) => {
+        if (a.count !== b.count) return a.count - b.count;
+        if (a.id !== b.id) return a.id - b.id;
+        return a.slot - b.slot;
+    });
+    const chosen = [];
+    const taken = new Map();
+    for (const st of pool) {
+        if (chosen.length >= slotsNeeded) break;
+        const already = taken.has(st.name) ? taken.get(st.name) : 0;
+        const rec = keep.get(st.name);
+        const keepN = rec ? rec.count : 0;
+        if (already + st.count > counts[st.name] - keepN) continue;
+        chosen.push(st);
+        taken.set(st.name, already + st.count);
+    }
+    const chosenByName = new Map();
+    for (const st of chosen) {
+        let list = chosenByName.get(st.name);
+        if (!list) { list = []; chosenByName.set(st.name, list); }
+        list.push(st);
+    }
+    for (const c of candidates) {
+        const picked = chosenByName.has(c.item) ? chosenByName.get(c.item) : [];
+        let pickedCount = 0;
+        for (const st of picked) pickedCount += st.count;
+        const rejected = c.potential < 1;
+        const remove = rejected ? c.surplus : pickedCount;
+        let suffix = '';
+        if (rejected) suffix = ' rejected';
+        console.log(`[slot] candidate item=${c.item} held=${c.held} keep=${c.keep} provenance=${c.provenance} remove=${remove} predicted_freed=${c.potential}${suffix}`);
+    }
+    const removals = [];
+    for (const st of chosen) {
+        let g = null;
+        for (const r of removals) if (r.item === st.name) g = r;
+        if (g === null) {
+            g = { item: st.name, remove: 0, keep: st.keep, provenance: st.provenance, stacks: [] };
+            removals.push(g);
+        }
+        g.remove += st.count;
+        g.stacks.push({ slot: st.slot, count: st.count });
+    }
+    const craft = bestSlotFreeingCraft(registry, recipesOf, counts);
+    return { slotsNeeded, candidates, removals, freed: chosen.length, craft };
+}

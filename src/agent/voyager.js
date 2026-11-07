@@ -16,7 +16,7 @@ import { checkNeedSource, needInterruptSource, isUnblamedInterruptKind, sampleBe
 import { peekPreconditionUnmet, clearPreconditionUnmet, checkNeed, reachNeedForBlocks } from './precondition.js';   // fix76; fix81: structured needs (markPreconditionUnmet is called by seeded code)
 import { SlotEffects } from './slot_effects.js';   // fix59
 import { obtainPlanner } from './recipe_plan.js';   // fix81
-import { stackableCounts, emptySlotsToFit, bestSlotFreeingCraft, surplusFromConsumption, slotsFreedBy } from './slot_room.js';   // fix84
+import { stackableCounts, emptySlotsToFit, roomFor, surplusFromConsumption, inventoryStacks, capacityPlan } from './slot_room.js';   // fix84, fix92
 // fix14: crash-safe writes (tmp file + rename)
 export function writeAtomic(fp, text) { const tmp = `${fp}.tmp-${process.pid}`; writeFileSync(tmp, text); renameSync(tmp, fp); }
 import * as world from './library/world.js';
@@ -3018,8 +3018,9 @@ Use only c; no other globals.`;
         // trial of the eatCookedMutton candidate was refused ("not replaying ... skill eatCookedMutton is demoted") every 5 min
         if (e.demoted && !e.candidate) return { kind: 'invalid', why: `skill ${t} is demoted` };
         if (e.mergedInto) return { kind: 'invalid', why: `skill ${t} was merged into ${e.mergedInto}; propose ${e.mergedInto}` };
+        const host = this._curSub && this._curSub.task === t && this._curSub.slotRequest ? this._curSub.slotRequest : null;
         const need = requiredArgs(e);
-        if (need.length) return { kind: 'invalid', why: `skill ${t} needs arguments (${need.join(', ')}); propose an item goal instead` };
+        if (need.length && host === null) return { kind: 'invalid', why: `skill ${t} needs arguments (${need.join(', ')}); propose an item goal instead` };
         if (!e.contract?.post) {
             delete e.contractTried;   // fix55: _backfillContracts learns it on the next step
             console.log(`[fix55] LOUD: skill goal ${t} has no learned post-contract; contract learning queued`);
@@ -3265,6 +3266,64 @@ Use only c; no other globals.`;
         console.log(`[fix90] "${task}": skill names only items of kind ${cover[0].key} and the bot holds none; anyOf ${cover[0].items.length} from game data`);
         return this._needsForKinds(cover);
     }
+    // fix92: the slot need that actually blocked this run. A root-reported need wins (fix85). Otherwise the deepest
+    // failure that propagated to the root (the same parent walk as blame), then the first slot need on that path.
+    // A nested need whose caller succeeded is that call's, and is not promoted.
+    _blockingSlotNeed(trace) {
+        if (!Array.isArray(trace) || trace.length === 0) return null;
+        const roots = trace.filter(r => r.parent < 0 && Object.hasOwn(r, 'reportedNeed'));
+        if (roots.length > 1) throw new Error(`[fix85] ${roots.length} root frames reported a need`);
+        if (roots.length === 1) {
+            const need = roots[0].reportedNeed;
+            if (!need || need.reason !== 'slot') return null;
+            if (typeof roots[0].name !== 'string' || roots[0].name.length === 0) throw new Error('[fix92] slot frame has no name');
+            return { item: need.item, count: need.count, reason: 'slot', owner: roots[0].name };
+        }
+        const failed = [];
+        for (let i = 0; i < trace.length; i++) {
+            const r = trace[i];
+            if (r.ok) continue;
+            if (r.intr) continue;
+            let propagates = true;
+            let c = r;
+            let p = r.parent;
+            const seen = new Set();
+            while (p >= 0) {
+                if (seen.has(p)) throw new Error(`[fix92] trace cycle at frame ${p}`);
+                seen.add(p);
+                if (typeof p !== 'number' || p >= trace.length) throw new Error(`[fix92] frame ${r.name} parent ${p} is outside the trace`);
+                const a = trace[p];
+                if (a.ok || (c.err && !a.err)) { propagates = false; break; }
+                c = a;
+                p = a.parent;
+            }
+            if (propagates) {
+                if (typeof r.depth !== 'number') throw new Error(`[fix92] trace frame ${JSON.stringify(r.name)} has no numeric depth`);
+                failed.push({ i, depth: r.depth });
+            }
+        }
+        if (!failed.length) return null;
+        failed.sort((a, b) => {
+            if (a.depth !== b.depth) return b.depth - a.depth;
+            return b.i - a.i;
+        });
+        let i = failed[0].i;
+        const walked = new Set();
+        while (i >= 0) {
+            if (walked.has(i)) throw new Error(`[fix92] trace cycle at frame ${i}`);
+            walked.add(i);
+            if (i >= trace.length) throw new Error(`[fix92] frame parent ${i} is outside the trace`);
+            const r = trace[i];
+            if (Object.hasOwn(r, 'reportedNeed') && r.reportedNeed && r.reportedNeed.reason === 'slot') {
+                if (typeof r.name !== 'string' || r.name.length === 0) throw new Error('[fix92] slot frame has no name');
+                if (typeof r.reportedNeed.item !== 'string' || !Number.isInteger(r.reportedNeed.count)) throw new Error(`[fix92] slot need is malformed: ${JSON.stringify(r.reportedNeed)}`);
+                return { item: r.reportedNeed.item, count: r.reportedNeed.count, reason: 'slot', owner: r.name };
+            }
+            i = r.parent;
+            if (typeof i !== 'number') throw new Error(`[fix92] frame ${r.name} parent is not a number`);
+        }
+        return null;
+    }
     _failureNeeds(task, reported, trace, state) {
         // fix85: a need stamped on the root frame of this run is this task's. A need stamped only on a nested frame
         // (an iron_pickaxe craft inside "Collect 4 oak_planks") is that call's, and the global marker is the last write
@@ -3272,10 +3331,27 @@ Use only c; no other globals.`;
         if (Array.isArray(trace) && trace.some(r => Object.hasOwn(r, 'reportedNeed'))) {
             const roots = trace.filter(r => r.parent < 0 && Object.hasOwn(r, 'reportedNeed'));
             if (roots.length > 1) throw new Error(`[fix85] ${roots.length} root frames reported a need on "${task}"`);
-            if (roots.length === 1) return [this._checkNeed(roots[0].reportedNeed, `reported by ${roots[0].name}`)];
+            if (roots.length === 1) {
+                const need = this._checkNeed(roots[0].reportedNeed, `reported by ${roots[0].name}`);
+                if (need.reason === 'slot') {
+                    if (typeof roots[0].name !== 'string' || roots[0].name.length === 0) throw new Error('[fix92] slot frame has no name');
+                    need.owner = roots[0].name;
+                }
+                return [need];
+            }
+            const slot = this._blockingSlotNeed(trace);
+            if (slot !== null) {
+                const need = this._checkNeed({ item: slot.item, count: slot.count, reason: 'slot' }, `reported by ${slot.owner}`);
+                need.owner = slot.owner;
+                return [need];
+            }
             const nested = trace.filter(r => Object.hasOwn(r, 'reportedNeed'));
             console.log(`[fix85] "${task}": ${nested.map(r => `${r.name} reported ${r.reportedNeed.item || r.reportedNeed.reason} at depth ${r.depth}`).join('; ')}; a nested call's need is that call's, not this task's`);
-        } else if (reported !== null && Object.hasOwn(reported, 'need')) return [this._checkNeed(reported.need, 'reported')];
+        } else if (reported !== null && Object.hasOwn(reported, 'need')) {
+            const need = this._checkNeed(reported.need, 'reported');
+            if (need.reason === 'slot') need.owner = 'reported';
+            return [need];
+        }
         if (Array.isArray(trace)) {
             const rec = trace.filter(r => r.preFail && Object.hasOwn(r, 'need'));
             if (rec.length) return [this._checkNeed(rec[rec.length - 1].need, `contract of ${rec[rec.length - 1].name}`)];
@@ -3377,7 +3453,9 @@ Use only c; no other globals.`;
         }
         if (typeof item !== 'string') throw new Error(`[fix91b] need resolved to no item: ${JSON.stringify(n)}`);
         if (item.length === 0) throw new Error(`[fix91b] need resolved to no item: ${JSON.stringify(n)}`);
-        return { item, count: n.count, reason: n.reason, source: n.source, selector };
+        const out = { item, count: n.count, reason: n.reason, source: n.source, selector };
+        if (typeof n.owner === 'string') out.owner = n.owner;
+        return out;
     }
     _chainNeeds(task, needs, state) {
         const cur = this._curSub !== null && this._curSub !== undefined && this._curSub.task === task ? this._curSub : null;
@@ -3414,16 +3492,20 @@ Use only c; no other globals.`;
             //        slot change (stack sizes) is negative breaks it; otherwise it is a real cycle and throws.
             if (below.includes(key)) {
                 if (n.reason !== 'slot') throw new Error(`[fix81] LOUD: subgoal cycle ${[...below, key].join(' -> ')} (need of "${task}")`);
-                subs.push(this._breakSlotCycle(task, below, n));
+                subs.push(this._slotAction(task, n, below, state));
                 continue;
             }
-            subs.push(this._subgoalForNeed(n, state));
+            subs.push(this._subgoalForNeed(n, state, task, below));
         }
+        const runnable = [];
         for (const sb of subs) {
+            if (sb.met === true) continue;
+            if (typeof sb.task !== 'string' || sb.task.length === 0) throw new Error(`[fix92] subgoal has no task: ${JSON.stringify(sb.need)}`);
             if (sb.task === task) throw new Error(`[fix86] LOUD: subgoal cycle: "${task}" decomposes into itself`);
+            runnable.push(sb);
         }
         const edges = this.progress.recipeEdges;
-        for (const sb of subs) if (sb.edge !== null && !Object.hasOwn(edges, sb.edge)) edges[sb.edge] = { task: sb.task, status: 'untried', runs: 0, fails: 0 };
+        for (const sb of runnable) if (sb.edge !== null && !Object.hasOwn(edges, sb.edge)) edges[sb.edge] = { task: sb.task, status: 'untried', runs: 0, fails: 0 };
         const d = (this.progress.decomposed ||= {}), q = (this.progress.subgoals ||= []);
         const depth = cur === null ? 0 : cur.depth;
         d[task] = { subs: subs.map(sb => sb.task), skills: [], at: Date.now(), reason: `needs: ${desc}` };
@@ -3438,14 +3520,17 @@ Use only c; no other globals.`;
             const held = Object.hasOwn(inv, n.item) ? inv[n.item] : 0;
             return { item: n.item, count: held + n.count };
         };
-        q.unshift(...subs.map(sb => {
+        const slotWork = runnable.some(sb => sb.need && sb.need.reason === 'slot');
+        const retryChain = slotWork ? [...chain, 'slot'] : chain;
+        q.unshift(...runnable.map(sb => {
             // fix84: descendants of a slot need see 'slot' on the chain, so the logs a chest needs notice the loop
             const entryChain = sb.need.reason === 'slot' ? [...below, 'slot'] : below;
             const entry = { task: sb.task, parent: task, depth: depth + 1, chain: entryChain, edge: sb.edge };
+            if (sb.slotRequest) entry.slotRequest = sb.slotRequest;
             const t = target(sb.need, sb.task);
             if (t !== null) entry.atLeast = t;
             return entry;
-        }), { task, retry: true, prereq: true, depth, chain });
+        }), { task, retry: true, prereq: true, depth, chain: retryChain });
         // fix47's curriculum blockers, now from the structured needs (was the "Cannot break X" critic text); fix83: resolved once
         //        the bot HOLDS what the goal needs (held at the failure + shortfall), not once it holds the shortfall.
         //        fix84: a slot's count is how many more will not fit, not an absolute stack to hold.
@@ -3467,12 +3552,19 @@ Use only c; no other globals.`;
             this.progress.blockers.push(row);
         }
         this._saveProgress();
-        console.log(`[psn] DECOMPOSE (needs) "${task}" -> ${subs.map(sb => sb.task).join(', ')}; lacks ${desc}`);
+        const shown = runnable.length ? runnable.map(sb => sb.task).join(', ') : '(already fits)';
+        console.log(`[psn] DECOMPOSE (needs) "${task}" -> ${shown}; lacks ${desc}`);
         return true;
     }
     // fix91b: an anyOf blocker is met when one member is held at >= count. Not the sum: cheapest() plans `count` of one item.
     _blockerSatisfied(b, inv) {
         assertProgressBlocker(b);
+        if (b.reason === 'slot') {
+            const bot = this.agent.bot;
+            if (!bot || !bot.inventory || !Array.isArray(bot.inventory.slots)) throw new Error('[fix92] slot blocker needs the live inventory slots');
+            if (typeof b.item !== 'string') throw new Error(`[fix92] slot blocker has no item: ${JSON.stringify(b)}`);
+            return world.roomForItem(bot, b.item) >= b.count;
+        }
         if (Object.hasOwn(b, 'anyOf')) {
             for (const name of b.anyOf) {
                 if (Object.hasOwn(inv, name) && inv[name] >= b.count) return true;
@@ -3536,74 +3628,81 @@ Use only c; no other globals.`;
         }
         return null;
     }
-    // fix84: one need, one subgoal. proximity and reach are placement/search; a slot is a learned skill that has freed
-    //        slots (or an open task the code model writes). Anything else is a learned producer, else the game data.
-    _subgoalForNeed(n, state) {
+    // fix84: one need, one subgoal. proximity and reach are placement/search. A slot is a whole-slot capacity plan
+    //        (fix92). Anything else is a learned producer, else the game data.
+    _subgoalForNeed(n, state, task, below) {
         if (n.reason === 'proximity') return { task: `ensure ${n.item}`, need: n, edge: null };
         if (n.reason === 'reach') return { task: `reach ${n.item}`, need: n, edge: null };
-        if (n.reason === 'slot') return this._slotSubgoal(n);
+        if (n.reason === 'slot') return this._slotAction(task, n, below, state);
         const learned = this._subgoalToObtainItem(n.item, n.count, state.inventory, new Set());
         if (learned !== null) return { task: learned, need: n, edge: null };
         return { task: this._obtainPlanner(state).prerequisites(n.item, n.count, state.inventory).task, need: n, edge: n.item };
     }
-    // fix84: the learned skill whose traced runs freed the most slots (then the name). null when none has.
-    _slotFreeingSkill() {
-        if (!this.slotEffects) throw new Error('[fix84] slotEffects required to choose a slot-freeing skill');
-        const fits = [];
-        for (const s of this.skills) {
-            if (s.demoted) continue;
-            if (s.mergedInto) continue;
-            if (s.candidate) continue;
-            if (!s.contract || typeof s.contract.post !== 'string') continue;
-            if (requiredArgs(s).length) continue;
-            const eff = this.slotEffects.effect(s.name);
-            if (eff === null) continue;
-            if (typeof eff.freed !== 'number') throw new Error(`[fix84] slot effect of ${s.name} has no freed number`);
-            if (eff.freed > 0) fits.push({ s, freed: eff.freed });
-        }
-        fits.sort((a, b) => (b.freed - a.freed) || (a.s.name < b.s.name ? -1 : a.s.name > b.s.name ? 1 : 0));
-        return fits.length ? fits[0].s : null;
-    }
-    _slotSubgoal(n) {
-        const skill = this._slotFreeingSkill();
-        if (skill !== null) {
-            this._armSlotsNeeded(n);
-            return { task: skill.name, need: n, edge: null };
-        }
-        return { task: `free a slot for ${n.item}`, need: n, edge: null };
-    }
-    _armSlotsNeeded(n) {
+    _buildCapacityPlan(req, state, slotsNeeded) {
         const bot = this.agent.bot;
-        bot.__slotsNeeded = emptySlotsToFit(bot.registry, stackableCounts(bot), n.item, n.count);
+        if (typeof bot.recipesAll !== 'function') throw new Error('[fix92] bot.recipesAll required');
+        const goal = this._resolveGoal(req.parent);
+        let goalItem = req.item;
+        let goalCount = req.count;
+        if (goal.kind === 'item') { goalItem = goal.item; goalCount = goal.count; }
+        const planner = this._obtainPlanner(state);
+        return capacityPlan({
+            registry: bot.registry,
+            skills: this.skills,
+            stacks: inventoryStacks(bot),
+            slotsNeeded,
+            goalItem,
+            goalCount,
+            needItem: req.item,
+            prerequisites: (item, count, inv) => planner.prerequisites(item, count, inv),
+            toolsNeeded: item => planner.toolsNeeded(item, {}),
+            recipesOf: id => bot.recipesAll(id, null, true),
+        });
     }
-    // fix84: 'slot' is already on the ancestor chain (a chest needs logs, the logs need a free slot). A craft that
-    //        leaves fewer stacks than it started from, counted by stackSize, breaks it. Else the seeded toss of
-    //        learned surplus. Else the cycle is real: name it and throw.
-    _breakSlotCycle(task, below, n) {
+    // fix92: serve the capacity need before reach, explore, or repair. Toss only when it empties whole slots.
+    //        A craft that frees slots is the cycle break once a toss is already on the chain. No safe plan throws.
+    _slotAction(task, n, below, state) {
+        if (typeof n.owner !== 'string' || n.owner.length === 0) throw new Error(`[fix92] slot need has no traced owner: ${JSON.stringify(n)}`);
         const bot = this.agent.bot;
         const counts = stackableCounts(bot);
-        const registry = bot.registry;
-        if (typeof bot.recipesAll !== 'function') throw new Error('[fix84] bot.recipesAll required to resolve a slot cycle');
-        const named = [...below, 'slot'].join(' -> ');
-        const craft = bestSlotFreeingCraft(registry, id => bot.recipesAll(id, null, true), counts);
-        if (craft !== null && !below.includes(craft.item)) {
-            console.log(`[fix84] slot cycle ${named} (need of "${task}") broken by ${craft.task} (frees ${craft.freed} slot(s) by stack size)`);
-            return { task: craft.task, need: n, edge: craft.item };
-        }
-        const surplus = surplusFromConsumption(this.skills, counts);
-        const freed = surplus.length ? slotsFreedBy(registry, counts, surplus) : 0;
-        if (freed > 0) {
+        const room = roomFor(bot.registry, counts, n.item);
+        const slotsNeeded = emptySlotsToFit(bot.registry, counts, n.item, n.count);
+        console.log(`[slot] need item=${n.item} count=${n.count} owner=${n.owner} parent=${task} room_before=${room} slots_needed=${slotsNeeded}`);
+        if (slotsNeeded < 1) return { met: true, task: null, need: n, edge: null };
+        const req = { item: n.item, count: n.count, owner: n.owner, parent: task, slotsNeeded };
+        const plan = this._buildCapacityPlan(req, state, slotsNeeded);
+        const chain = Array.isArray(below) ? below : [];
+        const again = chain.includes('slot');
+        if (!again && plan.freed >= slotsNeeded) {
             const toss = this.skills.find(s => s.name === 'tossClutter');
-            if (!toss) throw new Error(`[fix84] LOUD: subgoal cycle ${named} (need of "${task}"); learned surplus would free ${freed} slot(s) but tossClutter is not in the library`);
-            if (!toss.contract || typeof toss.contract.post !== 'string') throw new Error(`[fix84] LOUD: subgoal cycle ${named} (need of "${task}"); learned surplus would free ${freed} slot(s) but tossClutter has no post-contract, so a toss cannot be verified`);
-            if (requiredArgs(toss).length) throw new Error(`[fix84] LOUD: subgoal cycle ${named} (need of "${task}"); tossClutter requires arguments (${requiredArgs(toss).join(', ')})`);
-            if (below.includes(toss.name)) throw new Error(`[fix84] LOUD: subgoal cycle ${named} (need of "${task}"); tossClutter is already on the chain and did not free a slot`);
-            this._armSlotsNeeded(n);
-            console.log(`[fix84] slot cycle ${named} (need of "${task}") broken by tossClutter (learned surplus frees ${freed} slot(s))`);
-            return { task: toss.name, need: n, edge: null };
+            if (!toss) throw new Error(`[fix92] LOUD: capacity plan frees ${plan.freed} slot(s) for ${n.item} but tossClutter is not in the library`);
+            if (!toss.contract || typeof toss.contract.post !== 'string') throw new Error('[fix92] LOUD: tossClutter has no post-contract, so a toss cannot be verified');
+            const post = toss.contract.post;
+            if (!post.includes('c.post.free')) throw new Error(`[fix92] LOUD: tossClutter post does not measure empty slots (${post})`);
+            if (!post.includes('c.pre.free')) throw new Error(`[fix92] LOUD: tossClutter post does not measure empty slots (${post})`);
+            return { task: toss.name, need: n, edge: null, slotRequest: { ...req, removals: plan.removals } };
         }
-        const why = craft === null ? 'no slot-freeing craft (net slot change from stack sizes)' : `the only slot-freeing craft is ${craft.item}, which is already on the chain`;
-        throw new Error(`[fix84] LOUD: subgoal cycle ${named} (need of "${task}"); ${why} and no learned surplus toss frees a slot`);
+        if (plan.craft !== null && plan.craft.freed >= slotsNeeded && !chain.includes(plan.craft.item)) {
+            console.log(`[slot] craft ${plan.craft.task} frees ${plan.craft.freed} slot(s) for ${n.item}`);
+            return { task: plan.craft.task, need: n, edge: plan.craft.item };
+        }
+        const rejected = [];
+        for (const c of plan.candidates) if (c.potential < 1) rejected.push(`${c.item}(keep ${c.keep})`);
+        const why = plan.craft === null ? 'no slot-freeing craft' : `craft ${plan.craft.item} is already on the chain`;
+        let detail = rejected.join(', ');
+        if (detail.length === 0) detail = 'none';
+        throw new Error(`[fix92] LOUD: no whole-slot plan frees ${slotsNeeded} slot(s) for ${n.count} ${n.item} (${why}; rejected: ${detail})`);
+    }
+    _tossClutterCall(entry) {
+        const req = entry.slotRequest;
+        if (!req || typeof req.item !== 'string' || !Number.isInteger(req.count) || req.count < 1) throw new Error(`[fix92] tossClutter subgoal has no slot request: ${JSON.stringify(entry)}`);
+        const bot = this.agent.bot;
+        const live = emptySlotsToFit(bot.registry, stackableCounts(bot), req.item, req.count);
+        if (live < 1) throw new Error(`[fix92] LOUD: ${req.item} already fits; tossClutter plan is stale`);
+        const plan = this._buildCapacityPlan(req, this.observe(), live);
+        if (plan.freed < live) throw new Error(`[fix92] LOUD: tossClutter plan is stale; it frees ${plan.freed} of ${live} slot(s) for ${req.item}`);
+        bot.__capacityPlan = plan.removals;
+        return `await tossClutter(bot, ${live}, ${JSON.stringify(plan.removals)});`;
     }
     // fix74: how long a skill has been seen to run before returning on its own, from the trace of every traced run (replay,
     //        writeCode, practice): skill.runMs = { n, max }. A call that was interrupted (rec.intr) or never returned (no t1)
@@ -4457,6 +4556,15 @@ Use only c; no other globals.`;
         this.agent.bot.__uncertainItems = lists.uncertain;
         this.agent.bot.__surplus = lists.surplus;
         this.agent.bot.__knownChests = this.chestMemory;
+        const cur = this._curSub;
+        if (cur && cur.slotRequest) {
+            const req = cur.slotRequest;
+            const slotsNeeded = emptySlotsToFit(this.agent.bot.registry, stackableCounts(this.agent.bot), req.item, req.count);
+            if (slotsNeeded > 0) {
+                const plan = this._buildCapacityPlan(req, this.observe(), slotsNeeded);
+                this.agent.bot.__capacityPlan = plan.removals;
+            } else this.agent.bot.__capacityPlan = [];
+        } else this.agent.bot.__capacityPlan = [];
     }
     // fix37/fix49/fix74: run one practice skill. Returns null when the code-model call completed (abort: no verdict),
     // { skipped } when the bot cannot practice now, { notRun } when the skill could not be staged, else the run's verdict
@@ -4632,7 +4740,11 @@ Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
         const task = it.task;
         const bad = validateTask(task);
         if (bad !== null) return bad;
-        const g = this._resolveGoal(task);
+        const prevSub = this._curSub;
+        if (it.slotRequest) this._curSub = it;
+        let g;
+        try { g = this._resolveGoal(task); }
+        finally { this._curSub = prevSub; }
         if (g.kind === 'invalid') return g.why;
         const retry = it.retry === true;
         if (!retry && typeof it.parent === 'string' && it.parent.length > 0) {
@@ -5316,6 +5428,13 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         // fix19 (5): an explicit FAILED line from a skill is a contract failure even if the task check passed (e.g. ensureChest inside a storage task)
         const explicit = trace.some(r => !r.intr && (r.ownFail || []).some(l => /FAILED|CONDITION violated/.test(l)));   // fix22: contract violations count
         if (ok && !revalFail && !explicit) return;
+        if (!ok && !died && !stalled && !timedOut && !crashed) {
+            const slotNeed = this._blockingSlotNeed(trace);
+            if (slotNeed !== null) {
+                console.log(`[slot] capacity failure item=${slotNeed.item} count=${slotNeed.count} owner=${slotNeed.owner}; not a repair`);
+                return;
+            }
+        }
         if (ok && explicit) console.log(`[psn] task check passed but a skill reported FAILED; attributing that contract failure`);
         console.log(`[psn] execution trace of ${root} (${trace.length} calls):\n${traceText(trace)}`);
         const learned = n => !!this.skills.find(s => s.name === n);   // fix33: seeded primitives included   // fix24: includes hand-written (repairs become learned candidates)
@@ -6006,7 +6125,11 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
         // fix56: an open goal is routed only by identity/parsed routes or by the embedding match (nearest skill among all candidates AND above
         // the learned replay threshold); never by lexical word overlap, which picks unrelated well-rated skills
         let route;
-        if (goalKind.kind === 'skill') route = { name: goalKind.skill.name, call: `await ${goalKind.skill.name}(bot);` };
+        if (goalKind.kind === 'skill') {
+            let call = `await ${goalKind.skill.name}(bot);`;
+            if (goalKind.skill.name === 'tossClutter' && this._curSub && this._curSub.task === task && this._curSub.slotRequest) call = this._tossClutterCall(this._curSub);
+            route = { name: goalKind.skill.name, call };
+        }
         else if (goalKind.kind === 'reach') {
             // fix86: a learned skill whose traced runs brought this block into nearby is the search. No surface or wood special case.
             const bringer = this._reachBringer(goalKind.item);
@@ -6781,86 +6904,55 @@ Voyager.SEEDED_PRIMITIVES = [
         deps: [],
     },
     {
-        // fix42: tossClutter uses LEARNED signals only - no hard-coded junk list
-        // Consults bot.__safeToToss (set by voyager before skill runs) for items safe to toss
-        // fix43: tossClutter uses POSITIVE learned signals only - unknown items NOT auto-tossed
-        // Fail loud if no learned signal, or if deposit prerequisite (chest) missing
+        // fix92: the caller passes the slot deficit and the whole-slot plan. Success is measured empty slots.
         name: 'tossClutter',
-        description: 'Toss surplus/low-value items to free inventory space using LEARNED signals (needs/produces, not hard-coded lists). If toss is insufficient, calls depositToChest. Fails loud if nothing is safe to toss/deposit or if chest prerequisite missing.',
+        description: 'Toss the whole-slot capacity plan passed by the caller. slotsNeeded is how many empty slots must be gained. Success is emptySlotCount increasing by at least that many, not an item count dropping.',
         task: 'toss clutter to free inventory space',
-        code: `async function tossClutter(bot, minFree = 4) {
-    // the argument is the caller's empty-slot target; a slot-need chain sets __slotsNeeded from stack sizes instead
-    if (!Number.isInteger(minFree) || minFree < 1) throw new Error('tossClutter: minFree must be a positive integer, got ' + JSON.stringify(minFree));
-    const need = Number.isInteger(bot.__slotsNeeded) && bot.__slotsNeeded > 0 ? bot.__slotsNeeded : minFree;
-    if (bot.inventory.emptySlotCount() >= need) return 0;
-    let tossed = 0;
-    let depositedTotal = 0;
-    // fix51: fail loud if signals not initialized (no fallback)
-    if (!Array.isArray(bot.__safeToToss)) {
-        log(bot, 'FAIL LOUD: bot.__safeToToss not initialized (voyager._prepareTossSignals not called before tossClutter)');
-        return false;
-    }
-    if (!Array.isArray(bot.__depositCandidates)) {
-        log(bot, 'FAIL LOUD: bot.__depositCandidates not initialized');
-        return false;
-    }
-    if (!Array.isArray(bot.__uncertainItems)) {
-        log(bot, 'FAIL LOUD: bot.__uncertainItems not initialized');
-        return false;
-    }
-    if (!Array.isArray(bot.__surplus)) {
-        log(bot, 'FAIL LOUD: bot.__surplus not initialized (voyager._prepareTossSignals not called before tossClutter)');
-        return false;
-    }
-    const depositList = bot.__depositCandidates;
-    // fix84: toss the learned surplus counts (verified consumption), not whole stacks and not a name list
-    for (const s of bot.__surplus) {
+        code: `async function tossClutter(bot, slotsNeeded, plan) {
+    if (!Number.isInteger(slotsNeeded) || slotsNeeded < 1) throw new Error('[fix92] tossClutter: slotsNeeded must be a positive integer, got ' + JSON.stringify(slotsNeeded));
+    if (!Array.isArray(plan) || plan.length < 1) throw new Error('[fix92] tossClutter: plan must list removals, got ' + JSON.stringify(plan));
+    const before = bot.inventory.emptySlotCount();
+    if (!Number.isInteger(before) || before < 0) throw new Error('[fix92] tossClutter: emptySlotCount is not a non-negative integer');
+    for (const row of plan) {
         if (bot.interrupt_code) return false;
-        if (bot.inventory.emptySlotCount() >= need) break;
-        if (typeof s.item !== 'string' || !Number.isInteger(s.count) || s.count < 1) throw new Error('tossClutter: surplus entry ' + JSON.stringify(s) + ' is not { item, count }');
-        const it = bot.inventory.items().find(x => x.name === s.item);
-        if (!it) throw new Error('tossClutter: learned surplus ' + s.item + ' is not in the inventory');
+        if (row === null || typeof row !== 'object' || Array.isArray(row)) throw new Error('[fix92] tossClutter: removal is not an object: ' + JSON.stringify(row));
+        if (typeof row.item !== 'string' || !Number.isInteger(row.remove) || row.remove < 1) throw new Error('[fix92] tossClutter: removal needs item and a positive remove: ' + JSON.stringify(row));
+        if (!Number.isInteger(row.keep) || row.keep < 0) throw new Error('[fix92] tossClutter: removal keep is not a non-negative integer: ' + JSON.stringify(row));
+        const regItem = bot.registry.itemsByName[row.item];
+        if (!regItem) throw new Error('[fix92] tossClutter: ' + row.item + ' is not an item in the game data');
+        const stacks = [];
+        for (const x of bot.inventory.items()) if (x.name === row.item) stacks.push(x);
+        let held = 0;
+        for (const x of stacks) held += x.count;
+        if (held < row.remove + row.keep) throw new Error('[fix92] tossClutter: stale plan for ' + row.item + '; held ' + held + ', remove ' + row.remove + ', keep ' + row.keep);
         if (bot.currentWindow) {
             const win = bot.currentWindow;
             bot.closeWindow(win);
             await new Promise(resolve => {
-                const onClose = (w) => { if (!w || w === win) { bot.off('windowClose', onClose); resolve(); } };
+                const onClose = (w) => {
+                    if (w === win) { bot.off('windowClose', onClose); resolve(); return; }
+                    if (w) return;
+                    bot.off('windowClose', onClose);
+                    resolve();
+                };
                 bot.on('windowClose', onClose);
             });
         }
-        const n = s.count < it.count ? s.count : it.count;
-        await bot.toss(it.type, null, n);
-        tossed++;
-        console.log(\`[toss] tossed \${n} \${s.item} (empty slots now \${bot.inventory.emptySlotCount()})\`);
+        await bot.toss(stacks[0].type, null, row.remove);
     }
-    if (tossed && !bot.interrupt_code) {
-        await moveAway(bot, 6);
-        console.log(\`[toss] moved away from \${tossed} dropped stack(s) to avoid re-pickup\`);
-    }
-    if (bot.inventory.emptySlotCount() >= need) return tossed + depositedTotal;
-    // fix84: the storage block is the game data's chest, and a missing one is a proximity need (same marker as before)
-    const chestBlock = bot.registry.blocksByName.chest;
-    if (!chestBlock) throw new Error('tossClutter: the game data has no chest block');
-    const chest = getNearestBlock(bot, chestBlock.name);
-    if (!chest) {
-        __mcPreconditionUnmet__(bot, { need: { item: chestBlock.name, count: 1, reason: 'proximity' } });
-        log(bot, \`PREREQUISITE FAILED: tossClutter needs a chest within reach to deposit (learned surplus did not free a slot). Place or find a chest first.\`);
-        return false;
-    }
-    if (depositList.length) {
-        console.log(\`[toss] still \${bot.inventory.emptySlotCount()} empty after tossing \${tossed}; depositing \${depositList.length} candidate(s) to chest at \${chest.position}\`);
-        for (const itemName of depositList) {
-            if (bot.interrupt_code) return false;
-            if (bot.inventory.emptySlotCount() >= need) break;
-            const ok = await depositToChest(bot, itemName);
-            if (ok) depositedTotal++;
-        }
-    }
-    if (bot.inventory.emptySlotCount() >= need) return tossed + depositedTotal;
-    log(bot, \`FAILED tossClutter: still \${bot.inventory.emptySlotCount()} empty after tossing \${tossed} and depositing \${depositedTotal}\`);
-    return false;
+    const after = bot.inventory.emptySlotCount();
+    if (!Number.isInteger(after) || after < 0) throw new Error('[fix92] tossClutter: emptySlotCount after the toss is not a non-negative integer');
+    const actual = after - before;
+    console.log('[slot] verified empty_before=' + before + ' empty_after=' + after + ' actual_freed=' + actual);
+    if (actual < slotsNeeded) return false;
+    return actual;
 }`,
-        deps: ['moveAway', 'depositToChest'],
+        deps: [],
+        contract: {
+            pre: 'c => c.pre.alive === true && Number.isInteger(c.args[0]) && c.args[0] > 0',
+            post: 'c => c.post.free > c.pre.free',
+            text: 'success is measured empty slots increasing, not an item-count drop',
+        },
     },
     // fix43/47: ensureCraftingTable with multi-cell retry AND inline 2x2 crafting (no craftRecipe dep)
     // Generic: for each missing ingredient, find a 2x2 recipe from recipesAll and craft it

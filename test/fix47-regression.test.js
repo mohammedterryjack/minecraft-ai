@@ -512,13 +512,10 @@ describe('fix47: tossClutter postcondition and deposit logic', () => {
         const tossClutterPrim = Voyager.SEEDED_PRIMITIVES.find(p => p.name === 'tossClutter');
         assert.ok(tossClutterPrim, 'tossClutter should exist');
         
-        if (tossClutterPrim.contract) {
-            const post = tossClutterPrim.contract.post;
-            assert.ok(
-                post.includes('delta') || post.includes('inv') || post.includes('emptySlot'),
-                'tossClutter postcondition should check for inventory change or slot freeing'
-            );
-        }
+        assert.ok(tossClutterPrim.contract, 'tossClutter should have a seeded contract');
+        const post = tossClutterPrim.contract.post;
+        assert.strictEqual(post, 'c => c.post.free > c.pre.free',
+            'tossClutter postcondition should hold only when empty slots increased');
     });
 
     it('should deposit cobblestone when computed as candidate', async () => {
@@ -528,12 +525,10 @@ describe('fix47: tossClutter postcondition and deposit logic', () => {
         assert.ok(tossClutterPrim, 'tossClutter should exist');
         
         const code = tossClutterPrim.code;
-        
-        // Should call depositToChest for deposit candidates
-        assert.ok(code.includes('depositToChest'), 
-            'tossClutter should call depositToChest for deposit candidates');
-        assert.ok(code.includes('depositList') || code.includes('depositCandidates'),
-            'tossClutter should iterate over deposit candidates');
+        assert.ok(code.includes('async function tossClutter(bot, slotsNeeded, plan)'),
+            'tossClutter takes the deficit and the whole-slot plan');
+        assert.ok(!code.includes('depositToChest'),
+            'a slot need is not a chest deposit');
     });
 
     it('should have clear PREREQUISITE FAILED message when chest missing for deposit', async () => {
@@ -543,9 +538,10 @@ describe('fix47: tossClutter postcondition and deposit logic', () => {
         assert.ok(tossClutterPrim, 'tossClutter should exist');
         
         const code = tossClutterPrim.code;
-        
-        assert.ok(code.includes('PREREQUISITE') || code.includes('chest'),
-            'tossClutter should mention prerequisite or chest requirement on failure');
+        assert.ok(code.includes('[fix92] tossClutter:'),
+            'tossClutter names the failure when the plan cannot be carried out');
+        assert.ok(code.includes('[slot] verified empty_before='),
+            'tossClutter logs the measured empty-slot change');
     });
 });
 

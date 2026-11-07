@@ -40,9 +40,10 @@ describe('fix74: the precondition marker has one writer, and generated code cann
         const v = src('src/agent/voyager.js');
         assert.strictEqual(v.includes('bot.__unmetPrecondition ='), false);
         // fix81: every call says what is missing: { need: { item | anyOf, count, reason } }
-        // fix84: three more structured calls (collectBlock slot, pickupNearbyItems slot, depositToChest with no known chest)
+        // fix84: structured slot/proximity calls (collectBlock slot, pickupNearbyItems slot, depositToChest with no known chest)
+        // fix92: tossClutter no longer falls through to a chest proximity marker; capacity work uses the shared plan
         assert.strictEqual((v.match(new RegExp(`${PRECONDITION_UNMET_BINDING}\\(bot\\);`, 'g')) || []).length, 0);
-        assert.strictEqual((v.match(new RegExp(`${PRECONDITION_UNMET_BINDING}\\(bot, \\{ need: \\{`, 'g')) || []).length, 8);
+        assert.strictEqual((v.match(new RegExp(`${PRECONDITION_UNMET_BINDING}\\(bot, \\{ need: \\{`, 'g')) || []).length, 7);
     });
     it('it is not on the model-visible API: not a skills.js export, not in getBareAPI (prompts, lint sandbox)', () => {
         assert.strictEqual(Object.hasOwn(skillsLib, 'markPreconditionUnmet'), false);

@@ -6,6 +6,7 @@ import settings from "../../../settings.js";
 import { watchPathing } from "../../utils/movement_model.js";
 import { findCarried } from "../../utils/carried.js";
 import { markPreconditionUnmet, markBlockOutOfRange } from "../precondition.js";
+import { emptySlotsToFit, stackableCounts } from "../slot_room.js";
 
 const blockPlaceDelay = settings.block_place_delay == null ? 0 : settings.block_place_delay;
 const useDelay = blockPlaceDelay > 0;
@@ -180,15 +181,16 @@ export async function craftRecipe(bot, itemName, num=1) {
     const requiredIngredients = mc.ingredientsFromPrismarineRecipe(recipe); //Items required to use the recipe once.
     const craftLimit = mc.calculateLimitingResource(inventory, requiredIngredients);
     
-    // fix25/fix26: when inventory is nearly full, attempt to free space using learned toss/deposit signals
-    // fix26: threshold aligned with _freeInventory (< 4) - was < 2, causing _freeInventory to never run at 2-3 empty slots
-    if (bot.inventory.emptySlotCount() < 4) {
-        console.log(`[craftRecipe] inventory nearly full (${bot.inventory.emptySlotCount()} empty), calling _freeInventory`);
-        await _freeInventory(bot, itemName);
-        // Re-check after attempting to free space
-        if (bot.inventory.emptySlotCount() === 0 && !bot.inventory.items().some(it => it.name === itemName && it.count < it.stackSize)) {
-            log(bot, `FAILED: Cannot craft ${itemName}: inventory still full after toss/deposit attempt (0 empty slots). Use depositToChest or tossClutter to free more space.`);
-            return false;
+    const slotsNeeded = emptySlotsToFit(bot.registry, stackableCounts(bot), itemName, 1);
+    if (slotsNeeded > 0 && Array.isArray(bot.__capacityPlan) && bot.__capacityPlan.length > 0) {
+        console.log(`[craftRecipe] ${itemName} needs ${slotsNeeded} empty slot(s); applying the capacity plan`);
+        const freed = await _freeInventory(bot, slotsNeeded, bot.__capacityPlan);
+        if (freed === false) {
+            const still = emptySlotsToFit(bot.registry, stackableCounts(bot), itemName, 1);
+            if (still > 0) {
+                log(bot, `FAILED: Cannot craft ${itemName}: the capacity plan did not free a slot.`);
+                return false;
+            }
         }
     }
     const beforeCount = world.getInventoryCounts(bot)[itemName] || 0;
@@ -540,82 +542,33 @@ export async function defendSelf(bot, range=9) {
 
 
 
-// fix84: toss the learned surplus counts (bot.__surplus, verified consumption). No name list, no whole-stack guess.
-// fix43: fail loud when deposit prerequisite (chest) missing
-// fix25: raised threshold from >= 2 to < 4 so it runs when 2-3 empty (not just 0-1)
-async function _freeInventory(bot, keepName) {
-    // survival-only: toss surplus items when nearly full
-    if (bot.inventory.emptySlotCount() >= 4) return;  // fix25: was >= 2
-    if (!Array.isArray(bot.__surplus)) throw new Error('[_freeInventory] bot.__surplus is not an array (voyager._prepareTossSignals not called)');
-    if (!Array.isArray(bot.__depositCandidates)) throw new Error('[_freeInventory] bot.__depositCandidates is not an array (voyager._prepareTossSignals not called)');
-    if (!Array.isArray(bot.__uncertainItems)) throw new Error('[_freeInventory] bot.__uncertainItems is not an array (voyager._prepareTossSignals not called)');
-    const surplus = bot.__surplus;
-    const depositList = bot.__depositCandidates;
-    const uncertainList = bot.__uncertainItems;
-    let freed = 0;
-    for (const s of surplus) {
-        if (s.item === keepName) continue;
-        if (typeof s.item !== 'string' || !Number.isInteger(s.count) || s.count < 1) throw new Error(`[_freeInventory] surplus entry ${JSON.stringify(s)} is not { item, count }`);
-        const it = bot.inventory.items().find(i => i.name === s.item);
-        if (!it) throw new Error(`[_freeInventory] learned surplus ${s.item} is not in the inventory`);
-        const n = s.count < it.count ? s.count : it.count;
-        await bot.toss(it.type, null, n);
-        freed++;
-        console.log(`[_freeInventory] tossed ${n} ${s.item} (verified surplus)`);
-        if (bot.inventory.emptySlotCount() >= 4) break;
+// fix92: toss the caller's whole-slot plan. slotsNeeded is how many empty slots must be gained.
+// Success is emptySlotCount increasing by at least that many. An item-count drop that frees no slot returns false.
+export async function _freeInventory(bot, slotsNeeded, plan) {
+    if (!Number.isInteger(slotsNeeded) || slotsNeeded < 1) throw new Error('[_freeInventory] slotsNeeded must be a positive integer, got ' + JSON.stringify(slotsNeeded));
+    if (!Array.isArray(plan) || plan.length < 1) throw new Error('[_freeInventory] plan must list removals, got ' + JSON.stringify(plan));
+    const before = bot.inventory.emptySlotCount();
+    if (!Number.isInteger(before) || before < 0) throw new Error('[_freeInventory] emptySlotCount is not a non-negative integer');
+    for (const row of plan) {
+        if (bot.interrupt_code) return false;
+        if (row === null || typeof row !== 'object' || Array.isArray(row)) throw new Error('[_freeInventory] removal is not an object: ' + JSON.stringify(row));
+        if (typeof row.item !== 'string' || !Number.isInteger(row.remove) || row.remove < 1) throw new Error('[_freeInventory] removal needs item and a positive remove: ' + JSON.stringify(row));
+        if (!Number.isInteger(row.keep) || row.keep < 0) throw new Error('[_freeInventory] removal keep is not a non-negative integer: ' + JSON.stringify(row));
+        const regItem = bot.registry.itemsByName[row.item];
+        if (!regItem) throw new Error('[_freeInventory] ' + row.item + ' is not an item in the game data');
+        const stacks = [];
+        for (const x of bot.inventory.items()) if (x.name === row.item) stacks.push(x);
+        let held = 0;
+        for (const x of stacks) held += x.count;
+        if (held < row.remove + row.keep) throw new Error('[_freeInventory] stale plan for ' + row.item + '; held ' + held + ', remove ' + row.remove + ', keep ' + row.keep);
+        await bot.toss(stacks[0].type, null, row.remove);
     }
-    if (freed) log(bot, `[_freeInventory] dropped ${freed} surplus stack(s) from verified consumption.`);
-    
-    // Phase 2: if still low on space, try to deposit to chest
-    // fix51: use ONLY learned chest memory (no world search, no distance cap)
-    if (bot.inventory.emptySlotCount() < 2 && depositList.length) {
-        if (!bot.__knownChests) {
-            log(bot, `[_freeInventory] FAIL LOUD: bot.__knownChests not initialized (voyager._prepareTossSignals not called)`);
-            return;
-        }
-        const chestKeys = Object.keys(bot.__knownChests);
-        if (chestKeys.length === 0) {
-            log(bot, `[_freeInventory] FAIL LOUD: no known chest in memory to deposit items (have ${depositList.length} deposit candidates). Discover or place a chest first.`);
-            return;
-        }
-        
-        // Find nearest known chest by Euclidean distance (no cap)
-        const botPos = bot.entity.position;
-        let nearestChest = null;
-        let nearestDist = Infinity;
-        for (const key of chestKeys) {
-            const [cx, cy, cz] = key.split(',').map(Number);
-            const dist = Math.hypot(cx - botPos.x, cy - botPos.y, cz - botPos.z);
-            if (dist < nearestDist) {
-                nearestDist = dist;
-                nearestChest = { x: cx, y: cy, z: cz, key };
-            }
-        }
-        
-        console.log(`[_freeInventory] still only ${bot.inventory.emptySlotCount()} empty after tossing ${freed} stacks; depositing to known chest at ${nearestChest.x},${nearestChest.y},${nearestChest.z} (dist ${Math.round(nearestDist)})`);
-        let deposited = 0;
-        for (const itemName of depositList) {
-            if (itemName === keepName) continue;
-            if (bot.inventory.emptySlotCount() >= 4) break;
-            // Call putInChest (the built-in deposit function) - bare name
-            try {
-                const ok = await putInChest(bot, itemName);
-                if (ok) deposited++;
-            } catch (e) {
-                log(bot, `[_freeInventory] FAILED to deposit ${itemName}: ${e.message}`);
-            }
-        }
-        if (deposited) console.log(`[_freeInventory] deposited ${deposited} item type(s) to chest (empty slots now ${bot.inventory.emptySlotCount()})`);
-    }
-    
-    // fix43: fail loud if we couldn't free space
-    if (bot.inventory.emptySlotCount() < 2) {
-        if (uncertainList.length && !surplus.length) {
-            log(bot, `[_freeInventory] FAILED: ${uncertainList.length} item(s) have no verified consumption and were not tossed.`);
-        } else if (!surplus.length && !depositList.length) {
-            log(bot, '[_freeInventory] FAILED: no verified consumption says what is surplus, and nothing is marked to deposit');
-        }
-    }
+    const after = bot.inventory.emptySlotCount();
+    if (!Number.isInteger(after) || after < 0) throw new Error('[_freeInventory] emptySlotCount after the toss is not a non-negative integer');
+    const actual = after - before;
+    console.log('[slot] verified empty_before=' + before + ' empty_after=' + after + ' actual_freed=' + actual);
+    if (actual < slotsNeeded) return false;
+    return actual;
 }
 
 // fix84: the item a broken block adds to the inventory, from the game data. null when the block drops nothing.
