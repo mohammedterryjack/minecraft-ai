@@ -224,7 +224,7 @@ describe('fix89: missing input on a raiser serve backchains instead of looping',
         assert.strictEqual(calls[0], 'need:hunger');
         const added = v.progress.subgoals.map(s => s.task).filter(t => !before.includes(t));
         assert.ok(added.some(t => t.includes(ITEM)), `subgoals ${JSON.stringify(v.progress.subgoals.map(s => s.task))}`);
-        assert.ok(v.progress.blockers.some(b => b.item === ITEM), JSON.stringify(v.progress.blockers));
+        assert.ok(v.progress.blockers.some(b => Array.isArray(b.anyOf) && b.anyOf.includes(ITEM)), JSON.stringify(v.progress.blockers));
         assert.strictEqual(await v._serveUrgent(), false);
         assert.strictEqual(calls.length, 1, 'the raiser is not replayed while its backchain is queued');
         assert.strictEqual(v.currentTask, null);

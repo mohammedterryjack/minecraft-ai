@@ -132,7 +132,8 @@ describe('fix81: respawn without tools — the failure chains iron_ore -> stone_
         assert.deepStrictEqual(q[0].chain, ['iron_ore']);
         assert.strictEqual(q[0].edge, 'stone_pickaxe', 'a game-data edge');
         assert.deepStrictEqual({ retry: q[1].retry, prereq: q[1].prereq }, { retry: true, prereq: true });
-        assert.deepStrictEqual(v.progress.blockers.map(({ at, ...b }) => b), [{ item: 'stone_pickaxe', count: 1, reason: 'tool', task: 'Mine 1 iron_ore' }]);
+        const tools = Object.keys(registry.blocksByName.iron_ore.harvestTools).map(id => registry.items[id].name);
+        assert.deepStrictEqual(v.progress.blockers.map(({ at, ...b }) => b), [{ anyOf: tools, count: 1, reason: 'tool', task: 'Mine 1 iron_ore' }]);
         assert.deepStrictEqual(v.progress.recipeEdges, { stone_pickaxe: { task: 'Craft 1 stone_pickaxe', status: 'untried', runs: 0, fails: 0 } });
     });
 
