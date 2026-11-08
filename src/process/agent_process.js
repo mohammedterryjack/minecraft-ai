@@ -2,6 +2,7 @@ import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
 import { logoutAgent } from '../mindcraft/mindserver.js';
 import { logExitCause, writeProcessLoud } from './exit_log.js';
+import { parentExitForChild } from './backend_unavailable.js';
 
 const init_agent_path = fileURLToPath(new URL('./init_agent.js', import.meta.url));
 
@@ -32,15 +33,11 @@ export class AgentProcess {
         agentProcess.on('exit', (code, signal) => {
             this.running = false;
             logoutAgent(this.name);
-            // Parent must exit so launchd/supervisor restarts; do not keep a zombie main or respawn here.
-            if (signal === 'SIGINT' && (code === 0 || code === null)) {
-                logExitCause(`agent child ${this.name} exited on SIGINT code=${code} signal=${signal}`);
-                process.exit(0);
-                return;
-            }
-            const exitCode = typeof code === 'number' && code !== 0 ? code : 1;
-            logExitCause(`agent child ${this.name} exited code=${code} signal=${signal}; parent exiting ${exitCode}`);
-            process.exit(exitCode);
+            // Parent exits with the child's status. Exit 0 (backend-unavailable, or SIGINT) is a
+            // successful exit: KeepAlive SuccessfulExit false does not restart it. A crash stays nonzero.
+            const decided = parentExitForChild(code, signal);
+            logExitCause(`agent child ${this.name} exited code=${code} signal=${signal}; parent exiting ${decided.code} (${decided.kind})`);
+            process.exit(decided.code);
         });
     
         agentProcess.on('error', (err) => {

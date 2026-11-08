@@ -11,9 +11,9 @@ export class CodeModel {
         this.quotaUntil = 0; this.pName = primary.model_name || 'primary';
         this.fName = fallback?.model_name || 'local-free'; this.onFallback = false; this.switchedAt = null;
     }
-    async sendRequest(turns, systemMessage) {
+    async sendRequest(turns, systemMessage, meta) {
         if (Date.now() < this.quotaUntil) {
-            if (this.fallback) return await this._useFreeFallback(turns, systemMessage);
+            if (this.fallback) return await this._useFreeFallback(turns, systemMessage, meta);
             throw new Error(`[${this.label}] ${this.pName} quota cooldown active until ${new Date(this.quotaUntil).toISOString()} - paused (no free fallback configured)`);
         }
         if (this.onFallback) {
@@ -22,7 +22,7 @@ export class CodeModel {
         }
         // fix51: no wrapper timeout (was a magic 120s/180s race); the provider owns its timeout and reports its own error
         try {
-            const r = await this.primary.sendRequest(turns, systemMessage);
+            const r = await this.primary.sendRequest(turns, systemMessage, meta);
             console.log(`[${this.label}] used ${this.pName}`);
             return r;
         } catch (err) {
@@ -31,17 +31,17 @@ export class CodeModel {
                 if (this.fallback) {
                     console.error(`\n!!! [${this.label}] *** PAID PATH EXHAUSTED *** ${this.pName} quota/usage limit hit !!!`);
                     console.error(`!!! [${this.label}] EXPLICIT SWITCH to FREE LOCAL CODER: ${this.fName} (retrying ${this.pName} after ${Math.round(this.cooldownMs / 60000)} min) !!!\n`);
-                    return await this._useFreeFallback(turns, systemMessage);
+                    return await this._useFreeFallback(turns, systemMessage, meta);
                 }
                 console.error(`[${this.label}] ${this.pName} quota/usage limit hit - PAUSED for ${Math.round(this.cooldownMs / 60000)} min (no free fallback configured)`);
             } else console.error(`[${this.label}] ${this.pName} FAILED: ${err?.message ?? err}`);
             throw err;
         }
     }
-    async _useFreeFallback(turns, systemMessage) {
+    async _useFreeFallback(turns, systemMessage, meta) {
         if (!this.onFallback) { this.onFallback = true; this.switchedAt = new Date().toISOString(); }
         console.log(`[${this.label}] using FREE fallback ${this.fName} (paid ${this.pName} exhausted until ${new Date(this.quotaUntil).toISOString()})`);
-        const r = await this.fallback.sendRequest(turns, systemMessage);
+        const r = await this.fallback.sendRequest(turns, systemMessage, meta);
         console.log(`[${this.label}] used FREE ${this.fName} (fallback)`);
         return r;
     }

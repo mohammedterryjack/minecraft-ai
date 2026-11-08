@@ -23,6 +23,7 @@ import { startMainThreadWatchdog, watchdogEvidencePath } from '../utils/main_thr
 import { inspect } from 'node:util';
 import { fatalExit, runUpdateLoop } from './fatal.js';   // fix59
 import { logExitCause, writeProcessLoud } from '../process/exit_log.js';
+import { applyDisconnect } from '../process/backend_unavailable.js';
 
 export class Agent {
     async start(load_mem=false, init_message=null, count_id=0) {
@@ -80,15 +81,22 @@ export class Agent {
             return inspect(reason, { depth: 6, maxArrayLength: 50, breakLength: 120 });
         };
 
-        // Connection Handler: verbatim reason, then exit non-zero (launchd / parent restarts)
+        // Connection Handler. A backend refusal (proxy up, 127.0.0.1:25565 refused) is one
+        // terminal exit 0 so KeepAlive SuccessfulExit false does not respawn it. Anything else
+        // exits 1. Duplicate kicked/end/error callbacks do not exit again.
+        this._disconnectLatch = { latched: false };
         const onDisconnect = (event, reason) => {
-            if (this._disconnectHandled) return;
-            this._disconnectHandled = true;
-
             const raw = verbatimReason(reason);
-            logExitCause(`[connection] ${event}; reason verbatim: ${raw}`);
-            log(this.name, `[connection] ${event}; reason verbatim: ${raw}`);
-            process.exit(1);
+            applyDisconnect(this._disconnectLatch, event, raw, (code, outcome) => {
+                if (outcome.kind === 'backend-unavailable') {
+                    logExitCause(`[connection] backend-unavailable; ${outcome.evidence}`);
+                    log(this.name, `[connection] backend-unavailable; ${outcome.evidence}`);
+                } else {
+                    logExitCause(`[connection] ${event}; reason verbatim: ${raw}`);
+                    log(this.name, `[connection] ${event}; reason verbatim: ${raw}`);
+                }
+                process.exit(code);
+            });
         };
         
         // Bind events

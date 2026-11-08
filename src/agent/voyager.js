@@ -35,6 +35,11 @@ import { watchdogEvidencePath } from '../utils/main_thread_watchdog.js';
 import { wrapBotForApiTiming } from '../utils/bot_api_timing.js';
 import { logPromptBreakdown, extractBareCalls } from './prompt_utils.js';   // fix47: shared prompt utilities
 import { recordConsumeEvidence, verifiedConsumes, recordEffectEvidence, verifiedEffects, count as invCount } from './consume_evidence.js';   // fix70, fix74
+import { practiceWorld, causalChanges, effectVerdict, noteCausalSuccess } from './practice_rank.js';   // fix93
+import { createInferenceCover } from './inference_cover.js';   // fix93
+import { repairRetrySuffix, executableIdentity, repeatedRejection, builtInsCalled } from './repair_attempt.js';   // fix93
+import { voyagerCodingInstructions } from './prompt_cut.js';   // fix93
+import { edibleNames, entityDroppers, planFoodAcquisition, hungerDeficitClosed } from './food_backchain.js';   // fix93
 // fix70: how much of a repair's evidence a [psn] log line shows (a log excerpt; the full evidence stays on the queue entry)
 const LOG_EVIDENCE_CHARS = 160;
 // fix79: _attribute's verdict when the run met every contract and the goal failed only because the route sent it to a skill with no
@@ -1732,7 +1737,13 @@ Use only c; no other globals.`;
             throw new Error(`[fix80] need raiser serve failed without a reason: ${JSON.stringify(rp)}`);
         }
 
-        // Cold start: no playable raiser — propose, then run the NORMAL pursue path (replay then generate-code).
+        // fix93: a learned food effect on a built-in (consume is not a library skill, so best is null).
+        // Obtain an edible from game data, then the next serve runs the raiser. Do not cold-start a curriculum task.
+        if (this.vitals.foodRaisers().length > 0) {
+            return await this._serveLearnedFood(st, before);
+        }
+
+        // Cold start: no learned food raiser at all — propose, then run the NORMAL pursue path (replay then generate-code).
         // currentTask stays need:hunger so we do not re-enter; queues stay deferred.
         const hun = this._hunger();
         const hunText = this.vitals.hungerText(hun);
@@ -1766,6 +1777,50 @@ Use only c; no other globals.`;
             return false;
         }
         throw new Error(`[fix91] _pursueProposedTask returned ${JSON.stringify(acted)} for "${task}"; expected true or false`);
+    }
+    // fix93: built-in raiser. An edible already held is eaten and the deficit closes on measured food.
+    // Otherwise the cheapest game-data plan is queued ahead of the raiser. The open-goal retry of
+    // need:hunger is not left on the queue. Unrelated queued work stays.
+    async _consumeItem(item) {
+        return skills.consume(this.agent.bot, item);
+    }
+    async _serveLearnedFood(st, before) {
+        const registry = this.agent.bot.registry;
+        if (!registry) throw new Error('[fix93] bot.registry required to plan food from game data');
+        const edibles = edibleNames(registry);
+        const inv = before.inventory;
+        const planner = this._obtainPlanner(before);
+        const plan = planFoodAcquisition({
+            edibles,
+            inventory: inv,
+            cheapest: (items, count, inventory) => planner.cheapest(items, count, inventory),
+            prerequisites: (item, count, inventory) => planner.prerequisites(item, count, inventory),
+            entityDroppersFor: (item) => entityDroppers(registry, item),
+        });
+        if (plan.executable) {
+            const beforeFood = this.agent.bot.food;
+            const ate = await this._consumeItem(plan.item);
+            if (ate !== true) throw new Error(`[fix93] LOUD: consume(${plan.item}) did not eat; returned ${JSON.stringify(ate)}`);
+            const afterFood = this.agent.bot.food;
+            const floor = st.firstRise === null ? null : st.firstRise.f;
+            const closed = hungerDeficitClosed(beforeFood, afterFood, floor);
+            console.log(`[urgent-need] consume ${plan.item}: food ${closed.beforeFood} -> ${closed.afterFood}; learned floor ${closed.floor}; closed=${closed.closed}`);
+            if (!closed.closed) throw new Error(`[fix93] LOUD: food ${closed.afterFood} is still below the learned floor ${closed.floor} after consume(${plan.item})`);
+            this._afterSuccess();
+            return true;
+        }
+        const droppers = plan.entityDroppers.length ? plan.entityDroppers.join(', ') : 'none in game data';
+        console.log(`[urgent-need] no edible held; plan ${plan.task} for ${plan.item} (${plan.how}); entity droppers: ${droppers}`);
+        const queued = Array.isArray(this.progress.subgoals) ? this.progress.subgoals.map(s => s.task) : [];
+        const chained = this._chainNeeds('need:hunger', plan.needs, before);
+        if (chained !== true) throw new Error('[fix93] LOUD: food backchain did not queue a plan');
+        if (!Array.isArray(this.progress.subgoals)) throw new Error('[fix93] food backchain left no subgoal queue');
+        this.progress.subgoals = this.progress.subgoals.filter(s => !(s.task === 'need:hunger' && s.retry === true));
+        for (const t of queued) {
+            if (!this.progress.subgoals.some(s => s.task === t)) throw new Error(`[fix93] LOUD: food backchain dropped unrelated queued work ${JSON.stringify(t)}`);
+        }
+        console.log(`[urgent-need] queued ${plan.task} ahead of the food raiser; unrelated queue kept (${queued.length})`);
+        return true;
     }
 
     // fix76: structural unmet-precondition classification (no message-text matching).
@@ -1972,7 +2027,7 @@ Use only c; no other globals.`;
         const system = `You write PSN skill contracts for a Minecraft mineflayer skill library.\n${Voyager.CONTRACT_SPEC}\nReply ONLY with JSON: {"<skillName>": {"pre": "c => ...", "post": "c => ...", "text": "<one-line contract summary>"}, ...} for exactly the skills given.`;
         const user = learnable.map(e => `--- ${e.name} ---\ndescription: ${e.description}\nobserved effects: ${JSON.stringify(e.effects)}\n${e.contractFail ? `previous contract was refused: ${e.contractFail}\n` : ''}${e.contract ? `current contract (${fixNote || 'to fix'}): ${JSON.stringify(e.contract)}\n` : ''}code:\n${String(e.code).slice(0, 1800)}`).join('\n');
         console.log(`[contract] learning contracts for ${learnable.length} skill(s) (${why}): ${learnable.map(e => e.name).join(', ')}`);
-        let out; try { out = parseJSON(await this._ask(system, user)); } catch (err) { console.log(`[contract] learning FAILED: ${err.message}`); return 0; }
+        let out; try { out = parseJSON(await this._ask(system, user, this._inferMeta('contract', { system, user }))); } catch (err) { console.log(`[contract] learning FAILED: ${err.message}`); return 0; }
         let n = 0;
         for (const e of learnable) {
             const ct = out?.[e.name], bad = this._validContract(ct, e);
@@ -2031,6 +2086,13 @@ Use only c; no other globals.`;
     // fix19 (6): did the bot die during the current run? (agent.lastDeath set by the death message handler)
     // fix27: an action with no position/inventory change for longer than learned (fix66; was 60s) is stopped and traced as a failure (no waiting out the 5-min timeout)
     async _run(label, fn, timeout) {
+        // fix93: settle practice before the foreground reads the world, then resume it if a model call is still waiting
+        const cover = this._inferCover;
+        if (cover) await cover.claim();
+        try { return await this._runForeground(label, fn, timeout); }
+        finally { if (cover) cover.resume('foreground'); }
+    }
+    async _runForeground(label, fn, timeout) {
         // fix42: populate bot.__safeToToss before any skill run (for tossClutter/freeInventory)
         this._prepareTossSignals();
         // fix51: track inventory+equipment before run for death item-drop reporting (same view as satisfaction check)
@@ -2345,6 +2407,8 @@ Use only c; no other globals.`;
             food_max: skills.VITALS_MAX.food,
             health_value: Math.round(bot.health),
             health_max: skills.VITALS_MAX.health,
+            alive: bot.health > 0,
+            dimension: bot.game.dimension,
             // fix58: learned: hp below max and not recovering at the current food level (from the bot's own vitals history)
             health_recovery_blocked: this._recovery().blocked,
             // fix76: learned hunger (food vs regen floor / decay) — fires at full HP; not a hard-coded eat threshold
@@ -2507,11 +2571,40 @@ Use only c; no other globals.`;
     }
     // small local model (Mac Studio Ollama) for curriculum + critic judgment; unloads after 5 min idle
     // fix31: one local request in flight at a time (solo decode speed; Ollama keeps a prefix-cache slot per prompt type)
-    async _askLocal(system, user) {
+    _ensureInferCover() {
+        if (!this._inferCover) {
+            this._inferCover = createInferenceCover({
+                start: (callNum) => this._startIdlePractice(callNum),
+                stop: () => this._stopIdlePractice(),
+            });
+        }
+        return this._inferCover;
+    }
+    _inferMeta(kind, parts) {
+        if (typeof kind !== 'string' || kind.length === 0) throw new Error('[fix93] inference kind required');
+        if (parts === null || parts === undefined || typeof parts !== 'object') throw new Error('[fix93] prompt components required');
+        const components = {};
+        for (const [k, v] of Object.entries(parts)) {
+            if (typeof v !== 'string') throw new Error(`[fix93] prompt component ${k} is not text`);
+            components[k] = v.length;
+        }
+        return { kind, components };
+    }
+    async _askLocal(system, user, meta) {
+        if (!meta || typeof meta.kind !== 'string' || meta.kind.length === 0) throw new Error('[fix93] _askLocal requires { kind, components }');
         CALLS.local++;
+        meta.requestId = `${meta.kind}#${CALLS.local}`;
         const prev = this._localQ || Promise.resolve(); let release; this._localQ = new Promise(r => release = r);
         const tq = Date.now(); await prev; const waited = Date.now() - tq; if (waited > 500) console.log(`[timing] local call waited ${waited}ms for the previous local call`);
-        let r; const t0 = Date.now(); try { r = await this._local().sendRequest([{ role: 'user', content: user }], system); } finally { release(); } console.log(`[timing] ${new Date().toISOString().slice(11,19)}Z local call took ${Date.now() - t0}ms`);   // fix27
+        const cover = this._ensureInferCover();
+        cover.enter(CALLS.local);
+        let r; const t0 = Date.now();
+        try { r = await this._local().sendRequest([{ role: 'user', content: user }], system, meta); }
+        finally {
+            try { await cover.leave(); }
+            finally { release(); }
+        }
+        console.log(`[timing] ${new Date().toISOString().slice(11,19)}Z local call #${CALLS.local} took ${Date.now() - t0}ms kind=${meta.kind}`);
         console.log(`[voyager] local model call #${CALLS.local}`);
         return r;
     }
@@ -4305,9 +4398,11 @@ Use only c; no other globals.`;
     }
     // fix35: serialized code-model calls with loud logging (one in flight at a time; no dual same-model Ollama generate)
     // fix37: idle practice runs during code-model waits (no separate 30s idle required)
-    async _ask(system, user) {
+    async _ask(system, user, meta) {
+        if (!meta || typeof meta.kind !== 'string' || meta.kind.length === 0) throw new Error('[fix93] _ask requires { kind, components }');
         CALLS.code++;
         const callNum = CALLS.code;
+        meta.requestId = `${meta.kind}#${callNum}`;
         // serialize code-model calls; queue if another is in flight
         const prev = this._askQ || Promise.resolve();
         let release; this._askQ = new Promise(r => release = r);
@@ -4322,15 +4417,15 @@ Use only c; no other globals.`;
         if (wasQueued) console.log(`[overlap] code-model call #${callNum} now running (previous finished)`);
         // fix33: CodeModel.sendRequest handles paid→free fallback internally; no pre/post quota check here
         const cm = this.agent.prompter.code_model;
-        const t0 = Date.now(); console.log(`[timing] ${new Date().toISOString().slice(11,19)}Z composer call #${callNum} start (prompt ${system.length + user.length} chars)`);
+        const t0 = Date.now(); console.log(`[timing] ${new Date().toISOString().slice(11,19)}Z composer call #${callNum} start kind=${meta.kind} (prompt ${system.length + user.length} chars)`);
         // fix35: overlap CPU-only maintenance with code-model wait (flush debounced saves, extract shared fragments)
         this._overlapCpuMaintenance();
-        // fix37: start idle practice in background during code-model wait (learned skills, no 30s idle required)
-        const practicePromise = this._startIdlePractice(callNum);
-        let r; try { r = await cm.sendRequest([{ role: 'user', content: user }], system); } finally {
-            this._stopIdlePractice();
+        // fix37/fix93: one practice controller covers this wait and any local wait already in flight
+        const cover = this._ensureInferCover();
+        cover.enter(callNum);
+        let r; try { r = await cm.sendRequest([{ role: 'user', content: user }], system, meta); } finally {
             // fix79: a practice error now rejects here (it fails the step); the next code-model call is released either way
-            try { await practicePromise; }   // fix70: no practice run outlives this call into the next action's window (see _runPracticeSkill)
+            try { await cover.leave(); }   // fix70: no practice run outlives this call into the next action's window
             finally {
                 release();
                 console.log(`[timing] ${new Date().toISOString().slice(11,19)}Z composer call #${callNum} took ${Date.now() - t0}ms (reply ${String(r ?? '').length} chars)`);
@@ -4452,31 +4547,60 @@ Use only c; no other globals.`;
         // Uncertainty = (s+1)(f+1) / ((n+2)^2 * (n+3)) where s=successes, f=failures, n=s+f
         // Skills with n=0 get max variance naturally. No hand weights or recency constants.
         // Note: filter above ensures s.stats exists (via `s.stats &&`)
+        // fix93: a post that already holds on this world is not a candidate. Relevance 0 is not usefulness.
+        //        A known causal effect with no plan overlap has nothing to learn and nothing to serve.
+        const obs = this.observe();
         const pendingSize = pending.size;
-        const scored = filtered.map(s => {
+        const excluded = [];
+        const scored = [];
+        for (const s of filtered) {
+            const met = this._practicePostAlreadyMet(s, obs);
+            if (met.met) { excluded.push(`${s.name}: ${met.reason}`); continue; }
             const successes = s.stats.success;
             const failures = s.stats.fail;
             const n = successes + failures;
-            
-            // Beta-posterior variance: (s+1)(f+1) / ((n+2)^2 * (n+3))
             const uncertainty = ((successes + 1) * (failures + 1)) / (Math.pow(n + 2, 2) * (n + 3));
-            
-            // plan relevance = |effects ∩ pending needs| / |pending needs|
-            // effects may be empty array but never undefined (initialized at save time)
             const effects = s.effects;
             const intersection = effects.filter(eff => pending.has(eff)).length;
             const planRelevance = pendingSize > 0 ? intersection / pendingSize : 0;
-            
-            // final score: uncertainty * (1 + plan_relevance)
+            const effectKnown = Object.hasOwn(s, 'causalEvidence') && s.causalEvidence.success > 0;
+            const information = !effectKnown;
+            const useful = planRelevance > 0;
+            if (!information && !useful) { excluded.push(`${s.name}: no information gain and no plan usefulness`); continue; }
+            const because = information && useful ? 'information gain and plan usefulness' : (information ? 'information gain' : 'plan usefulness');
             const score = uncertainty * (1 + planRelevance);
-            return { s, score, reason: `n=${n} unc=${uncertainty.toFixed(4)} rel=${planRelevance.toFixed(2)}` };
-        }).sort((a, b) => b.score - a.score);
-        
-        if (scored.length > 0) {
-            console.log(`[idle-practice] top candidate: ${scored[0].s.name} (${scored[0].reason})`);
+            scored.push({ s, score, reason: `n=${n} unc=${uncertainty.toFixed(4)} rel=${planRelevance.toFixed(2)} ${because}` });
         }
-        // pick the highest-scoring skill (no randomization - uncertainty is the tiebreaker)
-        return scored[0]?.s || null;
+        scored.sort((a, b) => b.score - a.score);
+        if (scored.length === 0) {
+            console.log(`[idle-practice] idle: no eligible practice; ${excluded.join('; ')}`);
+            return null;
+        }
+        console.log(`[idle-practice] top candidate: ${scored[0].s.name} (${scored[0].reason})`);
+        return scored[0].s;
+    }
+    // fix93: the learned post, evaluated as if the skill returned true and changed nothing.
+    // Missing observations are not "already met". A throw from the post is a contract bug.
+    _practicePostAlreadyMet(skill, obs) {
+        if (!skill.contract || typeof skill.contract.post !== 'string') return { met: false, evaluable: false, reason: 'no post-contract' };
+        if (!skill.contract.post.includes('=>')) return { met: false, evaluable: false, reason: 'post is not an arrow predicate' };
+        const fields = this._extractPostFields(skill.contract.post);
+        const world = practiceWorld(obs);
+        if ((fields.pos || fields.dist) && !world.pos) return { met: false, evaluable: false, reason: 'post reads position; observation has none' };
+        if (fields.hp && typeof world.hp !== 'number') return { met: false, evaluable: false, reason: 'post reads hp; observation has none' };
+        if (fields.food && typeof world.food !== 'number') return { met: false, evaluable: false, reason: 'post reads food; observation has none' };
+        for (const item of fields.inv) {
+            if (!world.inv || !Object.hasOwn(world.inv, item)) return { met: false, evaluable: false, reason: `post reads inv.${item}; observation has none` };
+        }
+        for (const slot of fields.eq) {
+            if (!world.eq || !Object.hasOwn(world.eq, slot)) return { met: false, evaluable: false, reason: `post reads eq.${slot}; observation has none` };
+        }
+        if (skill.contract.post.includes('.alive') && typeof world.alive !== 'boolean') return { met: false, evaluable: false, reason: 'post reads alive; observation has none' };
+        if (skill.contract.post.includes('.dim') && typeof world.dim !== 'string') return { met: false, evaluable: false, reason: 'post reads dim; observation has none' };
+        const snap = { pos: world.pos, hp: world.hp, food: world.food, alive: world.alive, dim: world.dim, inv: world.inv, eq: world.eq, free: world.free };
+        const held = this._compileContract(skill.contract.post)(this._contractCtx({ args: [], ret: true, pre: snap, post: snap, delta: {} }));
+        if (held !== true && held !== false) throw new Error(`[fix93] ${skill.name} post returned ${JSON.stringify(held)}, not a boolean`);
+        return { met: held === true, evaluable: true, reason: held === true ? 'postcondition already holds in the current world' : 'post does not hold' };
     }
     // fix42: get items needed by pending/failed tasks (from learned needs/produces, not hard-coded)
     // fix25: prefer smeltGoal so "Smelt X into Y" prioritizes Y (product), ingredients come from consumes
@@ -4660,7 +4784,17 @@ Use only c; no other globals.`;
             if (unmetT) return finish({ ok: null, detail: `unmet precondition (${unmetT}), not evidence about the skill` });
             return finish({ ok: false, detail: `threw: ${outcome.err.message}` });
         }
-        const verdict = this._practiceRunChanged(skill, stateBefore, after);
+        let verdict = this._practiceRunChanged(skill, stateBefore, after);
+        // fix93: a post that holds only because ret is truthy, with no position, inventory, or equipment change, is not an effect success
+        if (verdict.ok === true || verdict.ok === false || verdict.ok === null) {
+            const root = trace.find(t => t.name === skill.name && (t.parent ?? -1) < 0);
+            const changes = causalChanges({ before: stateBefore, after, traceRoot: root === undefined ? null : root });
+            const ev = effectVerdict(verdict.ok, changes);
+            if (verdict.ok === true && ev.effect === null) {
+                console.log(`[idle-practice] NOT SUCCESS ${skill.name}: no causal state change; not an effect success`);
+                verdict = { ok: null, detail: `no causal state change; not an effect success (${verdict.detail})` };
+            } else if (ev.effect === true) noteCausalSuccess(skill);
+        }
         // fix76 semantics for practice: a failed run whose precondition was unmet (typed marker, or a learned food-raiser
         //        started at the food cap) is no verdict on the skill, as in replay (_classifyUnmetPrecondition)
         const unmet = verdict.ok === false && this._classifyUnmetPrecondition(skill.name, stateBefore.food_value);
@@ -4715,7 +4849,7 @@ Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
         // fix39: enriched known_skills with descriptions for primitives and space-freeing skills
         const user = `goal: ${task}\nwhy it failed: ${String(reason).slice(0, 600)}\ndeath_hotspots: ${this._deathHotspots()}\n${this._stateText(this.observe())}\nknown_skills: ${JSON.stringify(this._knownSkillsFacts())}`;
         let subs = [];
-        try { subs = (parseLocalJSON(await this._askLocal(system, user), ['subgoals']).subgoals || []).map(t => String(t).trim()).filter(t => t && t !== task && !validateTask(t)).slice(0, 4); }
+        try { subs = (parseLocalJSON(await this._askLocal(system, user, this._inferMeta('curriculum-decompose', { system, user })), ['subgoals']).subgoals || []).map(t => String(t).trim()).filter(t => t && t !== task && !validateTask(t)).slice(0, 4); }
         catch (e) { console.log(`[psn] decompose FAILED for "${task}": ${e.message}`); return false; }
         if (subs.length < 2) { console.log(`[psn] decompose FAILED for "${task}": model gave ${subs.length} valid subgoal(s)`); d[task] = { subs, skills: [], at: Date.now(), reason: String(reason).slice(0, 200) }; this._saveProgress(); return false; }
         d[task] = { subs, skills: [], at: Date.now(), reason: String(reason).slice(0, 200) };
@@ -5094,7 +5228,7 @@ current_health: ${Math.round(bot.health)}/${vmax.health}\ncurrent_food: ${bot.fo
             history: JSON.stringify(this.progress.completed.slice(-30)).length + JSON.stringify(this.progress.failed.slice(-15)).length,
             recipes: facts.length
         });
-        return parseLocalJSON(await this._askLocal(system, finalUser), ['reasoning', 'task', 'context']);
+        return parseLocalJSON(await this._askLocal(system, finalUser, this._inferMeta('curriculum', { system, user: finalUser })), ['reasoning', 'task', 'context']);
     }
 
     // ---------- skill library ----------
@@ -5246,7 +5380,7 @@ current_health: ${Math.round(bot.health)}/${vmax.health}\ncurrent_food: ${bot.fo
 Be strict: success only if the evidence (inventory/position/output) shows the task is done.
 Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false, "critique": "how to fix it if failed (1-2 sentences), else empty"}`;
         const user = `task: ${task}\n${recipeFacts(task)}\n--- before ---\n${this._stateText(before)}\n--- after ---\n${this._stateText(after)}\n--- code output ---\n${output}${invFullFact ? `\n--- observed fact ---\n${invFullFact}` : ''}`;
-        const v = parseLocalJSON(await this._askLocal(system, user), ['reasoning', 'success', 'critique']);
+        const v = parseLocalJSON(await this._askLocal(system, user, this._inferMeta('critic', { system, user })), ['reasoning', 'success', 'critique']);
 
         // fix37 (D): if inventory full was detected as a cause, ensure it's in the critique for contract/decompose learning
         if (invFullFact && !v.success && v.critique && !v.critique.toLowerCase().includes('inventory')) {
@@ -5596,10 +5730,11 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         const awmHints = this.repairMemory.formatHintsForCoder(pastLessons);
         // fix40: unified bare-name API - all functions called by bare name (no skills.*/world.* prefix)
         const relevantSkills = new Set([e.name, ...this._closure(e.name), ...parentsOf(e.name, this._graph())]);
+        const usedBuiltIn = builtInsCalled(getBareAPI().sigs, e.code);
         const system = `You repair ONE skill in a Minecraft mineflayer skill library (PSN-style targeted fix). Return a single \`\`\`javascript code block containing ONLY the fixed function, with the SAME name and a compatible signature. First line inside the block: // DESCRIPTION: <one sentence>. Every loop must check bot.interrupt_code. If something still cannot be done, log(bot, 'FAILED: <reason>') and return a falsy value; no silent fallbacks. findBlock/findBlocks/nearestEntity/bot.entities/blockAt results can be null or empty: always null-check them before reading .position/.x or calling methods on them.
 
 AVAILABLE FUNCTIONS (call by bare name, e.g. goToPosition(bot, x, y, z) - do NOT use skills.* or world.* prefix):
-${this.unifiedAPIList(relevantSkills)}
+${this.unifiedAPIList(relevantSkills, usedBuiltIn)}
 
 IMPORTANT: All functions use bare names. Do NOT write skills.goToPosition - write goToPosition. Do NOT write world.getNearestBlock - write getNearestBlock.`;
         const user = `Blamed skill: ${e.name} (${q.kind === 'caller_fix' ? 'it calls the leaf ' + q.leaf + ' in a situation where the leaf cannot succeed: fix how/when it calls it, e.g. obtain the missing prerequisite first' : 'its own logic failed'})\nTask that failed: ${q.task}\nFailure path: ${q.path.join(' > ')}\nEvidence: ${q.evidence}\n--- execution trace (indent = call depth) ---\n${q.trace}\n${e.contract ? `--- learned contract of ${e.name} (must hold after your fix) ---\npre: ${e.contract.pre}\npost: ${e.contract.post}\n` : ''}--- current code of ${e.name} ---\n${e.code}\n--- skills it uses ---\n${kids.map(k => '// ' + k.description + '\n' + signatureOf(k.code, k.name)).join('\n')}\n${(e.repairHistory || []).length ? `\n--- your last ${e.repairHistory.length} repair proposal(s) for ${e.name} (do not repeat what failed) ---\n` + e.repairHistory.map((h, i) => `${i + 1}. [${h.outcome || 'pending'}] ${h.kind}: ${h.evidence}\n   change: ${h.desc}`).join('\n') : ''}${q.peers?.length > 1 ? `\nOther skills blamed on the same failure (repaired children-first): ${q.peers.join(', ')}` : ''}${awmHints ? `\n${awmHints}` : ''}\nWrite the fixed ${e.name}:`;
@@ -5607,28 +5742,19 @@ IMPORTANT: All functions use bare names. Do NOT write skills.goToPosition - writ
         console.log(`[psn] REPAIR ${e.name} [${q.kind}] with the code model (evidence: ${q.evidence.slice(0, LOG_EVIDENCE_CHARS)})`);
         let code, body, desc, extra = '';
         let _repairStaged = null;
-        // fix37: duplicate-reply detection state for repair loop
-        let prevRepairHash = null, repairDupes = 0, accepted = false;
-        for (let att = 1; att <= 2; att++) {   // fix19 (3): one retry with the lint/format error fed back
-            // fix37: escalating duplicate feedback for repair loop
-            const dupeWarn = repairDupes > 0 ? `\n\n!!! CRITICAL: Your previous reply was IDENTICAL. You MUST write DIFFERENT code. !!!` : '';
+        let accepted = false;
+        let lastRejected = null;
+        for (let att = 1; att <= 2; att++) {   // fix19 (3): one retry with the rejected candidate and its exact reason
             let reply;
-            try { reply = await this._ask(system, user + extra + dupeWarn); } catch (err) { console.log(`[psn] repair FAILED for ${e.name}: ${err.message}`); return false; }
-            // fix37: duplicate-reply detection for repair loop
-            const repairHash = this._hashReply(reply);
-            if (prevRepairHash !== null && repairHash === prevRepairHash) {
-                repairDupes++;
-                console.log(`[duplicate] DETECTED in repair: reply #${att} identical to #${att - 1} (hash ${repairHash})`);
-                if (repairDupes >= 2) {
-                    console.error(`[duplicate] ABORT repair of ${e.name}: 2 consecutive duplicate replies; repair FAILED LOUDLY`);
-                    this._noteProposal(e, { task: q.task, kind: q.kind, evidence: q.evidence.slice(0, 200), desc: 'ABORTED: duplicate replies', outcome: 'duplicate replies' });
-                    return false;
+            try { reply = await this._ask(system, user + extra, this._inferMeta('repair', { system, user: user + extra })); } catch (err) { console.log(`[psn] repair FAILED for ${e.name}: ${err.message}`); return false; }
+            const ident = executableIdentity(t => this._hashReply(t), reply, extractCode);
+            if (lastRejected) {
+                const repeated = repeatedRejection(lastRejected, { n: att, candidate: ident.source, identity: ident.identity });
+                if (repeated) {
+                    console.log(`[duplicate] DETECTED in repair: reply #${att} repeated rejected candidate ${ident.identity}`);
+                    return this._finishRepeatedRejection(e, q, repeated);
                 }
-                extra = `\n--- your previous reply was IDENTICAL to the one before ---\nYou MUST write DIFFERENT code. Change your approach.\n--- previous code ---\n${code || '(none)'}`;
-                continue;
             }
-            prevRepairHash = repairHash;
-            repairDupes = 0;
             code = extractCode(reply);
             const fn = code && code.match(/async\s+function\s+([A-Za-z_]\w*)\s*\(/);
             let err = null;
@@ -5673,15 +5799,11 @@ IMPORTANT: All functions use bare names. Do NOT write skills.goToPosition - writ
                 await this.repairMemory.recordRepair({ errorSignature: q.evidence, fixSnippet: code?.slice(0, 300), outcome: false, taskHint: q.task, skillName: e.name });
                 return false;
             }
-            extra = `\n--- your previous reply was rejected ---\n${err}\n--- previous code ---\n${code || '(none)'}\nFix the error and write the fixed ${e.name} again:`;
+            const rejectedSource = typeof code === 'string' && code.length > 0 ? code : String(reply);
+            lastRejected = { n: att, candidate: rejectedSource, reason: String(err), identity: this._hashReply(rejectedSource) };
+            extra = repairRetrySuffix(lastRejected);
         }
-        // fix82: a duplicate reply on the last attempt left the loop with the REJECTED attempt's body, which was then submitted
-        //        to the gate as if it had passed (fail open). Only an accepted reply is submitted.
-        if (!accepted) {
-            console.log(`[psn] repair FAILED for ${e.name}: no reply passed (the last one repeated a rejected reply)`);
-            this._noteProposal(e, { task: q.task, kind: q.kind, evidence: q.evidence.slice(0, 200), desc: 'duplicate of a rejected reply', outcome: 'duplicate replies' });
-            return false;
-        }
+        if (!accepted) throw new Error(`[fix93] repair of ${e.name} ended without an accepted reply or a named failure`);
         this._lastEffects = e.effects;
         this._noteProposal(e, { task: q.task, kind: q.kind, evidence: q.evidence.slice(0, 200), desc: desc.slice(0, 200) });
         const saved = await this.saveSkill(e.name, desc, body, `repair: ${q.task}`, { repair: true });
@@ -5697,6 +5819,19 @@ IMPORTANT: All functions use bare names. Do NOT write skills.goToPosition - writ
         if (e.candidate) this._setTrialTask(e, q);   // fix28: dedicated trial run next step (fix79: only on a task it was routed to)
         console.log(`[psn] repaired ${e.name}: submitted to the gate (parents are re-validated once it is promoted)`);
         return true;
+    }
+    // fix93: one named failure. The rejected candidate is not saved and the signature is recorded,
+    // so the same need is not repaired again and nothing is learned from the repeat.
+    _finishRepeatedRejection(e, q, failure) {
+        if (failure.name !== 'repeated-rejected-reply') throw new Error(`[fix93] unexpected repair failure ${failure.name}`);
+        if (!Array.isArray(failure.attempts) || failure.attempts.length < 2) throw new Error('[fix93] a repeated rejection needs both attempts');
+        if (typeof q.sig !== 'string' || q.sig.length === 0) throw new Error(`[fix93] repair of ${e.name} has no signature; cannot record ${failure.name}`);
+        const evidence = failure.attempts.map(a => `attempt ${a.n} identity ${a.identity}: ${a.reason}${a.repeated === true ? ' REPEATED' : ''}`).join(' || ');
+        console.log(`[psn] repair FAILED for ${e.name}: ${failure.name} (${evidence})`);
+        this._noteProposal(e, { task: q.task, kind: q.kind, evidence: q.evidence.slice(0, 200), desc: failure.name, outcome: failure.name });
+        this._proposalOutcome(e, failure.name, q.sig);
+        this._repairTerminal = { name: failure.name, skill: e.name, evidence, attempts: failure.attempts };
+        return false;
     }
 
     // fix37 (C): improved extraction of function bodies from joint repair replies
@@ -5816,7 +5951,7 @@ ${this.unifiedAPIList(relevantSkills)}
 IMPORTANT: All functions use bare names. Do NOT write skills.goToPosition - write goToPosition. Do NOT write world.getNearestBlock - write getNearestBlock.`;
         const user = `Task that failed: ${q.task}\nEvidence: ${q.evidence}\n--- current bot state ---\n${this._stateText(this.observe())}\n--- execution trace ---\n${extractFeedback(q.trace || '', 2500)}\n--- child ${e.name} ---\n${e.code}\n--- caller ${pe.name} ---\n${pe.code}${e.contract ? `\n--- contract of ${e.name} ---\npre: ${e.contract.pre}\npost: ${e.contract.post}` : ''}${pe.contract ? `\n--- contract of ${pe.name} ---\npre: ${pe.contract.pre}\npost: ${pe.contract.post}` : ''}${awmHints ? `\n${awmHints}` : ''}\nWrite both fixed functions (${e.name} first, then ${pe.name}):`;
         console.log(`[psn] REPAIR JOINT ${e.name} + ${pe.name} with the code model (evidence: ${String(q.evidence).slice(0, LOG_EVIDENCE_CHARS)})`);
-        let reply; try { reply = await this._ask(system, user); } catch (err) { console.log(`[psn] joint repair FAILED: ${err.message}`); return false; }
+        let reply; try { reply = await this._ask(system, user, this._inferMeta('repair-joint', { system, user })); } catch (err) { console.log(`[psn] joint repair FAILED: ${err.message}`); return false; }
 
         // fix37 (C): improved extraction with better logging on failure
         const code = extractCode(reply) || '';
@@ -5907,7 +6042,7 @@ ${this.unifiedAPIList()}
 IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call functions directly by name.`;
         const user = `Repeated fragment:\n${h.fragment}\n${ents.map(e => `--- ${e.name} ---\n${e.code}`).join('\n')}\nWrite the helper then the rewritten skills:`;
         console.log(`[psn] REFACTOR ${id}: extracting the fragment shared by ${ents.map(e => e.name).join(', ')}`);
-        let reply; try { reply = await this._ask(system, user); } catch (err) { console.log(`[psn] refactor FAILED: ${err.message}`); return false; }
+        let reply; try { reply = await this._ask(system, user, this._inferMeta('refactor', { system, user })); } catch (err) { console.log(`[psn] refactor FAILED: ${err.message}`); return false; }
         const code = extractCode(reply) || '';
         const fns = []; const re = /(?:^|\n)async\s+function\s+([A-Za-z_]\w*)\s*\(/g; let mm, idx = [];
         while ((mm = re.exec(code))) idx.push([mm[1], mm.index]);
@@ -5971,7 +6106,7 @@ ${this.unifiedAPIList()}
 IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call functions directly by name.`;
         const user = `Similar skills to generalise:\n${ents.map(e => `--- ${e.name} ---\n${e.description}\n${e.code}`).join('\n')}\nWrite the parameterized helper then the wrapper skills:`;
         console.log(`[psn] GENERALISE ${id}: parameterising ${ents.map(e => e.name).join(', ')}`);
-        let reply; try { reply = await this._ask(system, user); } catch (err) { console.log(`[psn] generalise FAILED: ${err.message}`); return false; }
+        let reply; try { reply = await this._ask(system, user, this._inferMeta('generalise', { system, user })); } catch (err) { console.log(`[psn] generalise FAILED: ${err.message}`); return false; }
         const code = extractCode(reply) || '';
         const fns = []; const re = /(?:^|\n)async\s+function\s+([A-Za-z_]\w*)\s*\(/g; let mm, idx = [];
         while ((mm = re.exec(code))) idx.push([mm[1], mm.index]);
@@ -6010,7 +6145,7 @@ ${this.unifiedAPIList()}
 IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call functions directly by name.`;
         const user = `Large skill to split:\n--- ${e.name} ---\n${e.description}\n${e.code}\nWrite the sub-skills then the rewritten main skill:`;
         console.log(`[psn] SPLIT ${id}: breaking ${e.name} (${e.code.split('\n').length} lines) into sub-skills`);
-        let reply; try { reply = await this._ask(system, user); } catch (err) { console.log(`[psn] split FAILED: ${err.message}`); return false; }
+        let reply; try { reply = await this._ask(system, user, this._inferMeta('split', { system, user })); } catch (err) { console.log(`[psn] split FAILED: ${err.message}`); return false; }
         const code = extractCode(reply) || '';
         const fns = []; const re = /(?:^|\n)async\s+function\s+([A-Za-z_]\w*)\s*\(/g; let mm, idx = [];
         while ((mm = re.exec(code))) idx.push([mm[1], mm.index]);
@@ -6191,7 +6326,7 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
         // fix47: get relevant built-in API functions via embedding search + skill deps
         const relevantBuiltIn = await this._relevantBuiltInAPI(task + ' ' + (proposal.context || ''), apiTopK, shown);
         
-        let system = await prompter.replaceStrings(prompter.profile.coding, [{ role: "user", content: `!newAction(${task})` }], prompter.coding_examples);
+        let system = voyagerCodingInstructions(prompter.profile.coding, this.agent.name);
         // fix40: unified bare-name API - all functions called by bare name
         // fix47: use relevantBuiltIn instead of full API list
         const apiList = this.unifiedAPIList(shown, relevantBuiltIn);
@@ -6207,8 +6342,7 @@ COMPOSE: build your function out of these skills (they can take arguments). Your
 SHARED CODE: these fragments are repeated in several skills; if you need this logic, put it in its own small reusable async function skill (named, with parameters) and call it, instead of inlining it again:
 ${this.sharedHints.map(h => '// used in ' + h.skills.join(', ') + '\n' + h.fragment).join('\n')}` : ''}
 Interrupts: the bot may be interrupted at any time (danger, getting stuck, a player talking). Every loop must start with \`if (bot.interrupt_code) return;\` and you must return immediately after any await when bot.interrupt_code is true. Every async function must contain an await. Never catch an error and keep looping; no unbounded loops (always cap attempts). There is no setTimeout/setInterval in scope; to wait use \`await sleep(ms)\`. findBlock/findBlocks/nearestEntity/bot.entities/blockAt results can be null or empty: always null-check them before reading .position/.x or calling methods on them.`;
-        // define every library skill so calls to any known skill lint/run; only `related` are shown as context
-        const learnedSrc = this.skills.map(s => s.code).join('\n\n');
+        // only `related` are shown as context; the library is already in the execution scope, so its source is not copied into the prompt
         const ctx = related.slice(0, 3).map(s => `// ${s.description}\n${s.code}`).join('\n\n');   // fix32: full code for the top 3; the rest are signatures in the catalogue
 
         // fix37 (D): include inventory-full fact from replay failure in feedback for code gen
@@ -6248,7 +6382,7 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
                     retry: feedback.length
                 });
             }
-            const reply = await this._ask(system, user);
+            const reply = await this._ask(system, user, this._inferMeta(i === 1 ? 'compose' : 'compose-retry', { system, user }));
             // fix37: duplicate-reply detection - hash and compare to previous
             const replyHash = this._hashReply(reply);
             if (prevReplyHash !== null && replyHash === prevReplyHash) {
@@ -6470,7 +6604,11 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             const repaired = await this._repair();
             if (repaired === true) return;
             if (repaired !== false) throw new Error(`[fix91] _repair returned ${JSON.stringify(repaired)}; expected true or false`);
-            console.log('[fix91] repair produced nothing; the step continues');
+            if (this._repairTerminal) {
+                const t = this._repairTerminal;
+                this._repairTerminal = null;
+                console.log(`[fix93] repair ${t.name} for ${t.skill}: ${t.evidence}`);
+            } else console.log('[fix91] repair produced nothing; the step continues');
         }
         // fix80: one shared pre-emption slot (hunger now; fix77 threat later). After repairs, BEFORE decompose/subgoals
         // so a fresh decomposition cannot starve the need for a whole LLM call. Queues stay untouched (BT re-tick).

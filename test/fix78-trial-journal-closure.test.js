@@ -35,7 +35,7 @@ function codePathRig(dir) {
     for (const m of ['_checkHomeGround', '_watchWindows', '_watchDimension', '_oneshot', '_requeueDeferred', '_prefetchPlan', '_logPromptBreakdown']) v[m] = () => {};
     for (const m of ['_queueApiLintRepairs', '_gateTrial', '_backfillContracts', '_refactor', '_prune', '_generalise', '_split', '_retention', '_idlePractice']) v[m] = async () => false;
     v._apiLinted = v._apiSignature = () => 'same'; v._apiLinted = 'same';
-    v.agent = { bot: { currentWindow: null, version: '1.21.4', food: 20, health: 20, game: { maxHealth: 20, maxFood: 20 } }, prompter: { profile: { coding: '' }, coding_examples: [], replaceStrings: async s => s },
+    v.agent = { bot: { currentWindow: null, version: '1.21.4', food: 20, health: 20, game: { maxHealth: 20, maxFood: 20 } }, prompter: { profile: { coding: 'Write one function.\n$SELF_PROMPT\n$MEMORY\n$STATS\n$INVENTORY\n$CODE_DOCS\n$EXAMPLES' }, coding_examples: [], replaceStrings: async s => s },
         coder: { userGeneratedCodeLintBlockers: () => null } };
     v.vitals = new VitalsModel({ regen: {}, runs: {}, foodSamples: { drop: { n: 0, sum: 0 }, rise: { n: 0, sum: 0 } } });
     v.observe = () => ({ inventory: {}, equipment: eq, nearby_blocks: [] });

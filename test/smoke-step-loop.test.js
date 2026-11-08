@@ -167,7 +167,9 @@ function createMockAgent(bot, prompter) {
             getHistory: () => [],
             memory: '',
         },
-        isIdle: () => true,
+        // This mock is not a live idle body. Practice covers the local wait and must not stage a skill here.
+        isIdle: () => false,
+        requestInterrupt() { bot.interrupt_code = true; },
         self_prompter: {
             isActive: () => false,
             isStopped: () => true,
@@ -269,8 +271,11 @@ describe('smoke: full step loop', { skip: !DEPS_AVAILABLE ? `Dependencies not in
         extractFeedback = voyagerModule.extractFeedback;
         _setVersionForTest = voyagerModule._setVersionForTest;
         
-        // fix49: VERSION must be set for countGoal/parseVerboseGoal
+        // fix49: VERSION must be set for countGoal/parseVerboseGoal.
+        // fix93: a local model wait observes the world (practice), which reads biomes from loaded game data.
         _setVersionForTest('1.20.4');
+        const mc = await import('../src/utils/mcdata.js');
+        mc._setVersionForTest('1.20.4');
         
         bot = createMockBot();
         prompter = createMockPrompter();
