@@ -209,7 +209,8 @@ describe('fix82 (2): craftItem "Cannot read properties of undefined (reading \'f
         try { assert.strictEqual(await v._repair(), false); } finally { console.log = orig; }
         assert.match(prompts[1], /lint: A learned skill is ONE top-level function: `async function checkForIronPickaxe\(bot, \.\.\.\)`.*top-level function checkIronPickaxe besides checkForIronPickaxe/);
         // the model repeated the rejected reply: before, the loop ended on the duplicate and submitted attempt 1's body
-        assert.strictEqual(entry.repairHistory.at(-1).outcome, 'duplicate replies');
+        assert.strictEqual(entry.repairHistory.at(-1).outcome, 'repeated-rejected-reply');
+        assert.ok(v.progress.failedRepairSigs && v.progress.failedRepairSigs.s, 'the repeat is recorded on the repair signature');
     });
     it('writeCode and the repair loop run the same gate; saveSkill runs it for every other path', () => {
         const src = readFileSync(new URL('../src/agent/voyager.js', import.meta.url), 'utf8');

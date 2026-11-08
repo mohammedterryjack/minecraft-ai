@@ -210,7 +210,7 @@ describe('fix80: _serveUrgent with pending decompose (food 10 / HP 20)', () => {
         v.unifiedAPIList = () => '';
         v.sharedHints = [];
         v._logPromptBreakdown = () => {};
-        v.agent.prompter = { profile: { coding: '' }, coding_examples: [], replaceStrings: async s => s };
+        v.agent.prompter = { profile: { coding: 'Write one function.\n$SELF_PROMPT\n$MEMORY\n$STATS\n$INVENTORY\n$CODE_DOCS\n$EXAMPLES' }, coding_examples: [], replaceStrings: async s => s };
         v.agent.coder = { userGeneratedCodeLintBlockers: () => null };
         v._compactState = () => 'state';
         let sawNeedLabel = false;

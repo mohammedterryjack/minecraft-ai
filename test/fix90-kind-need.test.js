@@ -173,7 +173,7 @@ describe('fix90: curriculum replay of eatFood chains the need onto the hunger se
         assert.ok(v.progress.subgoals.some(s => typeof s.task === 'string' && blocker.anyOf.some(n => s.task.endsWith(' ' + n))), JSON.stringify(v.progress.subgoals));
     });
 
-    it('cold start (raiser none playable) chains once; the next serve does not replay eatFood', async () => {
+    it('a learned consume effect plans food once and does not replay eatFood', async () => {
         const runs = {};
         const m = liveRegen(runs);
         m.noteRun('consume', { hp: 18, food: 10 }, { hp: 18, food: 13.5 });
@@ -184,12 +184,13 @@ describe('fix90: curriculum replay of eatFood chains the need onto the hunger se
         v.agent.bot.food = 17;
         v.agent.bot.health = 18;
         const calls = replayFail(v);
-        v.proposeTask = async () => ({ task: 'eatFood', reasoning: 'the bot is hungry', context: '' });
+        v.proposeTask = async () => { throw new Error('proposeTask must not cold-start over a learned consume effect'); };
         assert.strictEqual(await v._serveUrgent(), true);
-        assert.deepStrictEqual(calls, ['eatFood']);
+        assert.deepStrictEqual(calls, [], 'eatFood is not replayed');
         assert.ok(Object.hasOwn(v.progress.decomposed, 'need:hunger'));
+        assert.ok(v.progress.subgoals.some(s => s.parent === 'need:hunger'), JSON.stringify(v.progress.subgoals));
         assert.strictEqual(await v._serveUrgent(), false);
-        assert.deepStrictEqual(calls, ['eatFood'], 'the backchain is the serve; eatFood is not proposed again');
+        assert.deepStrictEqual(calls, [], 'the queued plan is the serve; eatFood is not proposed');
     });
 
     it('a playable raiser that fails the same way chains under the need label', async () => {

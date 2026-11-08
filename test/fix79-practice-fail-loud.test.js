@@ -58,8 +58,9 @@ describe('fix79: the practice session does not swallow errors', () => {
             _stopIdlePractice: () => {},
         });
         v.agent.prompter = { code_model: { sendRequest: async () => 'reply' } };
-        await assert.rejects(v._ask('s', 'u'), /practice bug/);
-        assert.strictEqual(await v._ask('s', 'u'), 'reply', 'the queue was released');
+        const meta = { kind: 'test', components: { system: 1, user: 1 } };
+        await assert.rejects(v._ask('s', 'u', meta), /practice bug/);
+        assert.strictEqual(await v._ask('s', 'u', { kind: 'test', components: { system: 1, user: 1 } }), 'reply', 'the queue was released');
     });
     it('no catch is left in the practice session or run', () => {
         const start = SRC.indexOf('    async _startIdlePractice(callNum) {');
@@ -74,13 +75,13 @@ describe('fix79: the practice session does not swallow errors', () => {
 
 describe('fix79: _ask queue serialises only (no empty catch)', () => {
     it('awaits prev with no catch; matches _askLocal (f850a88) resolve-only mutex', () => {
-        const start = SRC.indexOf('    async _ask(system, user) {');
+        const start = SRC.indexOf('    async _ask(system, user, meta) {');
         const ask = code(SRC.slice(start, SRC.indexOf('    _hashReply(text) {', start)));
         assert.match(ask, /\n\s*await prev;\n/);
         assert.doesNotMatch(ask, /await prev; \} catch/);
         assert.doesNotMatch(ask, /previous call's error doesn't block us/);
         // previous rejection already reaches its caller; the next _ask still runs (release in finally)
-        const local = code(SRC.slice(SRC.indexOf('    async _askLocal(system, user) {'), SRC.indexOf('    _cursorLimited()')));
+        const local = code(SRC.slice(SRC.indexOf('    async _askLocal(system, user, meta) {'), SRC.indexOf('    _cursorLimited()')));
         assert.match(local, /await prev;/);
         assert.doesNotMatch(local, /await prev;.*catch/);
     });
@@ -92,7 +93,8 @@ describe('fix79: _ask queue serialises only (no empty catch)', () => {
             _stopIdlePractice: () => {},
         });
         v.agent.prompter = { code_model: { sendRequest: async () => { if (n++ === 0) throw new Error('first call failed'); return 'ok'; } } };
-        await assert.rejects(v._ask('s', 'u'), /first call failed/);
-        assert.strictEqual(await v._ask('s', 'u'), 'ok');
+        const meta = { kind: 'test', components: { system: 1, user: 1 } };
+        await assert.rejects(v._ask('s', 'u', meta), /first call failed/);
+        assert.strictEqual(await v._ask('s', 'u', { kind: 'test', components: { system: 1, user: 1 } }), 'ok');
     });
 });

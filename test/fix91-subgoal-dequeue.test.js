@@ -38,8 +38,7 @@ function liveRegen() {
         runs: {},
         foodSamples: { drop: { n: 0, sum: 0 }, rise: { n: 0, sum: 0 } },
     });
-    // Measured food raiser that is not a library skill: "raiser none playable", cold start.
-    m.noteRun('consume', { hp: 18, food: 10 }, { hp: 18, food: 13.5 });
+    // No measured food raiser. A learned consume effect is a food plan (fix93), not this cold start.
     return m;
 }
 

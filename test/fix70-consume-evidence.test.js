@@ -100,6 +100,12 @@ describe('fix70: effects are measured over the skill\'s own run', () => {
         assert.strictEqual(bot.interrupt_code, false, 'the interrupt that ended it is not left on the bot');
     });
     it('_ask waits for the practice it started before returning the model reply', () => {
-        assert.match(SRC, /this\._stopIdlePractice\(\);\n(?:\s*\/\/[^\n]*\n)?\s+try \{ await practicePromise; \}/);   // fix79: awaited in try/finally (the queue is released when practice rejects)
+        // fix93: one cover owns the wait. leave() stops practice and awaits that promise;
+        // the await sits in try/finally so a practice rejection still releases the queue.
+        const ask = SRC.slice(SRC.indexOf('    async _ask(system, user, meta) {'), SRC.indexOf('    _hashReply(text) {'));
+        assert.match(ask, /try \{ await cover\.leave\(\); \}[^\n]*\n\s*finally \{\s*\n\s*release\(\);/);
+        const cover = readFileSync(new URL('../src/agent/inference_cover.js', import.meta.url), 'utf8');
+        const halt = cover.slice(cover.indexOf('async _halt()'), cover.indexOf('resume(callNum)'));
+        assert.match(halt, /stop\(\);\s*\n\s*await pending;/);
     });
 });

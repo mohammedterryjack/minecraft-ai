@@ -1,6 +1,7 @@
 import { strictFormat } from '../utils/text.js';
 import { Agent } from 'undici';
 import { recordCall, recordCut, callBound, requestShape, workOf, noteUnboundedCall, takeLearnedBound } from './call_durations.js';
+import { inferenceTiming, formatOllamaTiming } from './inference_timing.js';
 
 // fix60: Ollama with stream:false sends its response headers only after the whole generation, so undici's implicit
 // 300 s headersTimeout/bodyTimeout (the global Agent installed when cheerio loads undici) killed long but healthy local
@@ -18,7 +19,7 @@ export class Ollama {
         this.embedding_endpoint = '/api/embeddings';
     }
 
-    async sendRequest(turns, systemMessage) {
+    async sendRequest(turns, systemMessage, meta) {
         let model = this.model_name || 'sweaterdog/andy-4:micro-q8_0';
         let messages = strictFormat(turns);
         messages.unshift({ role: 'system', content: systemMessage });
@@ -37,11 +38,10 @@ export class Ollama {
                     stream: false,
                     ...(this.params || {}),
                     keep_alive: this._keepAlive()
-                });
+                }, meta);
                 if (apiResponse?.done_reason === 'length') { truncated = apiResponse; }   // fix31
                 if (apiResponse) {
                     res = apiResponse['message']['content'];
-                    console.log(`[ollama-timing] model=${this.model_name} prompt_tokens=${apiResponse.prompt_eval_count} prompt_ms=${Math.round((apiResponse.prompt_eval_duration||0)/1e6)} gen_tokens=${apiResponse.eval_count} total_ms=${Math.round((apiResponse.total_duration||0)/1e6)}`);
                 } else {
                     res = 'No response data.';
                 }
@@ -49,7 +49,7 @@ export class Ollama {
                 if (err.code === 'OLLAMA_LEARNED_BOUND') throw err;   // fix60: a hang beyond the learned bound fails loud, never a canned reply
                 if (err.message.toLowerCase().includes('context length') && turns.length > 1) {
                     console.log('Context length exceeded, trying again with shorter context.');
-                    return await this.sendRequest(turns.slice(1), systemMessage);
+                    return await this.sendRequest(turns.slice(1), systemMessage, meta);
                 } else {
                     console.log(err);
                     res = 'My brain disconnected, try again.';
@@ -98,7 +98,7 @@ export class Ollama {
         return v;
     }
 
-    async send(endpoint, body) {
+    async send(endpoint, body, meta) {
         const url = new URL(endpoint, this.url);
         let method = 'POST';
         let headers = new Headers();
@@ -127,7 +127,9 @@ export class Ollama {
             throw new Error(errMsg);
         }
         const json = await res.json();
-        recordCall(key, Date.now() - t0, shape.chars, workOf(endpoint, json));
+        const wallMs = Date.now() - t0;
+        console.log(formatOllamaTiming(this.model_name, inferenceTiming({ json, wallMs, url: this.url, meta })));
+        recordCall(key, wallMs, shape.chars, workOf(endpoint, json));
         const learned = takeLearnedBound(key, shape);
         if (learned) console.log(`[ollama] ${key} now bounded (${learned.bound.ms}ms for a request like this one; learned from n=${learned.bound.stats.n} calls; ${learned.calls} call(s) ran unbounded)`);
         return json;
