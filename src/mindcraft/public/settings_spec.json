@@ -19,6 +19,11 @@
         "description": "The minecraft server port to connect to. -1 for auto-detect.",
         "default": 55916
     },
+    "backend_log_dir": {
+        "type": "string",
+        "description": "Directory of the Minecraft backend's latest.log. After a refusal the process watches this directory for the server's Done line. Required; there is no default.",
+        "required": true
+    },
     "auth": {
         "type": "string",
         "description": "The authentication method to use",

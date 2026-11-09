@@ -82,6 +82,28 @@ export function noteUnboundedCall(key) {
     _unbounded[key] = (_unbounded[key] || 0) + 1;
     return first;
 }
+export function learnedCharsPerToken(key) {
+    const stats = _store ? _store[key] : undefined;
+    if (!stats) return undefined;
+    if (stats.cpt === undefined) return undefined;
+    if (typeof stats.cpt !== 'number' || !(stats.cpt > 0)) throw new Error(`[fix94] stored chars-per-token for ${key} is not a positive number`);
+    return stats.cpt;
+}
+
+// The 400 names the real token count. Record chars/tokens when it is denser than anything
+// learned from a successful reply, so the next send cuts before it is sent.
+export function notePromptDensity(key, chars, tokens) {
+    if (typeof key !== 'string' || key.length === 0) throw new Error('[fix94] density key required');
+    if (typeof chars !== 'number' || chars < 0) throw new Error('[fix94] density chars required');
+    if (typeof tokens !== 'number' || !Number.isInteger(tokens) || tokens <= 0) throw new Error('[fix94] density token count required');
+    if (!_store) throw new Error('[fix94] no call-duration store to record prompt density');
+    if (!_store[key]) _store[key] = { n: 0 };
+    const cpt = chars / tokens;
+    const stats = _store[key];
+    if (stats.cpt === undefined || cpt < stats.cpt) stats.cpt = cpt;
+    return stats.cpt;
+}
+
 export function takeLearnedBound(key, shape) {
     if (!(key in _unbounded)) return null;
     const bound = callBound(key, shape);

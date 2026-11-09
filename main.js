@@ -47,6 +47,10 @@ if (process.env.MINECRAFT_HOST) {
 if (process.env.MINECRAFT_PORT) {
     settings.port = process.env.MINECRAFT_PORT;
 }
+if (Object.hasOwn(process.env, 'BACKEND_LOG_DIR')) {
+    if (process.env.BACKEND_LOG_DIR.length === 0) throw new Error('[fix94] BACKEND_LOG_DIR is empty');
+    settings.backend_log_dir = process.env.BACKEND_LOG_DIR;
+}
 if (process.env.MINDSERVER_PORT) {
     settings.mindserver_port = process.env.MINDSERVER_PORT;
 }
