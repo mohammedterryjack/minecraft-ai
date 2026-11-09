@@ -10,7 +10,8 @@ import * as acorn from "acorn";
 const { tokenizer: acornTokenizer, tokTypes } = acorn;
 import pf from 'mineflayer-pathfinder';
 import { logPromptBreakdown } from './prompt_utils.js';
-import { withStallPhase, pushStallPhase, popStallPhase } from '../utils/event_loop_guard.js';
+import { withStallPhase, pushStallPhase, popStallPhase, getStallPhaseStack } from '../utils/event_loop_guard.js';
+import { mainThreadWatchdogStarted, publishMainThreadCode } from '../utils/main_thread_watchdog.js';
 import { wrapBotForApiTiming } from '../utils/bot_api_timing.js';
 import { markPreconditionUnmet } from './precondition.js';
 
@@ -397,7 +398,7 @@ export class Coder {
                     if (nm) errs.add(`'${a.value}' is not an item, block or entity name in this Minecraft version (did you mean '${nm}'?)`); }
             }
         }
-        return errs.size ? `API gate: ${[...errs].slice(0, 8).join('; ')}` : null;
+        return errs.size ? `API gate: ${[...errs].join('; ')}` : null;   // fix96: every error, none cut
     }
     // fix34: Levenshtein distance for API name matching
     _lev(a, b) {
@@ -1065,6 +1066,10 @@ export class Coder {
             return { src_lint_copy, preludeLines };
         }
         src = this.code_template.replace('/* CODE HERE */', src);
+        // fix96: the watchdog writes this into watchdog_kill.json if the main thread blocks while it runs. Kills at 15:43 and
+        //        17:32 GMT on 9 Nov named only the skill (smeltWithFuel, expandExplorationRangeForCactus); the generated code
+        //        that blocked was never saved, so the cause could not be read.
+        if (mainThreadWatchdogStarted()) publishMainThreadCode({ label: getStallPhaseStack().join(' <- '), source: src });
 
         let filename = this.file_counter + '.js';
         // if (this.file_counter > 0) {

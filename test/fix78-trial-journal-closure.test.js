@@ -13,6 +13,8 @@ import { VitalsModel } from '../src/agent/vitals_model.js';
 
 let Voyager, settings;
 before(async () => {
+    // fix96: recipeFacts reads the registry with no catch (it swallowed the unloaded-registry error before); load it as login does
+    (await import('../src/utils/mcdata.js'))._setVersionForTest('1.20.4');
     const mod = await import('../src/agent/voyager.js');
     Voyager = mod.Voyager;
     mod._setVersionForTest('1.21.4');

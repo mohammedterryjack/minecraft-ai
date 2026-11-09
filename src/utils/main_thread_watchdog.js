@@ -23,6 +23,10 @@ import { fileURLToPath } from 'node:url';
 const WORKER_PATH = fileURLToPath(new URL('./main_thread_watchdog_worker.mjs', import.meta.url));
 export const BEAT = 0;
 export const LIMIT = 1;
+// fix96: the bot API call running on the main thread right now, for the kill evidence. A blocked main thread cannot post a
+// message, so the call is written into shared memory before it starts: [length, ...utf8 bytes]. The slot holds the longest
+// description the worker reports; a longer one is stored with its length so the worker says how much it could not read.
+export const CALL_SLOT_BYTES = 8192;
 
 /** @type {{ ctl: Int32Array, port: import('node:worker_threads').MessagePort, worker: Worker } | null} */
 let _wd = null;
@@ -40,13 +44,15 @@ export function startMainThreadWatchdog(evidencePath) {
     if (typeof evidencePath !== 'string' || !evidencePath) throw new Error('[watchdog] startMainThreadWatchdog: evidence path required');
     if (_wd) return _wd;
     const ctl = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 2));
+    const callLen = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+    const callBytes = new Uint8Array(new SharedArrayBuffer(CALL_SLOT_BYTES));
     const { port1, port2 } = new MessageChannel();
-    const worker = new Worker(WORKER_PATH, { workerData: { sab: ctl.buffer, port: port2, pid: process.pid, evidencePath }, transferList: [port2] });
+    const worker = new Worker(WORKER_PATH, { workerData: { sab: ctl.buffer, callLenSab: callLen.buffer, callSab: callBytes.buffer, port: port2, pid: process.pid, evidencePath }, transferList: [port2] });
     worker.on('error', (e) => { throw new Error(`[watchdog] LOUD FAIL: watchdog worker crashed: ${e && e.stack ? e.stack : e}`); });
     worker.on('exit', (code) => { throw new Error(`[watchdog] LOUD FAIL: watchdog worker exited (code ${code}); the main thread is unguarded`); });
     worker.unref();
     port1.unref();
-    _wd = { ctl, port: port1, worker };
+    _wd = { ctl, port: port1, worker, callLen, callBytes, encoder: new TextEncoder() };
     console.log('[watchdog] main-thread watchdog worker started; it arms once the stall guard learns the server keep_alive gap');
     return _wd;
 }
@@ -86,4 +92,27 @@ export function beatMainThreadWatchdog() {
  */
 export function publishMainThreadEvidence(ev) {
     _need().port.postMessage(ev);
+}
+
+/**
+ * fix96: the code about to run on the main thread (the staged bundle). Posted once per staging, not with every evidence
+ * update; the worker keeps the latest and writes it into watchdog_kill.json, so a kill names the code that was running.
+ * @param {{ label: string, source: string }} code
+ */
+export function publishMainThreadCode(code) {
+    if (!code || typeof code.label !== 'string' || typeof code.source !== 'string') throw new Error('[watchdog] publishMainThreadCode: { label, source } required');
+    _need().port.postMessage({ code: { label: code.label, source: code.source, at: new Date().toISOString() } });
+}
+
+/**
+ * fix96: the synchronous bot API call starting now ('' when it returned). Written to shared memory: no message, no allocation
+ * on the worker side, so it is readable while the main thread is blocked inside that call.
+ * @param {string} text
+ */
+export function noteMainThreadCall(text) {
+    if (typeof text !== 'string') throw new Error('[watchdog] noteMainThreadCall: text required');
+    const wd = _need();
+    const { read, written } = wd.encoder.encodeInto(text, wd.callBytes);
+    const full = read < text.length ? Buffer.byteLength(text) : written;
+    Atomics.store(wd.callLen, 0, full);
 }

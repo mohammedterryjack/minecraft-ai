@@ -1091,7 +1091,8 @@ describe('fix51 issue 22: idle practice requires real effect change', async () =
 describe('fix51 rule fixes: structured prereq + deposit without name regex', async () => {
     it('seeded ensureCraftingTable reports a structured need; decomposition does not parse text', () => {
         const src = readFileSync('./src/agent/voyager.js', 'utf8');
-        assert.ok(src.includes("__mcPreconditionUnmet__(bot, { need: { item: ingItem.name, count: shortfall, reason: 'ingredients' } })"), 'ensureCraftingTable should report the structured need (fix81; was __prereqFail)');
+        // fix96: the need is built from every crafting_table recipe (anyOf when each lacks one ingredient), then reported
+        assert.ok(src.includes("? { anyOf: [...new Set(variants.map(v => v.uncovered[0].item.name))], count: counts[0], reason: 'ingredients' }") && src.includes('__mcPreconditionUnmet__(bot, { need });'), 'ensureCraftingTable should report the structured need (fix81; was __prereqFail)');
         const body = src.slice(src.indexOf('    _failureNeeds(task, reported, trace, state)'), src.indexOf('    _subgoalToObtainItem('));
         assert.ok(!body.includes('match(') && !body.includes('could not parse'), 'decomposition must not parse text');
     });

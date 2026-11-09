@@ -1,3 +1,51 @@
+diff --git a/node_modules/mineflayer/lib/plugins/blocks.js b/node_modules/mineflayer/lib/plugins/blocks.js
+index d75b9c5..ba8c3ae 100644
+--- a/node_modules/mineflayer/lib/plugins/blocks.js
++++ b/node_modules/mineflayer/lib/plugins/blocks.js
+@@ -127,12 +127,19 @@ function inject (bot, { version, storageBuilder, hideErrors }) {
+     // match in the palette, we can skip this section.
+     if (section.palette) {
+       for (const stateId of section.palette) {
+-        if (matcher(Block.fromStateId(stateId, 0))) {
++        if (matcher.forState ? matcher.forState(stateId) : matcher(Block.fromStateId(stateId, 0))) {
+           return true // the block is in the palette
+         }
+       }
+       return false // skip
+     }
++    // minecraft-ai fix96: a section of ONE state (all air above ground, all stone or water below) is stored as a
++    // single-value container: it has no palette, and was treated as "global palette" here, so all 4096 of its blocks
++    // were read with blockAt on every search. Its one state answers the question.
++    if (section.data && section.data.palette === undefined && Object.hasOwn(section.data, 'value')) {
++      const stateId = section.data.value
++      return matcher.forState ? matcher.forState(stateId) : matcher(Block.fromStateId(stateId, 0))
++    }
+     return true // global palette, the block might be in there
+   }
+ 
+@@ -154,7 +161,21 @@ function inject (bot, { version, storageBuilder, hideErrors }) {
+   }
+ 
+   bot.findBlocks = (options) => {
+-    const matcher = getMatchingFunction(options.matching)
++    const blockMatcher = getMatchingFunction(options.matching)
++    // minecraft-ai fix96: the palette check built a Block (Block.fromStateId) for every palette entry of every loaded
++    // section on every call, so a search for an absent block cost seconds (live: 15-17.6 s per call, then the watchdog
++    // killed the process). A section palette holds state ids; the same states repeat across sections, so each state is
++    // matched once per call and remembered. Same matcher, same answer (the palette check already used state + biome 0).
++    const stateMatch = new Map()
++    const matcher = (block) => blockMatcher(block)
++    matcher.forState = (stateId) => {
++      let m = stateMatch.get(stateId)
++      if (m === undefined) {
++        m = blockMatcher(Block.fromStateId(stateId, 0))
++        stateMatch.set(stateId, m)
++      }
++      return m
++    }
+     const point = (options.point || bot.entity.position).floored()
+     const maxDistance = options.maxDistance || 16
+     const count = options.count || 1
 diff --git a/node_modules/mineflayer/lib/plugins/digging.js b/node_modules/mineflayer/lib/plugins/digging.js
 index 5ae5552..af28eef 100644
 --- a/node_modules/mineflayer/lib/plugins/digging.js

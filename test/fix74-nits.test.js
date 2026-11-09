@@ -43,7 +43,10 @@ describe('fix74: the precondition marker has one writer, and generated code cann
         // fix84: structured slot/proximity calls (collectBlock slot, pickupNearbyItems slot, depositToChest with no known chest)
         // fix92: tossClutter no longer falls through to a chest proximity marker; capacity work uses the shared plan
         assert.strictEqual((v.match(new RegExp(`${PRECONDITION_UNMET_BINDING}\\(bot\\);`, 'g')) || []).length, 0);
-        assert.strictEqual((v.match(new RegExp(`${PRECONDITION_UNMET_BINDING}\\(bot, \\{ need: \\{`, 'g')) || []).length, 7);
+        // fix96: ensureCraftingTable builds its need from every crafting_table recipe and passes it as { need } (its two old
+        //        oak-only markers are one)
+        assert.strictEqual((v.match(new RegExp(`${PRECONDITION_UNMET_BINDING}\\(bot, \\{ need: \\{`, 'g')) || []).length, 5);
+        assert.strictEqual((v.match(new RegExp(`${PRECONDITION_UNMET_BINDING}\\(bot, \\{ need \\}\\);`, 'g')) || []).length, 1);
     });
     it('it is not on the model-visible API: not a skills.js export, not in getBareAPI (prompts, lint sandbox)', () => {
         assert.strictEqual(Object.hasOwn(skillsLib, 'markPreconditionUnmet'), false);

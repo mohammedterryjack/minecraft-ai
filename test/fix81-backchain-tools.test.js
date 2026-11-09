@@ -272,6 +272,8 @@ describe('fix81: structured needs are validated and reach the curriculum', () =>
     it('progress.blockers become the BLOCKERS line of the curriculum prompt, and clear once the item is held', () => {
         const v = mkV({ inv: {}, nearby: [] });
         v.progress.blockers = [{ item: 'stone_pickaxe', count: 1, reason: 'tool', task: 'Mine 1 iron_ore', at: 1 }, { item: 'chest', count: 1, reason: 'proximity', task: 'Store spare items in a chest', at: 2 }];
+        // fix96: a blocker is what an OPEN goal lacks; both goals' retry entries are queued (as _chainNeeds leaves them)
+        v.progress.subgoals = [{ task: 'Mine 1 iron_ore', retry: true }, { task: 'Store spare items in a chest', retry: true }];
         assert.strictEqual(v._blockerHint({}), '\nBLOCKERS (prioritize these - what failed goals lack): "Mine 1 iron_ore" needs 1 stone_pickaxe (tool); "Store spare items in a chest" needs 1 chest (proximity)');
         assert.strictEqual(v._blockerHint({ stone_pickaxe: 1 }), '\nBLOCKERS (prioritize these - what failed goals lack): "Store spare items in a chest" needs 1 chest (proximity)');
         const src = Voyager.prototype.proposeTask.toString();
@@ -282,7 +284,7 @@ describe('fix81: structured needs are validated and reach the curriculum', () =>
 describe('fix81: obtainPlanner (game data only)', () => {
     const planner = (nearby, learned = () => false) => obtainPlanner({
         registry, recipesOf: id => Recipe.find(id),
-        known: (item, src) => src.some(b => nearby.includes(b)) || learned(item), proven: () => false,
+        known: (item, src) => src.some(b => nearby.includes(b)) || learned(item), proven: () => false, edgeSuccess: () => 1, smeltInputs: () => [],
     });
     it('cheapest harvest tool for stone from nothing is the wooden pickaxe (fix47 case, structural)', () => {
         const pre = planner(['oak_log']).prerequisites('stone', 3, {});
@@ -312,10 +314,10 @@ describe('fix81: obtainPlanner (game data only)', () => {
         const reg = {
             items: { 1: { id: 1, name: 'a_item' }, 2: { id: 2, name: 'b_item' } },
             itemsByName: { a_item: { id: 1, name: 'a_item' }, b_item: { id: 2, name: 'b_item' } },
-            blocksByName: {}, blockLoot: {},
+            blocksByName: {}, blockLoot: {}, entityLoot: {},
         };
         const rec = { 1: [{ result: { count: 1 }, delta: [{ id: 2, count: -1 }, { id: 1, count: 1 }] }], 2: [{ result: { count: 1 }, delta: [{ id: 1, count: -1 }, { id: 2, count: 1 }] }] };
-        const pre = obtainPlanner({ registry: reg, recipesOf: id => rec[id], known: () => false, proven: () => false }).prerequisites('a_item', 1, {});
+        const pre = obtainPlanner({ registry: reg, recipesOf: id => rec[id], known: () => false, proven: () => false, edgeSuccess: () => 1, smeltInputs: () => [] }).prerequisites('a_item', 1, {});
         assert.deepStrictEqual(pre.cycles, ['a_item -> b_item -> a_item']);
         assert.strictEqual(pre.task, 'Craft 1 a_item');
         assert.deepStrictEqual(pre.steps.map(st => st.task), ['Obtain 1 b_item']);
@@ -326,8 +328,9 @@ describe('fix81: obtainPlanner (game data only)', () => {
             itemsByName: { x_item: { id: 1, name: 'x_item' } },
             blocksByName: { x_item: { name: 'x_item', harvestTools: { 1: true } } },
             blockLoot: { x_item: { drops: [{ item: 'x_item' }] } },
+            entityLoot: {},
         };
-        const p = obtainPlanner({ registry: reg, recipesOf: () => [], known: () => false, proven: () => false });
+        const p = obtainPlanner({ registry: reg, recipesOf: () => [], known: () => false, proven: () => false, edgeSuccess: () => 1, smeltInputs: () => [] });
         assert.throws(() => p.prerequisites('x_item', 1, {}), /no acyclic way to obtain 1 x_item .*cycles: x_item -> x_item.*unobtainable: x_item from x_item/);
     });
 });

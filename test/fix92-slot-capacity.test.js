@@ -45,7 +45,7 @@ function analysed(name, consume = {}, use = {}) {
     };
 }
 function planner() {
-    return obtainPlanner({ registry, recipesOf: id => Recipe.find(id), known: () => false, proven: () => false });
+    return obtainPlanner({ registry, recipesOf: id => Recipe.find(id), known: () => false, proven: () => false, edgeSuccess: () => 1, smeltInputs: () => [] });
 }
 function args(stacks, slotsNeeded, goalItem, goalCount, needItem, skills) {
     const p = planner();

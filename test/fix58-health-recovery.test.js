@@ -137,7 +137,7 @@ describe('fix58: wiring into voyager', () => {
         v._hutBuilt = () => false; v._cursorLimited = () => false; v._logPromptBreakdown = () => {}; v._saveProgress = () => {};
         let prompt = null;
         v._askLocal = async (sys, user) => { prompt = user; return '{"reasoning":"r","task":"eatFood","context":""}'; };
-        const state = { position: '0, 32, 0', biome: 'plains', time: 'day (1)', health_value: 17, health_max: 20, food_value: 17, food_max: 20, inventory_slots: '1/36', empty_inventory_slots: 35, threats: 'none', inventory: {}, equipment: { hand: 'empty' } };
+        const state = { position: '0, 32, 0', biome: 'plains', time: 'day (1)', health_value: 17, health_max: 20, food_value: 17, food_max: 20, inventory_slots: '1/36', empty_inventory_slots: 35, threats: 'none', inventory: {}, nearby_blocks: [], equipment: { hand: 'empty' } };
         const r = await v.proposeTask(state);
         assert.strictEqual(r.task, 'eatFood');
         assert.match(prompt, /health_recovery \(learned from own vitals\): hp 17\.3\/20, food 17; .*not recovering at food 17/);

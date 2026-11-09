@@ -114,6 +114,13 @@ export function checkRecord(rec) {
         if (!Array.isArray(rec.path) || !rec.path.length) throw new Error(`${label}: progress record needs path[]`);
         if (!isPlainObject(rec.delete_entry_where) || !Object.keys(rec.delete_entry_where).length) throw new Error(`${label}: delete_entry_where needs a non-empty object of fields to match, got ${JSON.stringify(rec.delete_entry_where)}`);
         if (Object.hasOwn(rec, 'expect') || Object.hasOwn(rec, 'delete_path')) throw new Error(`${label}: delete_entry_where is its own operation; expect/delete_path do not belong on it`);
+    } else if (rec.file === 'progress' && Object.hasOwn(rec, 'delete_entries_where')) {
+        // fix96: delete EVERY entry of the list at path that matches all listed fields; the list holds identical rows
+        //        (one per failed attempt in the same state), so the expected number of matches is the precondition
+        if (!Array.isArray(rec.path) || !rec.path.length) throw new Error(`${label}: progress record needs path[]`);
+        if (!isPlainObject(rec.delete_entries_where) || !Object.keys(rec.delete_entries_where).length) throw new Error(`${label}: delete_entries_where needs a non-empty object of fields to match, got ${JSON.stringify(rec.delete_entries_where)}`);
+        if (!Number.isInteger(rec.expect_count) || rec.expect_count < 1) throw new Error(`${label}: delete_entries_where needs expect_count (a positive integer: how many entries it deletes), got ${JSON.stringify(rec.expect_count)}`);
+        if (Object.hasOwn(rec, 'expect') || Object.hasOwn(rec, 'delete_path')) throw new Error(`${label}: delete_entries_where is its own operation; expect/delete_path do not belong on it`);
     } else if (rec.file === 'progress') {
         if (!Array.isArray(rec.path) || !rec.path.length) throw new Error(`${label}: progress record needs path[]`);
         if (!Object.hasOwn(rec, 'expect')) throw new Error(`${label}: progress record needs expect (the value at path it resets)`);
@@ -183,6 +190,19 @@ export function applyManifest({ manifest, botsDir, apply = false, log = console.
             const [[entry, i]] = hits;
             got.value.splice(i, 1);
             changes.push({ id: label, op: 'delete_entry', target: `${rec.path.join('.')}[${i}]`, before: entry, after: undefined });
+        } else if (rec.file === 'progress' && Object.hasOwn(rec, 'delete_entries_where')) {
+            const got = getAt(progress, rec.path);
+            if (!got.ok || !Array.isArray(got.value)) throw new Error(`${label}: ${rec.path.join('.')} is not a list (${JSON.stringify(got.value)})`);
+            const where = rec.delete_entries_where;
+            const hits = got.value.map((e, i) => [e, i]).filter(([e]) => isPlainObject(e) && Object.entries(where).every(([k, v]) => Object.hasOwn(e, k) && deepEqual(e[k], v)));
+            if (hits.length !== rec.expect_count) {
+                mismatches.push({ id: label, key: `${rec.path.join('.')} matches`, expect: rec.expect_count, actual: hits.length });
+                continue;
+            }
+            for (const [entry, i] of [...hits].reverse()) {
+                got.value.splice(i, 1);
+                changes.push({ id: label, op: 'delete_entry', target: `${rec.path.join('.')}[${i}]`, before: entry, after: undefined });
+            }
         } else if (rec.file === 'progress') {
             const got = getAt(progress, rec.path);
             // expect is the whole value at path (required, checkRecord)

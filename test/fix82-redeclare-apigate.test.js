@@ -214,8 +214,9 @@ describe('fix82 (2): craftItem "Cannot read properties of undefined (reading \'f
     });
     it('writeCode and the repair loop run the same gate; saveSkill runs it for every other path', () => {
         const src = readFileSync(new URL('../src/agent/voyager.js', import.meta.url), 'utf8');
-        assert.match(src, /const gate = shape === null \? this\.agent\.coder\.userGeneratedCodeLintBlockers\(code, this\.skills\.map\(s => s\.name\)\) : null;/);
-        assert.match(src, /const apiErr = this\.agent\.coder\._apiGate\(code, \[\.\.\.names\]\);/);
+        // fix96: the gate knows the marker binding exactly when the replaced code calls it (markerCallsMissing runs first)
+        assert.match(src, /const gate = shape === null && !markerGap \? this\.agent\.coder\.userGeneratedCodeLintBlockers\(code, \[\.\.\.this\.skills\.map\(s => s\.name\), \.\.\.markerGateNames\(e\.code, PRECONDITION_UNMET_BINDING\)\]\) : null;/);
+        assert.match(src, /const apiErr = this\.agent\.coder\._apiGate\(code, \[\.\.\.names, \.\.\.markerGateNames\(incumbent \? incumbent\.code : '', PRECONDITION_UNMET_BINDING\)\]\);/);
         // writeCode: the shape lint runs before staging, and what is saved is the AST-cut source
         // fix83: the shape is read first (script parse), then the lint
         assert.match(src, /const scriptParse = parsesAsScript\(code\);\n\s*const split = scriptParse === true \? splitGeneratedCode\(code, own\) : null;\n\s*let lint = scriptParse !== true \? `does not parse as a script: \$\{scriptParse\}` : \(split\.violations\.length \? oneFunctionFeedback\(own, split\.violations, pastedLibrarySkills\(code, own, libraryNames\)\) : null\);\n\s*if \(lint === null\) lint = this\.agent\.coder\.userGeneratedCodeLintBlockers\(code, this\.skills\.map\(s => s\.name\)\);/);

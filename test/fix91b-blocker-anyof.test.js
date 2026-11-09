@@ -111,6 +111,7 @@ describe('fix91b: an anyOf blocker clears when one member is held, and the promp
     it('one member at the count resolves it; a split across members does not', () => {
         const v = mkV();
         v.progress.blockers = [{ anyOf: SOURCES, count: 2, reason: 'reach', task: 'Collect 1 wheat_seeds', at: 1 }];
+        v.progress.subgoals = [{ task: 'Collect 1 wheat_seeds', retry: true }];   // fix96: the goal is still open
         const stayed = v._blockerHint({ oak_log: 1, birch_log: 1 });
         assert.strictEqual(v.progress.blockers.length, 1);
         assert.match(stayed, /one of oak_log, birch_log/);
@@ -123,6 +124,7 @@ describe('fix91b: an anyOf blocker clears when one member is held, and the promp
     it('the curriculum line has no undefined item', () => {
         const v = mkV();
         v.progress.blockers = [{ anyOf: SOURCES, count: 1, reason: 'reach', task: 'Collect 1 wheat_seeds', at: 1794046192920 }];
+        v.progress.subgoals = [{ task: 'Collect 1 wheat_seeds', retry: true }];   // fix96: the goal is still open
         const line = v._blockerHint({});
         assert.strictEqual(line, '\nBLOCKERS (prioritize these - what failed goals lack): "Collect 1 wheat_seeds" needs 1 one of oak_log, birch_log (reach)');
         assert.equal(line.includes('undefined'), false);
