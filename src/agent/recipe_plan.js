@@ -1,5 +1,5 @@
 import { itemSourceBlocks } from '../utils/item_sources.js';
-import { furnaceInputsOf } from './furnace_recipes.js';
+import { furnaceInputsOf, fuelItemNames } from './furnace_recipes.js';
 
 // fix81: what it takes to obtain an item, from the game's own data only (no recipe, item or tool lists of ours).
 //   recipes  - recipesOf(itemId): every recipe for the item (bot.recipesAll(id, null, true): all of them, not only the
@@ -26,10 +26,11 @@ import { furnaceInputsOf } from './furnace_recipes.js';
 // is "obtain" from the named entities, not opaque. Learned smelt edges (smeltInputs(item): the inputs of "Smelt N <in>
 // into N <item>" goals that succeeded) plan the input, then the smelt.
 // fix97: furnace recipes come from minecraft-data (PC recipes.json has no furnace type; the package's bedrock furnace
-// tables name the same items). A smelt plans its input, a furnace, and a fuel (an input of the charcoal furnace recipe).
-// An item no recipe, block, entity, or furnace recipe yields is not an option. When `feasible` is true (the food
-// need-raiser), a collect counts only when a source block is present or a producer edge is proven; an entity drop counts
-// because the game data names the mob.
+// tables name the same items). A smelt plans its input, a furnace, and a fuel. The fuel is the cheapest of the Java
+// names for logs, wood, planks, coal, and charcoal (legacy bedrock names mapped through minecraft-data), using what
+// is held, nearby, or proven. An item no recipe, block, entity, or furnace recipe yields is an opaque obtain (egg,
+// milk_bucket): feasible only when that obtain is known or proven, so the food raiser does not queue it. When
+// `feasible` is true, a collect counts only when a source block is present or a producer edge is proven.
 export function obtainPlanner({ registry, recipesOf, known, proven, edgeSuccess, smeltInputs, present }) {
     if (!registry) throw new Error('[fix81] obtainPlanner: registry required');
     if (typeof recipesOf !== 'function') throw new Error('[fix81] obtainPlanner: recipesOf(itemId) required');
@@ -116,17 +117,8 @@ export function obtainPlanner({ registry, recipesOf, known, proven, edgeSuccess,
         ingredients: r.delta.filter(d => d.count < 0).map(d => ({ item: itemName(d.id), count: -d.count })),
     }));
     const has = (inv, item) => (Object.hasOwn(inv, item) ? inv[item] : 0);
-    // fix97: fuels are the inputs of the charcoal furnace recipe (the woods the game smelts into charcoal), restricted to
-    // names in this registry. Held fuel is planned first; otherwise the lexical first input that plans.
-    const fuelNames = furnaceInputsOf('charcoal').filter(name => Object.hasOwn(registry.itemsByName, name));
-    fuelNames.sort((a, b) => {
-        const as = sources(a).length ? 0 : 1;
-        const bs = sources(b).length ? 0 : 1;
-        if (as !== bs) return as - bs;
-        if (a < b) return -1;
-        if (a > b) return 1;
-        return 0;
-    });
+    // Java fuels (logs, wood, planks, coal, charcoal). Legacy names are mapped in fuelItemNames, not listed here.
+    const fuelNames = fuelItemNames(registry);
     const reachableCollect = (item, src) => src.some(block => present(block) === true) || proven(item) === true;
     // One furnace plan and one fuel plan per inventory. A smelt does not consume the item it smelts, so every food shares
     // them. Nested smelts (the furnace's own ingredients) do not plan a second furnace: that is the same cycle the path
@@ -191,17 +183,26 @@ export function obtainPlanner({ registry, recipesOf, known, proven, edgeSuccess,
     }
     function planFuel(inv, ctx, path) {
         const key = (ctx.feasible === true ? '1' : '0') + '\0' + invKey(inv);
-        return sharedSubplan(fuelSlot, key, () => {
-            const fuelOrder = fuelNames.filter(name => has(inv, name) > 0);
-            const fuels = fuelOrder.length ? fuelOrder : fuelNames;
-            if (!fuels.length) throw new Error('[fix97] LOUD: no charcoal furnace input exists in this registry, so a smelt has no fuel');
-            for (const name of fuels) {
-                if (path.includes(name)) continue;
-                const fuel = plan(name, 1, { ...inv }, [], ctx, false);
-                if (fuel) return fuel;
+        const fuel = sharedSubplan(fuelSlot, key, () => {
+            if (!fuelNames.length) throw new Error('[fix97] LOUD: no fuel item exists in this registry, so a smelt has no fuel');
+            // A held fuel is an inventory plan (cost 0), which is cheaper than any obtain. Same order as cheapest.
+            const held = fuelNames.filter(name => has(inv, name) > 0);
+            const candidates = held.length ? held : fuelNames;
+            const opts = [];
+            for (const name of candidates) {
+                const sub = plan(name, 1, { ...inv }, [], ctx, false);
+                if (!sub) continue;
+                if (ctx.feasible === true && sub.feasible !== true) continue;
+                sub.fuelItem = name;
+                opts.push({ cost: sub.cost, item: name, steps: sub.steps, plan: sub });
             }
-            return null;
+            const best = pick(opts, ctx, 'fuel');
+            return best ? best.plan : null;
         });
+        if (!fuel) return null;
+        if (typeof fuel.fuelItem !== 'string' || fuel.fuelItem.length === 0) throw new Error('[fix97] LOUD: fuel plan has no fuel item');
+        if (path.includes(fuel.fuelItem)) return null;
+        return fuel;
     }
     function plan(item, need, inv, path, ctx, gain) {
         // an ingredient that is already being planned on this branch is a cycle, even when the inventory holds it
@@ -271,6 +272,7 @@ export function obtainPlanner({ registry, recipesOf, known, proven, edgeSuccess,
                 steps: [...sub.steps, ...furnace.steps, ...fuel.steps, { verb: 'smelt', item, count: rem, input }],
                 how: 'smelt',
                 input,
+                fuelItem: fuel.fuelItem,
                 missing,
                 ingredients: [{ item: input, count: rem }, ...furnace.ingredients, ...fuel.ingredients],
                 feasible: true,
@@ -302,6 +304,14 @@ export function obtainPlanner({ registry, recipesOf, known, proven, edgeSuccess,
                 const best = Math.max(...mobs.map(m => m.yield));
                 const units = expected(rem, best, item, 'obtain');
                 opts.push({ cost: [0, isKnown ? 0 : units, units, 1], inv, steps: [{ verb: 'obtain', item, count: rem }], how: 'obtain', from: mobs.map(m => m.entity), missing: [], ingredients: [], feasible: true });
+            } else if (recipes(item).length === 0 && furnaceInputsOf(item).length === 0) {
+                // No crafting recipe, block, mob drop, or furnace recipe (egg, milk_bucket). A cycle that
+                // emptied `crafts` still has recipes, so it is not this option. Unknown obtains are not
+                // feasible, so the food raiser does not queue them.
+                const feasible = isKnown || proven(item) === true;
+                if (!(ctx.feasible === true && !feasible)) {
+                    opts.push({ cost: [isKnown ? 0 : 1, isKnown ? 0 : rem, rem, 1], inv, steps: [{ verb: 'obtain', item, count: rem }], how: 'obtain', missing: [], ingredients: [], feasible });
+                }
             }
         }
         return pick(opts, ctx, item);
@@ -342,6 +352,7 @@ export function obtainPlanner({ registry, recipesOf, known, proven, edgeSuccess,
                 cycles: [...ctx.cycles],
                 ties: [...ctx.ties],
                 cost: best.cost,
+                fuel: Object.hasOwn(best, 'fuelItem') ? best.fuelItem : null,
             };
         },
         // the one of `items` that is cheapest to gain `count` of from `inv` (a need that any of several items meets:

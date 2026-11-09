@@ -32,7 +32,7 @@ before(async () => {
 
 const none = { runs: 1, items: {} };
 function ev(items) { return { runs: 1, items }; }
-function analysed(name, consume = {}, use = {}) {
+function analysed(name, consume = {}) {
     return {
         name,
         code: `async function ${name}(bot) { return true; }`,
@@ -41,7 +41,6 @@ function analysed(name, consume = {}, use = {}) {
         consumes: {},
         stats: { success: 1, fail: 0 },
         consumeEvidence: ev(consume),
-        useEvidence: ev(use),
     };
 }
 function planner() {
@@ -85,7 +84,6 @@ function tossSkill() {
         effects: [],
         consumes: {},
         consumeEvidence: none,
-        useEvidence: none,
         contract: TOSS_POST,
     };
 }
@@ -157,7 +155,7 @@ describe('fix92: whole-slot plan', () => {
 
     it('equipment, a held harvest tool, and the active recipe input stay reserved', () => {
         const axe = [{ slot: 9, name: 'iron_axe', count: 1 }, { slot: 10, name: 'oak_planks', count: 2 }, { slot: 11, name: 'dirt', count: 64 }];
-        const sticks = capacityPlan(args(axe, 1, 'stick', 4, 'stick', [analysed('swing', {}, { iron_axe: { runs: 1, max: 1 } })]));
+        const sticks = capacityPlan(args(axe, 1, 'stick', 4, 'stick', [analysed('swing', { iron_axe: { runs: 1, max: 1 } })]));
         assert.deepStrictEqual(sticks.removals.map(r => r.item), ['dirt']);
         const plank = sticks.candidates.find(c => c.item === 'oak_planks');
         assert.strictEqual(plank.keep, 2);
@@ -171,15 +169,17 @@ describe('fix92: whole-slot plan', () => {
         assert.strictEqual(mined.candidates.find(c => c.item === 'stone_pickaxe').keep, 1);
     });
 
-    it('absent use evidence is no measured reserve; malformed use evidence still throws', () => {
+    it('useEvidence is not a reserve; malformed consume evidence still throws', () => {
         const stacks = [{ slot: 9, name: 'diamond', count: 10 }];
+        const stale = analysed('bare');
+        stale.useEvidence = ev({ diamond: { runs: 1, max: 10 } });
+        assert.throws(() => capacityPlan(args(stacks, 1, 'oak_log', 1, 'oak_log', [stale])), /useEvidence, which is not recorded/);
         const missing = analysed('bare');
-        delete missing.useEvidence;
         const open = capacityPlan(args(stacks, 1, 'oak_log', 1, 'oak_log', [missing]));
         assert.deepStrictEqual(open.removals.map(r => r.item), ['diamond']);
         const malformed = analysed('bare');
-        malformed.useEvidence = { runs: 1, items: { diamond: { runs: 1 } } };
-        assert.throws(() => capacityPlan(args(stacks, 1, 'oak_log', 1, 'oak_log', [malformed])), /incomplete useEvidence for bare item diamond: max/);
+        malformed.consumeEvidence = { runs: 1, items: { diamond: { runs: 1 } } };
+        assert.throws(() => capacityPlan(args(stacks, 1, 'oak_log', 1, 'oak_log', [malformed])), /incomplete consumeEvidence for bare item diamond: max/);
         const demoted = [{ name: 'old', demoted: true }, analysed('idle')];
         const plan = capacityPlan(args(stacks, 1, 'oak_log', 1, 'oak_log', demoted));
         assert.deepStrictEqual(plan.removals.map(r => r.item), ['diamond']);
@@ -204,7 +204,7 @@ describe('fix92: whole-slot plan', () => {
             { slot: 9, name: 'dragon_egg', count: 1, metadata: 0 },
             { slot: 10, name: 'dragon_egg', count: 1, metadata: 1 },
         ];
-        const worn = capacityPlan(args(eggs, 1, 'oak_log', 1, 'oak_log', [analysed('keep', {}, { dragon_egg: { runs: 1, max: 1 } })]));
+        const worn = capacityPlan(args(eggs, 1, 'oak_log', 1, 'oak_log', [analysed('keep', { dragon_egg: { runs: 1, max: 1 } })]));
         assert.strictEqual(worn.removals[0].remove, 1);
         assert.deepStrictEqual(worn.removals[0].stacks, [{ slot: 9, count: 1 }]);
         const partial = { oak_log: 10 };

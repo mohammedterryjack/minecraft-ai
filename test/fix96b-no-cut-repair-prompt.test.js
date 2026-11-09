@@ -165,14 +165,21 @@ describe('fix96b: a prompt that does not fit fails that call loudly; the bot kee
         } finally { server.close(); }
     });
 
-    it('the step loop does not exit on CONTEXT_FULL, even twice in a row; another repeated error still exits', async () => {
+    it('CONTEXT_FULL decomposes the current task and throws when that is impossible; another repeated error still exits', async () => {
         const { Voyager } = await import('../src/agent/voyager.js');
         const { CONTEXT_FULL } = await import('../src/models/ollama.js');
         const v = Object.create(Voyager.prototype);
         const fatal = [];
         v.agent = { fatal: (where) => fatal.push(where) };
+        v.progress = { failed: [], decomposed: {}, subgoals: [] };
+        v._saveProgress = () => {};
         const full = () => { const e = new Error('!!! [fix96] qwen3: prompt does not fit: 8243 tokens, context 8192 tokens'); e.code = CONTEXT_FULL; return e; };
-        v._onStepError(full()); v._onStepError(full());
+        await assert.rejects(() => v._onStepError(full()), /prompt does not fit/);
+        v.currentTask = 'Collect 1 oak_log';
+        v._decompose = async () => false;
+        await assert.rejects(() => v._onStepError(full()), /prompt does not fit/);
+        v._decompose = async () => true;
+        await v._onStepError(full());
         assert.deepStrictEqual(fatal, []);
         const same = new Error('boom');
         v._onStepError(same); v._onStepError(same);

@@ -89,6 +89,8 @@ function skillBot(over = {}) {
         heldItem: null,
         modes: { isOn: () => true, pause() {}, unpause() {} },
         chat() {},
+        on() {},
+        removeListener() {},
         ...over,
     };
     return bot;
@@ -161,7 +163,7 @@ describe('fix69: equip / consume window cleanup in finally', () => {
 });
 
 describe('fix69: pickupNearbyItems uses goToGoal\'s result instead of catching', () => {
-    const item = { name: 'item', isValid: true, position: { x: 3, y: 64, z: 0 }, getDroppedItem() { return { name: 'oak_log', count: 1 }; } };
+    const item = { name: 'item', isValid: true, width: 0.25, position: { x: 3, y: 64, z: 0 }, getDroppedItem() { return { name: 'oak_log', count: 1 }; } };
 
     it('an interrupt (goToGoal -> false) ends the pickup with false instead of retrying', async () => {
         const { pickupNearbyItems } = await import('../src/agent/library/skills.js');
