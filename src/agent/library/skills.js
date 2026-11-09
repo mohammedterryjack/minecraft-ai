@@ -7,6 +7,7 @@ import { watchPathing } from "../../utils/movement_model.js";
 import { findCarried } from "../../utils/carried.js";
 import { markPreconditionUnmet, markBlockOutOfRange } from "../precondition.js";
 import { emptySlotsToFit, stackableCounts } from "../slot_room.js";
+import { itemSourceBlocks } from "../../utils/item_sources.js";
 
 const blockPlaceDelay = settings.block_place_delay == null ? 0 : settings.block_place_delay;
 const useDelay = blockPlaceDelay > 0;
@@ -667,7 +668,9 @@ export async function collectBlock(bot, blockType, num=1, exclude=null) {
         log(bot, `Invalid number of blocks to collect: ${num}.`);
         return false;
     }
-    let blocktypes = [blockType];
+    // fix95: an item name that is not a block (wheat_seeds, apple) is collected from the blocks whose loot yields it
+    //        (game data). Before, it matched no block and returned false with no I/O, so a retry loop spun the event loop.
+    let blocktypes = Object.hasOwn(bot.registry.blocksByName, blockType) ? [blockType] : itemSourceBlocks(bot.registry, blockType);
     if (blockType === 'coal' || blockType === 'diamond' || blockType === 'emerald' || blockType === 'iron' || blockType === 'gold' || blockType === 'lapis_lazuli' || blockType === 'redstone')
         blocktypes.push(blockType+'_ore');
     if (blockType.endsWith('ore'))
@@ -676,6 +679,7 @@ export async function collectBlock(bot, blockType, num=1, exclude=null) {
         blocktypes.push('grass_block');
     if (blockType === 'cobblestone')
         blocktypes.push('stone');
+    if (blocktypes.length === 0) throw new Error(`collectBlock: ${JSON.stringify(blockType)} is not a block in the game data and no block drops it; obtain it another way (craft, smelt, or a mob drop)`);
     const isLiquid = blockType === 'lava' || blockType === 'water';
 
     let collected = 0;
@@ -2698,19 +2702,17 @@ export async function gatherUntil(bot, itemName, target, maxRadius=256) {
     while (have() < target && fails < 3) {
         if (bot.interrupt_code) return false;
         const before = have();
-        const searched = [itemName === 'cobblestone' ? 'stone' : itemName];
-        if (itemName === 'dirt') searched.push('grass_block');
-        let block = null;
-        for (const name of searched) {
-            block = world.getNearestBlock(bot, name, maxRadius);
-            if (block) break;
-        }
+        // fix95: the blocks that yield itemName come from the game data (blockLoot), not a cobblestone/dirt list. An item
+        //        no block yields fails loudly here instead of returning false with no I/O to a caller that retries it.
+        const searched = itemSourceBlocks(bot.registry, itemName);
+        if (searched.length === 0) throw new Error(`gatherUntil: no block in the game data drops ${itemName}; obtain it another way (craft, smelt, or a mob drop)`);
+        const block = world.getNearestBlock(bot, searched, maxRadius);
         if (!block) {
             log(bot, `FAILED: have ${have()}/${target} ${itemName}; no more ${itemName} found within ${maxRadius} blocks. Move to a new area (!moveAway(100)) or use a substitute material.`);
             markBlockOutOfRange(bot, searched, target - have());
             return false;
         }
-        await collectBlock(bot, itemName, Math.min(target - before, 16));
+        await collectBlock(bot, block.name, Math.min(target - before, 16));
         if (have() <= before) fails++; else fails = 0;
     }
     const got = have();

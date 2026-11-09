@@ -82,7 +82,7 @@ function mkV({ inv, nearby, failTasks = [] }) {
     };
     v.skills = [];
     v.npGraph = null;
-    v.progress = { subgoals: [], decomposed: {}, failed: [], completed: [], blockers: [], recipeEdges: {}, goalStats: {} };   // the schema the constructor loads
+    v.progress = { subgoals: [], decomposed: {}, failed: [], completedAt: {}, completed: [], blockers: [], recipeEdges: {}, goalStats: {} };   // the schema the constructor loads
     v._saveProgress = () => {};
     v._windowCheck = () => {};
     v._afterSuccess = () => {};

@@ -237,7 +237,7 @@ describe('fix45: already-have goal satisfaction', () => {
         const mockVoyager = Object.create(Voyager.prototype);
         mockVoyager.skills = [];
         mockVoyager.npGraph = { consumesOf: () => ({}), getProducersOf: () => [], getRequirementsOf: () => [] };
-        mockVoyager.progress = { completed: [], failed: [] };
+        mockVoyager.progress = { completedAt: {}, completed: [], failed: [] };
         mockVoyager._saveProgress = () => {};
         
         const satisfied = mockVoyager._goalAlreadySatisfied('obtain 1 iron_pickaxe', { inventory: { iron_pickaxe: 1 }, equipment: { hand: 'empty', off_hand: 'empty', head: 'empty', torso: 'empty', legs: 'empty', feet: 'empty' } });

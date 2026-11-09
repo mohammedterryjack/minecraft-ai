@@ -125,7 +125,7 @@ function mkV({ inv, nearby, skills, runs }) {
     v.agent = { bot };
     v.skills = skills;
     v.npGraph = null;
-    v.progress = { subgoals: [], decomposed: {}, failed: [], completed: [], blockers: [], recipeEdges: {}, goalStats: {}, slots: { runs } };
+    v.progress = { subgoals: [], decomposed: {}, failed: [], completedAt: {}, completed: [], blockers: [], recipeEdges: {}, goalStats: {}, slots: { runs } };
     v.slotEffects = new SlotEffects(v.progress.slots);
     v._saveProgress = () => {};
     v._windowCheck = () => {};

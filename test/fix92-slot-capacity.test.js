@@ -106,7 +106,7 @@ function host(inv, skills, nearby = ['oak_log']) {
     const v = Object.create(Voyager.prototype);
     v.agent = { bot, openChat() {} };
     v.skills = skills;
-    v.progress = { subgoals: [], decomposed: {}, failed: [], completed: [], blockers: [], recipeEdges: {}, goalStats: {}, goalFailStates: [], failedRepairSigs: {} };
+    v.progress = { subgoals: [], decomposed: {}, failed: [], completedAt: {}, completed: [], blockers: [], recipeEdges: {}, goalStats: {}, goalFailStates: [], failedRepairSigs: {} };
     v.slotEffects = new SlotEffects({ runs: {} });
     v._saveProgress = () => {};
     v._saveSkills = () => {};

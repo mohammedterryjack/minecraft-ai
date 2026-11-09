@@ -161,7 +161,9 @@ describe('fix86: a generic description is not a subgoal, and a self-decompositio
         v.skills = [{ name: 'craftItem', task: 'Craft N of an item', code: 'async function craftItem(bot) { return false; }', effects: ['iron_pickaxe'], consumes: {}, demoted: false, candidate: false, mergedInto: null }];
         v.npGraph = null;
         v._boltzmann = list => list[0];
-        assert.throws(() => v._subgoalToObtainItem('iron_pickaxe', 1, {}, new Set()), /does not name iron_pickaxe/);
+        // fix95: not a subgoal, and not a throw (the throw recurred every step and exited the process): null, so the
+        //        caller takes the game-data plan, whose task names the item.
+        assert.strictEqual(v._subgoalToObtainItem('iron_pickaxe', 1, {}, new Set()), null);
     });
     it('a subgoal whose task is the parent task throws', () => {
         const v = Object.create(Voyager.prototype);
@@ -232,7 +234,7 @@ describe('fix86: underground, no logs, the chain reaches a log through a learned
             { name: 'seekSource', task: 'seek a source that was brought into range', description: 'bring a missing block into range', code: 'async function seekSource(bot) { return true; }', effects: [], consumes: {}, deps: [], broughtNear: ['oak_log'], demoted: false, primitive: false, stats: { success: 1, fail: 0 } },
         ];
         v.npGraph = { confirmedProduces: () => [], getProducersOf: () => [], recordDelta() {} };
-        v.progress = { subgoals: [], decomposed: {}, failed: [], completed: [], blockers: [], recipeEdges: {}, goalStats: {} };
+        v.progress = { subgoals: [], decomposed: {}, failed: [], completedAt: {}, completed: [], blockers: [], recipeEdges: {}, goalStats: {} };
         v._saveProgress = () => {};
         v._saveSkills = () => {};
         v._windowCheck = () => {};

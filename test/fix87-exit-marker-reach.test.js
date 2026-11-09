@@ -83,8 +83,10 @@ describe('fix87: no block of a registry type within search range is a reach need
         const marked = peekPreconditionUnmet(bot);
         assert.deepStrictEqual(marked.need, { item: 'oak_log', count: 1, reason: 'reach' });
         const other = { registry, output: '' };
-        assert.strictEqual(markBlockOutOfRange(other, ['not_a_real_block'], 1), null);
+        // fix95: a search miss for a name that is not a block is a wrong question: loud, and no reach need is stamped
+        assert.throws(() => markBlockOutOfRange(other, ['not_a_real_block'], 1), /none of these is a block in the game data/);
         assert.strictEqual(peekPreconditionUnmet(other), null);
+        assert.strictEqual(reachNeedForBlocks(registry.blocksByName, ['not_a_real_block'], 1), null);
         assert.deepStrictEqual(reachNeedForBlocks(registry.blocksByName, ['iron_ore', 'deepslate_iron_ore'], 3), { anyOf: ['iron_ore', 'deepslate_iron_ore'], count: 3, reason: 'reach' });
     });
 
@@ -96,7 +98,7 @@ describe('fix87: no block of a registry type within search range is a reach need
         v.agent = { bot, openChat() {} };
         v.skills = [];
         v.npGraph = null;
-        v.progress = { subgoals: [], decomposed: {}, failed: [], completed: [], blockers: [], recipeEdges: {}, goalStats: {} };
+        v.progress = { subgoals: [], decomposed: {}, failed: [], completedAt: {}, completed: [], blockers: [], recipeEdges: {}, goalStats: {} };
         v._saveProgress = () => {};
         v._curSub = null;
         v.observe = () => ({ inventory: {}, nearby_blocks: [] });

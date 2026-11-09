@@ -187,7 +187,7 @@ describe('fix70: blame-aware accounting (where the throwing frame lives)', () =>
 });
 
 describe('fix70: a demoted skill comes back only through its candidate\'s trials', () => {
-    const mk = (skills) => { const v = Object.create(Voyager.prototype); v.skills = JSON.parse(JSON.stringify(skills)); v.progress = { completed: [], failed: [], goalStats: {}, fix25: true }; v._saveProgress = () => {}; v._saveSkills = () => {}; return v; };
+    const mk = (skills) => { const v = Object.create(Voyager.prototype); v.skills = JSON.parse(JSON.stringify(skills)); v.progress = { completedAt: {}, completed: [], failed: [], goalStats: {}, fix25: true }; v._saveProgress = () => {}; v._saveSkills = () => {}; return v; };
     it('the live demoted eatCookedMutton with its pending candidate is a valid skill goal (the gate trial was refused every 5 min)', () => {
         assert.strictEqual(mk(LIVE.skills)._resolveGoal('eatCookedMutton').kind, 'skill');
     });

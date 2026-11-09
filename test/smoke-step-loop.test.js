@@ -210,7 +210,7 @@ function setupTestEnvironment() {
     
     writeFileSync(`${TEST_BOT_DIR}/skills/index.json`, JSON.stringify(testSkills, null, 2));
     writeFileSync(`${TEST_BOT_DIR}/skills/progress.json`, JSON.stringify({
-        completed: ['Mine 5 oak_log'],
+        completedAt: {}, completed: ['Mine 5 oak_log'],
         failed: [],
         enabled: true,
     }));

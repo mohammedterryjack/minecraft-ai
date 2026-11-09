@@ -62,7 +62,7 @@ function mkV({ vitals, food = 10, health = 20, skillsList, proposeTask, decompos
             { task: 'Smelt 1 iron_ingot', parent: 'Craft 1 iron_pickaxe', depth: 1 },
         ],
         decomposeQueue: decompose !== undefined ? decompose : { task: 'Craft 1 iron_pickaxe', reason: 'failed 2x' },
-        decomposed: {}, failed: [], completed: [], blockers: [], goalStats: {},
+        decomposed: {}, failed: [], completedAt: {}, completed: [], blockers: [], goalStats: {},
         deathSpots: deathSpots || {},
     };
     Object.defineProperty(v, '_decomposeQueue', {

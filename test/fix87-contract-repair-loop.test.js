@@ -141,6 +141,11 @@ describe('fix87 C: a repair that returns the same pre/post is rejected once', ()
             assert.strictEqual(first.ok, null);
             assert.ok(first.detail.includes(DID_NOTHING), first.detail);
             assert.strictEqual(v._repairQueue.length, 1);
+            const evidence = v._repairQueue[0].evidence;
+            // fix95: that run is learned on the skill; this exact contract is not used to judge practice again
+            assert.strictEqual(e.postUnverifiable.post, post);
+            assert.strictEqual(e.postUnverifiable.pre, pre);
+            assert.strictEqual(v._practiceJudgeable(e), false);
             assert.strictEqual(await v._repair(), false);
             assert.strictEqual(asks, 1);
             assert.strictEqual(e.contract, contract, 'the identical pre/post is not installed');
@@ -149,9 +154,13 @@ describe('fix87 C: a repair that returns the same pre/post is rejected once', ()
             assert.strictEqual(Object.hasOwn(e, 'contractPrev'), false);
             assert.ok(logs.some(l => l.includes('returned the SAME pre/post')), logs.join('\n'));
             assert.strictEqual(e.repairHistory.at(-1).outcome, 'rejected same contract');
-            assert.strictEqual(v._repairQueue.length, 1, 'practice re-queued during the model call, before the rejection was recorded');
+            // fix95: the practice run during the model call no longer re-judges on this contract, so it re-queues nothing
+            assert.strictEqual(v._repairQueue.length, 0, 'practice re-queued a repair on a contract already shown unable to verify a run');
             for (let step = 0; step < 3; step++) {
-                v._practiceRunChanged(e, {}, {});
+                const again = v._practiceRunChanged(e, {}, {});
+                assert.strictEqual(again.ok, null);
+                assert.ok(!again.detail.includes(DID_NOTHING), again.detail);
+                v._queueContractFix(e, evidence);
                 while (v._repairQueue.length) {
                     const before = asks;
                     assert.strictEqual(await v._repair(), false);
@@ -160,7 +169,6 @@ describe('fix87 C: a repair that returns the same pre/post is rejected once', ()
             }
             assert.strictEqual(asks, 1);
             assert.ok(logs.some(l => l.includes('not re-queued')), logs.join('\n'));
-            assert.ok(logs.some(l => l.includes('not run')), logs.join('\n'));
         } finally { console.log = orig; }
         const other = 'post threw: TypeError: c.post.pos.dist is not a function';
         v._queueContractFix(e, other);
@@ -171,6 +179,8 @@ describe('fix87 C: a repair that returns the same pre/post is rejected once', ()
         assert.strictEqual(await v._repair(), true);
         assert.strictEqual(asks, 2);
         assert.strictEqual(e.contract.post, next);
+        // fix95: a changed contract judges practice again
+        assert.strictEqual(v._practiceJudgeable(e), true);
     });
 });
 

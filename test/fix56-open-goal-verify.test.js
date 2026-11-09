@@ -24,7 +24,7 @@ before(async () => {
 function mk(skills) {
     const v = Object.create(Voyager.prototype);
     v.skills = skills.map(s => JSON.parse(JSON.stringify(s)));
-    v.progress = { completed: [], failed: [], goalStats: {}, fix25: true, replayThreshold: 0.85 };
+    v.progress = { completedAt: {}, completed: [], failed: [], goalStats: {}, fix25: true, replayThreshold: 0.85 };
     v.npGraph = { recordDelta: () => {} };
     v._saveProgress = () => {}; v._saveSkills = () => {};
     v.queued = []; v._queueContractFix = (e, why) => v.queued.push([e.name, why]);

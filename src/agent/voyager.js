@@ -451,6 +451,10 @@ export class Voyager {
         if (!Object.hasOwn(this.progress, 'blockers')) this.progress.blockers = [];
         for (const b of this.progress.blockers) assertProgressBlocker(b);
         if (!Object.hasOwn(this.progress, 'recipeEdges')) this.progress.recipeEdges = {};
+        // fix95: when each task last completed (ms). A decomposition is stale only when its parent completed AFTER it was
+        //        decomposed. Older progress files have no map; it starts empty (no completion is known to postdate a decomposition).
+        if (!Object.hasOwn(this.progress, 'completedAt')) this.progress.completedAt = {};
+        if (this.progress.completedAt === null || typeof this.progress.completedAt !== 'object' || Array.isArray(this.progress.completedAt)) throw new Error(`[fix95] progress.completedAt must be an object, got ${JSON.stringify(this.progress.completedAt)}`);
         // fix58: learned vitals relations (food level -> hp regen, skill -> food/hp change), persisted with progress
         if (!this.progress.vitals) this.progress.vitals = { regen: {}, runs: {}, foodSamples: { drop: { n: 0, sum: 0 }, rise: { n: 0, sum: 0 } } };
         if (!this.progress.vitals.foodSamples) this.progress.vitals.foodSamples = { drop: { n: 0, sum: 0 }, rise: { n: 0, sum: 0 } };
@@ -3714,12 +3718,25 @@ Use only c; no other globals.`;
             }
         }
         if (skill.task) {
-            const named = skill.task.split(/[^A-Za-z0-9_]+/).includes(item);
-            const g = this._resolveGoal(skill.task);
-            if ((g.kind === 'item' && g.item === item) || named) return skill.task;
-            throw new Error(`[fix86] LOUD: skill ${skill.name} produces ${item} but its task ${JSON.stringify(skill.task)} does not name ${item}; a subgoal cannot be built from a generic description`);
+            // fix95: a parameterised producer (craftItem, task "Craft N of an item") can make the item, but its task does
+            //        not name it, so it is not a subgoal for it. fix86 threw here; the throw recurred on every step and the
+            //        same step error twice exited the process (live 17:15 GMT 9 Nov, iron_pickaxe; later stick). The
+            //        learned path has no subgoal for this item: null, and _subgoalForNeed takes the game-data plan, whose
+            //        task names the item (routing still replays craftItem for it).
+            if (this._taskIsGenericFor(skill, item)) {
+                console.log(`!!! [psn] LOUD: learned producer ${skill.name} makes ${item}, but its task ${JSON.stringify(skill.task)} does not name ${item}; not a subgoal, the game data names it`);
+                return null;
+            }
+            return skill.task;
         }
         return null;
+    }
+    // fix95: true when the skill has a task and that task does not name `item` (as its item goal or as a word).
+    _taskIsGenericFor(skill, item) {
+        if (!skill.task) return false;
+        if (skill.task.split(/[^A-Za-z0-9_]+/).includes(item)) return false;
+        const g = this._resolveGoal(skill.task);
+        return !(g.kind === 'item' && g.item === item);
     }
     // fix84: one need, one subgoal. proximity and reach are placement/search. A slot is a whole-slot capacity plan
     //        (fix92). Anything else is a learned producer, else the game data.
@@ -3830,12 +3847,20 @@ Use only c; no other globals.`;
     //   - else nothing can judge it: an inventory change is not a success (fix51's "any delta" counted a walk that picked
     //     up a block); _selectPracticeSkill does not pick such a skill
     _practiceRunChanged(skill, before, after) {
-        if (skill.contract?.post) {
+        if (this._postJudges(skill)) {
             const held = this._postHolds(skill);
             if (!held) return { ok: false, detail: `learned post ${skill.contract.post} does not hold` };
             const v = this._postVerifiesRun(skill);
             // fix87: ok null is "this run is not evidence", not a violation. ok false is a bad post and is queued once.
-            if (v.ok === false) { this._queueContractFix(skill, `post cannot verify a run: ${v.why}`); return { ok: null, detail: `post ${skill.contract.post} held but cannot verify a run (${v.why}); queued contract repair` }; }
+            // fix95: and it is learned on the skill: this post cannot judge a practice run, so the skill is not picked to
+            //        practise on it again until its contract changes (live: logCactusAbsence picked 76 times in 1h27m,
+            //        NO VERDICT every time, its repair already rejected, stats never moved).
+            if (v.ok === false) {
+                skill.postUnverifiable = { pre: skill.contract.pre, post: skill.contract.post, why: v.why, at: new Date().toISOString() };
+                this._saveSkills();
+                this._queueContractFix(skill, `post cannot verify a run: ${v.why}`);
+                return { ok: null, detail: `post ${skill.contract.post} held but cannot verify a run (${v.why}); queued contract repair; not practised on this post again` };
+            }
             if (v.ok === null) return { ok: null, detail: v.why };
             if (v.ok !== true) throw new Error(`[fix87] _postVerifiesRun(${skill.name}) returned ok=${JSON.stringify(v.ok)}`);
             return { ok: true, detail: `learned post ${skill.contract.post} holds` };
@@ -3848,7 +3873,16 @@ Use only c; no other globals.`;
         }
         return { ok: null, detail: 'no learned post-contract and no verified effects to judge it by' };
     }
-    _practiceJudgeable(skill) { return !!skill.contract?.post || verifiedEffects(skill).length > 0; }
+    _practiceJudgeable(skill) { return this._postJudges(skill) || verifiedEffects(skill).length > 0; }
+    // fix95: a learned post judges a practice run unless a run already showed that this exact contract (pre and post)
+    //        cannot verify one. A changed contract (contract repair) is judged again.
+    _postJudges(skill) {
+        if (!skill.contract || !skill.contract.post) return false;
+        if (!Object.hasOwn(skill, 'postUnverifiable')) return true;
+        const u = skill.postUnverifiable;
+        if (u === null || typeof u !== 'object' || typeof u.post !== 'string') throw new Error(`[fix95] ${skill.name}.postUnverifiable must be { pre, post, why }, got ${JSON.stringify(u)}`);
+        return u.post !== skill.contract.post || u.pre !== skill.contract.pre;
+    }
     // fix32 (H): does the root call of the last trace satisfy the skill's learned postcondition (and report success)?
     // fix55: the verifier of skill and open goals; every "does not hold" says why
     _postHolds(e) {
@@ -3881,7 +3915,10 @@ Use only c; no other globals.`;
         // fix87: pre false -> this run neither confirms nor refutes the post's discriminative power. No violation.
         if (typeof e.contract.pre === 'string') {
             const preHeld = this._compileContract(e.contract.pre)(this._contractCtx({ args: r.argv, ret: r.rv, pre: r.s0, post: r.s1, delta: r.delta }));
-            if (preHeld !== true && preHeld !== false) throw new Error(`[fix87] ${e.name}.pre returned ${preHeld === undefined ? 'undefined' : JSON.stringify(preHeld)}, not a boolean`);
+            // fix95: a learned pre that returns a non-boolean (c.pre.inv.x && ... is undefined when x is not held) is a bad
+            //        contract, the same as a post that cannot verify a run: the caller queues its repair. Thrown, it was an
+            //        unhandled rejection in idle practice (live 9 Nov, tossOneRawCopper.pre returned undefined).
+            if (preHeld !== true && preHeld !== false) return { ok: false, why: `pre ${e.contract.pre} returned ${preHeld === undefined ? 'undefined' : JSON.stringify(preHeld)}, not a boolean` };
             if (preHeld === false) return { ok: null, why: 'pre did not hold, so this run is not evidence for or against the post' };
         }
         const f = this._compileContract(src), dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
@@ -4532,7 +4569,7 @@ Use only c; no other globals.`;
         const filtered = candidates.filter(s => {
             if (notAgain.has(s.name)) return false;
             if (!this._practiceJudgeable(s)) {
-                if (!this._unjudgeableNoted.has(s.name)) { this._unjudgeableNoted.add(s.name); console.log(`[idle-practice] not practising ${s.name}: no learned post-contract and no effects verified by run evidence, so a practice run could not be judged`); }
+                if (!this._unjudgeableNoted.has(s.name)) { this._unjudgeableNoted.add(s.name); console.log(`[idle-practice] not practising ${s.name}: ${s.contract && s.contract.post ? `its post cannot verify a run (${s.postUnverifiable.why})` : 'no learned post-contract'} and no effects verified by run evidence, so a practice run could not be judged`); }
                 return false;
             }
             const skip = this._shouldSkipPractice(s, inv, pending);
@@ -4883,21 +4920,34 @@ Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
         const retry = it.retry === true;
         if (!retry && typeof it.parent === 'string' && it.parent.length > 0) {
             const parent = it.parent;
-            const done = this.progress.completed;
-            if (!Array.isArray(done)) throw new Error('[fix91] progress.completed must be an array');
-            if (done.includes(parent)) return `parent "${parent}" is already completed`;
             const d = this.progress.decomposed;
             if (d === null || d === undefined || typeof d !== 'object' || !Object.hasOwn(d, parent)) return `parent "${parent}" has no decomposition`;
             const rec = d[parent];
             if (rec === null || typeof rec !== 'object') throw new Error(`[fix91] decomposed[${JSON.stringify(parent)}] must be an object`);
             if (!Array.isArray(rec.subs)) throw new Error(`[fix91] decomposed[${JSON.stringify(parent)}].subs must be an array`);
             if (!rec.subs.includes(task)) return `parent "${parent}" no longer lists "${task}"`;
+            // fix95: a parent that completed once is not done forever. A recurring need (need:hunger) completes, comes back,
+            //        and is decomposed again; "completed ever" dropped every later food plan as stale (live: 337 "Collect 1
+            //        apple" drops, the bot never ate). Only a completion AFTER this decomposition makes the child stale.
+            if (typeof rec.at !== 'number' || !Number.isFinite(rec.at)) throw new Error(`[fix95] decomposed[${JSON.stringify(parent)}].at must be a time, got ${JSON.stringify(rec.at)}`);
+            const at = this.progress.completedAt;
+            if (at === null || typeof at !== 'object' || Array.isArray(at)) throw new Error('[fix95] progress.completedAt must be an object');
+            if (Object.hasOwn(at, parent) && at[parent] >= rec.at) return `parent "${parent}" completed after it was decomposed`;
         }
         if (retry) {
             const why = this._goalStateBackedOff(task, state);
             if (why !== null) return why;
         }
         return null;
+    }
+    // fix95: the one place a task is recorded as completed: the history list and when it last completed.
+    _markCompleted(task) {
+        if (typeof task !== 'string' || task.length === 0) throw new Error(`[fix95] _markCompleted needs a task string, got ${JSON.stringify(task)}`);
+        if (!Array.isArray(this.progress.completed)) throw new Error('[fix91] progress.completed must be an array');
+        const at = this.progress.completedAt;
+        if (at === null || typeof at !== 'object' || Array.isArray(at)) throw new Error('[fix95] progress.completedAt must be an object');
+        this.progress.completed.push(task);
+        at[task] = Date.now();
     }
     _dropSubgoal(it, why) {
         const q = this.progress.subgoals;
@@ -4911,8 +4961,7 @@ Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
     // Same record a pursue makes when the goal already holds: success, not a fake failure.
     _noteSatisfiedSubgoal(task, reason) {
         console.log(`[voyager] goal already satisfied: ${task} (${reason})`);
-        if (!Array.isArray(this.progress.completed)) throw new Error('[fix91] progress.completed must be an array');
-        this.progress.completed.push(task);
+        this._markCompleted(task);
         if (!Array.isArray(this.progress.failed)) throw new Error('[fix91] progress.failed must be an array');
         this.progress.failed = this.progress.failed.filter(t => t !== task);
         if (Array.isArray(this.progress.blockers)) this.progress.blockers = this.progress.blockers.filter(b => b.task !== task);
@@ -6243,7 +6292,7 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
         const alreadySatisfied = this._goalAlreadySatisfied(task, before);
         if (alreadySatisfied.satisfied) {
             console.log(`[voyager] goal already satisfied: ${task} (${alreadySatisfied.reason})`);
-            this.progress.completed.push(task);
+            this._markCompleted(task);
             this.progress.failed = this.progress.failed.filter(t => t !== task);
             // fix47: clear blockers for this task when it passes
             this.progress.blockers = (this.progress.blockers || []).filter(b => b.task !== task);
@@ -6277,7 +6326,7 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
         if (rp?.interrupted) { console.log('[voyager] task interrupted'); return true; }
         if (rp?.ok) {
             this._noteEdgeOutcome(task, true);   // fix81
-            this.progress.completed.push(task); this.progress.failed = this.progress.failed.filter(t => t !== task);
+            this._markCompleted(task); this.progress.failed = this.progress.failed.filter(t => t !== task);
             // fix47: clear blockers for this task when it passes
             this.progress.blockers = (this.progress.blockers || []).filter(b => b.task !== task);
             this._noteGoalState(task, true, null, before);   // fix90
@@ -6501,7 +6550,7 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
                     lastCode = code;
                     continue;
                 }
-                this.progress.completed.push(task);
+                this._markCompleted(task);
                 this.progress.failed = this.progress.failed.filter(t => t !== task);
                 // fix47: clear blockers for this task when it passes
                 this.progress.blockers = (this.progress.blockers || []).filter(b => b.task !== task);

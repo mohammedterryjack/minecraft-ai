@@ -85,7 +85,7 @@ function liveVoyager() {
     const v = Object.create(Voyager.prototype);
     v.skills = JSON.parse(JSON.stringify(LIVE));
     v.dir = `${BOT_DIR}/skills`;
-    v.progress = { completed: [], failed: [] };
+    v.progress = { completedAt: {}, completed: [], failed: [] };
     v.agent = { bot: { inventory: { emptySlotCount: () => 5 } } };
     v._saveSkills = () => {};
     v._saveProgress = () => {};

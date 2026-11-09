@@ -25,7 +25,7 @@ before(async () => {
 function mk(skills) {
     const v = Object.create(Voyager.prototype);
     v.skills = skills.map(s => JSON.parse(JSON.stringify(s)));
-    v.progress = { completed: [], failed: [], goalStats: {}, fix25: true };
+    v.progress = { completedAt: {}, completed: [], failed: [], goalStats: {}, fix25: true };
     v.npGraph = { consumesOf: () => ({}), getProducersOf: () => [], getRequirementsOf: () => [], recordDelta: () => {} };
     v._saveProgress = () => {};
     v._saveSkills = () => {};

@@ -33,7 +33,7 @@ function mkV(nearby = []) {
     const v = Object.create(Voyager.prototype);
     v.agent = { bot: { version: VER, registry, recipesAll: id => Recipe.find(id), inventory: { emptySlotCount: () => 1 } } };
     v.skills = [];
-    v.progress = { subgoals: [], decomposed: {}, failed: [], completed: [], blockers: [], recipeEdges: {} };
+    v.progress = { subgoals: [], decomposed: {}, failed: [], completedAt: {}, completed: [], blockers: [], recipeEdges: {} };
     v._saveProgress = () => {};
     v._curSub = null;
     v._maturity = () => ({ V: 1 });
@@ -168,7 +168,8 @@ describe('fix85 (D): collectBlock\'s search and the reach observation see the sa
             blockAt: () => oak,
         };
         const pred = b => b.name === 'oak_planks';
-        assert.strictEqual(getNearestBlock(bot, pred, 64), null);
+        // fix95: a predicate is not a block name; getNearestBlock refuses it loudly instead of matching nothing
+        assert.throws(() => getNearestBlock(bot, pred, 64), /getNearestBlocksWhere for a predicate/);
         assert.strictEqual(getNearestBlocksWhere(bot, pred, 64, 1)[0].name, 'oak_planks');
         const src = Voyager.SEEDED_PRIMITIVES.find(p => p.name === 'collectBlock').code;
         assert.match(src, /if \(b\.position === null\) return true/);

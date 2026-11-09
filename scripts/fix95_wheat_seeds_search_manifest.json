@@ -1,0 +1,155 @@
+{
+  "version": 1,
+  "bot": "icefox2000",
+  "inventory": "fix95: wheat_seeds goal posteriors learned while the library searched for a block named wheat_seeds (an item, dropped by tall_grass/fern/wheat). Every attempt failed and the posterior backed the goal off. Apply ONLY after fix95 is deployed; a count that moved since the read refuses (re-count, then update expect).",
+  "files": {
+    "index": "skills/index.json",
+    "progress": "skills/progress.json"
+  },
+  "records": [
+    {
+      "id": "goalStats.wheat_seeds.search.1",
+      "file": "progress",
+      "path": [
+        "goalStats",
+        "Collect 1 wheat_seeds::failed 4x"
+      ],
+      "cause": {
+        "fix": "fix95",
+        "name": "a search for wheat_seeds looked for a block named wheat_seeds (an item); it matched nothing, returned null with no I/O, and every attempt failed"
+      },
+      "evidence": "iMac skills/progress.json goalStats read 19:3x GMT 9 Nov 2026 (read-only). Only the '::failed 4x' outcomes of goals that obtain or look up wheat_seeds; movement stalls and real reach misses are kept.",
+      "expect": {
+        "success": 0,
+        "fail": 17
+      },
+      "delete_path": true
+    },
+    {
+      "id": "goalStats.wheat_seeds.search.2",
+      "file": "progress",
+      "path": [
+        "goalStats",
+        "collectSurface: Collect 1 wheat_seeds::failed 4x"
+      ],
+      "cause": {
+        "fix": "fix95",
+        "name": "a search for wheat_seeds looked for a block named wheat_seeds (an item); it matched nothing, returned null with no I/O, and every attempt failed"
+      },
+      "evidence": "iMac skills/progress.json goalStats read 19:3x GMT 9 Nov 2026 (read-only). Only the '::failed 4x' outcomes of goals that obtain or look up wheat_seeds; movement stalls and real reach misses are kept.",
+      "expect": {
+        "success": 0,
+        "fail": 11
+      },
+      "delete_path": true
+    },
+    {
+      "id": "goalStats.wheat_seeds.search.3",
+      "file": "progress",
+      "path": [
+        "goalStats",
+        "gatherItem: Gather at least 1 wheat_seeds::failed 4x"
+      ],
+      "cause": {
+        "fix": "fix95",
+        "name": "a search for wheat_seeds looked for a block named wheat_seeds (an item); it matched nothing, returned null with no I/O, and every attempt failed"
+      },
+      "evidence": "iMac skills/progress.json goalStats read 19:3x GMT 9 Nov 2026 (read-only). Only the '::failed 4x' outcomes of goals that obtain or look up wheat_seeds; movement stalls and real reach misses are kept.",
+      "expect": {
+        "success": 0,
+        "fail": 1
+      },
+      "delete_path": true
+    },
+    {
+      "id": "goalStats.wheat_seeds.search.4",
+      "file": "progress",
+      "path": [
+        "goalStats",
+        "collectSurface: Collect 1 wheat_seeds from a surface block within 32 blocks::failed 4x"
+      ],
+      "cause": {
+        "fix": "fix95",
+        "name": "a search for wheat_seeds looked for a block named wheat_seeds (an item); it matched nothing, returned null with no I/O, and every attempt failed"
+      },
+      "evidence": "iMac skills/progress.json goalStats read 19:3x GMT 9 Nov 2026 (read-only). Only the '::failed 4x' outcomes of goals that obtain or look up wheat_seeds; movement stalls and real reach misses are kept.",
+      "expect": {
+        "success": 0,
+        "fail": 9
+      },
+      "delete_path": true
+    },
+    {
+      "id": "goalStats.wheat_seeds.search.5",
+      "file": "progress",
+      "path": [
+        "goalStats",
+        "gatherItem: Gather 1 wheat_seeds::failed 4x"
+      ],
+      "cause": {
+        "fix": "fix95",
+        "name": "a search for wheat_seeds looked for a block named wheat_seeds (an item); it matched nothing, returned null with no I/O, and every attempt failed"
+      },
+      "evidence": "iMac skills/progress.json goalStats read 19:3x GMT 9 Nov 2026 (read-only). Only the '::failed 4x' outcomes of goals that obtain or look up wheat_seeds; movement stalls and real reach misses are kept.",
+      "expect": {
+        "success": 0,
+        "fail": 17
+      },
+      "delete_path": true
+    },
+    {
+      "id": "goalStats.wheat_seeds.search.6",
+      "file": "progress",
+      "path": [
+        "goalStats",
+        "gatherItem 1 wheat_seeds::failed 4x"
+      ],
+      "cause": {
+        "fix": "fix95",
+        "name": "a search for wheat_seeds looked for a block named wheat_seeds (an item); it matched nothing, returned null with no I/O, and every attempt failed"
+      },
+      "evidence": "iMac skills/progress.json goalStats read 19:3x GMT 9 Nov 2026 (read-only). Only the '::failed 4x' outcomes of goals that obtain or look up wheat_seeds; movement stalls and real reach misses are kept.",
+      "expect": {
+        "success": 0,
+        "fail": 1
+      },
+      "delete_path": true
+    },
+    {
+      "id": "goalStats.wheat_seeds.search.7",
+      "file": "progress",
+      "path": [
+        "goalStats",
+        "collectSurface 1 wheat_seeds::failed 4x"
+      ],
+      "cause": {
+        "fix": "fix95",
+        "name": "a search for wheat_seeds looked for a block named wheat_seeds (an item); it matched nothing, returned null with no I/O, and every attempt failed"
+      },
+      "evidence": "iMac skills/progress.json goalStats read 19:3x GMT 9 Nov 2026 (read-only). Only the '::failed 4x' outcomes of goals that obtain or look up wheat_seeds; movement stalls and real reach misses are kept.",
+      "expect": {
+        "success": 0,
+        "fail": 1
+      },
+      "delete_path": true
+    },
+    {
+      "id": "goalStats.wheat_seeds.search.8",
+      "file": "progress",
+      "path": [
+        "goalStats",
+        "verifyBlockType: Check if the block type 'wheat_seeds' exists within 32 blocks of the current position::failed 4x"
+      ],
+      "cause": {
+        "fix": "fix95",
+        "name": "a search for wheat_seeds looked for a block named wheat_seeds (an item); it matched nothing, returned null with no I/O, and every attempt failed"
+      },
+      "evidence": "iMac skills/progress.json goalStats read 19:3x GMT 9 Nov 2026 (read-only). Only the '::failed 4x' outcomes of goals that obtain or look up wheat_seeds; movement stalls and real reach misses are kept.",
+      "expect": {
+        "success": 0,
+        "fail": 2
+      },
+      "delete_path": true
+    }
+  ]
+}
