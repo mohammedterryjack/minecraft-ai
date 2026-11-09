@@ -22,6 +22,7 @@ import { setCallDurationStore, learnedCharsPerToken } from '../src/models/call_d
 const POLICY = { successfulExit: false };
 const DONE = '[12:06:01] [Server thread/INFO]: Done (2.5s)!\n';
 const OLD_DONE = '[12:05:38] [Server thread/INFO]: Done (146.414s)!\n';
+const START = '[12:04:00] [Server thread/INFO]: Starting minecraft server version 1.21.4\n';
 
 function listen(handler) {
     const server = http.createServer(handler);
@@ -45,7 +46,7 @@ describe('fix94 backend ready', () => {
     it('an old Done is not readiness; rotation to a new latest.log Done exits 75 once', async () => {
         const dir = await mkdtemp(path.join(tmpdir(), 'fix94-'));
         const latest = path.join(dir, 'latest.log');
-        await writeFile(latest, OLD_DONE);
+        await writeFile(latest, START + OLD_DONE + '[12:05:40] [Server thread/INFO]: Stopping server\n');
         const latch = { latched: false };
         const refusal = 'AnnotatedConnectException finishConnect(..) failed with error(-61): Connection refused: /10.9.8.7:40000';
         latchDisconnect(latch, 'kicked', refusal);
@@ -53,7 +54,7 @@ describe('fix94 backend ready', () => {
         let settled = false;
         handle.ready.then(() => { settled = true; }, () => { settled = true; });
         await Promise.resolve();
-        assert.strictEqual(settled, false, 'Done already on disk at arm is not a new start');
+        assert.strictEqual(settled, false, 'a Done followed by Stopping server is not the current run');
         const exits = [];
         const logs = [];
         const pending = resumeWhenBackendReady({
@@ -85,7 +86,7 @@ describe('fix94 backend ready', () => {
     it('Stopping server after arm is backend-stopping and waits; without it the disconnect exits 1', async () => {
         const dir = await mkdtemp(path.join(tmpdir(), 'fix94-stop-'));
         const latest = path.join(dir, 'latest.log');
-        await writeFile(latest, 'server up\n');
+        await writeFile(latest, START + 'server up\n');
         const quiet = armBackendReady({ logDir: dir });
         const plain = { latched: false };
         const plainExits = [];
@@ -121,7 +122,7 @@ describe('fix94 backend ready', () => {
     it('a new latest.log without Done does not resolve, and a watcher read error rejects', async () => {
         const dir = await mkdtemp(path.join(tmpdir(), 'fix94-rot-'));
         const latest = path.join(dir, 'latest.log');
-        await writeFile(latest, 'boot\n');
+        await writeFile(latest, START + 'boot\n');
         const handle = armBackendReady({ logDir: dir });
         let settled = false;
         handle.ready.then(() => { settled = true; }, () => { settled = true; });
@@ -135,7 +136,7 @@ describe('fix94 backend ready', () => {
 
         const dir2 = await mkdtemp(path.join(tmpdir(), 'fix94-err-'));
         const log2 = path.join(dir2, 'latest.log');
-        await writeFile(log2, 'up\n');
+        await writeFile(log2, START + 'up\n');
         const broken = armBackendReady({ logDir: dir2 });
         const failed = broken.ready.then(() => { throw new Error('watch resolved'); }, (err) => err);
         await rm(log2);
@@ -178,6 +179,81 @@ describe('fix94 backend ready', () => {
         const launcher = readFileSync(new URL('../run-native.sh', import.meta.url), 'utf8');
         assert.doesNotMatch(launcher, /BACKEND_LOG_DIR:-/);
         assert.doesNotMatch(launcher, /\$\{BACKEND_LOG_DIR:-/);
+    });
+});
+
+describe('fix94 current run already Done', () => {
+    it('a latest.log with no Starting minecraft server line throws', async () => {
+        const dir = await mkdtemp(path.join(tmpdir(), 'fix94-nostart-'));
+        await writeFile(path.join(dir, 'latest.log'), OLD_DONE);
+        assert.throws(() => armBackendReady({ logDir: dir }), /Starting minecraft server/);
+        await rm(dir, { recursive: true, force: true });
+    });
+
+    it('Done already present before arming resolves immediately on the exit 75 path', async () => {
+        const dir = await mkdtemp(path.join(tmpdir(), 'fix94-already-'));
+        const latest = path.join(dir, 'latest.log');
+        await writeFile(latest, START + '[12:04:02] [Server thread/INFO]: Done (1.2s)!\n');
+        const latch = { latched: true, kind: 'backend-unavailable', evidence: 'refused' };
+        const exits = [];
+        const logs = [];
+        const line = await resumeWhenBackendReady({
+            logDir: dir,
+            latch,
+            exitFn: (code) => exits.push(code),
+            log: (msg) => logs.push(msg),
+        });
+        assert.match(line, /Done \(1\.2s\)!/);
+        assert.deepStrictEqual(exits, [EXIT_BACKEND_READY]);
+        assert.strictEqual(EXIT_BACKEND_READY, 75);
+        assert.strictEqual(latch.resumed, true);
+        assert.match(logs[0], /backend ready: .*Done \(1\.2s\)!/);
+        await rm(dir, { recursive: true, force: true });
+    });
+
+    it('Done from a previous run followed by Stopping server does not resolve', async () => {
+        const dir = await mkdtemp(path.join(tmpdir(), 'fix94-prev-'));
+        const latest = path.join(dir, 'latest.log');
+        await writeFile(latest, START + OLD_DONE + '[12:05:40] [Server thread/INFO]: Stopping server\n');
+        const handle = armBackendReady({ logDir: dir });
+        let settled = false;
+        handle.ready.then(() => { settled = true; }, () => { settled = true; });
+        await Promise.resolve();
+        assert.strictEqual(settled, false);
+        assert.strictEqual(handle.sawStopping(), true);
+        await appendFile(latest, '[12:06:00] [Server thread/INFO]: Starting minecraft server version 1.21.4\n');
+        await appendFile(latest, '[12:06:00] [Server thread/INFO]: Preparing spawn area: 0%\n');
+        handle.readNew();
+        await Promise.resolve();
+        assert.strictEqual(settled, false, 'the new run has not logged Done');
+        handle.close();
+        await rm(dir, { recursive: true, force: true });
+    });
+
+    it('Done written after arm still resolves', async () => {
+        const dir = await mkdtemp(path.join(tmpdir(), 'fix94-after-'));
+        const latest = path.join(dir, 'latest.log');
+        await writeFile(latest, START + '[12:04:01] [Server thread/INFO]: Preparing spawn area: 20%\n');
+        const latch = { latched: true, kind: 'backend-unavailable', evidence: 'refused' };
+        const handle = armBackendReady({ logDir: dir });
+        let settled = false;
+        handle.ready.then(() => { settled = true; }, () => { settled = true; });
+        await Promise.resolve();
+        assert.strictEqual(settled, false);
+        const exits = [];
+        const pending = resumeWhenBackendReady({
+            logDir: dir,
+            latch,
+            watch: handle,
+            exitFn: (code) => exits.push(code),
+            log: () => {},
+        });
+        await appendFile(latest, DONE);
+        const line = await pending;
+        assert.match(line, /Done \(2\.5s\)!/);
+        assert.deepStrictEqual(exits, [75]);
+        assert.strictEqual(latch.resumed, true);
+        await rm(dir, { recursive: true, force: true });
     });
 });
 

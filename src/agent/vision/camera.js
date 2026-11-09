@@ -1,6 +1,7 @@
 import { Viewer } from 'prismarine-viewer/viewer/lib/viewer.js';
 import { WorldView } from 'prismarine-viewer/viewer/lib/worldView.js';
 import { getBufferFromStream } from 'prismarine-viewer/viewer/lib/simpleUtils.js';
+import { columnRangeFromRegistry } from 'prismarine-viewer/viewer/lib/columnRange.js';
 
 import THREE from 'three';
 import { createCanvas } from 'node-canvas-webgl/lib/index.js';
@@ -31,7 +32,7 @@ export class Camera extends EventEmitter {
     async _init () {
         const botPos = this.bot.entity.position;
         const center = new Vec3(botPos.x, botPos.y+this.bot.entity.height, botPos.z);
-        this.viewer.setVersion(this.bot.version);
+        this.viewer.setVersion(this.bot.version, columnRangeFromRegistry(this.bot.registry, this.bot.game.dimension));
         // Load world
         const worldView = new WorldView(this.bot.world, this.viewDistance, center);
         this.viewer.listen(worldView);
