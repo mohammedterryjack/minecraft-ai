@@ -10,9 +10,22 @@
  * 7. Satisfaction check prevents unnecessary crafting when have >= goal
  */
 
-import { describe, it, mock, beforeEach, before } from 'node:test';
+import { describe, it, mock, beforeEach, before, after } from 'node:test';
 import assert from 'node:assert';
-import { readFileSync } from 'fs';
+import { readFileSync, rmSync } from 'fs';
+
+// Constructor persists skills a second later. These tests replace this.skills with fixtures that have no
+// source; cancel that write so the next process does not load a codeless skill and fail relink.
+function holdVoyager(V, bot) {
+    const v = new V({ name: 'fix51', fatal() {}, bot, agent: { prompter: { task: () => {} }, npc: { constructs: {} } } });
+    if (v._saveTimer) { clearTimeout(v._saveTimer); v._saveTimer = null; }
+    v._skillsDirty = false;
+    return v;
+}
+after(() => {
+    rmSync('./bots/fix51', { recursive: true, force: true });
+    rmSync('./bots/undefined', { recursive: true, force: true });
+});
 
 // Issue 1: Cycle handling at _relink - demote promoted skills creating cycles
 describe('fix51 issue 1: cycle handling at _relink', async () => {
@@ -710,7 +723,7 @@ describe('fix51 issue 16: smelt goal uses exact count not producible', async () 
             once: () => {},
             removeListener: () => {} 
         };
-        const v = new Voyager({ bot: mockBot, agent: { prompter: { task: () => {} }, npc: { constructs: {} } } });
+        const v = holdVoyager(Voyager, mockBot);
         v.skills = [];
         v._compileContract = () => () => false;
 
@@ -736,7 +749,7 @@ describe('fix51 issue 16: smelt goal uses exact count not producible', async () 
             once: () => {},
             removeListener: () => {} 
         };
-        const v = new Voyager({ bot: mockBot, agent: { prompter: { task: () => {} }, npc: { constructs: {} } } });
+        const v = holdVoyager(Voyager, mockBot);
         v.skills = [];
         v._compileContract = () => () => false;
 
@@ -914,7 +927,7 @@ describe('fix51 issue 19: sub-skill post must not satisfy parent goal', async ()
             once: () => {},
             removeListener: () => {}
         };
-        const v = new Voyager({ bot: mockBot, agent: { prompter: { task: () => {} }, npc: { constructs: {} } } });
+        const v = holdVoyager(Voyager, mockBot);
         v.skills = skills;
         v._compileContract = () => () => true;
         return v;
@@ -992,7 +1005,7 @@ describe('fix51 issue 20: ensureCraftingTable dependency chain', async () => {
         const mod = await import('../src/agent/voyager.js');
         const Voyager = mod.Voyager;
         const mockBot = { version: '1.21.4', chat: () => {}, on: () => {}, off: () => {}, once: () => {}, removeListener: () => {} };
-        const v = new Voyager({ bot: mockBot, agent: { prompter: { task: () => {} }, npc: { constructs: {} } } });
+        const v = holdVoyager(Voyager, mockBot);
         v.progress = { decomposed: {}, subgoals: [], blockers: [], recipeEdges: {} };
         v.skills = [{
             name: 'collectOakLog',
@@ -1070,7 +1083,7 @@ describe('fix51 issue 22: idle practice requires real effect change', async () =
         const mod = await import('../src/agent/voyager.js');
         const Voyager = mod.Voyager;
         const mockBot = { version: '1.21.4', chat: () => {}, on: () => {}, off: () => {}, once: () => {}, removeListener: () => {} };
-        const v = new Voyager({ bot: mockBot, agent: { prompter: { task: () => {} }, npc: { constructs: {} } } });
+        const v = holdVoyager(Voyager, mockBot);
         // fix74: effects judge a practice run only when verified by run evidence
         const skill = { name: 'craftOneIronPickaxe', effects: ['iron_pickaxe'], effectEvidence: { runs: 1, items: { iron_pickaxe: { runs: 1, gained: 1 } } } };
         const inv = { iron_ingot: 36, stick: 6 };
@@ -1110,7 +1123,7 @@ describe('fix51 exact equip / goal item resolution', async () => {
     mod._setVersionForTest('1.21.4');
     const mk = () => {
         const bot = { version: '1.21.4', chat: () => {}, on: () => {}, off: () => {}, once: () => {}, removeListener: () => {} };
-        const v = new mod.Voyager({ bot, agent: { prompter: { task: () => {} }, npc: { constructs: {} } } });
+        const v = holdVoyager(mod.Voyager, bot);
         v.skills = [{ name: 'craftThreeSticks', effects: ['stick'], contract: { post: 'c => c.delta.stick >= 3' } }];
         return v;
     };

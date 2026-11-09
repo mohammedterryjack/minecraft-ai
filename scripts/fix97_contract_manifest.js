@@ -8,18 +8,27 @@
 import { readFileSync } from 'fs';
 import { join, resolve } from 'path';
 import { fileURLToPath } from 'url';
+import { Voyager } from '../src/agent/voyager.js';
 
 const CAUSE = {
     fix: 'fix97',
     name: 'a contract numeric literal that is not in the skill source or recorded evidence was invented by the contract model',
 };
 
-function literals(src) {
-    const out = [];
-    const re = /(?<![.\w])(\d+(?:\.\d+)?)/g;
-    let m;
-    while ((m = re.exec(String(src)))) out.push(m[1]);
-    return out;
+function unsupportedNumbers(src, skill) {
+    const code = typeof skill.code === 'string' ? skill.code : '';
+    const codeNumbers = new Set(Voyager.contractNumericLiterals(code));
+    const evidenceNumbers = new Set(Voyager.recordedNumbers({
+        consumes: skill.consumes, effects: skill.effects, consumeEvidence: skill.consumeEvidence,
+        effectEvidence: skill.effectEvidence, observedRuns: skill.observedRuns, stats: skill.stats,
+    }));
+    const hits = [];
+    for (const n of Voyager.contractNumericLiterals(src)) {
+        if (n === 0 || n === 1) continue;
+        if (codeNumbers.has(n) || evidenceNumbers.has(n)) continue;
+        hits.push(n);
+    }
+    return hits;
 }
 
 export function buildContractManifest(skills) {
@@ -28,23 +37,16 @@ export function buildContractManifest(skills) {
     for (const skill of skills) {
         if (!skill || typeof skill.name !== 'string') throw new Error('[fix97] skill entry has no name');
         if (!skill.contract) continue;
-        const evidence = JSON.stringify({
-            consumes: skill.consumes, effects: skill.effects, consumeEvidence: skill.consumeEvidence,
-            effectEvidence: skill.effectEvidence, observedRuns: skill.observedRuns, stats: skill.stats,
-        });
-        const code = typeof skill.code === 'string' ? skill.code : '';
         for (const field of ['pre', 'post']) {
             const src = skill.contract[field];
             if (typeof src !== 'string') continue;
-            for (const token of literals(src)) {
-                if (token === '0' || token === '1') continue;
-                if (code.includes(token) || evidence.includes(token)) continue;
+            for (const token of unsupportedNumbers(src, skill)) {
                 records.push({
                     id: `${skill.name}.${field}.${token}`,
                     file: 'skills',
                     path: [skill.name, 'contract', field],
                     cause: CAUSE,
-                    evidence: `${field} literal ${token} is not in the skill code or recorded evidence`,
+                    evidence: `${field} literal ${token} is not a whole number in the skill code or recorded evidence`,
                     apply: false,
                 });
             }

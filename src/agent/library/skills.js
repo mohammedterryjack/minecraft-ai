@@ -812,14 +812,15 @@ export async function pickupNearbyItems(bot) {
         // inventory gain. A path that leaves the same entity on the ground is no progress: stop, do not sleep and retry.
         let collected = false;
         const onCollect = (_who, entity) => { if (entity === nearestItem) collected = true; };
-        if (typeof bot.on === 'function') bot.on('playerCollect', onCollect);
-        const followRange = typeof nearestItem.width === 'number' ? nearestItem.width : 0;
+        bot.on('playerCollect', onCollect);
+        if (typeof nearestItem.width !== 'number') throw new Error('pickupNearbyItems: dropped item has no width');
+        const followRange = nearestItem.width;
         let reached;
         try {
             bot.pathfinder.setMovements(_survivalMovements(bot, {dig: false}));
             reached = await goToGoal(bot, new pf.goals.GoalFollow(nearestItem, followRange));
         } finally {
-            if (typeof bot.removeListener === 'function') bot.removeListener('playerCollect', onCollect);
+            bot.removeListener('playerCollect', onCollect);
         }
         if (!reached && bot.interrupt_code) {
             log(bot, `Picked up ${pickedUp} items before being interrupted.`);

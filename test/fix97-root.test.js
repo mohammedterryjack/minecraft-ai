@@ -67,23 +67,45 @@ describe('fix97 food: an unreachable craft is not queued', () => {
         assert.strictEqual(pre.how, 'smelt');
         assert.ok(pre.plan.includes('Obtain 1 mutton'), pre.plan.join(' | '));
         assert.ok(pre.plan.some(s => s.includes('furnace')), pre.plan.join(' | '));
-        assert.ok(pre.plan.some(s => s.includes('mangrove_log')), pre.plan.join(' | '));
+        assert.strictEqual(typeof pre.fuel, 'string');
+        assert.ok(pre.plan.some(s => s.includes(pre.fuel)), `${pre.fuel}: ${pre.plan.join(' | ')}`);
         assert.ok(pre.from.length === 0 || pre.plan.includes('Obtain 1 mutton'));
+    });
+
+    it('held oak_log with oak nearby makes cooked_beef reachable, and the fuel is oak_log', () => {
+        const v = mkV({});
+        const inv = { oak_log: 10, cobblestone: 8 };
+        const planner = v._obtainPlanner({ inventory: inv, nearby_blocks: ['oak_log'] });
+        const pre = planner.prerequisites('cooked_beef', 1, inv);
+        assert.strictEqual(pre.how, 'smelt');
+        assert.strictEqual(pre.fuel, 'oak_log');
+        const chosen = planner.cheapest(['cooked_beef'], 1, inv, true);
+        assert.strictEqual(chosen.item, 'cooked_beef');
+    });
+
+    it('egg and milk_bucket are obtains, not a missing recipe', () => {
+        const v = mkV({});
+        const planner = v._obtainPlanner({ inventory: {}, nearby_blocks: [] });
+        const egg = planner.prerequisites('egg', 1, {});
+        const milk = planner.prerequisites('milk_bucket', 1, {});
+        assert.strictEqual(egg.how, 'obtain');
+        assert.strictEqual(milk.how, 'obtain');
+        assert.throws(() => planner.cheapest(['egg'], 1, {}, true), /none of egg is reachable/);
     });
 });
 
 describe('fix97 goal identity: Collect 1 apple stays Collect 1 apple', () => {
-    it('subgoals are the leaf blocks that drop an apple, not a dirt skill task', async () => {
+    it('reaches one present source, not every leaf in list order', async () => {
         const v = mkV({});
-        v.observe = () => ({ inventory: {}, nearby_blocks: ['dirt'] });
         v._askLocal = async () => { throw new Error('the model must not rewrite an item goal'); };
         v._producers = () => [{ s: { name: 'collectSurface', task: 'Collect 64 dirt', effects: ['apple'], code: 'async function collectSurface(bot) { return true; }' }, V: 1 }];
-        const ok = await v._decompose('Collect 1 apple', 'no apples');
-        assert.strictEqual(ok, true);
+        v.observe = () => ({ inventory: {}, nearby_blocks: ['dirt'] });
+        assert.strictEqual(await v._decompose('Collect 1 apple', 'no apples'), false);
+        assert.strictEqual(v.progress.decomposed['Collect 1 apple'], undefined);
+        v.observe = () => ({ inventory: {}, nearby_blocks: ['oak_leaves', 'dirt'] });
+        assert.strictEqual(await v._decompose('Collect 1 apple', 'no apples'), true);
         const subs = v.progress.decomposed['Collect 1 apple'].subs;
-        assert.ok(subs.includes('reach oak_leaves'), subs.join(', '));
-        assert.ok(subs.includes('reach dark_oak_leaves'), subs.join(', '));
-        assert.ok(!subs.some(s => s.includes('dirt')), subs.join(', '));
+        assert.deepStrictEqual(subs, ['reach oak_leaves']);
         assert.ok(v.progress.subgoals.some(s => s.task === 'Collect 1 apple' && s.retry === true));
     });
 });
@@ -96,6 +118,9 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         assert.match(bad, /pre uses 55/);
         const ok = v._validContract({ pre: 'c => c.args.length >= 1 && c.args[0] === null', post: 'c => true' }, skill);
         assert.strictEqual(ok, null);
+        const buried = { name: 'checkOakLog', code: 'async function checkOakLog(bot) { return 155; }', consumes: {}, effects: [], stats: { success: 5512, fail: 0 } };
+        const still = v._validContract({ pre: 'c => c.pre.inv.oak_log < 55', post: 'c => true' }, buried);
+        assert.match(still, /pre uses 55/);
     });
 
     it('the manifest lists a 55 contract and does not apply; this checkout has no checkOakLog', () => {
@@ -134,6 +159,10 @@ describe('fix97 pickup stops when the item is still there', () => {
         assert.strictEqual(paths, 1);
         assert.match(bot.output, /No progress/);
         void _ignored;
+        const noWidth = { ...item };
+        delete noWidth.width;
+        const bare = { ...bot, nearestEntity: () => noWidth };
+        await assert.rejects(pickupNearbyItems(bare), /no width/);
     });
 });
 
@@ -197,6 +226,35 @@ describe('fix97 prompts do not paste skill bodies, and an overflow splits', () =
         assert.strictEqual(v._splitDue, true);
         assert.strictEqual(v._splitHint, 'ensureCraftingTable');
         assert.strictEqual(v._splitBecause, 'context');
+    });
+
+    it('a failed split is recorded and not repeated, and the next overflow decomposes', async () => {
+        const v = mkV({});
+        const code = 'async function bigSkill(bot) {\n' + '  return true;\n'.repeat(41) + '}';
+        v.skills = [{ name: 'bigSkill', description: 'd', code, deps: [], primitive: false, handwritten: false, demoted: false }];
+        v._maturity = () => ({ V: 0.1 });
+        v._cursorLimited = () => false;
+        v._hashReply = Voyager.prototype._hashReply;
+        v.scopedAPIList = () => '';
+        v._splitHint = 'bigSkill';
+        v._splitDue = true;
+        v._splitBecause = null;
+        v._inferMeta = () => ({});
+        v._closure = () => [];
+        v._ask = async () => { throw new Error('split model failed'); };
+        assert.strictEqual(await v._split(), false);
+        assert.strictEqual(v.progress.splitFailures.length, 1);
+        v._detectSplit();
+        assert.notStrictEqual(v._splitDue, true);
+        v.currentTask = 'Collect 1 oak_log';
+        let decomposed = null;
+        v._decompose = async (task) => { decomposed = task; return true; };
+        const err = new Error('request (9925 tokens) exceeds the available context size (8192 tokens)');
+        err.code = CONTEXT_FULL;
+        await v._onStepError(err);
+        assert.strictEqual(decomposed, 'Collect 1 oak_log');
+        v._decompose = async () => false;
+        await assert.rejects(() => v._onStepError(err), /exceeds the available context/);
     });
 });
 

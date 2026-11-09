@@ -501,7 +501,7 @@ export class Voyager {
             process.on('uncaughtException', onErr('UNCAUGHT EXCEPTION'));
             process.on('unhandledRejection', onErr('UNHANDLED REJECTION'));
         }
-        if (!globalThis.__logRotate) { globalThis.__logRotate = setInterval(() => rotateLog('./logs/mindcraft.log', 25e6, 3), 60e3); rotateLog('./logs/mindcraft.log', 25e6, 3); }   // fix28
+        if (!globalThis.__logRotate) { const timer = setInterval(() => rotateLog('./logs/mindcraft.log', 25e6, 3), 60e3); timer.unref(); globalThis.__logRotate = timer; rotateLog('./logs/mindcraft.log', 25e6, 3); }   // fix28: the rotator must not hold the process open
         this._migrateToBarenames();  // fix40: one-time migration from skills.*/world.* to bare names
         this._seedPrimitives();
         this._relink();
@@ -1296,17 +1296,16 @@ Use only c; no other globals.`;
         //        heldItem is that string, not an item with .type. Posts that also read delta/inv are about the inventory, not this probe.
         const fields = this._extractPostFields(ct.post);
         if (skill && typeof skill.code === 'string') {
-            const evidence = JSON.stringify({
+            const codeNumbers = new Set(Voyager.contractNumericLiterals(skill.code));
+            const evidenceNumbers = new Set(Voyager.recordedNumbers({
                 consumes: skill.consumes, effects: skill.effects, consumeEvidence: skill.consumeEvidence,
                 effectEvidence: skill.effectEvidence, observedRuns: skill.observedRuns, stats: skill.stats,
-            });
+            }));
             for (const k of ['pre', 'post']) {
                 for (const n of Voyager.contractNumericLiterals(ct[k])) {
                     if (n === 0 || n === 1) continue;
-                    const token = String(n);
-                    if (skill.code.includes(token)) continue;
-                    if (evidence.includes(token)) continue;
-                    return `${k} uses ${token}, which is not in the skill's code or recorded evidence`;
+                    if (codeNumbers.has(n) || evidenceNumbers.has(n)) continue;
+                    return `${k} uses ${n}, which is not in the skill's code or recorded evidence`;
                 }
             }
         }
@@ -1341,8 +1340,9 @@ Use only c; no other globals.`;
         walk(ast);
         return out;
     }
-    // fix97: a numeric literal in a contract (oak log count < 55) that is not in the skill source or recorded evidence
-    // is a hallucinated constant. 0 and 1 are the contract encoding (absent, one argument), not a game threshold.
+    // fix97: a numeric literal in a contract (oak log count < 55) that is not a whole literal in the skill source
+    // or a number in the recorded evidence is a hallucinated constant. 55 must not match inside 155 or 5512.
+    // 0 and 1 are the contract encoding (absent, one argument), not a game threshold.
     static contractNumericLiterals(src) {
         const ast = acorn.parse(`(${String(src)})`, { ecmaVersion: 'latest' }), out = [];
         const walk = n => {
@@ -1351,6 +1351,17 @@ Use only c; no other globals.`;
             for (const v of Object.values(n)) { if (Array.isArray(v)) v.forEach(walk); else if (v && typeof v === 'object' && typeof v.type === 'string') walk(v); }
         };
         walk(ast);
+        return out;
+    }
+    // Numbers actually stored on the skill (counts, maxima), not the digits of their JSON text.
+    static recordedNumbers(value) {
+        const out = [];
+        const walk = v => {
+            if (typeof v === 'number') out.push(v);
+            else if (Array.isArray(v)) v.forEach(walk);
+            else if (v !== null && typeof v === 'object') Object.values(v).forEach(walk);
+        };
+        walk(value);
         return out;
     }
     // fix84: a postcondition that requires a held or returned item the named block's harvestTools omit
@@ -2439,8 +2450,20 @@ Use only c; no other globals.`;
         // fix33: quota check removed; CodeModel handles paid→free fallback internally
         this.running = true; this.abort = false;
         const c0 = { ...CALLS };
-        this.step().then(() => { this._lastStepErrSig = null; }, e => this._onStepError(e)).finally(() => { this.running = false; this.lastTaskEnd = Date.now(); this.idlePractice.markBusy();
+        this.step().then(() => { this._lastStepErrSig = null; }, e => this._onStepError(e)).catch(err => this.agent.fatal('prompt overflow and decomposition is impossible', err)).finally(() => { this.running = false; this.lastTaskEnd = Date.now(); this.idlePractice.markBusy();
             console.log(`[timing] step model calls: local ${CALLS.local - c0.local}, code ${CALLS.code - c0.code}, replay ${CALLS.replay - c0.replay}`); });
+    }
+
+    // The task a code or curriculum overflow can be broken into. The step's task, otherwise the latest failed task.
+    _overflowTask() {
+        if (typeof this.currentTask === 'string' && this.currentTask.length > 0) return this.currentTask;
+        if (!this.progress || !Object.hasOwn(this.progress, 'failed')) return null;
+        const failed = this.progress.failed;
+        if (!Array.isArray(failed)) throw new Error(`[fix97] progress.failed must be an array, got ${JSON.stringify(failed)}`);
+        if (failed.length === 0) return null;
+        const last = failed[failed.length - 1];
+        if (typeof last !== 'string' || last.length === 0) throw new Error(`[fix97] progress.failed entry is not a task: ${JSON.stringify(last)}`);
+        return last;
     }
 
     // fix75: a step that throws is our bug. fix31 (f850a88) answered it with an exponential backoff scaled by the failing step's
@@ -2450,11 +2473,22 @@ Use only c; no other globals.`;
     // signature on two consecutive steps is a repeat by definition (the step after the failure, on a fresh state, hit the
     // same throw at the same place), so the loop cannot make progress past it: agent.fatal, and launchd restarts the
     // process where the restart is visible.
-    _onStepError(e) {
-        // fix96: a prompt that does not fit the model's context fails that step loudly; the same prompt is rebuilt after a
-        //        restart, so exiting (the same-error-twice rule below) would only restart the bot into the same failure
+    async _onStepError(e) {
+        // fix97: a code or curriculum prompt that does not fit the context is decomposed. num_ctx is not raised.
+        //        Decomposition that cannot run (no task, or the plan and the model both refuse) throws: the step
+        //        handler exits on that, it does not swallow the overflow and repeat it.
         if (e instanceof Error && e.code === CONTEXT_FULL) {
-            console.error(`!!! [voyager] step failed, the bot keeps running: ${e.message}`);
+            if (this._inOverflowDecompose) throw e;
+            const task = typeof e.decomposeTask === 'string' && e.decomposeTask.length > 0 ? e.decomposeTask : this._overflowTask();
+            if (typeof task !== 'string' || task.length === 0) throw e;
+            this._inOverflowDecompose = true;
+            try {
+                const ok = await this._decompose(task, e.message);
+                if (ok !== true) throw e;
+            } finally {
+                this._inOverflowDecompose = false;
+            }
+            console.error(`!!! [voyager] prompt does not fit (${e.message}). Decomposed "${task}" instead of repeating the step. num_ctx is not raised.`);
             return;
         }
         const sig = stepErrorSignature(e);
@@ -4328,10 +4362,25 @@ Use only c; no other globals.`;
         for (const [base, g] of groups) if (g.length >= 3 && !this._generaliseDue) { this._generaliseHint = g.map(s => s.name); this._generaliseDue = true; console.log(`[psn] generalise due: ${g.length} skills share base "${base}"`); }
     }
     // fix34 (PSN split): detect large monolithic skills that could be split
+    _splitAlreadyFailed(name, code) {
+        if (!this.progress || !Object.hasOwn(this.progress, 'splitFailures')) return false;
+        const rows = this.progress.splitFailures;
+        if (!Array.isArray(rows)) throw new Error(`[fix97] progress.splitFailures must be an array, got ${JSON.stringify(rows)}`);
+        const hash = this._hashReply(code);
+        return rows.some(r => r && r.name === name && r.hash === hash);
+    }
+    _recordSplitFailure(name, code, why) {
+        if (this._splitAlreadyFailed(name, code)) return;
+        if (!this.progress) throw new Error('[fix97] progress required to record a split failure');
+        if (!Object.hasOwn(this.progress, 'splitFailures')) this.progress.splitFailures = [];
+        if (!Array.isArray(this.progress.splitFailures)) throw new Error('[fix97] progress.splitFailures must be an array');
+        this.progress.splitFailures.push({ name, hash: this._hashReply(code), why: String(why) });
+        this._saveProgress();
+    }
     _detectSplit() {
         if (this._splitDue) return;
         const large = this.skills.filter(s => !s.primitive && !s.handwritten && !s.demoted && !s.mergedInto && !s.candidate
-            && (s.code || '').split('\n').length > 40 && this._maturity(s).V < 0.5);
+            && (s.code || '').split('\n').length > 40 && this._maturity(s).V < 0.5 && !this._splitAlreadyFailed(s.name, s.code));
         if (large.length) { this._splitHint = large[0].name; this._splitDue = true; console.log(`[psn] split due: ${large[0].name} has ${large[0].code.split('\n').length} lines and V < 0.5`); }
     }
     // fix32: windowed rollback - a promoted skill is rolled back when the task success rate over the 3 tasks after the
@@ -5020,10 +5069,19 @@ Use only c; no other globals.`;
             if (pre.how === 'collect') {
                 const src = planner.sources(goal.item);
                 if (!src.length) throw new Error(`[fix97] LOUD: ${goal.item} is collected but the game data names no source block`);
-                for (const block of src) {
-                    const reach = `reach ${block}`;
-                    if (reach !== task) subs.push(reach);
+                if (!Array.isArray(state.nearby_blocks)) throw new Error(`[fix97] observe().nearby_blocks must be an array to choose a source of ${goal.item}`);
+                const edges = this.progress.recipeEdges;
+                if (edges === null || typeof edges !== 'object' || Array.isArray(edges)) throw new Error('[fix97] progress.recipeEdges required to choose a proven source');
+                const present = src.filter(block => state.nearby_blocks.includes(block));
+                const proven = Object.hasOwn(edges, goal.item) && edges[goal.item].status === 'proven';
+                const pool = present.length ? present : (proven ? src : []);
+                if (!pool.length) {
+                    console.log(`[psn] decompose skipped for "${task}": no source of ${goal.item} is present or proven (${src.join(', ')})`);
+                    return false;
                 }
+                const ranked = [...pool].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+                const reach = `reach ${ranked[0]}`;
+                if (reach !== task) subs.push(reach);
             } else {
                 for (const step of pre.plan) if (step !== task && !subs.includes(step)) subs.push(step);
             }
@@ -5054,7 +5112,11 @@ Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
         const user = `goal: ${task}\nwhy it failed: ${String(reason)}\ndeath_hotspots: ${this._deathHotspots()}\n${this._stateText(this.observe())}\nknown_skills: ${skillLines}`;
         let subs = [];
         try { subs = (parseLocalJSON(await this._askLocal(system, user, this._inferMeta('curriculum-decompose', { system, user })), ['subgoals']).subgoals || []).map(t => String(t).trim()).filter(t => t && t !== task && !validateTask(t)).slice(0, 4); }
-        catch (e) { console.log(`[psn] decompose FAILED for "${task}": ${e.message}`); return false; }
+        catch (e) {
+            if (e instanceof Error && e.code === CONTEXT_FULL) throw e;
+            console.log(`[psn] decompose FAILED for "${task}": ${e.message}`);
+            return false;
+        }
         if (subs.length < 2) { console.log(`[psn] decompose FAILED for "${task}": model gave ${subs.length} valid subgoal(s)`); d[task] = { subs, skills: [], at: Date.now(), reason: String(reason) }; this._saveProgress(); return false; }
         d[task] = { subs, skills: [], at: Date.now(), reason: String(reason) };
         q.unshift(...subs.map(t => ({ task: t, parent: task, depth: depth + 1 })), { task, retry: true, depth });
@@ -6028,7 +6090,7 @@ IMPORTANT: All functions use bare names. Do NOT write skills.goToPosition - writ
             // fix96: what the repair prompt is made of (repair prompts reached 33k chars; nothing is cut now, so one that does
             //        not fit fails loudly and this line says which part grew)
             this._logPromptBreakdown('repair', { ...sections, retry: extra.length }, system.length + user.length + extra.length);
-            try { reply = await this._ask(system, user + extra, this._inferMeta('repair', { system, user: user + extra })); } catch (err) { console.log(err instanceof Error && err.code === CONTEXT_FULL ? `!!! [psn] repair of ${e.name} does not fit the context (${err.message}). The skill is split into smaller skills instead of resending this prompt. num_ctx is not raised.` : `[psn] repair FAILED for ${e.name}: ${err.message}`); if (err instanceof Error && err.code === CONTEXT_FULL) { this._splitHint = e.name; this._splitDue = true; this._splitBecause = 'context'; } return false; }
+            try { reply = await this._ask(system, user + extra, this._inferMeta('repair', { system, user: user + extra })); } catch (err) { console.log(err instanceof Error && err.code === CONTEXT_FULL ? `!!! [psn] repair of ${e.name} does not fit the context (${err.message}). The skill is split into smaller skills instead of resending this prompt. num_ctx is not raised.` : `[psn] repair FAILED for ${e.name}: ${err.message}`); if (err instanceof Error && err.code === CONTEXT_FULL) { if (this._splitAlreadyFailed(e.name, e.code)) throw err; this._splitHint = e.name; this._splitDue = true; this._splitBecause = 'context'; } return false; }
             const ident = executableIdentity(t => this._hashReply(t), reply, extractCode);
             if (lastRejected) {
                 const repeated = repeatedRejection(lastRejected, { n: att, candidate: ident.source, identity: ident.identity });
@@ -6432,6 +6494,7 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
         // fix97: a repair that does not fit the context is split even when the skill is under 40 lines. The repair prompt
         // carries the trace and the history; the split prompt is the skill. The 40-line rule stays for the size detector.
         if (!e || (because !== 'context' && (e.code || '').split('\n').length <= 40)) { console.log(`[psn] split skipped: ${name} no longer qualifies`); return false; }
+        if (this._splitAlreadyFailed(e.name, e.code)) { console.log(`[psn] split of ${e.name} already failed for this code; not repeating it`); return false; }
         const id = `sp${Date.now()}`;
         // fix40: unified bare-name API
         const system = `You refactor a Minecraft mineflayer skill library (PSN split: break a large skill into smaller reusable sub-skills). Return ONE \`\`\`javascript block with: first 2-3 NEW sub-skill async functions (bot) that each do one logical piece of the work, each preceded by // DESCRIPTION: <one sentence>; then the original skill rewritten to call those sub-skills. Keep the SAME name and signature for the original. Every loop checks bot.interrupt_code.
@@ -6442,24 +6505,24 @@ ${this.scopedAPIList([e])}
 IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call functions directly by name.`;
         const user = `Large skill to split:\n--- ${e.name} ---\n${e.description}\n${e.code}\nWrite the sub-skills then the rewritten main skill:`;
         console.log(`[psn] SPLIT ${id}: breaking ${e.name} (${e.code.split('\n').length} lines) into sub-skills`);
-        let reply; try { reply = await this._ask(system, user, this._inferMeta('split', { system, user })); } catch (err) { console.log(`[psn] split FAILED: ${err.message}`); return false; }
+        let reply; try { reply = await this._ask(system, user, this._inferMeta('split', { system, user })); } catch (err) { console.log(`[psn] split FAILED: ${err.message}`); this._recordSplitFailure(e.name, e.code, err.message); return false; }
         const code = extractCode(reply) || '';
         const fns = []; const re = /(?:^|\n)async\s+function\s+([A-Za-z_]\w*)\s*\(/g; let mm, idx = [];
         while ((mm = re.exec(code))) idx.push([mm[1], mm.index]);
         for (let i = 0; i < idx.length; i++) fns.push([idx[i][0], code.slice(idx[i][1], i + 1 < idx.length ? idx[i + 1][1] : code.length).trim()]);
         const subs = fns.filter(([n]) => !this.skills.some(s => s.name === n));
         const main = fns.find(([n]) => n === e.name);
-        if (subs.length < 2 || !main) { console.log(`[psn] split ${id} FAILED: reply had ${subs.length} sub-skill(s) and ${main ? 'the' : 'no'} rewritten main`); return false; }
+        if (subs.length < 2 || !main) { console.log(`[psn] split ${id} FAILED: reply had ${subs.length} sub-skill(s) and ${main ? 'the' : 'no'} rewritten main`); this._recordSplitFailure(e.name, e.code, `reply had ${subs.length} sub-skill(s)`); return false; }
         const over = { [main[0]]: main[1] }; for (const [n, c] of subs) over[n] = c;
         const spNames = new Set(Object.keys(over));
         for (const n of Object.keys(over)) for (const d of this._closure(n)) spNames.add(d);
         const spBundle = this._libSrcSubset(spNames, over) + `\n\n${subs.map(s => s[1]).join('\n\n')}\n\nawait Promise.resolve();`;
         const { lint } = await this._stageLintExec(spBundle, spNames, `voyager:split:${id}`);
-        if (lint) { console.log(`[psn] split ${id} FAILED lint: ${String(lint).slice(0, 300)}`); return false; }
+        if (lint) { console.log(`[psn] split ${id} FAILED lint: ${String(lint).slice(0, 300)}`); this._recordSplitFailure(e.name, e.code, String(lint)); return false; }
         for (const [n, c] of subs) {
             this._lastEffects = [];   // fix73: a new sub-skill has no run of its own yet (saveSkill takes the effects per call)
             const desc = ((c.match(/\/\/\s*DESCRIPTION:\s*(.+)/) || [])[1] || `sub-skill of ${e.name}`).trim();
-            if (!(await this.saveSkill(n, desc, c, `split ${id}`))) { console.log(`[psn] split ${id} FAILED: sub-skill ${n} rejected`); return false; }
+            if (!(await this.saveSkill(n, desc, c, `split ${id}`))) { console.log(`[psn] split ${id} FAILED: sub-skill ${n} rejected`); this._recordSplitFailure(e.name, e.code, `sub-skill ${n} rejected`); return false; }
         }
         this.progress.refactors = { ...(this.progress.refactors || {}), [id]: { main: e.name, subs: subs.map(s => s[0]), kind: 'split', at: Date.now() } }; this._saveProgress();
         this._lastEffects = e.effects;
@@ -7265,7 +7328,8 @@ Voyager.SEEDED_PRIMITIVES = [
         let collected = false;
         const onCollect = (_who, entity) => { if (entity === nearestItem) collected = true; };
         bot.on('playerCollect', onCollect);
-        const followRange = typeof nearestItem.width === 'number' ? nearestItem.width : 0;
+        if (typeof nearestItem.width !== 'number') throw new Error('pickupNearbyItems: dropped item has no width');
+        const followRange = nearestItem.width;
         let reached;
         try { reached = await goToGoal(bot, new GoalFollow(nearestItem, followRange)); }
         finally { bot.removeListener('playerCollect', onCollect); }

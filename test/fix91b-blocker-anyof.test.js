@@ -38,6 +38,7 @@ function mkV() {
     v.agent = {
         bot: { version: VER, registry, recipesAll: (id) => Recipe.find(id), inventory: { emptySlotCount: () => 36 } },
         openChat() {},
+        fatal() {},
     };
     v.skills = [];
     v.npGraph = null;
@@ -79,16 +80,23 @@ describe('fix91b: recording an anyOf need keeps anyOf through JSON', () => {
 
 describe('fix91b: boot validator accepts item XOR anyOf', () => {
     const names = ['fix91b-item', 'fix91b-any', 'fix91b-neither', 'fix91b-both'];
-    after(() => { for (const name of names) rmSync(join(ROOT, 'bots', name), { recursive: true, force: true }); });
+    const booted = [];
+    after(() => {
+        for (const v of booted) if (v._saveTimer) clearTimeout(v._saveTimer);
+        for (const name of names) rmSync(join(ROOT, 'bots', name), { recursive: true, force: true });
+    });
 
     function boot(name, blockers) {
         const dir = join(ROOT, 'bots', name, 'skills');
         mkdirSync(dir, { recursive: true });
         writeFileSync(join(dir, 'progress.json'), JSON.stringify({ completedAt: {}, completed: [], failed: [], blockers }));
-        return new Voyager({
+        const v = new Voyager({
             name,
+            fatal() {},
             bot: { version: VER, chat() {}, on() {}, off() {}, once() {}, removeListener() {}, inventory: { emptySlotCount: () => 36 } },
         });
+        booted.push(v);
+        return v;
     }
 
     it('item-only and anyOf-only load; neither throws the structured-need error', () => {
