@@ -207,13 +207,13 @@ describe('fix81: the live inventory (56 iron_ingot, 410 cobblestone, 0 wood) cha
         assert.ok(stone.plan.includes('Collect 3 cobblestone') && stone.plan.indexOf('Craft 1 iron_pickaxe') < stone.plan.indexOf('Collect 3 cobblestone'), `cobblestone needs a pickaxe first: ${stone.plan.join(' > ')}`);
         const less = (a, b) => { for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return a[i] < b[i]; return false; };
         assert.ok(less(iron.cost, stone.cost), `${iron.cost} < ${stone.cost}`);
-        const ch = p.cheapest(['stone_pickaxe', 'iron_pickaxe', 'wooden_pickaxe', 'diamond_pickaxe', 'netherite_pickaxe'], 1, { iron_ingot: 56 });
+        const ch = p.cheapest(['stone_pickaxe', 'iron_pickaxe', 'wooden_pickaxe', 'diamond_pickaxe', 'netherite_pickaxe'], 1, { iron_ingot: 56 }, false);
         assert.deepStrictEqual(ch, { item: 'iron_pickaxe', ties: [] }, 'no tie: strictly by cost');
     });
     it('a cost tie goes to the option with fewer untried edges (a run-proven stone_pickaxe edge beats the untried iron one)', () => {
         const v = mkV({ inv: {}, nearby: [...SURFACE] });
         v.progress.recipeEdges = { stone_pickaxe: { task: 'Craft 1 stone_pickaxe', status: 'proven', runs: 1, fails: 0 } };
-        const ch = v._obtainPlanner(v.observe()).cheapest(['iron_pickaxe', 'stone_pickaxe'], 1, { ...LIVE_INV });
+        const ch = v._obtainPlanner(v.observe()).cheapest(['iron_pickaxe', 'stone_pickaxe'], 1, { ...LIVE_INV }, false);
         assert.strictEqual(ch.item, 'stone_pickaxe');
         assert.match(ch.ties[0], /"stone_pickaxe" \(3 untried\) over "iron_pickaxe" \(4 untried\)/);
     });
@@ -284,7 +284,7 @@ describe('fix81: structured needs are validated and reach the curriculum', () =>
 describe('fix81: obtainPlanner (game data only)', () => {
     const planner = (nearby, learned = () => false) => obtainPlanner({
         registry, recipesOf: id => Recipe.find(id),
-        known: (item, src) => src.some(b => nearby.includes(b)) || learned(item), proven: () => false, edgeSuccess: () => 1, smeltInputs: () => [],
+        known: (item, src) => src.some(b => nearby.includes(b)) || learned(item), proven: () => false, edgeSuccess: () => 1, smeltInputs: () => [], present: () => false,
     });
     it('cheapest harvest tool for stone from nothing is the wooden pickaxe (fix47 case, structural)', () => {
         const pre = planner(['oak_log']).prerequisites('stone', 3, {});
@@ -310,17 +310,14 @@ describe('fix81: obtainPlanner (game data only)', () => {
         assert.ok(pre.cycles.includes('iron_ingot -> iron_block -> iron_ingot'), pre.cycles.join('; '));
         assert.ok(!pre.plan.includes('Craft 1 iron_block'), `9 ingots -> block -> 9 ingots makes nothing: ${pre.plan.join(' -> ')}`);
     });
-    it('an ingredient whose every recipe cycles back and that no block yields is obtained by the normal path (cycle reported)', () => {
+    it('an ingredient whose every recipe cycles back and that no block, mob, or furnace yields is not an opaque obtain', () => {
         const reg = {
             items: { 1: { id: 1, name: 'a_item' }, 2: { id: 2, name: 'b_item' } },
             itemsByName: { a_item: { id: 1, name: 'a_item' }, b_item: { id: 2, name: 'b_item' } },
             blocksByName: {}, blockLoot: {}, entityLoot: {},
         };
         const rec = { 1: [{ result: { count: 1 }, delta: [{ id: 2, count: -1 }, { id: 1, count: 1 }] }], 2: [{ result: { count: 1 }, delta: [{ id: 1, count: -1 }, { id: 2, count: 1 }] }] };
-        const pre = obtainPlanner({ registry: reg, recipesOf: id => rec[id], known: () => false, proven: () => false, edgeSuccess: () => 1, smeltInputs: () => [] }).prerequisites('a_item', 1, {});
-        assert.deepStrictEqual(pre.cycles, ['a_item -> b_item -> a_item']);
-        assert.strictEqual(pre.task, 'Craft 1 a_item');
-        assert.deepStrictEqual(pre.steps.map(st => st.task), ['Obtain 1 b_item']);
+        assert.throws(() => obtainPlanner({ registry: reg, recipesOf: id => rec[id], known: () => false, proven: () => false, edgeSuccess: () => 1, smeltInputs: () => [], present: () => false }).prerequisites('a_item', 1, {}), /no acyclic way to obtain 1 a_item .*a_item -> b_item -> a_item/);
     });
     it('throws, naming the cycle, when the data gives no acyclic way at all (a block only its own drop can harvest)', () => {
         const reg = {
@@ -330,7 +327,7 @@ describe('fix81: obtainPlanner (game data only)', () => {
             blockLoot: { x_item: { drops: [{ item: 'x_item' }] } },
             entityLoot: {},
         };
-        const p = obtainPlanner({ registry: reg, recipesOf: () => [], known: () => false, proven: () => false, edgeSuccess: () => 1, smeltInputs: () => [] });
+        const p = obtainPlanner({ registry: reg, recipesOf: () => [], known: () => false, proven: () => false, edgeSuccess: () => 1, smeltInputs: () => [], present: () => false });
         assert.throws(() => p.prerequisites('x_item', 1, {}), /no acyclic way to obtain 1 x_item .*cycles: x_item -> x_item.*unobtainable: x_item from x_item/);
     });
 });

@@ -1,4 +1,5 @@
 import { itemSourceBlocks } from '../utils/item_sources.js';
+import { furnaceInputsOf } from './furnace_recipes.js';
 
 // fix81: what it takes to obtain an item, from the game's own data only (no recipe, item or tool lists of ours).
 //   recipes  - recipesOf(itemId): every recipe for the item (bot.recipesAll(id, null, true): all of them, not only the
@@ -23,14 +24,20 @@ import { itemSourceBlocks } from '../utils/item_sources.js';
 // used (see meanDrop); what a source really yields is learned from the runs.
 // fix96: entity loot (registry.entityLoot) is a source of an item no recipe or block yields (beef from a cow): that option
 // is "obtain" from the named entities, not opaque. Learned smelt edges (smeltInputs(item): the inputs of "Smelt N <in>
-// into N <item>" goals that succeeded; furnace recipes are not in the game data) plan the input, then the smelt.
-export function obtainPlanner({ registry, recipesOf, known, proven, edgeSuccess, smeltInputs }) {
+// into N <item>" goals that succeeded) plan the input, then the smelt.
+// fix97: furnace recipes come from minecraft-data (PC recipes.json has no furnace type; the package's bedrock furnace
+// tables name the same items). A smelt plans its input, a furnace, and a fuel (an input of the charcoal furnace recipe).
+// An item no recipe, block, entity, or furnace recipe yields is not an option. When `feasible` is true (the food
+// need-raiser), a collect counts only when a source block is present or a producer edge is proven; an entity drop counts
+// because the game data names the mob.
+export function obtainPlanner({ registry, recipesOf, known, proven, edgeSuccess, smeltInputs, present }) {
     if (!registry) throw new Error('[fix81] obtainPlanner: registry required');
     if (typeof recipesOf !== 'function') throw new Error('[fix81] obtainPlanner: recipesOf(itemId) required');
     if (typeof known !== 'function') throw new Error('[fix81] obtainPlanner: known(item, sourceBlocks) required');
     if (typeof proven !== 'function') throw new Error('[fix81] obtainPlanner: proven(item) required (a run-proven producer edge)');
     if (typeof edgeSuccess !== 'function') throw new Error('[fix96] obtainPlanner: edgeSuccess(item, verb) required (observed success of a producer edge)');
     if (typeof smeltInputs !== 'function') throw new Error('[fix96] obtainPlanner: smeltInputs(item) required (learned smelt edges)');
+    if (typeof present !== 'function') throw new Error('[fix97] obtainPlanner: present(block) required (a source block observed nearby)');
     if (registry.entityLoot === undefined || registry.entityLoot === null) throw new Error('[fix96] obtainPlanner: registry.entityLoot required');
     if (!registry.blockLoot) throw new Error('[fix81] obtainPlanner: registry.blockLoot required');
     const itemName = id => {
@@ -109,6 +116,35 @@ export function obtainPlanner({ registry, recipesOf, known, proven, edgeSuccess,
         ingredients: r.delta.filter(d => d.count < 0).map(d => ({ item: itemName(d.id), count: -d.count })),
     }));
     const has = (inv, item) => (Object.hasOwn(inv, item) ? inv[item] : 0);
+    // fix97: fuels are the inputs of the charcoal furnace recipe (the woods the game smelts into charcoal), restricted to
+    // names in this registry. Held fuel is planned first; otherwise the lexical first input that plans.
+    const fuelNames = furnaceInputsOf('charcoal').filter(name => Object.hasOwn(registry.itemsByName, name));
+    fuelNames.sort((a, b) => {
+        const as = sources(a).length ? 0 : 1;
+        const bs = sources(b).length ? 0 : 1;
+        if (as !== bs) return as - bs;
+        if (a < b) return -1;
+        if (a > b) return 1;
+        return 0;
+    });
+    const reachableCollect = (item, src) => src.some(block => present(block) === true) || proven(item) === true;
+    // One furnace plan and one fuel plan per inventory. A smelt does not consume the item it smelts, so every food shares
+    // them. Nested smelts (the furnace's own ingredients) do not plan a second furnace: that is the same cycle the path
+    // used to cut, and it is what made choosing among every food replan the tool chain once per food.
+    const invKey = inv => {
+        const keys = Object.keys(inv).filter(k => inv[k]);
+        keys.sort();
+        return keys.map(k => k + '=' + inv[k]).join(',');
+    };
+    const clonePlan = p => {
+        if (p === null) return null;
+        const out = { ...p, inv: { ...p.inv }, steps: p.steps.map(s => ({ ...s })), ingredients: p.ingredients.map(i => ({ ...i })) };
+        if (Array.isArray(p.missing)) out.missing = p.missing.map(m => ({ ...m }));
+        if (Array.isArray(p.from)) out.from = [...p.from];
+        return out;
+    };
+    const furnaceSlot = { current: null };
+    const fuelSlot = { current: null };
     // the harvest tools a source of `item` needs, or null when some source drops it by hand or with a tool already held
     const toolsNeeded = (item, inv) => {
         const tools = new Set();
@@ -140,6 +176,33 @@ export function obtainPlanner({ registry, recipesOf, known, proven, edgeSuccess,
         return ranked[0].o;
     };
 
+    function sharedSubplan(slot, key, compute) {
+        if (slot.current && slot.current.key === key && slot.current.plan !== undefined) return clonePlan(slot.current.plan);
+        if (slot.current && slot.current.key === key) return null;
+        slot.current = { key };
+        const planResult = compute();
+        slot.current = { key, plan: clonePlan(planResult) };
+        return planResult;
+    }
+    function planFurnace(inv, ctx) {
+        if (!Object.hasOwn(registry.itemsByName, 'furnace')) throw new Error('[fix97] registry has no furnace item');
+        const key = (ctx.feasible === true ? '1' : '0') + '\0' + invKey(inv);
+        return sharedSubplan(furnaceSlot, key, () => plan('furnace', 1, { ...inv }, [], ctx, false));
+    }
+    function planFuel(inv, ctx, path) {
+        const key = (ctx.feasible === true ? '1' : '0') + '\0' + invKey(inv);
+        return sharedSubplan(fuelSlot, key, () => {
+            const fuelOrder = fuelNames.filter(name => has(inv, name) > 0);
+            const fuels = fuelOrder.length ? fuelOrder : fuelNames;
+            if (!fuels.length) throw new Error('[fix97] LOUD: no charcoal furnace input exists in this registry, so a smelt has no fuel');
+            for (const name of fuels) {
+                if (path.includes(name)) continue;
+                const fuel = plan(name, 1, { ...inv }, [], ctx, false);
+                if (fuel) return fuel;
+            }
+            return null;
+        });
+    }
     function plan(item, need, inv, path, ctx, gain) {
         // an ingredient that is already being planned on this branch is a cycle, even when the inventory holds it
         // (9 iron_ingot -> iron_block -> 9 iron_ingot makes nothing)
@@ -147,26 +210,28 @@ export function obtainPlanner({ registry, recipesOf, known, proven, edgeSuccess,
         const have = gain ? 0 : Math.min(has(inv, item), need);
         if (have) inv[item] -= have;
         const rem = need - have;
-        if (rem === 0) return { cost: [0, 0, 0, 0], inv, steps: [], how: 'inventory', ingredients: [] };
+        if (rem === 0) return { cost: [0, 0, 0, 0], inv, steps: [], how: 'inventory', ingredients: [], feasible: true };
         const onPath = [...path, item];
         const crafts = [];
         for (const r of recipes(item)) {
             const times = Math.ceil(rem / r.yield);
             let sim = { ...inv }, cost = [0, 0, 0, 1];
             const steps = [], missing = [];
-            let ok = true;
+            let ok = true, feasible = true;
             for (const ing of r.ingredients) {
                 const want = ing.count * times;
                 const short = want - Math.min(has(sim, ing.item), want);
                 const sub = plan(ing.item, want, sim, onPath, ctx, false);
                 if (!sub) { ok = false; break; }
+                if (sub.feasible !== true) feasible = false;
                 if (short > 0) missing.push({ item: ing.item, count: short, how: sub.how, input: sub.input });
                 sim = sub.inv; cost = add(cost, sub.cost); steps.push(...sub.steps);
             }
             if (!ok) continue;
+            if (ctx.feasible === true && !feasible) continue;
             sim[item] = has(sim, item) + times * r.yield - rem;
             steps.push({ verb: 'craft', item, count: rem });
-            crafts.push({ cost, inv: sim, steps, how: 'craft', missing, ingredients: r.ingredients.map(ing => ({ item: ing.item, count: ing.count * times })) });
+            crafts.push({ cost, inv: sim, steps, how: 'craft', missing, ingredients: r.ingredients.map(ing => ({ item: ing.item, count: ing.count * times })), feasible });
         }
         // raw: collected from a source block (its harvest tool planned the same way), or obtained some other way when no
         // block yields it — the latter only when the game data has no acyclic recipe or the item is known (learned/observed)
@@ -176,40 +241,67 @@ export function obtainPlanner({ registry, recipesOf, known, proven, edgeSuccess,
         const failing = proven(item) === false && success(item, null) < 1;
         const isKnown = known(item, src) && !failing;
         const opts = [...crafts];
-        // learned furnace edges: plan the input, then smelt it (one step)
-        const ins = smeltInputs(item);
-        if (!Array.isArray(ins)) throw new Error(`[fix96] smeltInputs(${item}) must return an array`);
+        // furnace recipes (game data) and learned smelt edges: plan the input, a furnace, and a fuel, then the smelt
+        const learnedIns = smeltInputs(item);
+        if (!Array.isArray(learnedIns)) throw new Error(`[fix96] smeltInputs(${item}) must return an array`);
+        const ins = [];
+        for (const input of [...furnaceInputsOf(item).filter(name => Object.hasOwn(registry.itemsByName, name)), ...learnedIns]) {
+            if (input === item || path.includes(input) || ins.includes(input)) continue;
+            ins.push(input);
+        }
         for (const input of ins) {
             const sub = plan(input, rem, { ...inv }, onPath, ctx, false);
             if (!sub) continue;
+            const furnace = path.includes('furnace') ? null : planFurnace(inv, ctx);
+            if (!furnace) continue;
+            const fuel = planFuel(inv, ctx, path);
+            if (!fuel) continue;
+            if (ctx.feasible === true && (sub.feasible !== true || furnace.feasible !== true || fuel.feasible !== true)) continue;
             const units = expected(rem, 1, item, 'smelt') - rem;   // the input's own units are in sub.cost; this adds the edge's failures
-            opts.push({ cost: add(sub.cost, [0, units, units, 1]), inv: sub.inv, steps: [...sub.steps, { verb: 'smelt', item, count: rem, input }], how: 'smelt', input, missing: rem - Math.min(has(inv, input), rem) > 0 ? [{ item: input, count: rem - Math.min(has(inv, input), rem), how: sub.how, input: sub.input }] : [], ingredients: [{ item: input, count: rem }] });
+            const missing = [];
+            if (rem - Math.min(has(inv, input), rem) > 0) missing.push({ item: input, count: rem - Math.min(has(inv, input), rem), how: sub.how, input: sub.input });
+            if (furnace.steps.length) missing.push({ item: 'furnace', count: 1, how: furnace.how, input: furnace.input });
+            if (fuel.steps.length) {
+                const got = fuel.steps[fuel.steps.length - 1];
+                missing.push({ item: got.item, count: got.count, how: got.verb, input: got.input });
+            }
+            opts.push({
+                cost: add(add(add(sub.cost, furnace.cost), fuel.cost), [0, units, units, 1]),
+                inv: sub.inv,
+                steps: [...sub.steps, ...furnace.steps, ...fuel.steps, { verb: 'smelt', item, count: rem, input }],
+                how: 'smelt',
+                input,
+                missing,
+                ingredients: [{ item: input, count: rem }, ...furnace.ingredients, ...fuel.ingredients],
+                feasible: true,
+            });
         }
         if (src.length) {
-            const units = expected(rem, blockYield(item), item, 'collect');
-            const unknown = isKnown ? 0 : units;
-            const tools = toolsNeeded(item, inv);
-            if (!tools) opts.push({ cost: [0, unknown, units, 1], inv, steps: [{ verb: 'collect', item, count: rem }], how: 'collect', missing: [], ingredients: [] });
-            else {
-                const withTool = [];
-                for (const t of tools) {
-                    const sub = plan(t, 1, { ...inv }, onPath, ctx, false);
-                    if (!sub) continue;
-                    sub.inv[t] = has(sub.inv, t) + 1;   // a tool is kept, not consumed
-                    withTool.push({ cost: add(sub.cost, [0, unknown, units, 1]), inv: sub.inv, steps: [...sub.steps, { verb: 'collect', item, count: rem }], how: 'collect', tool: t, missing: [{ item: t, count: 1, how: sub.how, input: sub.input }], ingredients: [] });
+            const reachable = reachableCollect(item, src);
+            if (!(ctx.feasible === true && !reachable)) {
+                const units = expected(rem, blockYield(item), item, 'collect');
+                const unknown = isKnown ? 0 : units;
+                const tools = toolsNeeded(item, inv);
+                if (!tools) opts.push({ cost: [0, unknown, units, 1], inv, steps: [{ verb: 'collect', item, count: rem }], how: 'collect', missing: [], ingredients: [], feasible: reachable });
+                else {
+                    const withTool = [];
+                    for (const t of tools) {
+                        const sub = plan(t, 1, { ...inv }, onPath, ctx, false);
+                        if (!sub) continue;
+                        if (ctx.feasible === true && sub.feasible !== true) continue;
+                        sub.inv[t] = has(sub.inv, t) + 1;   // a tool is kept, not consumed
+                        withTool.push({ cost: add(sub.cost, [0, unknown, units, 1]), inv: sub.inv, steps: [...sub.steps, { verb: 'collect', item, count: rem }], how: 'collect', tool: t, missing: [{ item: t, count: 1, how: sub.how, input: sub.input }], ingredients: [], feasible: reachable });
+                    }
+                    if (!withTool.length) ctx.unobtainable.add(`${item} from ${src.join('/')} (needs one of ${tools.join(', ')}; none obtainable without a cycle)`);
+                    opts.push(...withTool);
                 }
-                if (!withTool.length) ctx.unobtainable.add(`${item} from ${src.join('/')} (needs one of ${tools.join(', ')}; none obtainable without a cycle)`);
-                opts.push(...withTool);
             }
         } else {
             const mobs = entitySources(item);
             if (mobs.length) {
                 const best = Math.max(...mobs.map(m => m.yield));
                 const units = expected(rem, best, item, 'obtain');
-                opts.push({ cost: [0, isKnown ? 0 : units, units, 1], inv, steps: [{ verb: 'obtain', item, count: rem }], how: 'obtain', from: mobs.map(m => m.entity), missing: [], ingredients: [] });
-            } else if (!crafts.length || isKnown) {
-                const units = expected(rem, 1, item, 'obtain');
-                opts.push({ cost: [isKnown ? 0 : 1, isKnown ? 0 : units, units, 1], inv, steps: [{ verb: 'obtain', item, count: rem }], how: 'obtain', missing: [], ingredients: [] });
+                opts.push({ cost: [0, isKnown ? 0 : units, units, 1], inv, steps: [{ verb: 'obtain', item, count: rem }], how: 'obtain', from: mobs.map(m => m.entity), missing: [], ingredients: [], feasible: true });
             }
         }
         return pick(opts, ctx, item);
@@ -255,14 +347,18 @@ export function obtainPlanner({ registry, recipesOf, known, proven, edgeSuccess,
         // the one of `items` that is cheapest to gain `count` of from `inv` (a need that any of several items meets:
         // a harvest tool tier, a storage block); exact ties as in pick (proven edges, then name), reported in ties.
         // Throws when none of them can be obtained.
-        cheapest(items, count, inv) {
-            const opts = [], ctx = { cycles: new Set(), unobtainable: new Set(), ties: new Set() };
+        cheapest(items, count, inv, feasible) {
+            if (typeof feasible !== 'boolean') throw new Error('[fix97] cheapest: feasible (true or false) required');
+            const opts = [], ctx = { cycles: new Set(), unobtainable: new Set(), ties: new Set(), feasible };
             for (const item of items) {
-                const best = plan(item, count, { ...inv }, [], { cycles: new Set(), unobtainable: new Set(), ties: new Set() }, true);
+                const best = plan(item, count, { ...inv }, [], { cycles: new Set(), unobtainable: new Set(), ties: new Set(), feasible }, true);
                 if (best) opts.push({ cost: best.cost, item, steps: best.steps });
             }
             const best = pick(opts, ctx, `one of ${items.join('/')}`);
-            if (best === null) throw new Error(`[fix81] LOUD: none of ${items.join(', ')} can be obtained from the game data`);
+            if (best === null) {
+                if (feasible) throw new Error(`[fix97] LOUD: none of ${items.join(', ')} is reachable from the inventory, nearby blocks, entity loot, furnace recipes, and proven edges`);
+                throw new Error(`[fix81] LOUD: none of ${items.join(', ')} can be obtained from the game data`);
+            }
             return { item: best.item, ties: [...ctx.ties] };
         },
     };

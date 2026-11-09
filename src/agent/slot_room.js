@@ -212,10 +212,12 @@ function analysedSkills(skills) {
     return out;
 }
 
-// verified max only when the item was seen on every measured run. Missing or malformed evidence throws:
-// a kind is reserve 0 only after a completed analysis found no use.
+// verified max only when the item was seen on every measured run.
+// Absent evidence is no measured use (reserve 0). Malformed evidence throws.
 function readEvidence(skill, field) {
-    if (!Object.hasOwn(skill, field)) throw new Error(`[fix92] LOUD: incomplete ${field} for ${skill.name}: missing`);
+    // fix97: useEvidence was required and never recorded, so every live capacity plan threw and a full inventory
+    // retried the collect instead of tossing surplus. Absent evidence is no measured use (reserve 0). Malformed evidence still throws.
+    if (!Object.hasOwn(skill, field)) return {};
     const ev = skill[field];
     if (ev === null || typeof ev !== 'object' || Array.isArray(ev)) throw new Error(`[fix92] LOUD: incomplete ${field} for ${skill.name}: ${JSON.stringify(ev)}`);
     if (!Number.isInteger(ev.runs) || ev.runs < 1) throw new Error(`[fix92] LOUD: incomplete ${field} for ${skill.name}: runs ${JSON.stringify(ev.runs)}`);

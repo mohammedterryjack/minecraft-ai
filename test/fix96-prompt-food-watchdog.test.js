@@ -114,7 +114,7 @@ describe('fix96 (2): the food plan weighs observed edge success, entity loot and
         const planner = v._obtainPlanner(state);
         return planFoodAcquisition({
             edibles: edibleNames(registry), inventory: state.inventory,
-            cheapest: (items, count, inv) => planner.cheapest(items, count, inv),
+            cheapest: (items, count, inv) => planner.cheapest(items, count, inv, false),
             prerequisites: (item, count, inv) => planner.prerequisites(item, count, inv),
             entityDroppersFor: item => entityDroppers(registry, item),
         });
@@ -146,9 +146,13 @@ describe('fix96 (2): the food plan weighs observed edge success, entity loot and
         assert.deepStrictEqual(v._learnedSmeltInputs('iron_ingot'), ['raw_iron']);
         const pre = v._obtainPlanner({ inventory: {}, nearby_blocks: [] }).prerequisites('cooked_beef', 1, {});
         assert.strictEqual(pre.task, 'Smelt 1 beef into 1 cooked_beef');
-        assert.deepStrictEqual(pre.steps.map(s => s.task), ['Obtain 1 beef']);
+        assert.ok(pre.plan.includes('Obtain 1 beef'), pre.plan.join(' | '));
+        assert.ok(pre.plan.some(s => s.includes('furnace')), pre.plan.join(' | '));
+        assert.ok(pre.steps.some(s => s.task === 'Obtain 1 beef'), JSON.stringify(pre.steps));
         const none = mkV({});
-        assert.strictEqual(none._obtainPlanner({ inventory: {}, nearby_blocks: [] }).prerequisites('cooked_beef', 1, {}).how, 'obtain');
+        const cooked = none._obtainPlanner({ inventory: {}, nearby_blocks: [] }).prerequisites('cooked_beef', 1, {});
+        assert.strictEqual(cooked.how, 'smelt');
+        assert.ok(cooked.plan.includes('Obtain 1 beef'), cooked.plan.join(' | '));
         assert.throws(() => mkV({ goalStats: undefined })._learnedSmeltInputs('cooked_beef'), /goalStats required/);
     });
 
