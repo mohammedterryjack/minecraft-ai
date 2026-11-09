@@ -320,7 +320,7 @@ describe('fix94b OBS viewer leak', () => {
     it('the served bundle is the webpack build and the cache buster changed', () => {
         const html = readFileSync(require.resolve('prismarine-viewer/public/index.html'), 'utf8');
         const bundle = readFileSync(require.resolve('prismarine-viewer/public/index.js'), 'utf8');
-        assert.match(html, /index\.js\?v=fix94b/);
+        assert.match(html, /index\.js\?v=fix94c/);
         assert.doesNotMatch(html, /v=zombie1/);
         assert.match(bundle, /userData\.shared/);
         assert.match(bundle, /__pvPlaySound/);
