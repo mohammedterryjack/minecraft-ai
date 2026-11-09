@@ -1,3 +1,5 @@
+import { itemSourceBlocks } from '../utils/item_sources.js';
+
 // fix81: what it takes to obtain an item, from the game's own data only (no recipe, item or tool lists of ours).
 //   recipes  - recipesOf(itemId): every recipe for the item (bot.recipesAll(id, null, true): all of them, not only the
 //              ones the inventory can make now); ingredients and yield come from each recipe's delta / result
@@ -14,11 +16,22 @@
 // recursively from block.harvestTools (stone_pickaxe needs cobblestone, whose blocks need a pickaxe), unless a held tool
 // works. Exact cost ties are not a choice to randomise: the option with fewer untried (not run-proven) edges wins, then
 // the lexically first option name; each tie broken is reported (ties) and logged by the caller.
-export function obtainPlanner({ registry, recipesOf, known, proven }) {
+// fix96: an option's raw units are EXPECTED units: the count over the expected yield of one source (the loot's mean stack
+// size; the block of the item's own name yields 1; entity loot the same way) and over the observed success of the item's
+// producer edge (progress.recipeEdges runs/fails, posterior (s+1)/(n+2), 1 before any failure). A raw count alone made
+// "Collect 1 apple" (oak_leaves nearby, 86 of 86 runs failed) the cheapest food every time. The data's dropChance is not
+// used (see meanDrop); what a source really yields is learned from the runs.
+// fix96: entity loot (registry.entityLoot) is a source of an item no recipe or block yields (beef from a cow): that option
+// is "obtain" from the named entities, not opaque. Learned smelt edges (smeltInputs(item): the inputs of "Smelt N <in>
+// into N <item>" goals that succeeded; furnace recipes are not in the game data) plan the input, then the smelt.
+export function obtainPlanner({ registry, recipesOf, known, proven, edgeSuccess, smeltInputs }) {
     if (!registry) throw new Error('[fix81] obtainPlanner: registry required');
     if (typeof recipesOf !== 'function') throw new Error('[fix81] obtainPlanner: recipesOf(itemId) required');
     if (typeof known !== 'function') throw new Error('[fix81] obtainPlanner: known(item, sourceBlocks) required');
     if (typeof proven !== 'function') throw new Error('[fix81] obtainPlanner: proven(item) required (a run-proven producer edge)');
+    if (typeof edgeSuccess !== 'function') throw new Error('[fix96] obtainPlanner: edgeSuccess(item, verb) required (observed success of a producer edge)');
+    if (typeof smeltInputs !== 'function') throw new Error('[fix96] obtainPlanner: smeltInputs(item) required (learned smelt edges)');
+    if (registry.entityLoot === undefined || registry.entityLoot === null) throw new Error('[fix96] obtainPlanner: registry.entityLoot required');
     if (!registry.blockLoot) throw new Error('[fix81] obtainPlanner: registry.blockLoot required');
     const itemName = id => {
         const it = registry.items[id];
@@ -30,19 +43,66 @@ export function obtainPlanner({ registry, recipesOf, known, proven }) {
         if (!it) throw new Error(`[fix81] "${name}" is not an item in this registry`);
         return it.id;
     };
-    const droppers = new Map();
-    for (const [block, loot] of Object.entries(registry.blockLoot)) {
-        for (const d of loot.drops) {
-            if (d.silkTouch) continue;
-            if (!droppers.has(d.item)) droppers.set(d.item, new Set());
-            droppers.get(d.item).add(block);
-        }
-    }
+    // fix96: the same source list the search uses (fix95 itemSourceBlocks): a loot key that is not a block in this registry
+    // (1.20.4 keeps "grass") is not a source; it used to reach toolsNeeded and read blocksByName["grass"].harvestTools.
+    const sourceMemo = new Map();   // game data does not change while a planner lives
     const sources = item => {
-        const s = new Set(droppers.has(item) ? droppers.get(item) : []);
-        if (registry.blocksByName[item]) s.add(item);
-        return [...s];
+        if (!sourceMemo.has(item)) sourceMemo.set(item, itemSourceBlocks(registry, item));
+        return [...sourceMemo.get(item)];
     };
+    // The data's dropChance is not a probability the bot can use: 1.20.4 minecraft-data gives apple from oak_leaves 1 (the game:
+    // 0.5%), oak_sapling 0.5, and splits every silk-touch / no-silk-touch alternative 0.5 / 0.5 (raw_iron from iron_ore 0.5,
+    // though without silk touch it always drops). Read as a chance, it made raw_iron cheaper to craft from a raw_iron_block
+    // than to mine. The prior is the stack size only; the observed edge success (below) is what measures the chance.
+    const meanDrop = (d, where) => {
+        const r = d.stackSizeRange;
+        if (!Array.isArray(r) || r.length !== 2) throw new Error(`[fix96] ${where} drop ${d.item}: stackSizeRange [min, max] required, got ${JSON.stringify(r)}`);
+        // 1.20.4 data leaves one bound null on three drops (melon [null,1], mushroom blocks [0,null]): the stated bounds
+        // are what is known; a drop with no positive stated bound adds no expected yield (null: the caller skips it).
+        const stated = r.filter(x => typeof x === 'number');
+        if (stated.length === 0) return null;
+        const mean = stated.reduce((a, b) => a + b, 0) / stated.length;
+        return mean > 0 ? mean : null;
+    };
+    // expected items per source broken: the best source (the collect goes to whichever source is found)
+    const blockYield = item => {
+        let best = 0;
+        for (const b of sources(item)) {
+            if (b === item) { best = Math.max(best, 1); continue; }
+            for (const d of registry.blockLoot[b].drops) {
+                if (d.item !== item || d.silkTouch) continue;
+                const y = meanDrop(d, `blockLoot ${b}`);
+                if (y !== null) best = Math.max(best, y);
+            }
+        }
+        if (!(best > 0)) throw new Error(`[fix96] LOUD: ${item} has sources ${sources(item).join(', ')} but no positive expected drop`);
+        return best;
+    };
+    const entityEntries = Array.isArray(registry.entityLoot) ? registry.entityLoot : Object.values(registry.entityLoot);
+    const entityMemo = new Map();
+    const entitySources = item => {
+        if (!entityMemo.has(item)) entityMemo.set(item, entityDropsOf(item));
+        return entityMemo.get(item);
+    };
+    const entityDropsOf = item => {
+        const out = [];
+        for (const e of entityEntries) {
+            if (!e || typeof e.entity !== 'string' || !Array.isArray(e.drops)) throw new Error(`[fix96] entityLoot entry is malformed: ${JSON.stringify(e)}`);
+            for (const d of e.drops) {
+                if (d.item !== item) continue;
+                const y = meanDrop(d, `entityLoot ${e.entity}`);
+                if (y !== null) out.push({ entity: e.entity, yield: y });
+            }
+        }
+        return out;
+    };
+    const success = (item, verb) => {
+        const p = edgeSuccess(item, verb);   // verb null: the item's edge, whatever its verb
+        if (typeof p !== 'number' || !(p > 0) || p > 1) throw new Error(`[fix96] edgeSuccess(${item}, ${verb}) must be in (0, 1], got ${JSON.stringify(p)}`);
+        return p;
+    };
+    // expected units: count / (yield per source x observed success of the edge)
+    const expected = (rem, perSource, item, verb) => rem / (perSource * success(item, verb));
     // a block that is not an item (water, carrots ...) has no recipe in the game data; it can only be collected
     const recipes = item => (Object.hasOwn(registry.itemsByName, item) ? recipesOf(itemId(item)) : []).map(r => ({
         yield: r.result.count,
@@ -100,7 +160,7 @@ export function obtainPlanner({ registry, recipesOf, known, proven }) {
                 const short = want - Math.min(has(sim, ing.item), want);
                 const sub = plan(ing.item, want, sim, onPath, ctx, false);
                 if (!sub) { ok = false; break; }
-                if (short > 0) missing.push({ item: ing.item, count: short, how: sub.how });
+                if (short > 0) missing.push({ item: ing.item, count: short, how: sub.how, input: sub.input });
                 sim = sub.inv; cost = add(cost, sub.cost); steps.push(...sub.steps);
             }
             if (!ok) continue;
@@ -111,28 +171,55 @@ export function obtainPlanner({ registry, recipesOf, known, proven }) {
         // raw: collected from a source block (its harvest tool planned the same way), or obtained some other way when no
         // block yields it — the latter only when the game data has no acyclic recipe or the item is known (learned/observed)
         const src = sources(item);
-        const isKnown = known(item, src);
-        const unknown = isKnown ? 0 : rem;
+        // fix96: a producer edge that ran and never succeeded is not a known way to get the item (86 of 86 apple runs failed
+        //        with oak_leaves in sight); its expected units count as unknown until a run succeeds.
+        const failing = proven(item) === false && success(item, null) < 1;
+        const isKnown = known(item, src) && !failing;
         const opts = [...crafts];
+        // learned furnace edges: plan the input, then smelt it (one step)
+        const ins = smeltInputs(item);
+        if (!Array.isArray(ins)) throw new Error(`[fix96] smeltInputs(${item}) must return an array`);
+        for (const input of ins) {
+            const sub = plan(input, rem, { ...inv }, onPath, ctx, false);
+            if (!sub) continue;
+            const units = expected(rem, 1, item, 'smelt') - rem;   // the input's own units are in sub.cost; this adds the edge's failures
+            opts.push({ cost: add(sub.cost, [0, units, units, 1]), inv: sub.inv, steps: [...sub.steps, { verb: 'smelt', item, count: rem, input }], how: 'smelt', input, missing: rem - Math.min(has(inv, input), rem) > 0 ? [{ item: input, count: rem - Math.min(has(inv, input), rem), how: sub.how, input: sub.input }] : [], ingredients: [{ item: input, count: rem }] });
+        }
         if (src.length) {
+            const units = expected(rem, blockYield(item), item, 'collect');
+            const unknown = isKnown ? 0 : units;
             const tools = toolsNeeded(item, inv);
-            if (!tools) opts.push({ cost: [0, unknown, rem, 1], inv, steps: [{ verb: 'collect', item, count: rem }], how: 'collect', missing: [], ingredients: [] });
+            if (!tools) opts.push({ cost: [0, unknown, units, 1], inv, steps: [{ verb: 'collect', item, count: rem }], how: 'collect', missing: [], ingredients: [] });
             else {
                 const withTool = [];
                 for (const t of tools) {
                     const sub = plan(t, 1, { ...inv }, onPath, ctx, false);
                     if (!sub) continue;
                     sub.inv[t] = has(sub.inv, t) + 1;   // a tool is kept, not consumed
-                    withTool.push({ cost: add(sub.cost, [0, unknown, rem, 1]), inv: sub.inv, steps: [...sub.steps, { verb: 'collect', item, count: rem }], how: 'collect', tool: t, missing: [{ item: t, count: 1, how: sub.how }], ingredients: [] });
+                    withTool.push({ cost: add(sub.cost, [0, unknown, units, 1]), inv: sub.inv, steps: [...sub.steps, { verb: 'collect', item, count: rem }], how: 'collect', tool: t, missing: [{ item: t, count: 1, how: sub.how, input: sub.input }], ingredients: [] });
                 }
                 if (!withTool.length) ctx.unobtainable.add(`${item} from ${src.join('/')} (needs one of ${tools.join(', ')}; none obtainable without a cycle)`);
                 opts.push(...withTool);
             }
-        } else if (!crafts.length || isKnown) opts.push({ cost: [isKnown ? 0 : 1, unknown, rem, 1], inv, steps: [{ verb: 'obtain', item, count: rem }], how: 'obtain', missing: [], ingredients: [] });
+        } else {
+            const mobs = entitySources(item);
+            if (mobs.length) {
+                const best = Math.max(...mobs.map(m => m.yield));
+                const units = expected(rem, best, item, 'obtain');
+                opts.push({ cost: [0, isKnown ? 0 : units, units, 1], inv, steps: [{ verb: 'obtain', item, count: rem }], how: 'obtain', from: mobs.map(m => m.entity), missing: [], ingredients: [] });
+            } else if (!crafts.length || isKnown) {
+                const units = expected(rem, 1, item, 'obtain');
+                opts.push({ cost: [isKnown ? 0 : 1, isKnown ? 0 : units, units, 1], inv, steps: [{ verb: 'obtain', item, count: rem }], how: 'obtain', missing: [], ingredients: [] });
+            }
+        }
         return pick(opts, ctx, item);
     }
 
-    const taskFor = (how, item, count) => {
+    const taskFor = (how, item, count, input) => {
+        if (how === 'smelt') {
+            if (typeof input !== 'string' || input.length === 0) throw new Error(`[fix96] taskFor: a smelt of ${item} needs its input`);
+            return `Smelt ${count} ${input} into ${count} ${item}`;
+        }
         if (how === 'craft') return `Craft ${count} ${item}`;
         if (how === 'collect') return `Collect ${count} ${item}`;
         if (how === 'obtain') return `Obtain ${count} ${item}`;
@@ -154,11 +241,12 @@ export function obtainPlanner({ registry, recipesOf, known, proven }) {
             if (!Array.isArray(best.ingredients)) throw new Error(`[fix92] plan for ${item} has no direct ingredient list`);
             return {
                 how: best.how,
-                task: taskFor(best.how, item, count),
+                task: taskFor(best.how, item, count, best.input),
                 tool: Object.hasOwn(best, 'tool') ? best.tool : null,
+                from: Object.hasOwn(best, 'from') ? best.from : [],
                 ingredients: best.ingredients,
-                steps: best.missing.map(m => ({ item: m.item, count: m.count, task: taskFor(m.how, m.item, m.count) })),
-                plan: best.steps.map(s => taskFor(s.verb, s.item, s.count)),
+                steps: best.missing.map(m => ({ item: m.item, count: m.count, task: taskFor(m.how, m.item, m.count, m.input) })),
+                plan: best.steps.map(s => taskFor(s.verb, s.item, s.count, s.input)),
                 cycles: [...ctx.cycles],
                 ties: [...ctx.ties],
                 cost: best.cost,

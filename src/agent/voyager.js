@@ -500,6 +500,7 @@ export class Voyager {
         this._assertOneFunctionSources();   // fix82
         this._polyMerge();
         this._extractShared();
+        this._reportWatchdogKill(watchdogEvidencePath(`./bots/${agent.name}`));   // fix96
         this._settleDeadTrials(watchdogEvidencePath(`./bots/${agent.name}`));   // fix65: a run that killed the previous process counts
         // fix50: assert no prefixed calls in prompt sources (fail loud at load time)
         if (this.agent?.prompter?.profile) {
@@ -2209,6 +2210,20 @@ Use only c; no other globals.`;
     // counts the hang against the deepest library skill on the blocked call stack, in the version that ran: a trial
     // candidate's trial fails, an incumbent (a just-promoted one too) records a failed run. Harness bookkeeping
     // ("<stack> <- (psn trace)") is nobody's skill: loud, not counted.
+    // fix96: the previous process's watchdog kill, printed once in full (the bot API call that was running and the staged code),
+    //        so the log of the restart holds what blocked. The file is marked reported, not removed (_settleDeadTrials reads it).
+    _reportWatchdogKill(evidencePath) {
+        if (!existsSync(evidencePath)) return;
+        const ev = JSON.parse(readFileSync(evidencePath, 'utf8'));
+        if (ev.reported === true) return;
+        const code = Object.hasOwn(ev, 'code') && ev.code !== null ? ev.code : null;
+        console.error(`!!! [watchdog] previous process ${ev.pid} was SIGKILLed at ${ev.at} after ${ev.silentMs}ms without a main-loop turn; `
+            + `phase ${ev.phases.join(' <- ')}; skill ${ev.skill}; stack ${ev.stack}; bot API call ${Object.hasOwn(ev, 'call') ? ev.call : '(not recorded by this watchdog version)'}`);
+        console.error(code === null
+            ? '!!! [watchdog] no staged code was recorded for that kill'
+            : `!!! [watchdog] staged code running at the kill (${code.label}, staged ${code.at}):\n${code.source}`);
+        writeAtomic(evidencePath, JSON.stringify({ ...ev, reported: true }));
+    }
     _settleDeadTrials(evidencePath) {
         if (!existsSync(this._trialJournalFile)) return;
         const j = JSON.parse(readFileSync(this._trialJournalFile, 'utf8'));
@@ -3199,7 +3214,33 @@ Use only c; no other globals.`;
                 return memo.get(item);
             },
             proven: item => Object.hasOwn(this.progress.recipeEdges, item) && this.progress.recipeEdges[item].status === 'proven',
+            edgeSuccess: (item, verb) => this._edgeSuccess(item, verb),
+            smeltInputs: item => this._learnedSmeltInputs(item),
         });
+    }
+    // fix96: observed success of an item's producer edge (progress.recipeEdges runs/fails), the fix90 posterior. 1 when there is
+    //        no edge, or the edge is another verb than the one asked (verb null: whatever its verb).
+    _edgeSuccess(item, verb) {
+        if (!Object.hasOwn(this.progress.recipeEdges, item)) return 1;
+        const e = this.progress.recipeEdges[item];
+        if (typeof e.task !== 'string' || typeof e.runs !== 'number' || typeof e.fails !== 'number') throw new Error(`[fix96] recipeEdges[${item}] is malformed: ${JSON.stringify(e)}`);
+        if (verb !== null) {
+            const g = this._resolveGoal(e.task);
+            const edgeVerb = Object.hasOwn(g, 'verb') ? String(g.verb).toLowerCase() : e.task.split(/\s+/)[0].toLowerCase();
+            if (edgeVerb !== verb) return 1;
+        }
+        return this._posteriorMean(e.runs - e.fails, e.fails);
+    }
+    // fix96: furnace recipes are not in the game data. A "Smelt N <in> into N <out>" goal that succeeded is a learned edge in -> out.
+    _learnedSmeltInputs(item) {
+        if (!this.progress.goalStats || typeof this.progress.goalStats !== 'object') throw new Error('[fix96] progress.goalStats required to read learned smelt edges');
+        const out = new Set();
+        for (const [key, st] of Object.entries(this.progress.goalStats)) {
+            if (!(st.success > 0)) continue;
+            const sm = smeltGoal(key.split('::')[0]);
+            if (sm !== null && sm.item === item && sm.input !== item) out.add(sm.input);
+        }
+        return [...out];
     }
     // fix81: the goal key a subgoal chain is seeking: an item goal seeks the item, an ensure goal the block PLACED nearby
     _goalKey(goal) {
@@ -3677,9 +3718,25 @@ Use only c; no other globals.`;
     }
     // fix81: the curriculum's BLOCKERS line, from the structured needs of failed goals (_chainNeeds); a need is resolved once held.
     //        fix91b: anyOf renders as "one of a, b, c" (the full list; other anyOf text joins every name, it does not truncate).
+    // fix96: a blocker is what an OPEN goal lacks. _chainNeeds writes it together with the goal's retry entry in
+    //        progress.subgoals; once that entry has left the queue (run, dropped as stale, backed off) the goal is no
+    //        longer pursued and its need is not a blocker of anything. Those rows used to stay forever (47 rows, 44 of
+    //        them for goals no longer queued, e.g. "needs 395 torch" from Nov 6) and were ~9.7k chars of the curriculum prompt.
+    _openGoalTasks() {
+        if (!Object.hasOwn(this.progress, 'subgoals')) return new Set();
+        if (!Array.isArray(this.progress.subgoals)) throw new Error(`[fix96] progress.subgoals must be an array, got ${JSON.stringify(this.progress.subgoals)}`);
+        return new Set(this.progress.subgoals.map(s => s.task));
+    }
     _blockerHint(inv) {
-        this.progress.blockers = this.progress.blockers.filter(b => !this._blockerSatisfied(b, inv));
-        if (this.progress.blockers.length > 0) this._saveProgress();
+        const open = this._openGoalTasks();
+        const closed = this.progress.blockers.filter(b => !open.has(b.task));
+        if (closed.length > 0) {
+            const tasks = [...new Set(closed.map(b => b.task))];
+            console.log(`[fix96] ${closed.length} blocker(s) dropped: their goal is no longer queued (${tasks.map(t => JSON.stringify(t)).join(', ')})`);
+        }
+        const before = this.progress.blockers.length;
+        this.progress.blockers = this.progress.blockers.filter(b => open.has(b.task) && !this._blockerSatisfied(b, inv));
+        if (this.progress.blockers.length !== before) this._saveProgress();
         const blockers = this.progress.blockers;
         return blockers.length > 0
             ? `\nBLOCKERS (prioritize these - what failed goals lack): ${blockers.map(b => `"${b.task}" needs ${b.count} ${this._blockerLabel(b)} (${b.reason})`).join('; ')}`
@@ -4240,7 +4297,7 @@ Use only c; no other globals.`;
             const isPrimitive = s.primitive || s.seeded;
             if (!frees && !isPrimitive) return s.name;
             const learned = frees ? ` (observed: frees ${eff.freed.toFixed(1)} inventory slots/run over ${eff.n} runs)` : '';
-            return `${s.name}: ${desc.slice(0, 120)}${learned}`;
+            return `${s.name}: ${desc}${learned}`;   // fix96: whole description (23 of 40 were cut mid-sentence at 120 chars)
         });
     }
     // fix47: retrieve relevant built-in API functions by embedding search + skill deps
@@ -4330,8 +4387,8 @@ Use only c; no other globals.`;
     }
     
     // fix47: per-prompt breakdown logging (uses shared helper, no magic threshold)
-    _logPromptBreakdown(kind, sections) {
-        return logPromptBreakdown(kind, sections);
+    _logPromptBreakdown(kind, sections, sent) {
+        return logPromptBreakdown(kind, sections, sent);
     }
     // fix70 (blame-aware accounting): when the traced call `name` threw and the error's top frame is outside the staged program
     // (thrownIn: the seeded library, mineflayer, node), the fault is counted against THAT code in progress.libraryFaults
@@ -4884,7 +4941,7 @@ Use only c; no other globals.`;
 Return 2-4 concrete, verifiable subgoals, in order, that together achieve the goal; each must be doable in a few minutes by ONE small reusable skill. Use the failure reason and the state. Do not repeat the goal itself.
 Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
         // fix39: enriched known_skills with descriptions for primitives and space-freeing skills
-        const user = `goal: ${task}\nwhy it failed: ${String(reason).slice(0, 600)}\ndeath_hotspots: ${this._deathHotspots()}\n${this._stateText(this.observe())}\nknown_skills: ${JSON.stringify(this._knownSkillsFacts())}`;
+        const user = `goal: ${task}\nwhy it failed: ${String(reason)}\ndeath_hotspots: ${this._deathHotspots()}\n${this._stateText(this.observe())}\nknown_skills: ${JSON.stringify(this._knownSkillsFacts())}`;
         let subs = [];
         try { subs = (parseLocalJSON(await this._askLocal(system, user, this._inferMeta('curriculum-decompose', { system, user })), ['subgoals']).subgoals || []).map(t => String(t).trim()).filter(t => t && t !== task && !validateTask(t)).slice(0, 4); }
         catch (e) { console.log(`[psn] decompose FAILED for "${task}": ${e.message}`); return false; }
@@ -5149,6 +5206,13 @@ Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
         if (last === null) throw new Error(`[fix90] ${task} counts ${f} failure(s) in this state but none are recorded`);
         return `backed off: "${task}" failed in this state (${last.reason}; state ${key}; posterior success ${m.toFixed(2)}); propose something else`;
     }
+    // fix96: failure text written by a backoff carries the full state key ("state inv:...;near:..."). When that key is the
+    //        state the prompt already shows, the copy says nothing new: it is named "the current state" (lossless).
+    _withCurrentState(text, key) {
+        if (typeof text !== 'string') throw new Error(`[fix96] failure text must be a string, got ${JSON.stringify(text)}`);
+        if (typeof key !== 'string' || key.length === 0) throw new Error('[fix96] current state key required');
+        return text.split(`state ${key}`).join('the current state');
+    }
     // Failures recorded in the state the curriculum is looking at, for the prompt.
     _sameStateFailureHint(state) {
         const rows = this._goalFailStates().filter(g => g.ok !== true);
@@ -5164,9 +5228,10 @@ Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
         const parts = [];
         for (const [task, g] of byTask) {
             const { s, f } = this._stateCounts(task, key);
-            parts.push(`"${task}" failed because ${g.reason} (state ${key}; posterior success ${this._posteriorMean(s, f).toFixed(2)})`);
+            parts.push(`"${task}" failed because ${this._withCurrentState(g.reason, key)} (posterior success ${this._posteriorMean(s, f).toFixed(2)})`);
         }
-        return `\nfailed_in_this_state (the state has not changed — propose a different task): ${parts.join('; ')}`;
+        // fix96: every row here is in the current state (key); it is named once, not once per row
+        return `\nfailed_in_this_state (the state has not changed — propose a different task; current state ${key}): ${parts.join('; ')}`;
     }
     // fix55: gate for a proposed task: syntax check, one goal resolver, learned backoff (planner proposals only).
     // fix90: when the caller passes the state, backoff is the posterior in that state.
@@ -5260,23 +5325,36 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "task": "...", "contex
         const recoveryHint = recText ? `\n${recText}` : '';
         const hungerHint = hunText ? `\n${hunText}` : '';
         const failStateHint = this._sameStateFailureHint(state);   // fix90: goal, reason, state of failures in this state
-        const user = `known_skills: ${JSON.stringify(knownSkillsFacts)}
-replayable_tasks (cheap, no new code needed): ${JSON.stringify(replayableTasks)} plus any "Mine N <block or ore>", "Collect N <log>", "Get N <item>", "Smelt N <raw> into N <out>", "Kill N <mob>", "Harvest N <crop>"
-completed_tasks: ${JSON.stringify(this.progress.completed.slice(-30))}
-failed_tasks: ${JSON.stringify(this.progress.failed.slice(-15))}${blockerHint}${edibleHint}${recoveryHint}${hungerHint}${failStateHint}
+        const stateKey = this._goalStateKey(state);
+        const completedText = JSON.stringify(this.progress.completed.slice(-30));
+        const failedText = JSON.stringify(this.progress.failed.slice(-15).map(f => this._withCurrentState(f, stateKey)));
+        const replayableText = JSON.stringify(replayableTasks);
+        const knownSkillsText = JSON.stringify(knownSkillsFacts);
+        const user = `known_skills: ${knownSkillsText}
+replayable_tasks (cheap, no new code needed): ${replayableText} plus any "Mine N <block or ore>", "Collect N <log>", "Get N <item>", "Smelt N <raw> into N <out>", "Kill N <mob>", "Harvest N <crop>"
+completed_tasks: ${completedText}
+failed_tasks: ${failedText}${blockerHint}${edibleHint}${recoveryHint}${hungerHint}${failStateHint}
 --- state (compact) ---
 ${compactStateText}
 current_health: ${Math.round(bot.health)}/${vmax.health}\ncurrent_food: ${bot.food}/${vmax.food} (${vmax.food}/${vmax.food} = full)${this._cursorLimited() ? '\nIMPORTANT: the code-writing model is unavailable right now, so ONLY propose a task from replayable_tasks or "Mine N <block>".' : ''}${workflowHints ? '\n' + workflowHints : ''}`;   // fix31: slow-changing lists first so Ollama reuses the cached prompt prefix
         const facts = recipeFacts(this.progress.failed.slice(-5).join(' '));
         const finalUser = facts ? user + '\n' + facts : user;
         // fix47: per-prompt breakdown logging for curriculum
+        // fix96: every section of the sent prompt is counted; framing is the fixed text around them (was ~half the prompt unlogged)
         this._logPromptBreakdown('curriculum', {
             system: system.length,
-            skills: JSON.stringify(knownSkillsFacts).length,
+            skills: knownSkillsText.length,
+            replayable: replayableText.length,
+            completed: completedText.length,
+            failed: failedText.length,
+            blockers: blockerHint.length,
+            edible: edibleHint.length,
+            vitals: recoveryHint.length + hungerHint.length,
+            failState: failStateHint.length,
             state: compactStateText.length,
-            history: JSON.stringify(this.progress.completed.slice(-30)).length + JSON.stringify(this.progress.failed.slice(-15)).length,
+            workflows: workflowHints ? workflowHints.length : 0,
             recipes: facts.length
-        });
+        }, system.length + finalUser.length);
         return parseLocalJSON(await this._askLocal(system, finalUser, this._inferMeta('curriculum', { system, user: finalUser })), ['reasoning', 'task', 'context']);
     }
 
@@ -5795,6 +5873,14 @@ IMPORTANT: All functions use bare names. Do NOT write skills.goToPosition - writ
         let lastRejected = null;
         for (let att = 1; att <= 2; att++) {   // fix19 (3): one retry with the rejected candidate and its exact reason
             let reply;
+            // fix96: what the repair prompt is made of (repair prompts reached 33k chars; nothing is cut now, so one that does
+            //        not fit fails loudly and this line says which part grew)
+            const kidsText = kids.map(k => '// ' + k.description + '\n' + signatureOf(k.code, k.name)).join('\n');
+            const historyText = (e.repairHistory || []).map((h, i) => `${i + 1}. [${h.outcome || 'pending'}] ${h.kind}: ${h.evidence}\n   change: ${h.desc}`).join('\n');
+            this._logPromptBreakdown('repair', {
+                system: system.length, evidence: String(q.evidence).length, trace: String(q.trace).length, code: e.code.length,
+                kids: kidsText.length, history: historyText.length, lessons: awmHints ? awmHints.length : 0, retry: extra.length,
+            }, system.length + user.length + extra.length);
             try { reply = await this._ask(system, user + extra, this._inferMeta('repair', { system, user: user + extra })); } catch (err) { console.log(`[psn] repair FAILED for ${e.name}: ${err.message}`); return false; }
             const ident = executableIdentity(t => this._hashReply(t), reply, extractCode);
             if (lastRejected) {
@@ -6413,23 +6499,24 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             // fix47: per-prompt breakdown logging
             if (i === 1) {
                 this._logPromptBreakdown('code', {
-                    system: system.length,
+                    system: system.length - apiList.length,   // fix96: apiList is inside system; counted once, as prelude
                     skills: ctx.length,
                     prelude: apiList.length,
                     state: compactStateText.length,
                     task: task.length + (proposal.context || '').length,
                     retry: 0
-                });
+                }, system.length + user.length);
                 console.log(`[voyager] code prompt: ${shown.size} of ${this.skills.filter(s => !s.demoted).length} skills in the catalogue (relevant + deps), ${Math.min(3, related.length)} with source; prompt ${system.length + user.length} chars`);
             } else {
                 // Log retry prompt size breakdown
                 this._logPromptBreakdown('code-retry', {
-                    system: system.length,
+                    system: system.length - apiList.length,
                     skills: ctx.length,
+                    prelude: apiList.length,
                     state: compactStateText.length,
                     history: lastCode.length,
-                    retry: feedback.length
-                });
+                    retry: feedback.length + dupeEscalation.length
+                }, system.length + user.length);
             }
             const reply = await this._ask(system, user, this._inferMeta(i === 1 ? 'compose' : 'compose-retry', { system, user }));
             // fix37: duplicate-reply detection - hash and compare to previous
@@ -7188,54 +7275,55 @@ Voyager.SEEDED_PRIMITIVES = [
             }
         }
         
-        // fix47: if can't craft, try to craft missing ingredients (generic: no hard-coded names/ratios)
-        if (!canCraft && !hasTable && allRecipes.length) {
-            const tableRecipe = allRecipes[0];
-            const ingredients = tableRecipe.delta?.filter(d => d.count < 0) || [];
-            
-            for (const ing of ingredients) {
-                const ingItem = bot.registry.items[ing.id];
-                if (!ingItem) continue;
-                const have = inv[ingItem.name] || 0;
-                const need = Math.abs(ing.count);
-                if (have >= need) continue;
-                
-                const shortfall = need - have;
-                // Find a 2x2 recipe (no table) that produces this ingredient
-                const ingRecipes = bot.recipesAll(ingItem.id, null, null);
-                let crafted = false;
-                
-                for (const ingRecipe of ingRecipes) {
-                    // Check if we have the ingredients for this recipe
-                    const subIngs = ingRecipe.delta?.filter(d => d.count < 0) || [];
-                    const canCraftIng = subIngs.every(sub => {
-                        const subItem = bot.registry.items[sub.id];
-                        return subItem && (inv[subItem.name] || 0) >= Math.abs(sub.count);
-                    });
-                    
-                    if (canCraftIng) {
-                        // Compute how many times to craft based on recipe output
-                        if (!ingRecipe.result?.count) { log(bot, \`FAILED: ensureCraftingTable - recipe for \${ingItem.name} has no result.count\`); return false; }
-                        const resultCount = ingRecipe.result.count;
-                        const craftTimes = Math.ceil(shortfall / resultCount);
-                        
-                        console.log(\`[ensureCraftingTable] crafting \${craftTimes}x \${ingItem.name} (produces \${resultCount} each)...\`);
-                        await bot.craft(ingRecipe, craftTimes, null);
-                        inv = getInventoryCounts(bot);
-                        crafted = true;
-                        break;
+        // fix96: every crafting_table recipe is considered (the game data has one per plank type). This used to read only
+        //        allRecipes[0], the oak_planks one, so a bot holding stripped_cherry_wood (4 cherry_planks, a table) was told it
+        //        "needs 4 more oak_planks but cannot craft it (no 2x2 recipe ...)" and went looking for oak logs underground.
+        if (!canCraft && !hasTable) {
+            const held = name => (Object.hasOwn(inv, name) ? inv[name] : 0);
+            const variants = [];
+            for (const tableRecipe of allRecipes) {
+                if (!Array.isArray(tableRecipe.delta)) { log(bot, 'FAILED: ensureCraftingTable - a crafting_table recipe has no delta'); return false; }
+                const short = [];
+                for (const ing of tableRecipe.delta.filter(d => d.count < 0)) {
+                    const ingItem = bot.registry.items[ing.id];
+                    if (!ingItem) { log(bot, \`FAILED: ensureCraftingTable - recipe ingredient id \${ing.id} is not an item\`); return false; }
+                    const need = -ing.count;
+                    if (held(ingItem.name) < need) short.push({ item: ingItem, need, count: need - held(ingItem.name) });
+                }
+                // a shortfall is covered when one of its own recipes (2x2: no table) runs on what is held now
+                const steps = [], uncovered = [];
+                for (const sh of short) {
+                    let found = null;
+                    for (const r of bot.recipesAll(sh.item.id, null, null)) {
+                        if (!r.result || typeof r.result.count !== 'number') { log(bot, \`FAILED: ensureCraftingTable - recipe for \${sh.item.name} has no result.count\`); return false; }
+                        const times = Math.ceil(sh.count / r.result.count);
+                        const subs = r.delta.filter(d => d.count < 0).map(d => ({ item: bot.registry.items[d.id], count: -d.count * times }));
+                        if (subs.every(x => x.item && held(x.item.name) >= x.count)) { found = { r, times }; break; }
                     }
+                    if (found) steps.push({ sh, ...found });
+                    else uncovered.push(sh);
                 }
-                
-                if (!crafted && shortfall > 0) {
-                    // fix51: fail loud with structured prerequisite info for decomposition/needs-produces
-                    __mcPreconditionUnmet__(bot, { need: { item: ingItem.name, count: shortfall, reason: 'ingredients' } });
-                    log(bot, \`PREREQUISITE FAILED: ensureCraftingTable needs \${shortfall} more \${ingItem.name} but cannot craft it (no 2x2 recipe or missing sub-ingredients). Decompose to obtain \${ingItem.name} first.\`);
-                    return false;
-                }
+                variants.push({ short, steps, uncovered });
             }
-            
-            // Retry table craft after ingredients
+            const workable = variants.find(v => v.uncovered.length === 0);
+            if (!workable) {
+                // every variant lacks something no held item makes. When each lacks exactly one ingredient, any one of them
+                // will do (one of the plank types): the need is anyOf, counted as the recipe's amount of one member.
+                const single = variants.every(v => v.uncovered.length === 1);
+                const counts = [...new Set(variants.map(v => (single ? v.uncovered[0].need : null)))];
+                const need = single && counts.length === 1
+                    ? { anyOf: [...new Set(variants.map(v => v.uncovered[0].item.name))], count: counts[0], reason: 'ingredients' }
+                    : { item: variants[0].uncovered[0].item.name, count: variants[0].uncovered[0].count, reason: 'ingredients' };
+                __mcPreconditionUnmet__(bot, { need });
+                const named = Object.hasOwn(need, 'anyOf') ? \`\${need.count} of one of \${need.anyOf.join(', ')}\` : \`\${need.count} \${need.item}\`;
+                log(bot, \`PREREQUISITE FAILED: ensureCraftingTable needs \${named}: none of the \${variants.length} crafting_table recipes can be made from the inventory (each lacks an ingredient whose own recipes need items not held). Decompose to obtain it first.\`);
+                return false;
+            }
+            for (const st of workable.steps) {
+                console.log(\`[ensureCraftingTable] crafting \${st.times}x \${st.sh.item.name} (produces \${st.r.result.count} each)...\`);
+                await bot.craft(st.r, st.times, null);
+            }
+            inv = getInventoryCounts(bot);
             recipes = tableId ? bot.recipesFor(tableId, null, 1, null) : [];
             for (const recipe of recipes) {
                 const beforeCount = (getInventoryCounts(bot)['crafting_table'] || 0);
@@ -7248,25 +7336,10 @@ Voyager.SEEDED_PRIMITIVES = [
                     break;
                 }
             }
-        }
-        
-        // FAIL loud if still can't craft - provide prerequisite info for decomposition
-        if (!canCraft && !hasTable) {
-            inv = getInventoryCounts(bot);
-            const missingIngredients = [];
-            const recipe = allRecipes[0];
-            const ingredients = recipe.delta?.filter(d => d.count < 0) || [];
-            for (const ing of ingredients) {
-                const ingItem = bot.registry.items[ing.id];
-                if (ingItem) {
-                    const have = inv[ingItem.name] || 0;
-                    const need = Math.abs(ing.count);
-                    if (have < need) missingIngredients.push({ item: ingItem.name, count: need - have, have });
-                }
+            if (!canCraft) {
+                log(bot, \`FAILED: ensureCraftingTable - crafted \${workable.steps.map(st => st.sh.item.name).join(', ')} but no crafting_table recipe is craftable from the inventory now (\${JSON.stringify(getInventoryCounts(bot))})\`);
+                return false;
             }
-            __mcPreconditionUnmet__(bot, { need: { item: missingIngredients[0].item, count: missingIngredients[0].count, reason: 'ingredients' } });
-            log(bot, \`PREREQUISITE FAILED: ensureCraftingTable cannot craft - missing: \${missingIngredients.map(m => \`\${m.item} (need \${m.count + m.have}, have \${m.have})\`).join(', ')}. Decompose to obtain prerequisites.\`);
-            return false;
         }
     }
     

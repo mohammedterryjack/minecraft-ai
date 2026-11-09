@@ -13,6 +13,8 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
+import { CALL_SLOT_BYTES } from '../src/utils/main_thread_watchdog.js';
+
 const WORKER = fileURLToPath(new URL('../src/utils/main_thread_watchdog_worker.mjs', import.meta.url));
 const LIMIT_MS = 50;
 
@@ -23,7 +25,8 @@ describe('fix79: watchdog worker writes its evidence once, complete, then parks'
         const victim = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1 << 30)'], { stdio: 'ignore' });
         const ctl = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 2));
         const { port1, port2 } = new MessageChannel();
-        const worker = new Worker(WORKER, { workerData: { sab: ctl.buffer, port: port2, pid: victim.pid, evidencePath: ev }, transferList: [port2], stderr: true });
+        const callLenSab = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT), callSab = new SharedArrayBuffer(CALL_SLOT_BYTES);   // fix96
+        const worker = new Worker(WORKER, { workerData: { sab: ctl.buffer, callLenSab, callSab, port: port2, pid: victim.pid, evidencePath: ev }, transferList: [port2], stderr: true });
         const errors = []; worker.on('error', e => errors.push(e));
         port1.postMessage({ phases: ['test'], skill: 'spin', stack: 'a <- b' });
         Atomics.store(ctl, 1, LIMIT_MS); Atomics.notify(ctl, 1);   // armed; no beats ever follow

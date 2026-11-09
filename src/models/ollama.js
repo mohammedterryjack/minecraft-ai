@@ -1,14 +1,20 @@
 import { strictFormat } from '../utils/text.js';
 import { Agent } from 'undici';
-import { recordCall, recordCut, callBound, requestShape, workOf, noteUnboundedCall, takeLearnedBound, learnedCharsPerToken, notePromptDensity, callDurationStore } from './call_durations.js';
+import { recordCall, recordCut, callBound, requestShape, workOf, noteUnboundedCall, takeLearnedBound } from './call_durations.js';
 import { inferenceTiming, formatOllamaTiming } from './inference_timing.js';
-import { resolveContextLength, promptBudget, estimateTokens, fitChatToBudget, parseContextOverflow } from '../agent/prompt_cut.js';
+import { parseContextOverflow, chatSectionSizes } from '../agent/prompt_cut.js';
 
 // fix60: Ollama with stream:false sends its response headers only after the whole generation, so undici's implicit
 // 300 s headersTimeout/bodyTimeout (the global Agent installed when cheerio loads undici) killed long but healthy local
 // calls with UND_ERR_HEADERS_TIMEOUT. A dedicated dispatcher with those implicit timers disabled (0) lets the call end
 // on Ollama's own reply or error, or on the connection failing.
 const OLLAMA_DISPATCHER = new Agent({ headersTimeout: 0, bodyTimeout: 0 });
+
+// fix96: Ollama's /api/chat defaults truncate:true (drops chat messages when the rendered prompt exceeds num_ctx)
+// and shift:true (drops context when generation reaches num_ctx). Both cut prompt text without saying so.
+// Off, a prompt that does not fit is an HTTP 400 naming its real token count, and a reply that runs out of
+// context ends with done_reason "length" (fix31 throws).
+export const NEVER_CUT_PROMPT = Object.freeze({ truncate: false, shift: false });
 
 export class Ollama {
     static prefix = 'ollama';
@@ -24,8 +30,6 @@ export class Ollama {
         let model = this.model_name || 'sweaterdog/andy-4:micro-q8_0';
         let messages = strictFormat(turns);
         messages.unshift({ role: 'system', content: systemMessage });
-        const budget = await this._promptBudget();
-        messages = this._fitToBudget(messages, budget);
         const maxAttempts = 5;
         let attempt = 0;
         let finalRes = null;
@@ -40,6 +44,7 @@ export class Ollama {
                     messages: messages,
                     stream: false,
                     ...(this.params || {}),
+                    ...NEVER_CUT_PROMPT,
                     keep_alive: this._keepAlive()
                 }, meta);
                 if (apiResponse?.done_reason === 'length') { truncated = apiResponse; }   // fix31
@@ -53,8 +58,7 @@ export class Ollama {
                 const message = err instanceof Error ? err.message : String(err);
                 const overflow = parseContextOverflow(message);
                 if (overflow) {
-                    this._noteOverflow(messages, overflow);
-                    throw new Error(`[fix94] Ollama context overflow: request is ${overflow.requestTokens} tokens and the model context is ${overflow.contextTokens} tokens (prompt budget ${budget}). ${message}`);
+                    throw new Error(`!!! [fix96] ${model}: prompt does not fit: ${overflow.requestTokens} tokens, context ${overflow.contextTokens} tokens; nothing was cut and nothing was sent to the model (message chars: ${chatSectionSizes(messages)}). ${message}`);
                 }
                 throw err instanceof Error ? err : new Error(message);
             }
@@ -84,53 +88,6 @@ export class Ollama {
         return finalRes;
     }
 
-    // Context the request will run in: options.num_ctx when the profile sets it, otherwise
-    // /api/show model_info <architecture>.context_length. num_predict, when set, stays free for generation.
-    async _promptBudget() {
-        const options = this.params && this.params.options;
-        const numPredict = options && Object.hasOwn(options, 'num_predict') ? options.num_predict : undefined;
-        if (options && Object.hasOwn(options, 'num_ctx')) return promptBudget(resolveContextLength(this.params, null).length, numPredict);
-        const show = await this._showModel();
-        return promptBudget(resolveContextLength(this.params, show).length, numPredict);
-    }
-
-    async _showModel() {
-        if (this._modelShown) return this._modelShown;
-        if (typeof this.model_name !== 'string' || this.model_name.length === 0) throw new Error('[fix94] ollama model name required for /api/show');
-        const url = new URL('/api/show', this.url);
-        const res = await fetch(url, {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ model: this.model_name }),
-            dispatcher: OLLAMA_DISPATCHER,
-        });
-        if (!res.ok) {
-            const text = await res.text();
-            throw new Error(`[fix94] /api/show failed for ${this.model_name}: ${res.status} ${text}`);
-        }
-        const body = await res.json();
-        this._modelShown = body;
-        return body;
-    }
-
-    _fitToBudget(messages, budget) {
-        if (!messages.every((message) => typeof message.content === 'string')) return messages;
-        const cpt = typeof this.model_name === 'string' ? learnedCharsPerToken(`${this.model_name} /api/chat`) : undefined;
-        const before = estimateTokens(messages.map((message) => message.content).join(''), cpt);
-        const fitted = fitChatToBudget(messages, budget, (text) => estimateTokens(text, cpt));
-        if (fitted.cut) console.log(`[fix94] ${this.model_name}: prompt cut from ${before} tokens to ${fitted.tokens} to fit context budget ${budget}`);
-        return fitted.messages;
-    }
-
-    _noteOverflow(messages, overflow) {
-        if (!callDurationStore()) return;
-        if (typeof this.model_name !== 'string' || this.model_name.length === 0) return;
-        if (overflow.requestTokens <= 0) return;
-        const chars = messages.reduce((sum, message) => sum + (typeof message.content === 'string' ? message.content.length : 0), 0);
-        if (chars <= 0) return;
-        notePromptDensity(`${this.model_name} /api/chat`, chars, overflow.requestTokens);
-    }
-
     // fix17: chat requests always carry the profile's keep_alive (mo_bot: -1 = keep loaded); missing -> fail loudly
     _keepAlive() {
         const k = this.params?.keep_alive;
@@ -142,7 +99,7 @@ export class Ollama {
     async embed(text) {
         // fix14: /api/embed, model pinned in memory (keep_alive -1); no fallback, fail loudly
         if (!this.model_name) throw new Error('[embed] no embedding model configured');
-        const res = await this.send('/api/embed', { model: this.model_name, input: text, keep_alive: -1 });
+        const res = await this.send('/api/embed', { model: this.model_name, input: text, keep_alive: -1, truncate: false });   // fix96: Ollama's default truncate:true cut long inputs silently
         const v = res?.embeddings?.[0];
         if (!Array.isArray(v) || !v.length) throw new Error(`[embed] ${this.model_name} returned no embedding`);
         return v;

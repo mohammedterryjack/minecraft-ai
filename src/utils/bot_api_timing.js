@@ -7,6 +7,25 @@
  * bot.__eventLoopStallThresholdMs (same keep_alive-derived threshold as the event-loop guard).
  * No new constants; no log until that threshold is learned.
  */
+import { mainThreadWatchdogStarted, noteMainThreadCall } from './main_thread_watchdog.js';
+
+// fix96: one argument as the kill evidence shows it: primitives as they are, a function as its name, an object by its
+// own primitive fields (a Vec3 is x,y,z; findBlocks options show maxDistance and count). Nothing is stringified deeply,
+// so a bot or a block (cyclic, large) costs no more than its own keys.
+export function describeApiArg(a) {
+    if (a === null || a === undefined) return String(a);
+    if (typeof a === 'function') return `fn ${a.name ? a.name : '(anonymous)'}`;
+    if (typeof a !== 'object') return JSON.stringify(a);
+    if (Array.isArray(a)) return `[${a.map(x => (x !== null && typeof x === 'object' ? 'obj' : describeApiArg(x))).join(',')}]`;
+    const fields = [];
+    for (const k of Object.keys(a)) {
+        const v = a[k];
+        if (v === null || typeof v !== 'object') fields.push(`${k}:${describeApiArg(v)}`);
+        else if (Array.isArray(v)) fields.push(`${k}:[${v.length}]`);
+    }
+    return `{${fields.join(',')}}`;
+}
+
 export function wrapBotForApiTiming(bot) {
     if (!bot) throw new Error('[bot_api_timing] bot is required');
     if (bot.__isBotApiTimingProxy === true) return bot;
@@ -36,12 +55,17 @@ export function wrapBotForApiTiming(bot) {
                     console.log(`[bot-api] ${String(prop)} ${ms}ms ctx=${ctx}`);
                 };
                 let ret;
+                // fix96: the watchdog worker reads this while the main thread is blocked inside the call
+                const noted = mainThreadWatchdogStarted();
+                if (noted) noteMainThreadCall(`${String(prop)}(${args.map(describeApiArg).join(', ')}) ctx=${tr.__psnStackStr != null ? String(tr.__psnStackStr) : '(no PSN trace)'}`);
                 try {
                     ret = raw.apply(tr, args);
                 } catch (e) {
+                    if (noted) noteMainThreadCall('');
                     done();
                     throw e;
                 }
+                if (noted) noteMainThreadCall('');
                 if (ret && typeof ret.then === 'function') {
                     return ret.then(
                         (v) => {

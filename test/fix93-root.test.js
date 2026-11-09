@@ -286,7 +286,7 @@ function foodRegistry() {
         },
         blocksByName: { wheat: { name: 'wheat', harvestTools: null } },
         blockLoot: { wheat: { drops: [{ item: 'wheat', silkTouch: false }] } },
-        entityLoot: { cow: { entity: 'cow', drops: [{ item: 'beef', dropChance: 1 }] } },
+        entityLoot: { cow: { entity: 'cow', drops: [{ item: 'beef', dropChance: 1, stackSizeRange: [1, 3] }] } },
         foodsByName: { bread: { name: 'bread', foodPoints: 5 }, beef: { name: 'beef', foodPoints: 3 } },
     };
 }
@@ -294,7 +294,7 @@ function foodRegistry() {
 describe('fix93 hunger backchain', () => {
     const registry = foodRegistry();
     const planner = (recipesOf = () => []) => obtainPlanner({
-        registry, recipesOf, known: () => false, proven: () => false,
+        registry, recipesOf, known: () => false, proven: () => false, edgeSuccess: () => 1, smeltInputs: () => [],
     });
     it('a held edible is eaten; a missing one is the cheapest game-data plan, including an entity drop', () => {
         assert.deepStrictEqual(heldEdible(edibleNames(registry), { bread: 2 }), ['bread']);
@@ -314,8 +314,17 @@ describe('fix93 hunger backchain', () => {
             entityDroppersFor: item => entityDroppers(registry, item),
         });
         assert.strictEqual(missing.executable, false);
-        assert.strictEqual(missing.item, 'bread');
-        assert.match(missing.task, /bread/);
+        // fix96: entity loot is a source, not an opaque obtain: 1 beef from one cow (expected 2 per kill) is cheaper than
+        //        3 wheat collected and crafted into bread
+        assert.strictEqual(missing.item, 'beef');
+        assert.strictEqual(missing.task, 'Obtain 1 beef');
+        const breadOnly = planFoodAcquisition({
+            edibles: ['bread'], inventory: {},
+            cheapest: (items, count, inv) => p.cheapest(items, count, inv),
+            prerequisites: (item, count, inv) => p.prerequisites(item, count, inv),
+            entityDroppersFor: item => entityDroppers(registry, item),
+        });
+        assert.match(breadOnly.task, /bread/);
         const beef = planFoodAcquisition({
             edibles: ['beef'], inventory: {},
             cheapest: (items, count, inv) => p.cheapest(items, count, inv),
@@ -348,9 +357,10 @@ describe('fix93 hunger backchain', () => {
             blockLoot: {
                 wheat: { drops: [{ item: 'wheat', silkTouch: false }] },
                 cobblestone: { drops: [{ item: 'cobblestone', silkTouch: false }] },
-                ore_block: { drops: [{ item: 'ore', silkTouch: false }] },
-                deep: { drops: [{ item: 'missing_pick', silkTouch: false }] },
+                ore_block: { drops: [{ item: 'ore', silkTouch: false, dropChance: 1, stackSizeRange: [1, 1] }] },
+                deep: { drops: [{ item: 'missing_pick', silkTouch: false, dropChance: 1, stackSizeRange: [1, 1] }] },
             },
+            entityLoot: {},
             foodsByName: { bread: { name: 'bread' } },
         };
         const withTool = obtainPlanner({
@@ -360,7 +370,7 @@ describe('fix93 hunger backchain', () => {
                 if (id === 3) return [{ result: { count: 1 }, delta: [{ id: 4, count: -3 }, { id: 3, count: 1 }] }];
                 return [];
             },
-            known: () => false, proven: () => false,
+            known: () => false, proven: () => false, edgeSuccess: () => 1, smeltInputs: () => [],
         });
         const bread = planFoodAcquisition({
             edibles: ['bread'], inventory: {},
@@ -370,7 +380,7 @@ describe('fix93 hunger backchain', () => {
         });
         assert.ok(bread.plan.some(step => step.includes('stone_pickaxe')), bread.plan.join(' | '));
         assert.ok(bread.plan.some(step => step.includes('cobblestone')), bread.plan.join(' | '));
-        const stuck = obtainPlanner({ registry: reg, recipesOf: () => [], known: () => false, proven: () => false });
+        const stuck = obtainPlanner({ registry: reg, recipesOf: () => [], known: () => false, proven: () => false, edgeSuccess: () => 1, smeltInputs: () => [] });
         assert.throws(() => planFoodAcquisition({
             edibles: ['ore'], inventory: {},
             cheapest: (items, count, inv) => stuck.cheapest(items, count, inv),

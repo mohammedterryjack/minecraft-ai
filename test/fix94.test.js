@@ -12,12 +12,9 @@ import {
     classifyBackendRefusal, latchDisconnect, applyDisconnect, latchBackendStopping,
     resumeWhenBackendReady, parentExitForChild, launchdWouldRestart, EXIT_BACKEND_READY,
 } from '../src/process/backend_unavailable.js';
-import {
-    contextLengthFromModelInfo, resolveContextLength, promptBudget, estimateTokens,
-    fitChatToBudget, parseContextOverflow,
-} from '../src/agent/prompt_cut.js';
-import { Ollama } from '../src/models/ollama.js';
-import { setCallDurationStore, learnedCharsPerToken } from '../src/models/call_durations.js';
+import { parseContextOverflow, chatSectionSizes } from '../src/agent/prompt_cut.js';
+import { Ollama, NEVER_CUT_PROMPT } from '../src/models/ollama.js';
+import { setCallDurationStore } from '../src/models/call_durations.js';
 
 const POLICY = { successfulExit: false };
 const DONE = '[12:06:01] [Server thread/INFO]: Done (2.5s)!\n';
@@ -257,116 +254,79 @@ describe('fix94 current run already Done', () => {
     });
 });
 
-describe('fix94 ollama context', () => {
-    it('the prompt budget is the reported context length, and the cut happens before that length', () => {
-        const reported = 64;
-        const show = { model_info: { 'qwen3.context_length': reported } };
-        const resolved = resolveContextLength({}, show);
-        assert.strictEqual(resolved.source, 'model_info');
-        assert.strictEqual(resolved.length, reported);
-        const longer = resolveContextLength({}, { model_info: { 'qwen2.context_length': reported + 30 } });
-        assert.strictEqual(longer.length, reported + 30);
-        const enforced = resolveContextLength({ options: { num_ctx: 40 } }, show);
-        assert.deepStrictEqual(enforced, { length: 40, source: 'num_ctx' });
-        assert.strictEqual(promptBudget(reported, 10), reported - 10);
-        const messages = [
-            { role: 'system', content: 'instructions' },
-            { role: 'user', content: 'u'.repeat(reported * 3) },
-        ];
-        const fitted = fitChatToBudget(messages, promptBudget(resolved.length, undefined), (text) => estimateTokens(text, undefined));
-        assert.strictEqual(fitted.cut, true);
-        assert.ok(fitted.tokens <= reported);
-        assert.strictEqual(fitted.tokens, reported);
+// fix96: the fix94 cut (keep a prefix, drop the tail, sized by a guessed chars-per-token) is gone. Mo: no prompt text is
+// ever cut. The whole prompt is sent with Ollama's own silent cuts off (truncate:false, shift:false); a prompt that does
+// not fit is Ollama's 400 with its real token count, thrown loudly, and nothing is learned from it to cut the next one.
+describe('fix96 ollama context: never cut', () => {
+    it('the 400 is parsed, and the overflow error names each message size', () => {
         const overflow = parseContextOverflow('Ollama 400: {"error":"request (8243 tokens) exceeds the available context size (8192 tokens), try increasing it"}');
         assert.deepStrictEqual(overflow, { requestTokens: 8243, contextTokens: 8192 });
-        assert.throws(() => contextLengthFromModelInfo({}), /none/);
-        assert.throws(() => resolveContextLength({}, null), /options\.num_ctx/);
-        assert.throws(
-            () => fitChatToBudget([{ role: 'system', content: 'x'.repeat(40) }], 8, () => 100),
-            /refusing to send/,
-        );
+        assert.strictEqual(chatSectionSizes([{ role: 'system', content: 'abc' }, { role: 'user', content: 'hello' }]), 'system=3,user=5');
+        assert.throws(() => chatSectionSizes([]), /messages required/);
+        assert.deepStrictEqual({ ...NEVER_CUT_PROMPT }, { truncate: false, shift: false });
     });
 
-    it('send cuts to the /api/show context length before /api/chat', async () => {
-        const reported = 48;
+    it('send passes the whole prompt with truncate:false and shift:false, and asks /api/show nothing', async () => {
         const seen = [];
         const server = await listen((req, res) => {
             let raw = '';
             req.on('data', (chunk) => { raw += chunk; });
             req.on('end', () => {
-                const body = JSON.parse(raw);
-                seen.push({ url: req.url, body });
-                if (req.url === '/api/show') {
-                    res.end(JSON.stringify({ model_info: { 'qwen3.context_length': reported } }));
-                    return;
-                }
-                const chars = body.messages.map((message) => message.content).join('').length;
-                if (chars > reported) {
-                    res.statusCode = 400;
-                    res.end(JSON.stringify({ error: 'request (900 tokens) exceeds the available context size (48 tokens), try increasing it' }));
-                    return;
-                }
-                res.end(chatReply('{"reasoning":"fit","task":"Mine 1 oak_log","context":"cut"}'));
+                seen.push({ url: req.url, body: JSON.parse(raw) });
+                res.end(chatReply('{"reasoning":"fit","task":"Mine 1 oak_log","context":"whole"}'));
             });
         });
         try {
-            setCallDurationStore({});
-            const ollama = new Ollama('qwen3', `http://127.0.0.1:${server.address().port}`, { keep_alive: -1 });
-            const reply = await ollama.sendRequest([{ role: 'user', content: 'u'.repeat(reported * 4) }], 'system prose');
-            assert.strictEqual(reply, '{"reasoning":"fit","task":"Mine 1 oak_log","context":"cut"}');
-            const show = seen.find((call) => call.url === '/api/show');
-            const chat = seen.find((call) => call.url === '/api/chat');
-            assert.ok(show);
-            assert.strictEqual(show.body.model, 'qwen3');
-            assert.ok(chat);
-            const sent = chat.body.messages.map((message) => message.content).join('').length;
-            assert.ok(sent <= reported, `sent ${sent} chars into a ${reported} context`);
-            assert.ok(sent > 0);
+            setCallDurationStore({ 'qwen3 /api/chat': { n: 1, cpt: 2.67 } });   // a learned density is not used to cut
+            const ollama = new Ollama('qwen3', `http://127.0.0.1:${server.address().port}`, { keep_alive: -1, options: { num_ctx: 48, num_predict: 8 } });
+            const user = 'u'.repeat(48 * 40);
+            const reply = await ollama.sendRequest([{ role: 'user', content: user }], 'system prose');
+            assert.strictEqual(reply, '{"reasoning":"fit","task":"Mine 1 oak_log","context":"whole"}');
+            assert.deepStrictEqual(seen.map((call) => call.url), ['/api/chat']);
+            const body = seen[0].body;
+            assert.strictEqual(body.truncate, false);
+            assert.strictEqual(body.shift, false);
+            assert.strictEqual(body.messages[0].content, 'system prose');
+            assert.strictEqual(body.messages[1].content, user, 'the user message reached Ollama whole');
         } finally {
             server.close();
+            setCallDurationStore({});
         }
     });
 
-    it('a context overflow throws (no canned reply) and the next send is cut from the reported density', async () => {
+    it('a prompt over the context throws loudly every time; nothing is learned and nothing is cut', async () => {
         const seen = [];
         const server = await listen((req, res) => {
             let raw = '';
             req.on('data', (chunk) => { raw += chunk; });
             req.on('end', () => {
-                const body = JSON.parse(raw || '{}');
-                seen.push(body);
-                const chars = body.messages.map((message) => message.content).join('').length;
-                if (chars > 80) {
-                    res.statusCode = 400;
-                    res.end(JSON.stringify({ error: 'request (8243 tokens) exceeds the available context size (8192 tokens), try increasing it' }));
-                    return;
-                }
-                res.end(chatReply('ok'));
+                seen.push(JSON.parse(raw || '{}'));
+                res.statusCode = 400;
+                res.end(JSON.stringify({ error: 'request (8243 tokens) exceeds the available context size (8192 tokens), try increasing it' }));
             });
         });
         try {
-            setCallDurationStore({ 'qwen3 /api/chat': { n: 1, cpt: 100 } });
+            const store = {};
+            setCallDurationStore(store);
             const ollama = new Ollama('qwen3', `http://127.0.0.1:${server.address().port}`, { keep_alive: -1, options: { num_ctx: 100 } });
             const user = 'y'.repeat(500);
-            await assert.rejects(
-                () => ollama.sendRequest([{ role: 'user', content: user }], 'system-instructions'),
-                (err) => {
-                    assert.match(err.message, /request is 8243 tokens/);
-                    assert.match(err.message, /model context is 8192 tokens/);
-                    assert.doesNotMatch(err.message, /My brain disconnected/);
-                    return true;
-                },
-            );
-            assert.ok(seen[0].messages.map((message) => message.content).join('').length > 80);
-            const learned = learnedCharsPerToken('qwen3 /api/chat');
-            assert.ok(learned < 1, `density learned from the 400, got ${learned}`);
-            const reply = await ollama.sendRequest([{ role: 'user', content: user }], 'system-instructions');
-            assert.strictEqual(reply, 'ok');
-            const second = seen[1].messages.map((message) => message.content).join('').length;
-            assert.ok(second <= 80, `second send was cut before the request (${second} chars)`);
+            for (let i = 0; i < 2; i++) {
+                await assert.rejects(
+                    () => ollama.sendRequest([{ role: 'user', content: user }], 'system-instructions'),
+                    (err) => {
+                        assert.match(err.message, /prompt does not fit: 8243 tokens, context 8192 tokens/);
+                        assert.match(err.message, /nothing was cut/);
+                        assert.match(err.message, /system=19,user=500/);
+                        return true;
+                    },
+                );
+            }
+            assert.strictEqual(seen.length, 2);
+            for (const body of seen) assert.strictEqual(body.messages[1].content, user);
+            assert.deepStrictEqual(store, {}, 'no density learned from the 400');
             const src = readFileSync(new URL('../src/models/ollama.js', import.meta.url), 'utf8');
+            assert.doesNotMatch(src, /fitChatToBudget|_fitToBudget|estimateTokens|learnedCharsPerToken|notePromptDensity|\/api\/show/);
             assert.doesNotMatch(src, /My brain disconnected/);
-            assert.doesNotMatch(src, /context length exceeded, trying again/i);
         } finally {
             server.close();
             setCallDurationStore({});
