@@ -2,6 +2,11 @@ const settings = {
     "minecraft_version": "1.20.4", // or specific version like "1.21.6"
     "host": "127.0.0.1", // or "localhost", "your.ip.address.here"
     "port": 25568, // set to -1 to automatically scan for open ports
+    // fix94: vanilla backend log directory. Confirmed from the iMac launcher
+    // ~/bin/start-minecraftserver-screen.sh, which cds to /Users/mohammedterry-jack/MinecraftServer
+    // (com.mo.minecraftserver ProgramArguments). The bot lives under ~/MinecraftBot; the server does not.
+    // No code default: a missing backend_log_dir throws.
+    "backend_log_dir": "/Users/mohammedterry-jack/MinecraftServer/logs",
     "auth": "offline", // or "microsoft"
 
     // the mindserver manages all agents and hosts the UI

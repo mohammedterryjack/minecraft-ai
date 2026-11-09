@@ -33,8 +33,9 @@ export class AgentProcess {
         agentProcess.on('exit', (code, signal) => {
             this.running = false;
             logoutAgent(this.name);
-            // Parent exits with the child's status. Exit 0 (backend-unavailable, or SIGINT) is a
-            // successful exit: KeepAlive SuccessfulExit false does not restart it. A crash stays nonzero.
+            // Parent exits with the child's status. Exit 0 (SIGINT) is a successful exit:
+            // KeepAlive SuccessfulExit false does not restart it. Exit 75 (backend ready) is the
+            // one respawn. A crash stays nonzero.
             const decided = parentExitForChild(code, signal);
             logExitCause(`agent child ${this.name} exited code=${code} signal=${signal}; parent exiting ${decided.code} (${decided.kind})`);
             process.exit(decided.code);

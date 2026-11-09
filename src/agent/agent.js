@@ -23,13 +23,18 @@ import { startMainThreadWatchdog, watchdogEvidencePath } from '../utils/main_thr
 import { inspect } from 'node:util';
 import { fatalExit, runUpdateLoop } from './fatal.js';   // fix59
 import { logExitCause, writeProcessLoud } from '../process/exit_log.js';
-import { applyDisconnect } from '../process/backend_unavailable.js';
+import { applyDisconnect, latchBackendStopping, resumeWhenBackendReady } from '../process/backend_unavailable.js';
+import { armBackendReady, requireBackendLogDir, configuredLink } from '../process/backend_ready.js';
 
 export class Agent {
     async start(load_mem=false, init_message=null, count_id=0) {
         this.last_sender = null;
         this.count_id = count_id;
         this._disconnectHandled = false;
+        this._waitingBackend = false;
+        this._backendLogDir = requireBackendLogDir(settings);
+        this._link = configuredLink(settings);
+        this._backendWatch = null;
 
         // Initialize components
         this.actions = new ActionManager(this);
@@ -81,20 +86,28 @@ export class Agent {
             return inspect(reason, { depth: 6, maxArrayLength: 50, breakLength: 120 });
         };
 
-        // Connection Handler. A backend refusal (proxy up, 127.0.0.1:25565 refused) is one
-        // terminal exit 0 so KeepAlive SuccessfulExit false does not respawn it. Anything else
-        // exits 1. Duplicate kicked/end/error callbacks do not exit again.
+        // Connection Handler. A backend refusal, or a disconnect after the server logged
+        // "Stopping server", stays in this process and watches backend_log_dir. The first
+        // Done line exits 75 (EX_TEMPFAIL) so launchd respawns once. Anything else exits 1.
+        // Duplicate kicked/end/error callbacks do not exit again.
         this._disconnectLatch = { latched: false };
         const onDisconnect = (event, reason) => {
+            this._disconnectHandled = true;
             const raw = verbatimReason(reason);
+            if (this._backendWatch) this._backendWatch.readNew();
+            if (this._backendWatch && this._backendWatch.sawStopping()) {
+                const outcome = latchBackendStopping(this._disconnectLatch, event, raw);
+                if (outcome.duplicate) return;
+                this._waitForBackend(outcome.kind);
+                return;
+            }
             applyDisconnect(this._disconnectLatch, event, raw, (code, outcome) => {
                 if (outcome.kind === 'backend-unavailable') {
-                    logExitCause(`[connection] backend-unavailable; ${outcome.evidence}`);
-                    log(this.name, `[connection] backend-unavailable; ${outcome.evidence}`);
-                } else {
-                    logExitCause(`[connection] ${event}; reason verbatim: ${raw}`);
-                    log(this.name, `[connection] ${event}; reason verbatim: ${raw}`);
+                    this._waitForBackend(outcome.kind);
+                    return;
                 }
+                logExitCause(`[connection] ${event}; reason verbatim: ${raw}`);
+                log(this.name, `[connection] ${event}; reason verbatim: ${raw}`);
                 process.exit(code);
             });
         };
@@ -107,6 +120,7 @@ export class Agent {
         initModes(this);
 
         this.bot.on('login', () => {
+            this._backendWatch = armBackendReady({ logDir: this._backendLogDir });
             console.log(this.name, 'logged in!');
             startMainThreadWatchdog(watchdogEvidencePath(`./bots/${this.name}`));   // fix64: off-thread; the guard below arms it with the learned keep_alive gap
             startEventLoopStallGuard(this.bot);
@@ -551,7 +565,30 @@ export class Agent {
     // fix59: see fatal.js (same exit path as #44 disconnects)
     fatal(where, err) { fatalExit(this.name, where, err); }
 
+    _waitForBackend(kind) {
+        this._waitingBackend = true;
+        const line = `[connection] ${kind}; waiting for backend start (${this._backendLogDir}/latest.log); link ${this._link}`;
+        logExitCause(line);
+        log(this.name, line);
+        this.bot.end(kind);
+        const waiting = resumeWhenBackendReady({
+            logDir: this._backendLogDir,
+            latch: this._disconnectLatch,
+            watch: this._backendWatch,
+            exitFn: (code) => process.exit(code),
+            log: (msg) => {
+                logExitCause(msg);
+                log(this.name, msg);
+            },
+        });
+        waiting.catch((err) => {
+            logExitCause(`[connection] backend log watch failed: ${err instanceof Error ? err.stack : err}`);
+            process.exit(1);
+        });
+    }
+
     async update(delta) {
+        if (this._waitingBackend) return;
         await this.bot.modes.update();
         this.self_prompter.update(delta);
         this.voyager.update();
