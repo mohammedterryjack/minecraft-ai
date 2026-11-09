@@ -45,7 +45,7 @@ function analysed(name, consume = {}, use = {}) {
     };
 }
 function planner() {
-    return obtainPlanner({ registry, recipesOf: id => Recipe.find(id), known: () => false, proven: () => false, edgeSuccess: () => 1, smeltInputs: () => [] });
+    return obtainPlanner({ registry, recipesOf: id => Recipe.find(id), known: () => false, proven: () => false, edgeSuccess: () => 1, smeltInputs: () => [], present: () => false });
 }
 function args(stacks, slotsNeeded, goalItem, goalCount, needItem, skills) {
     const p = planner();
@@ -171,11 +171,12 @@ describe('fix92: whole-slot plan', () => {
         assert.strictEqual(mined.candidates.find(c => c.item === 'stone_pickaxe').keep, 1);
     });
 
-    it('incomplete or malformed use evidence throws and is not treated as disposable', () => {
+    it('absent use evidence is no measured reserve; malformed use evidence still throws', () => {
         const stacks = [{ slot: 9, name: 'diamond', count: 10 }];
         const missing = analysed('bare');
         delete missing.useEvidence;
-        assert.throws(() => capacityPlan(args(stacks, 1, 'oak_log', 1, 'oak_log', [missing])), /incomplete useEvidence for bare/);
+        const open = capacityPlan(args(stacks, 1, 'oak_log', 1, 'oak_log', [missing]));
+        assert.deepStrictEqual(open.removals.map(r => r.item), ['diamond']);
         const malformed = analysed('bare');
         malformed.useEvidence = { runs: 1, items: { diamond: { runs: 1 } } };
         assert.throws(() => capacityPlan(args(stacks, 1, 'oak_log', 1, 'oak_log', [malformed])), /incomplete useEvidence for bare item diamond: max/);

@@ -795,11 +795,10 @@ export async function pickupNearbyItems(bot) {
      * await skills.pickupNearbyItems(bot);
      **/
     const distance = 8;
-    await new Promise(r => setTimeout(r, 400)); // let drops spawn and settle
-    const getNearestItem = bot => bot.nearestEntity(entity => entity.name === 'item' && bot.entity.position.distanceTo(entity.position) < distance);
-    let nearestItem = getNearestItem(bot);
+    const getNearestItem = () => bot.nearestEntity(entity => entity.name === 'item' && entity.isValid && bot.entity.position.distanceTo(entity.position) < distance);
+    let nearestItem = getNearestItem();
     let pickedUp = 0;
-    for (let tries = 0; nearestItem && tries < 12; tries++) {
+    while (nearestItem) {
         // fix84: the drop names its item; no room is a slot need, the same marker collectBlock uses
         if (typeof nearestItem.getDroppedItem !== 'function') throw new Error('pickupNearbyItems: dropped item entity has no getDroppedItem()');
         const dropped = nearestItem.getDroppedItem();
@@ -809,21 +808,30 @@ export async function pickupNearbyItems(bot) {
             log(bot, `PREREQUISITE FAILED: no free slot for ${dropped.count} ${dropped.name}.`);
             return false;
         }
-        bot.pathfinder.setMovements(_survivalMovements(bot, {dig: false}));
-        // fix69: goToGoal reports every pathfinder outcome (NoPath, Timeout, GoalChanged, PathStopped, stall, interrupt)
-        // as a logged FAILED line and `false`; it throws only on a bug, which now surfaces instead of being swallowed.
-        // An unreachable item is the next re-scan's business (the same valid item twice ends the loop); an interrupt
-        // ends the pickup.
-        const reached = await goToGoal(bot, new pf.goals.GoalNear(nearestItem.position.x, nearestItem.position.y, nearestItem.position.z, 0.5));
+        // fix97: follow the live entity (GoalFollow). Progress is playerCollect, the entity going invalid, or an
+        // inventory gain. A path that leaves the same entity on the ground is no progress: stop, do not sleep and retry.
+        let collected = false;
+        const onCollect = (_who, entity) => { if (entity === nearestItem) collected = true; };
+        if (typeof bot.on === 'function') bot.on('playerCollect', onCollect);
+        const followRange = typeof nearestItem.width === 'number' ? nearestItem.width : 0;
+        let reached;
+        try {
+            bot.pathfinder.setMovements(_survivalMovements(bot, {dig: false}));
+            reached = await goToGoal(bot, new pf.goals.GoalFollow(nearestItem, followRange));
+        } finally {
+            if (typeof bot.removeListener === 'function') bot.removeListener('playerCollect', onCollect);
+        }
         if (!reached && bot.interrupt_code) {
             log(bot, `Picked up ${pickedUp} items before being interrupted.`);
             return false;
         }
-        await new Promise(r => setTimeout(r, 500));
-        let prev = nearestItem;
-        nearestItem = getNearestItem(bot);
-        if (prev === nearestItem && prev.isValid) break;
-        pickedUp++;
+        if (!nearestItem.isValid || collected) {
+            pickedUp++;
+            nearestItem = getNearestItem();
+            continue;
+        }
+        log(bot, `No progress: dropped item is still on the ground and the inventory did not gain it.`);
+        return false;
     }
     log(bot, `Picked up ${pickedUp} items.`);
     return true;
@@ -1082,7 +1090,7 @@ export async function placeBlock(bot, blockType, x, y, z, placeOn='bottom', dont
 // Nothing works and nothing is required: the hand is emptied so an unrelated tool is not worn. Uses only bot + log so the seeded
 // primitive is this exact source (Voyager.SEEDED_PRIMITIVES equipToolForBlock).
 export async function equipToolForBlock(bot, block) {
-    if (!block) { log(bot, 'FAILED: equipToolForBlock needs a block'); return null; }
+    if (block === undefined || block === null) throw new Error('equipToolForBlock: block argument required');
     const reg = bot.registry;
     const speedsUp = (b, id) => !!(reg.materials[b.material] && reg.materials[b.material][id]);
     const works = id => block.harvestTools ? !!block.harvestTools[id] : speedsUp(block, id);

@@ -1295,6 +1295,21 @@ Use only c; no other globals.`;
         // fix86: an equip post is checked against the skill's traced successful returns (or a string it returns).
         //        heldItem is that string, not an item with .type. Posts that also read delta/inv are about the inventory, not this probe.
         const fields = this._extractPostFields(ct.post);
+        if (skill && typeof skill.code === 'string') {
+            const evidence = JSON.stringify({
+                consumes: skill.consumes, effects: skill.effects, consumeEvidence: skill.consumeEvidence,
+                effectEvidence: skill.effectEvidence, observedRuns: skill.observedRuns, stats: skill.stats,
+            });
+            for (const k of ['pre', 'post']) {
+                for (const n of Voyager.contractNumericLiterals(ct[k])) {
+                    if (n === 0 || n === 1) continue;
+                    const token = String(n);
+                    if (skill.code.includes(token)) continue;
+                    if (evidence.includes(token)) continue;
+                    return `${k} uses ${token}, which is not in the skill's code or recorded evidence`;
+                }
+            }
+        }
         const probes = fields.eq.includes('heldItem') && !fields.delta.length && !fields.inv.length ? this._returnProbes(skill) : [];
         for (const p of probes) {
             if (!p || !Object.hasOwn(p, 'rv') || !Object.hasOwn(p, 'heldItem')) throw new Error(`[fix86] return probe for ${skill.name} is missing rv or heldItem`);
@@ -1321,6 +1336,18 @@ Use only c; no other globals.`;
         const walk = n => {
             if (!n || typeof n.type !== 'string') return;
             if (n.type === 'ArrayExpression' && n.elements.length >= 2 && n.elements.every(e => e !== null && e.type === 'Literal' && typeof e.value === 'string')) out.push(`[${n.elements.map(e => `'${e.value}'`).join(', ')}]`);
+            for (const v of Object.values(n)) { if (Array.isArray(v)) v.forEach(walk); else if (v && typeof v === 'object' && typeof v.type === 'string') walk(v); }
+        };
+        walk(ast);
+        return out;
+    }
+    // fix97: a numeric literal in a contract (oak log count < 55) that is not in the skill source or recorded evidence
+    // is a hallucinated constant. 0 and 1 are the contract encoding (absent, one argument), not a game threshold.
+    static contractNumericLiterals(src) {
+        const ast = acorn.parse(`(${String(src)})`, { ecmaVersion: 'latest' }), out = [];
+        const walk = n => {
+            if (!n || typeof n.type !== 'string') return;
+            if (n.type === 'Literal' && typeof n.value === 'number') out.push(n.value);
             for (const v of Object.values(n)) { if (Array.isArray(v)) v.forEach(walk); else if (v && typeof v === 'object' && typeof v.type === 'string') walk(v); }
         };
         walk(ast);
@@ -1807,7 +1834,7 @@ Use only c; no other globals.`;
         const plan = planFoodAcquisition({
             edibles,
             inventory: inv,
-            cheapest: (items, count, inventory) => planner.cheapest(items, count, inventory),
+            cheapest: (items, count, inventory) => planner.cheapest(items, count, inventory, true),
             prerequisites: (item, count, inventory) => planner.prerequisites(item, count, inventory),
             entityDroppersFor: (item) => entityDroppers(registry, item),
         });
@@ -3259,6 +3286,7 @@ Use only c; no other globals.`;
                 if (!memo.has(item)) memo.set(item, src.some(b => near.has(b)) || this._producers(item).length > 0);
                 return memo.get(item);
             },
+            present: block => near.has(block),
             proven: item => Object.hasOwn(this.progress.recipeEdges, item) && this.progress.recipeEdges[item].status === 'proven',
             edgeSuccess: (item, verb) => {
                 let byVerb = edgeMemo.get(item);
@@ -3630,7 +3658,7 @@ Use only c; no other globals.`;
         const selector = readBlockerNames(n, `[fix91b] need must name exactly one of item / anyOf: ${JSON.stringify(n)}`);
         let item;
         if (Object.hasOwn(selector, 'anyOf')) {
-            const ch = this._obtainPlanner(state).cheapest(selector.anyOf, n.count, inv);
+            const ch = this._obtainPlanner(state).cheapest(selector.anyOf, n.count, inv, false);
             for (const t of ch.ties) console.log(`[backchain] cost tie broken (proven edges, then name): ${t}`);
             item = ch.item;
         } else {
@@ -3641,7 +3669,7 @@ Use only c; no other globals.`;
         if (n.reason === 'contract' && goal.kind === 'item' && item !== goal.item) {
             const tools = this._obtainPlanner(state).toolsNeeded(goal.item, inv);
             if (Array.isArray(tools) && tools.includes(item)) {
-                const ch = this._obtainPlanner(state).cheapest(tools, n.count, inv);
+                const ch = this._obtainPlanner(state).cheapest(tools, n.count, inv, false);
                 for (const t of ch.ties) console.log(`[backchain] cost tie broken (proven edges, then name): ${t}`);
                 console.log(`[fix86] contract named ${item} for "${task}"; harvestTools choose ${ch.item} from [${tools.join(', ')}]`);
                 item = ch.item;
@@ -4978,40 +5006,52 @@ Use only c; no other globals.`;
         if (depth >= 2) { console.log(`[psn] decompose skipped for "${task}": already a depth-${depth} subgoal`); return false; }
         if (d[task] && Date.now() - d[task].at < 30 * 60e3) { console.log(`[psn] decompose skipped for "${task}": decomposed ${Math.round((Date.now() - d[task].at) / 60e3)} min ago`); return false; }
         
-        // fix81: the fix47 "Cannot break X with current tools" reason-text branch is gone; a missing harvest tool is read
-        //        from the failed run's structured needs and the game data (_failureNeeds / _chainNeeds)
-        // fix47: inventory-first planning - before queuing gather/mine subgoals, check if we can produce
+        // fix97: an item goal keeps its own task. Subgoals come from the game-data plan (block loot, entity loot,
+        //        recipes, furnace recipes). A learned producer's task is a subgoal only when that task's item is the
+        //        goal item or a direct input. The old inventory-first path rewrote the goal with skill.task.replace,
+        //        so a dirt skill whose effects listed the goal became "collect dirt".
         const goal = smeltGoal(task) || countGoal(task) || parseVerboseGoal(task);
-        if (goal) {
+        if (goal && typeof goal.item === 'string' && Number.isInteger(goal.count)) {
             const state = this.observe();
             const inv = state.inventory || {};
-            const shortfallInfo = this._computeShortfall(goal, inv);
-            
-            // If shortfall is 0 and we can produce via learned producers, queue the learned skill's task as subgoal
-            if (shortfallInfo.shortfall === 0 && shortfallInfo.produceItems?.length > 0) {
-                const produceSubs = shortfallInfo.produceItems.map(s => {
-                    // Use the learned skill's own task string, scaled to needed count
-                    const needed = Math.min(s.count, goal.count - (inv[goal.item] || 0));
-                    if (s.task) {
-                        // Scale the count in the task string if it contains a number
-                        return s.task.replace(/\d+/, String(needed));
-                    }
-                    // Fallback: use producer name with needed count
-                    return `${s.producer} ${needed}`;
-                });
-                d[task] = { subs: produceSubs, skills: [], at: Date.now(), reason: `inventory-first: can produce ${goal.item} via learned producers` };
-                q.unshift(...produceSubs.map(t => ({ task: t, parent: task, depth: depth + 1 })), { task, retry: true, depth });
-                this._saveProgress();
-                console.log(`[psn] DECOMPOSE (inventory-first) "${task}" -> learned: ${produceSubs.join(', ')}; no mine/gather needed`);
-                return true;
+            const planner = this._obtainPlanner(state);
+            const pre = planner.prerequisites(goal.item, goal.count, inv);
+            const subs = [];
+            if (pre.how === 'collect') {
+                const src = planner.sources(goal.item);
+                if (!src.length) throw new Error(`[fix97] LOUD: ${goal.item} is collected but the game data names no source block`);
+                for (const block of src) {
+                    const reach = `reach ${block}`;
+                    if (reach !== task) subs.push(reach);
+                }
+            } else {
+                for (const step of pre.plan) if (step !== task && !subs.includes(step)) subs.push(step);
             }
+            const inputs = new Set([goal.item]);
+            for (const ing of pre.ingredients) inputs.add(ing.item);
+            for (const { s } of this._producers(goal.item)) {
+                if (typeof s.task !== 'string' || s.task.length === 0 || s.task === task || subs.includes(s.task)) continue;
+                const produced = smeltGoal(s.task) || countGoal(s.task) || parseVerboseGoal(s.task);
+                if (!produced || typeof produced.item !== 'string' || !inputs.has(produced.item)) continue;
+                subs.push(s.task);
+            }
+            if (!subs.length) {
+                console.log(`[psn] decompose skipped for "${task}": the game-data plan is already this goal (${pre.task})`);
+                return false;
+            }
+            d[task] = { subs, skills: [], at: Date.now(), reason: `game data ${pre.how}: ${pre.task}` };
+            q.unshift(...subs.map(t => ({ task: t, parent: task, depth: depth + 1 })), { task, retry: true, depth });
+            this._saveProgress();
+            console.log(`[psn] DECOMPOSE (game data) "${task}" -> ${subs.join(', ')}; parent kept`);
+            return true;
         }
         
         const system = `You break a Minecraft bot's failing goal into smaller steps (Voyager/PSN-style task decomposition).
 Return 2-4 concrete, verifiable subgoals, in order, that together achieve the goal; each must be doable in a few minutes by ONE small reusable skill. Use the failure reason and the state. Do not repeat the goal itself.
 Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
         // fix39: enriched known_skills with descriptions for primitives and space-freeing skills
-        const user = `goal: ${task}\nwhy it failed: ${String(reason)}\ndeath_hotspots: ${this._deathHotspots()}\n${this._stateText(this.observe())}\nknown_skills: ${JSON.stringify(this._knownSkillsFacts())}`;
+        const skillLines = this.skills.length === 0 ? '[]' : (await this.retrieveSkills(`${task}\n${String(reason)}`, settings.skill_topk)).map(s => `${signatureOf(s.code, s.name)}: ${s.description}`).join('\n');
+        const user = `goal: ${task}\nwhy it failed: ${String(reason)}\ndeath_hotspots: ${this._deathHotspots()}\n${this._stateText(this.observe())}\nknown_skills: ${skillLines}`;
         let subs = [];
         try { subs = (parseLocalJSON(await this._askLocal(system, user, this._inferMeta('curriculum-decompose', { system, user })), ['subgoals']).subgoals || []).map(t => String(t).trim()).filter(t => t && t !== task && !validateTask(t)).slice(0, 4); }
         catch (e) { console.log(`[psn] decompose FAILED for "${task}": ${e.message}`); return false; }
@@ -5373,7 +5413,23 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "task": "...", "contex
         // fix39: enriched known_skills with descriptions for primitives and space-freeing skills
         // fix47: use compact state for curriculum (full state too verbose for local model context)
         const compactStateText = this._compactState(state);
-        const knownSkillsFacts = this._knownSkillsFacts();
+        // fix97: the curriculum used to JSON-embed every primitive's full description (~8k chars). Retrieval returns the
+        // skills relevant to this note and the recent failures, as signature plus description, not their source.
+        let knownSkillsText;
+        if (this.skills.length === 0) knownSkillsText = '[]';
+        else {
+            const queryParts = [];
+            if (typeof state.note === 'string' && state.note.length > 0) queryParts.push(state.note);
+            const failed = this.progress.failed;
+            if (!Array.isArray(failed)) throw new Error('[fix97] progress.failed must be an array to retrieve curriculum skills');
+            for (const row of failed.slice(-3)) queryParts.push(String(row));
+            if (queryParts.length === 0) queryParts.push(compactStateText);
+            const query = queryParts.join('\n');
+            if (query.length === 0) throw new Error('[fix97] LOUD: curriculum has skills but no state, note, or failed task to retrieve against');
+            if (typeof settings.skill_topk !== 'number') throw new Error('[fix97] settings.skill_topk required');
+            const related = await this.retrieveSkills(query, settings.skill_topk);
+            knownSkillsText = related.map(s => `${signatureOf(s.code, s.name)}: ${s.description}`).join('\n');
+        }
         const replayableTasks = this.skills.filter(s => s.task && !s.primitive).map(s => s.task.split(/\s+(?:within|at|using|from)\b/i)[0]).slice(-25);
         // fix47: include active blockers so curriculum prioritizes unblocking goals
         // fix81: blockers are structured needs { item | anyOf, count, reason, task } (from _chainNeeds); resolved once held
@@ -5399,7 +5455,6 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "task": "...", "contex
         const completedText = JSON.stringify(this.progress.completed.slice(-30));
         const failedText = JSON.stringify(this.progress.failed.slice(-15).map(f => this._withCurrentState(f, stateKey)));
         const replayableText = JSON.stringify(replayableTasks);
-        const knownSkillsText = JSON.stringify(knownSkillsFacts);
         const user = `known_skills: ${knownSkillsText}
 replayable_tasks (cheap, no new code needed): ${replayableText} plus any "Mine N <block or ore>", "Collect N <log>", "Get N <item>", "Smelt N <raw> into N <out>", "Kill N <mob>", "Harvest N <crop>"
 completed_tasks: ${completedText}
@@ -5440,10 +5495,19 @@ current_health: ${Math.round(bot.health)}/${vmax.health}\ncurrent_food: ${bot.fo
         if (!em) throw new Error('[voyager] embedding model required (no fallback)');
         const C = (this._embCache ||= new Map());   // fix32: LRU cache (256 entries)
         if (C.has(text)) { const v = C.get(text); C.delete(text); C.set(text, v); this._embHits = (this._embHits || 0) + 1; return v; }
-        const v0 = await em.embed(text);   // fix14: fail loudly, no word-overlap fallback
-        const v = Array.isArray(v0?.[0]?.values) ? v0[0].values : v0;
-        C.set(text, v); if (C.size > 256) C.delete(C.keys().next().value);
-        return v;
+        // fix97: prefetches fired Promise.all of /api/embed. Each client's learned bound includes only a small `over`
+        // for queue time, so sibling embeds waiting inside Ollama exceeded the bound (~23.7s). One embed at a time:
+        // the bound measures the call, not the wait for another embed. No new timeout.
+        const prev = this._embedQ || Promise.resolve();
+        let release;
+        this._embedQ = new Promise(r => { release = r; });
+        await prev;
+        try {
+            const v0 = await em.embed(text);   // fix14: fail loudly, no word-overlap fallback
+            const v = Array.isArray(v0?.[0]?.values) ? v0[0].values : v0;
+            C.set(text, v); if (C.size > 256) C.delete(C.keys().next().value);
+            return v;
+        } finally { release(); }
     }
     // fix35: prefetch embeddings for skill names mentioned in a context string (overlapped with other work)
     _prefetchRelatedEmbeds(context) {
@@ -5881,7 +5945,7 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         const callers = parentsOf(e.name, this._graph());
         const usedBuiltIn = builtInsCalled(getBareAPI().sigs, e.code);
         const apiList = this.unifiedAPIList(relevantSkills, usedBuiltIn);
-        const system = `You repair ONE skill in a Minecraft mineflayer skill library (PSN-style targeted fix). Return a single \`\`\`javascript code block containing ONLY the fixed function, with the SAME name and a compatible signature. First line inside the block: // DESCRIPTION: <one sentence>. Every loop must check bot.interrupt_code. If something still cannot be done, log(bot, 'FAILED: <reason>') and return a falsy value; no silent fallbacks. findBlock/findBlocks/nearestEntity/bot.entities/blockAt results can be null or empty: always null-check them before reading .position/.x or calling methods on them.
+        const system = `You repair ONE skill in a Minecraft mineflayer skill library (PSN-style targeted fix). Return a single \`\`\`javascript code block containing ONLY the fixed function, with the SAME name and a compatible signature. First line inside the block: // DESCRIPTION: <one sentence>. Every loop must check bot.interrupt_code. If something still cannot be done, log(bot, 'FAILED: <reason>') and return a falsy value; no silent fallbacks. findBlock/findBlocks/nearestEntity/bot.entities/blockAt results can be null or empty: always null-check them before reading .position/.x or calling methods on them. Call AVAILABLE FUNCTIONS by name. Do not paste their source into this function. If this function is too large to fix as one piece, say so in the description and keep the body a composition of the listed skills.
 
 AVAILABLE FUNCTIONS (call by bare name, e.g. goToPosition(bot, x, y, z) - do NOT use skills.* or world.* prefix):
 ${apiList}
@@ -5964,7 +6028,7 @@ IMPORTANT: All functions use bare names. Do NOT write skills.goToPosition - writ
             // fix96: what the repair prompt is made of (repair prompts reached 33k chars; nothing is cut now, so one that does
             //        not fit fails loudly and this line says which part grew)
             this._logPromptBreakdown('repair', { ...sections, retry: extra.length }, system.length + user.length + extra.length);
-            try { reply = await this._ask(system, user + extra, this._inferMeta('repair', { system, user: user + extra })); } catch (err) { console.log(`[psn] repair FAILED for ${e.name}: ${err.message}`); return false; }
+            try { reply = await this._ask(system, user + extra, this._inferMeta('repair', { system, user: user + extra })); } catch (err) { console.log(err instanceof Error && err.code === CONTEXT_FULL ? `!!! [psn] repair of ${e.name} does not fit the context (${err.message}). The skill is split into smaller skills instead of resending this prompt. num_ctx is not raised.` : `[psn] repair FAILED for ${e.name}: ${err.message}`); if (err instanceof Error && err.code === CONTEXT_FULL) { this._splitHint = e.name; this._splitDue = true; this._splitBecause = 'context'; } return false; }
             const ident = executableIdentity(t => this._hashReply(t), reply, extractCode);
             if (lastRejected) {
                 const repeated = repeatedRejection(lastRejected, { n: att, candidate: ident.source, identity: ident.identity });
@@ -6362,8 +6426,12 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
         if (!this._splitDue || this._cursorLimited()) return false;
         this._splitDue = false;
         const name = this._splitHint;
+        const because = this._splitBecause;
+        this._splitBecause = null;
         const e = this.skills.find(s => s.name === name && !s.demoted && !s.mergedInto && !s.candidate);
-        if (!e || (e.code || '').split('\n').length <= 40) { console.log(`[psn] split skipped: ${name} no longer qualifies`); return false; }
+        // fix97: a repair that does not fit the context is split even when the skill is under 40 lines. The repair prompt
+        // carries the trace and the history; the split prompt is the skill. The 40-line rule stays for the size detector.
+        if (!e || (because !== 'context' && (e.code || '').split('\n').length <= 40)) { console.log(`[psn] split skipped: ${name} no longer qualifies`); return false; }
         const id = `sp${Date.now()}`;
         // fix40: unified bare-name API
         const system = `You refactor a Minecraft mineflayer skill library (PSN split: break a large skill into smaller reusable sub-skills). Return ONE \`\`\`javascript block with: first 2-3 NEW sub-skill async functions (bot) that each do one logical piece of the work, each preceded by // DESCRIPTION: <one sentence>; then the original skill rewritten to call those sub-skills. Keep the SAME name and signature for the original. Every loop checks bot.interrupt_code.
@@ -6579,7 +6647,10 @@ SHARED CODE: these fragments are repeated in several skills; if you need this lo
 ${this.sharedHints.map(h => '// used in ' + h.skills.join(', ') + '\n' + h.fragment).join('\n')}` : ''}
 Interrupts: the bot may be interrupted at any time (danger, getting stuck, a player talking). Every loop must start with \`if (bot.interrupt_code) return;\` and you must return immediately after any await when bot.interrupt_code is true. Every async function must contain an await. Never catch an error and keep looping; no unbounded loops (always cap attempts). There is no setTimeout/setInterval in scope; to wait use \`await sleep(ms)\`. findBlock/findBlocks/nearestEntity/bot.entities/blockAt results can be null or empty: always null-check them before reading .position/.x or calling methods on them.`;
         // only `related` are shown as context; the library is already in the execution scope, so its source is not copied into the prompt
-        const ctx = related.slice(0, 3).map(s => `// ${s.description}\n${s.code}`).join('\n\n');   // fix32: full code for the top 3; the rest are signatures in the catalogue
+        // fix97: the comment above said the library is already in scope and its source is not copied. The next line pasted
+        // the top 3 bodies anyway, so each rewrite was trained on (and returned) a longer function. Signature, description
+        // and contract only.
+        const ctx = related.slice(0, 3).map(s => `${signatureOf(s.code, s.name)}: ${s.description}${s.contract ? ` | pre ${s.contract.pre} | post ${s.contract.post}` : ''}`).join('\n');
 
         // fix37 (D): include inventory-full fact from replay failure in feedback for code gen
         // fix38: use extractFeedback to preserve FAILED lines
@@ -6607,7 +6678,7 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
                     task: task.length + (proposal.context || '').length,
                     retry: 0
                 }, system.length + user.length);
-                console.log(`[voyager] code prompt: ${shown.size} of ${this.skills.filter(s => !s.demoted).length} skills in the catalogue (relevant + deps), ${Math.min(3, related.length)} with source; prompt ${system.length + user.length} chars`);
+                console.log(`[voyager] code prompt: ${shown.size} of ${this.skills.filter(s => !s.demoted).length} skills in the catalogue (relevant + deps), ${Math.min(3, related.length)} as signature and description; prompt ${system.length + user.length} chars`);
             } else {
                 // Log retry prompt size breakdown
                 this._logPromptBreakdown('code-retry', {
@@ -7178,11 +7249,10 @@ Voyager.SEEDED_PRIMITIVES = [
         task: 'pick up items',
         code: `async function pickupNearbyItems(bot) {
     const distance = 8;
-    await sleep(400);
-    const getNearestItem = () => bot.nearestEntity(e => e.name === 'item' && bot.entity.position.distanceTo(e.position) < distance);
+    const getNearestItem = () => bot.nearestEntity(e => e.name === 'item' && e.isValid && bot.entity.position.distanceTo(e.position) < distance);
     let nearestItem = getNearestItem();
     let pickedUp = 0;
-    for (let tries = 0; nearestItem && tries < 12; tries++) {
+    while (nearestItem) {
         // fix84: the drop names its item (prismarine-entity getDroppedItem); no room is a slot need, same marker as collectBlock
         if (typeof nearestItem.getDroppedItem !== 'function') throw new Error('pickupNearbyItems: dropped item entity has no getDroppedItem()');
         const dropped = nearestItem.getDroppedItem();
@@ -7192,13 +7262,24 @@ Voyager.SEEDED_PRIMITIVES = [
             log(bot, \`PREREQUISITE FAILED: no free slot for \${dropped.count} \${dropped.name}.\`);
             return false;
         }
-        try { await goToPosition(bot, nearestItem.position.x, nearestItem.position.y, nearestItem.position.z, 0.5); }
-        catch (e) { log(bot, \`Failed to reach item: \${e.message}\`); throw e; }
-        await sleep(500);
-        const prev = nearestItem;
-        nearestItem = getNearestItem();
-        if (prev === nearestItem && prev.isValid) break;
-        pickedUp++;
+        let collected = false;
+        const onCollect = (_who, entity) => { if (entity === nearestItem) collected = true; };
+        bot.on('playerCollect', onCollect);
+        const followRange = typeof nearestItem.width === 'number' ? nearestItem.width : 0;
+        let reached;
+        try { reached = await goToGoal(bot, new GoalFollow(nearestItem, followRange)); }
+        finally { bot.removeListener('playerCollect', onCollect); }
+        if (!reached && bot.interrupt_code) {
+            log(bot, \`Picked up \${pickedUp} items before being interrupted.\`);
+            return false;
+        }
+        if (!nearestItem.isValid || collected) {
+            pickedUp++;
+            nearestItem = getNearestItem();
+            continue;
+        }
+        log(bot, 'No progress: dropped item is still on the ground and the inventory did not gain it.');
+        return false;
     }
     log(bot, \`Picked up \${pickedUp} items.\`);
     return true;
@@ -7511,9 +7592,9 @@ Voyager.SEEDED_PRIMITIVES = [
         code: skills.equipToolForBlock.toString(),   // fix62: one source of truth, the library function (bot + log only, so it runs bare in the sandbox)
         deps: [],
         contract: {
-            pre: 'c => true',
+            pre: 'c => c.args.length >= 1 && c.args[0] === null',
             post: 'c => c.ret === null || (c.post.eq ? c.post.eq.heldItem === c.ret : false)',
-            text: 'returns null (hand) or the equipped tool name matches c.post.eq.heldItem',
+            text: 'a placed block was passed (objects are null in c.args); returns null (hand) or the equipped tool name matches c.post.eq.heldItem',
         },
     },
 ];

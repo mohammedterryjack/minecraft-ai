@@ -122,6 +122,48 @@ export function botMembers(bot) {
         }
     return out;
 }
+function memberValue(obj, key) {
+    for (let o = obj; o && o !== Object.prototype; o = Object.getPrototypeOf(o)) {
+        if (!Object.prototype.hasOwnProperty.call(o, key)) continue;
+        const d = Object.getOwnPropertyDescriptor(o, key);
+        if (!d) continue;
+        if ('value' in d) return d.value;
+        if (typeof d.get === 'function') return obj[key];
+    }
+    return undefined;
+}
+// fix97: bot.inventory.hasItem is a MemberExpression whose object is bot.inventory, not bot.
+// The direct-bot check never saw hasItem. Walk the chain and name the closest real member of the object we reached.
+function botMemberChain(node) {
+    const parts = [];
+    let cur = node;
+    while (cur && cur.type === 'MemberExpression' && !cur.computed && cur.property && cur.property.type === 'Identifier') {
+        parts.unshift(cur.property.name);
+        cur = cur.object;
+    }
+    if (!cur || cur.type !== 'Identifier' || cur.name !== 'bot') return null;
+    return parts;
+}
+export function nestedBotMemberError(bot, node, assigned, nodes) {
+    const parts = botMemberChain(node);
+    if (!parts || parts.length < 2) return null;
+    let obj = bot;
+    for (let i = 0; i < parts.length; i++) {
+        const key = parts[i];
+        if (obj === null || (typeof obj !== 'object' && typeof obj !== 'function')) return null;
+        const known = botMembers(obj).has(key) || (i === 0 && assigned.has(key));
+        if (!known) {
+            // bot.recipes is already reported by the direct bot.member check. Only a missing member of a real object
+            // (bot.inventory.hasItem) is new.
+            if (i === 0) return null;
+            const isCall = i === parts.length - 1 && nodes.some(c => c.type === 'CallExpression' && c.callee === node);
+            const closest = nearestBotMember(obj, key, isCall).map(k => `bot.${[...parts.slice(0, i), k].join('.')}`);
+            return `bot.${parts.slice(0, i + 1).join('.')} does not exist (closest real members: ${closest.join(', ')})`;
+        }
+        if (i < parts.length - 1) obj = memberValue(obj, key);
+    }
+    return null;
+}
 export function nearestBotMember(bot, name, isCall) {
     const words = s => s.split(/(?=[A-Z])/).map(w => w.toLowerCase());
     const want = new Set(words(name));
@@ -391,6 +433,10 @@ export class Coder {
                 errs.add(`writing bot.${n.left.property.name} is forbidden in generated code (runtime-owned; seeded ensure* sets it)`);
             if (n.type === 'MemberExpression' && !n.computed && n.object.type === 'Identifier' && n.object.name === 'bot' && n.property.type === 'Identifier' && !(n.property.name in bot) && !assigned.has(n.property.name))
                 errs.add(`bot.${n.property.name} does not exist on the live bot (closest real members: ${nearestBotMember(bot, n.property.name, nodes.some(c => c.type === 'CallExpression' && c.callee === n)).map(k => 'bot.' + k).join(', ')})`);
+            if (n.type === 'MemberExpression') {
+                const nested = nestedBotMemberError(bot, n, assigned, nodes);
+                if (nested) errs.add(nested);
+            }
             if (n.type === 'CallExpression') {
                 if (n.callee.type === 'Identifier' && !declared.has(n.callee.name) && !sandbox.has(n.callee.name) && !(n.callee.name in globalThis))
                     errs.add(`${n.callee.name}() is not defined (not a skill, not declared in the code)`);

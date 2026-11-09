@@ -185,7 +185,7 @@ describe('fix85 (D): collectBlock\'s search and the reach observation see the sa
 describe('fix85 (B): a block with no harvestTools drops by hand', () => {
     it('oak_log has no harvestTools, and a contract that requires a pickaxe for it is refused', () => {
         assert.strictEqual(registry.blocksByName.oak_log.harvestTools, undefined);
-        const plan = obtainPlanner({ registry, recipesOf: id => Recipe.find(id), known: () => false, proven: () => false, edgeSuccess: () => 1, smeltInputs: () => [] }).prerequisites('oak_log', 1, {});
+        const plan = obtainPlanner({ registry, recipesOf: id => Recipe.find(id), known: () => false, proven: () => false, edgeSuccess: () => 1, smeltInputs: () => [], present: () => false }).prerequisites('oak_log', 1, {});
         assert.strictEqual(plan.tool, null);
         assert.deepStrictEqual(plan.steps, []);
         const v = mkV();

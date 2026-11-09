@@ -203,7 +203,7 @@ describe('fix86: coal\'s tool comes from harvestTools', () => {
     it('wooden_pickaxe harvests coal, and a contract that names only iron_pickaxe is not the need when cobblestone is held', () => {
         const tools = Object.keys(registry.blocksByName.coal_ore.harvestTools).map(id => registry.items[id].name);
         assert.ok(tools.includes('wooden_pickaxe'));
-        const planner = obtainPlanner({ registry, recipesOf: id => Recipe.find(id), known: () => false, proven: () => false, edgeSuccess: () => 1, smeltInputs: () => [] });
+        const planner = obtainPlanner({ registry, recipesOf: id => Recipe.find(id), known: () => false, proven: () => false, edgeSuccess: () => 1, smeltInputs: () => [], present: () => false });
         const plan = planner.prerequisites('coal', 79, { ...LIVE_INV });
         assert.ok(!plan.plan.includes('Craft 1 iron_pickaxe'), plan.plan.join(' > '));
         const v = Object.create(Voyager.prototype);
