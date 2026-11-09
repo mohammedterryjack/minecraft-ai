@@ -132,7 +132,7 @@ describe('fix58: wiring into voyager', () => {
         const v = mk(m.s, 17.26666831970215, 17);
         v.agent.name = 'icefox2000';
         v.skills = [];
-        v.progress = { completed: [], failed: [], blockers: [] };
+        v.progress = { completedAt: {}, completed: [], failed: [], blockers: [] };
         v.repairMemory = { getWorkflowsForTask: () => [], formatWorkflowHints: () => '' };
         v._hutBuilt = () => false; v._cursorLimited = () => false; v._logPromptBreakdown = () => {}; v._saveProgress = () => {};
         let prompt = null;

@@ -42,7 +42,7 @@ function liveRegen() {
     return m;
 }
 
-function rig({ food = 20, health = 20, subgoals, decomposed, completed, goalFailStates } = {}) {
+function rig({ food = 20, health = 20, subgoals, decomposed, completed, completedAt, goalFailStates } = {}) {
     const v = Object.create(Voyager.prototype);
     v.skills = [];
     v.npGraph = null;
@@ -51,6 +51,7 @@ function rig({ food = 20, health = 20, subgoals, decomposed, completed, goalFail
         decomposed: decomposed !== undefined ? decomposed : { 'Craft 1 iron_pickaxe': { ...LIVE_DEC, subs: [...LIVE_DEC.subs] } },
         decomposeQueue: null,
         completed: completed !== undefined ? completed : [],
+        completedAt: completedAt !== undefined ? completedAt : {},
         failed: [],
         blockers: [],
         goalStats: {},
@@ -161,7 +162,7 @@ describe('fix91: a no-op repair or decompose does not consume the step', () => {
 });
 
 describe('fix91: a dead head does not block a live subgoal', () => {
-    it('a subgoal whose parent is completed is removed; the next one runs', async () => {
+    it('a subgoal whose parent completed after it was decomposed is removed; the next one runs', async () => {
         const v = rig({
             food: 20,
             subgoals: [
@@ -169,6 +170,7 @@ describe('fix91: a dead head does not block a live subgoal', () => {
                 { ...LIVE },
             ],
             completed: ['Build a wall'],
+            completedAt: { 'Build a wall': 2 },
             decomposed: {
                 'Build a wall': { subs: ['Mine 1 stone'], skills: [], at: 1, reason: 'test' },
                 'Craft 1 iron_pickaxe': { ...LIVE_DEC, subs: [...LIVE_DEC.subs] },

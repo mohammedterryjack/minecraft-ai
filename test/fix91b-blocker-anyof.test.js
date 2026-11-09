@@ -41,7 +41,7 @@ function mkV() {
     };
     v.skills = [];
     v.npGraph = null;
-    v.progress = { subgoals: [], decomposed: {}, failed: [], completed: [], blockers: [], recipeEdges: {}, goalStats: {} };
+    v.progress = { subgoals: [], decomposed: {}, failed: [], completedAt: {}, completed: [], blockers: [], recipeEdges: {}, goalStats: {} };
     v._saveProgress = () => {};
     v._curSub = null;
     return v;
@@ -84,7 +84,7 @@ describe('fix91b: boot validator accepts item XOR anyOf', () => {
     function boot(name, blockers) {
         const dir = join(ROOT, 'bots', name, 'skills');
         mkdirSync(dir, { recursive: true });
-        writeFileSync(join(dir, 'progress.json'), JSON.stringify({ completed: [], failed: [], blockers }));
+        writeFileSync(join(dir, 'progress.json'), JSON.stringify({ completedAt: {}, completed: [], failed: [], blockers }));
         return new Voyager({
             name,
             bot: { version: VER, chat() {}, on() {}, off() {}, once() {}, removeListener() {}, inventory: { emptySlotCount: () => 36 } },

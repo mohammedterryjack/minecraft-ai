@@ -62,10 +62,9 @@ export function markBlockOutOfRange(bot, blockNames, count) {
     if (!bot || typeof bot !== 'object') throw new Error('[fix87] markBlockOutOfRange: bot required');
     if (!bot.registry || !bot.registry.blocksByName) throw new Error('[fix87] markBlockOutOfRange: bot.registry.blocksByName required');
     const need = reachNeedForBlocks(bot.registry.blocksByName, blockNames, count);
-    if (need === null) {
-        console.error(`[fix87] LOUD: search miss for ${blockNames.join(' / ')} is not a block in the game data; no reach need`);
-        return null;
-    }
+    // fix95: a search for a name that is not a block is a wrong question (the searches now throw before they get here).
+    //        Logging it and returning null let the caller retry the same search forever (7,061 such lines from 14:00 GMT 9 Nov).
+    if (need === null) throw new Error(`[fix95] search miss for ${blockNames.join(' / ')}: none of these is a block in the game data, so there is no reach need`);
     const named = need.item || need.anyOf.join(' / ');
     console.error(`[fix87] LOUD: no ${named} within search range; reporting a reach need of ${count}`);
     return markPreconditionUnmet(bot, { need });

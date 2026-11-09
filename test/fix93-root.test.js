@@ -401,7 +401,7 @@ describe('fix93 hunger serve', () => {
             runs, foodSamples: { drop: { n: 0, sum: 0 }, rise: { n: 0, sum: 0 } },
         });
         v.skills = [];
-        v.progress = { subgoals: [{ task: 'Mine 1 iron_ore' }], decomposed: {}, failed: [], completed: [], blockers: [], goalStats: {}, recipeEdges: {} };
+        v.progress = { subgoals: [{ task: 'Mine 1 iron_ore' }], decomposed: {}, failed: [], completedAt: {}, completed: [], blockers: [], goalStats: {}, recipeEdges: {} };
         v._saveProgress = () => {};
         v._saveSkills = () => {};
         v.currentTask = null;

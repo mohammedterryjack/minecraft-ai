@@ -63,7 +63,7 @@ function mkV(skills) {
     const v = Object.create(Voyager.prototype);
     v.skills = skills.map(s => JSON.parse(JSON.stringify(s)));
     v.progress = {
-        completed: [], failed: [], goalStats: {}, goalFailStates: [],
+        completedAt: {}, completed: [], failed: [], goalStats: {}, goalFailStates: [],
         subgoals: [], decomposed: {}, blockers: [], recipeEdges: {},
     };
     v.npGraph = null;

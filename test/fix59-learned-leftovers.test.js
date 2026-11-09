@@ -168,7 +168,7 @@ describe('fix59 (4): hp/food max from VITALS_MAX everywhere', () => {
             v.vitals = new VitalsModel({ regen: {}, runs: {} });
             v.agent = { name: 'icefox2000', bot: { health: 17, food: 12, game: {} } };
             v.skills = []; v.slotEffects = new SlotEffects({ runs: {} });
-            v.progress = { completed: [], failed: [], blockers: [] };
+            v.progress = { completedAt: {}, completed: [], failed: [], blockers: [] };
             v.repairMemory = { getWorkflowsForTask: () => [], formatWorkflowHints: () => '' };
             v._hutBuilt = () => false; v._cursorLimited = () => false; v._logPromptBreakdown = () => {}; v._saveProgress = () => {};
             let prompt = null;

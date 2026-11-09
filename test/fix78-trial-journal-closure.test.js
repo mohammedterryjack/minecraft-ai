@@ -29,7 +29,7 @@ function codePathRig(dir) {
     const v = Object.create(Voyager.prototype);
     v.skills = [LEAF, MID, OTHER].map(s => JSON.parse(JSON.stringify(s)));
     v.dir = dir;
-    v.progress = { completed: [], failed: [], goalStats: {}, fix25: true, replayThreshold: 0.85 };
+    v.progress = { completedAt: {}, completed: [], failed: [], goalStats: {}, fix25: true, replayThreshold: 0.85 };
     v.npGraph = { recordDelta: () => {} };
     v._saveProgress = () => {}; v._saveSkills = () => {};
     for (const m of ['_checkHomeGround', '_watchWindows', '_watchDimension', '_oneshot', '_requeueDeferred', '_prefetchPlan', '_logPromptBreakdown']) v[m] = () => {};

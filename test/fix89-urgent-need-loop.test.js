@@ -119,7 +119,7 @@ function mkV({ vitals, food = 17, health = 18, skillsList }) {
     v.progress = {
         subgoals: [{ task: 'Mine 1 iron_ore', parent: 'Craft 1 iron_pickaxe', depth: 1 }],
         decomposeQueue: null,
-        decomposed: {}, failed: [], completed: [], blockers: [], goalStats: {}, recipeEdges: {},
+        decomposed: {}, failed: [], completedAt: {}, completed: [], blockers: [], goalStats: {}, recipeEdges: {},
     };
     Object.defineProperty(v, '_decomposeQueue', {
         get() { return this.progress.decomposeQueue; },

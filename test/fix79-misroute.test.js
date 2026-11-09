@@ -29,7 +29,7 @@ const scanRoot = (t, extra = {}) => ({ name: 'scanForIronOreBlocks', args: '[]',
 function rig(skills, rec, links = {}) {
     const v = Object.create(Voyager.prototype);
     v.skills = skills;
-    v.progress = { completed: [], failed: [], goalStats: {}, replayThreshold: 0.85 };
+    v.progress = { completedAt: {}, completed: [], failed: [], goalStats: {}, replayThreshold: 0.85 };
     v.npGraph = confirmed(links);
     v._saveSkills = () => {}; v._saveProgress = () => {};
     const bot = { output: '', inventory: { emptySlotCount: () => 1 }, entity: { position: { x: -27, y: 66, z: 70 } }, food: 20 };

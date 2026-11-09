@@ -67,7 +67,7 @@ function mkV({ inv, nearby, reachable }) {
     v.agent = { bot: { version: VER, registry, recipesAll: (id) => Recipe.find(id), inventory: { emptySlotCount: () => 0 } }, openChat() {} };
     v.skills = [];
     v.npGraph = null;
-    v.progress = { subgoals: [], decomposed: {}, failed: [], completed: [], blockers: [], recipeEdges: {}, goalStats: {} };
+    v.progress = { subgoals: [], decomposed: {}, failed: [], completedAt: {}, completed: [], blockers: [], recipeEdges: {}, goalStats: {} };
     v._saveProgress = () => {};
     v._windowCheck = () => {};
     v._afterSuccess = () => {};

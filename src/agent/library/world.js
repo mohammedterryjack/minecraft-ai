@@ -2,6 +2,7 @@ import pf from 'mineflayer-pathfinder';
 import { Vec3 } from 'vec3';
 import * as mc from '../../utils/mcdata.js';
 import { carriedSlots } from '../../utils/carried.js';
+import { itemSourceBlocks } from '../../utils/item_sources.js';
 
 
 // fix42: getAllFreeSpaces returns all valid positions (for retry logic when placeBlock fails at one cell)
@@ -174,7 +175,17 @@ export function getNearestBlocks(bot, block_types=null, distance=8, count=10000)
         if (!Array.isArray(block_types))
             block_types = [block_types];
         for(let block_type of block_types) {
-            block_ids.push(mc.getBlockId(block_type));
+            // fix95: a name that is not a block (an item such as wheat_seeds) matched nothing, so the search returned
+            //        nothing without any I/O and code that retried it spun the event loop until the watchdog killed the
+            //        process. It is a wrong question, not an empty world: fail loudly and name the blocks that yield it.
+            if (typeof block_type !== 'string' || block_type.length === 0) throw new Error(`getNearestBlocks: a block name is a non-empty string, got ${typeof block_type === 'function' ? 'a function (use getNearestBlocksWhere for a predicate)' : JSON.stringify(block_type)}`);
+            const id = mc.getBlockId(block_type);
+            if (id === null) {
+                const sources = itemSourceBlocks(bot.registry, block_type);
+                throw new Error(`getNearestBlocks: ${JSON.stringify(block_type)} is not a block in the game data; ` +
+                    (sources.length ? `the blocks that drop it are ${sources.join(', ')}; search for those` : 'no block drops it; obtain it another way (craft, smelt, or a mob drop)'));
+            }
+            block_ids.push(id);
         }
     }
     return getNearestBlocksWhere(bot, block_ids, distance, count);  
