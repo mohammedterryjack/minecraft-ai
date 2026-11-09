@@ -255,9 +255,9 @@ describe('fix93 repair retry', () => {
     it('the retry carries the rejected candidate and the exact reason, and a suggestion is not a rewrite', () => {
         const candidate = 'async function scan(bot) { const z = bot.getNearbyEntities(); __mcPreconditionUnmet__(bot, { need: { item: "sword", count: 1, reason: "input" } }); }';
         const reason = 'API gate: bot.getNearbyEntities does not exist on the live bot (closest real members: bot.nearestEntity)';
-        const suffix = repairRetrySuffix({ candidate, reason, identity: 'abc', n: 1 });
+        const suffix = repairRetrySuffix({ candidate, reason, identity: 'abc', n: 1, current: 'async function scan(bot) { return false; }' });
         assert.match(suffix, /your previous reply was rejected/);
-        assert.ok(suffix.includes(candidate));
+        assert.ok(suffix.includes(candidate));   // fix96: the shorter of the diff and the candidate; here the candidate itself
         assert.ok(suffix.includes(reason));
         assert.ok(suffix.includes('__mcPreconditionUnmet__'));
         assert.ok(suffix.includes('bot.getNearbyEntities'));

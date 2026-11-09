@@ -398,7 +398,7 @@ export class Coder {
                     if (nm) errs.add(`'${a.value}' is not an item, block or entity name in this Minecraft version (did you mean '${nm}'?)`); }
             }
         }
-        return errs.size ? `API gate: ${[...errs].slice(0, 8).join('; ')}` : null;
+        return errs.size ? `API gate: ${[...errs].join('; ')}` : null;   // fix96: every error, none cut
     }
     // fix34: Levenshtein distance for API name matching
     _lev(a, b) {

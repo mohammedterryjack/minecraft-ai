@@ -93,16 +93,16 @@ export class IdlePractice {
 
     recordGap(task, reason) {
         if (!task) return;
-        const key = String(task).toLowerCase().slice(0, 100);
+        const key = String(task).toLowerCase();   // fix96: the whole task (a cut key became a cut practice goal)
         const existing = this.gaps.find(g => g.task === key);
         if (existing) {
             existing.count++;
             existing.lastSeen = Date.now();
-            existing.reason = String(reason || existing.reason).slice(0, 200);
+            existing.reason = String(reason || existing.reason);
         } else {
             this.gaps.push({
                 task: key,
-                reason: String(reason || '').slice(0, 200),
+                reason: String(reason || ''),
                 count: 1,
                 firstSeen: Date.now(),
                 lastSeen: Date.now(),
@@ -250,7 +250,7 @@ export class IdlePractice {
         }
         
         if (outcome && this.currentPractice?.goal) {
-            const goalKey = String(this.currentPractice.goal.goal || '').toLowerCase().slice(0, 100);
+            const goalKey = String(this.currentPractice.goal.goal || '').toLowerCase();
             this.gaps = this.gaps.filter(g => g.task !== goalKey);
         }
         

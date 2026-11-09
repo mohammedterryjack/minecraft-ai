@@ -162,10 +162,20 @@ export function markerCallTexts(code, name) {
     return out;
 }
 // null when `after` still contains every call of `name` that `before` contains. A skill that did not call it must not gain one.
+// fix96: the marker binding is a real sandbox endowment; the static API gate may treat it as defined exactly when the code
+//        being replaced already calls it (markerCallsMissing then holds the candidate to those same calls). Before, the gate
+//        always called it "not defined" while markerCallsMissing required it kept, so no skill that calls it could be
+//        repaired or replaced (live: every collectBlock/ensureCraftingTable/craftRecipe repair failed both attempts).
+export function markerGateNames(incumbentCode, name) {
+    return markerCallTexts(incumbentCode, name).length ? [name] : [];
+}
 export function markerCallsMissing(before, after, name) {
     const kept = markerCallTexts(before, name);
     const now = markerCallTexts(after, name);
     if (!kept.length && now.length) return `uses ${name}, reserved for seeded primitives (a new skill must not call it; a repair of a skill that already calls it must keep those calls)`;
+    // fix96: a repair keeps the incumbent's calls verbatim and adds none (each call voids a run's stats, fix76)
+    const added = now.filter(c => !kept.includes(c));
+    if (added.length) return `adds ${name} call(s) the current code does not have: ${added.join(' | ')}. A repair may keep the current calls, not add new ones.`;
     const missing = kept.filter(c => !now.includes(c));
     if (!missing.length) return null;
     return `repair dropped the ${name} call(s) the current code uses to report a structured need: ${missing.join(' | ')}. A repair must keep those calls. A seeded primitive that returned false after reporting a need is not a missing log line.`;
@@ -442,7 +452,8 @@ export function instrumentSrc(names) {
     //      overflowing inside finish must not escape as uncaught). threw() only writes the FAILED line and flags (no snapshot).
     // fix70: a traced call that throws also records the top frame of the error's stack (rec.errTop; the same for every caller
     //        it is rethrown through), so the learner can tell where the error was raised: see thrownIn
-    const wrap = `const __T = bot.__psnTrace = [];
+    const wrap = `const __T = bot.__psnTrace = []; __T.untraced = 0;   // fix96: calls past the record limit are counted, and the trace says so
+const __TRACE_RECORDS = 1500;
 const __rawInventoryCounts = getInventoryCounts;
 const __inv = () => __rawInventoryCounts(bot);
 const __eq = () => { const s = bot.inventory.slots; return { heldItem: s[bot.quickBarSlot + 36]?.name || null, offHand: s[45]?.name || null, helmet: s[5]?.name || null, chestplate: s[6]?.name || null, leggings: s[7]?.name || null, boots: s[8]?.name || null }; };
@@ -453,18 +464,30 @@ let __syncParent = -1;
 bot.__psnFrame = -1;   // fix85: the frame markPreconditionUnmet stamps its need on (the bot slot is last-write-wins)
 // fix83: argument text of a traced call; JSON renders NaN/Infinity as null and drops undefined, so the live trace showed
 //        craftSticks(null) for the craftSticks(NaN) call its contract refused (19:03:57 GMT)
-const __argText = xs => '[' + xs.map(x => typeof x === 'number' || x === undefined ? String(x) : JSON.stringify(x)).join(',') + ']';
+// fix96: a game object (block, entity: a name and a position) is rendered as its identity name@x,y,z. Before, the whole
+//        object was JSON-rendered (light, biome, metadata...) and the text cut at 120 chars, so the trace showed
+//        equipToolForBlock({"type":9,"metadata":0,"light":0,...,"biome":{"color":0,...") with neither the block name nor where
+//        it was. Nothing is cut now.
+const __gameObj = v => v !== null && typeof v === 'object' && typeof v.name === 'string' && v.position !== null && typeof v.position === 'object' && Number.isFinite(v.position.x);
+const __valText = x => {
+    if (typeof x === 'number' || x === undefined) return String(x);
+    if (__gameObj(x)) return x.name + '@' + x.position.x + ',' + x.position.y + ',' + x.position.z;
+    if (Array.isArray(x)) return '[' + x.map(__valText).join(',') + ']';
+    return JSON.stringify(x, (k, v) => (k !== '' && __gameObj(v) ? v.name + '@' + v.position.x + ',' + v.position.y + ',' + v.position.z : v));
+};
+const __argText = xs => '[' + xs.map(__valText).join(',') + ']';
 const __reported = new WeakSet();
 const __harness = (stackStr, fn) => { const was = bot.__psnStackStr; bot.__psnStackStr = stackStr + ' <- (psn trace)'; __inHarness = true; try { return fn(); } finally { __inHarness = false; bot.__psnStackStr = was; } };
 const __wrap = (n, f) => function (...a) {
-    if (__inHarness || __T.length >= 1500) return f.apply(this, a);
+    if (__inHarness) return f.apply(this, a);
+    if (__T.length >= __TRACE_RECORDS) { __T.untraced += 1; return f.apply(this, a); }
     const par = __syncParent;
     const __stackParts = []; for (let __i = par; __i >= 0 && __i < __T.length; __i = __T[__i].parent) __stackParts.push(__T[__i].name); const __stackStr = [...__stackParts.reverse(), n].join(' <- ');
     bot.__psnRunningSkill = n;
-    const rec = __harness(__stackStr, () => { const r0 = { name: n, args: __argText(a.slice(1)).slice(0, 120), parent: par, depth: par < 0 ? 0 : __T[par].depth + 1, o0: (bot.output || '').length, t0: Date.now(), pre: __have(), argv: a.slice(1).map(x => x === null || typeof x !== 'object' ? x : null) }; if (!n.startsWith('skills.')) r0.s0 = __st(); return r0; });
+    const rec = __harness(__stackStr, () => { const r0 = { name: n, args: __argText(a.slice(1)), parent: par, depth: par < 0 ? 0 : __T[par].depth + 1, o0: (bot.output || '').length, t0: Date.now(), pre: __have(), argv: a.slice(1).map(x => x === null || typeof x !== 'object' ? x : null) }; if (!n.startsWith('skills.')) r0.s0 = __st(); return r0; });
     bot.__psnStackStr = __stackStr;
     const id = __T.push(rec) - 1;
-    const settle = (r) => { rec.ret = r === undefined ? 'undefined' : String(JSON.stringify(r)).slice(0, 60); rec.rv = r === null || typeof r !== 'object' ? r : null; rec.fail = r === false || r === null || r === 0; return r; };
+    const settle = (r) => { rec.ret = __valText(r); rec.rv = r === null || typeof r !== 'object' ? r : null; rec.fail = r === false || r === null || r === 0; return r; };
     const threw = (e) => { rec.fail = true; const msg = e instanceof Error ? e.message : String(e); rec.err = msg; rec.rv = false; if (e instanceof Error) rec.errTop = String(e.stack).split('\\n').find(l => l.trimStart().startsWith('at ')); if (!__reported.has(e)) { if (e !== null && typeof e === 'object') __reported.add(e); bot.output = bot.output + '\\nFAILED: ' + n + ' threw ' + msg + '\\n'; } };
     const finishBody = () => { __harness(__stackStr, () => { rec.t1 = Date.now(); if (!n.startsWith('skills.')) rec.s1 = __st(); rec.o1 = (bot.output || '').length; bot.__psnOut = bot.output; const post = __have(); rec.delta = {}; for (const k of new Set([...Object.keys(rec.pre || {}), ...Object.keys(post)])) { const d = (post[k] || 0) - ((rec.pre || {})[k] || 0); if (d) rec.delta[k] = d; } delete rec.pre; rec.intr = !!bot.interrupt_code; }); bot.__psnRunningSkill = par >= 0 ? __T[par].name : null; bot.__psnStackStr = __stackParts.join(' <- '); };
     const finish = () => { Promise.resolve().then(finishBody); };
@@ -510,13 +533,46 @@ export function annotateTrace(trace, output) {
         let own = '', p = r.o0;
         for (const [a, b] of kids) { own += out.slice(p, a); p = Math.max(p, b); }
         own += out.slice(p, r.o1 ?? out.length);
-        r.ownFail = own.split('\n').filter(l => FAIL_LINE.test(l)).slice(0, 4);
+        r.ownFail = own.split('\n').filter(l => FAIL_LINE.test(l));
         r.ok = !r.intr && !r.fail && !r.ownFail.length;
     });
     return trace;
 }
-export function traceText(trace, max = 40) {
-    return trace.slice(0, max).map(r => `${'  '.repeat(r.depth)}${r.name}(${r.args.replace(/^\[|\]$/g, '')}) -> ${r.err ? 'threw ' + r.err : r.ret}${r.ok ? '' : ' FAIL'}${Object.keys(r.delta || {}).length ? ' inv' + JSON.stringify(r.delta) : ''}${r.ownFail?.length ? ' | ' + r.ownFail.join(' | ').slice(0, 200) : ''}`).join('\n');
+// fix96: identical consecutive lines (a call repeated in a loop with the same arguments and outcome, the same failure line
+//        printed again) are written once with their count; that is the whole trace, nothing is cut. Before, the trace kept
+//        its first 40/60 calls and each call's failure lines were cut at 4 lines / 200 chars.
+export function collapseRepeats(lines) {
+    if (!Array.isArray(lines)) throw new Error('collapseRepeats: lines array required');
+    const out = [];
+    for (const l of lines) {
+        const last = out[out.length - 1];
+        if (last && last.text === l) last.n += 1; else out.push({ text: l, n: 1 });
+    }
+    return out.map(o => (o.n > 1 ? `${o.text} (x${o.n})` : o.text));
+}
+export function traceText(trace) {
+    if (!Array.isArray(trace)) throw new Error('traceText: trace array required');
+    const line = r => `${'  '.repeat(r.depth)}${r.name}(${r.args.replace(/^\[|\]$/g, '')}) -> ${r.err ? 'threw ' + r.err : r.ret}${r.ok ? '' : ' FAIL'}${Object.keys(r.delta || {}).length ? ' inv' + JSON.stringify(r.delta) : ''}${r.ownFail?.length ? ' | ' + collapseRepeats(r.ownFail).join(' | ') : ''}`;
+    const kids = trace.map(() => []), roots = [];
+    trace.forEach((r, i) => { if (r.parent >= 0 && r.parent < trace.length) kids[r.parent].push(i); else roots.push(i); });
+    // fix96: a call repeated in a loop with the same arguments, outcome and sub-calls is written once with its count (live:
+    //        "collectItem (767 calls)" was collectLogs() and its 11 sub-calls, identical, ~60 times in a row)
+    const block = i => [line(trace[i]), ...siblings(kids[i])];
+    const siblings = ids => {
+        const out = [];
+        let prev = null, n = 0;
+        const flush = () => { if (!prev) return; out.push(n > 1 ? `${prev[0]} (x${n}: this call${prev.length > 1 ? ` and the ${prev.length - 1} under it` : ''} ran ${n} times in a row, identically)` : prev[0], ...prev.slice(1)); };
+        for (const id of ids) {
+            const b = block(id);
+            if (prev && b.length === prev.length && b.every((l, k) => l === prev[k])) { n += 1; continue; }
+            flush(); prev = b; n = 1;
+        }
+        flush();
+        return out;
+    };
+    const text = siblings(roots);
+    if (trace.untraced > 0) text.push(`(${trace.untraced} further call(s) ran after the trace's ${trace.length} records and were not recorded)`);
+    return text.join('\n');
 }
 // credit assignment: blame the deepest failing call; a failing leaf (hand-written primitive, no skill deps) is never edited,
 // so responsibility moves to its caller (PSN calling_pattern_issues -> caller_fix); otherwise the callee itself (callee_fix).
@@ -534,7 +590,7 @@ export function blame(trace, isLeaf) {
     let t = best[1], kind = 'callee_fix';
     while (t >= 0 && isLeaf(trace[t].name)) { t = trace[t].parent; kind = 'caller_fix'; }
     const swallowed = !propagated.length;
-    const evidence = (best[0].ownFail.join(' | ') || best[0].err || `returned ${best[0].ret}`).slice(0, 400);
+    const evidence = (collapseRepeats(best[0].ownFail).join(' | ') || best[0].err || `returned ${best[0].ret}`);
     if (t < 0) return { target: null, leaf: best[0].name, path, kind: 'leaf_only', swallowed, evidence };
     return { target: trace[t].name, leaf: best[0].name, path, kind, swallowed, evidence };
 }
@@ -563,7 +619,7 @@ export function blameAll(trace, isLeaf, isLearned) {
     for (const [r, i] of [...pool].sort((x, y) => y[0].depth - x[0].depth)) {   // deepest failure first: it defines each skill's role
         const chain = []; for (let k = i; k >= 0; k = trace[k].parent) chain.unshift(k);
         const path = chain.map(k => trace[k].name);
-        const evidence = (r.ownFail.join(' | ') || r.err || `returned ${r.ret}`).slice(0, 400);
+        const evidence = (collapseRepeats(r.ownFail).join(' | ') || r.err || `returned ${r.ret}`);
         for (const k of chain) {
             const n = trace[k].name; if (isLeaf(n) || !isLearned(n) || (k === i && trace[k].preFail)) continue;   // fix22: violated precondition -> caller's fault
             if (owned.has(k) && !trace[k].ownFail.length) continue;   // fix60: only propagated a callee-owned failure

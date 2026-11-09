@@ -553,14 +553,14 @@ describe('smoke: full step loop', { skip: !DEPS_AVAILABLE ? `Dependencies not in
     it('should call extractFeedback() without ReferenceError/TypeError', () => {
         let error = null;
         try {
-            const feedback = extractFeedback('Some output\nFAILED: test error\nMore output', 500);
+            const feedback = extractFeedback('Some output\nFAILED: test error\nMore output');
             assert.ok(typeof feedback === 'string', 'extractFeedback should return a string');
             assert.ok(feedback.includes('FAILED'), 'should preserve FAILED lines');
             
-            const emptyFeedback = extractFeedback('', 500);
+            const emptyFeedback = extractFeedback('');
             assert.ok(typeof emptyFeedback === 'string', 'extractFeedback("") should return a string');
             
-            const nullFeedback = extractFeedback(null, 500);
+            const nullFeedback = extractFeedback(null);
             assert.ok(typeof nullFeedback === 'string', 'extractFeedback(null) should return a string');
         } catch (e) {
             error = e;

@@ -63,17 +63,19 @@ export class RepairMemory {
         return sig;
     }
 
+    // fix96: entries are stored whole (errorRaw, fixSnippet, taskHint were cut at 300/500/200 chars and shown cut again at
+    //        150/200 in every repair prompt); repair lessons now carry the change's description, not the head of its code
     async recordRepair({ errorSignature, fixSnippet, outcome, taskHint, skillName }) {
         if (!errorSignature) return;
         
         const entry = {
             id: `repair_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
             errorSignature: this.normalizeError(errorSignature),
-            errorRaw: String(errorSignature).slice(0, 300),
-            fixSnippet: String(fixSnippet || '').slice(0, 500),
-            outcome: outcome === true ? 'success' : outcome === false ? 'failure' : String(outcome).slice(0, 50),
-            taskHint: String(taskHint || '').slice(0, 200),
-            skillName: String(skillName || '').slice(0, 100),
+            errorRaw: String(errorSignature),
+            fixSnippet: String(fixSnippet || ''),
+            outcome: outcome === true ? 'success' : outcome === false ? 'failure' : String(outcome),
+            taskHint: String(taskHint || ''),
+            skillName: String(skillName || ''),
             timestamp: new Date().toISOString(),
             embedding: null,
         };
@@ -166,8 +168,8 @@ export class RepairMemory {
         
         const hints = lessons.map((r, i) => {
             const outcomeIcon = r.outcome === 'success' ? '✓' : '✗';
-            return `${i + 1}. [${outcomeIcon}] Error pattern: ${r.errorRaw.slice(0, 150)}
-   ${r.outcome === 'success' ? 'Successful fix' : 'Failed attempt'}: ${r.fixSnippet.slice(0, 200)}${r.taskHint ? `\n   Context: ${r.taskHint}` : ''}`;
+            return `${i + 1}. [${outcomeIcon}] Error pattern: ${r.errorRaw}
+   ${r.outcome === 'success' ? 'Successful fix' : 'Failed attempt'}: ${r.fixSnippet}${r.taskHint ? `\n   Context: ${r.taskHint}` : ''}`;
         }).join('\n');
         
         return `PAST REPAIR EXPERIENCE (hints, not rules - adapt as needed):
@@ -179,9 +181,9 @@ ${hints}`;
         
         const workflow = {
             id: `wf_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-            task: String(task || '').slice(0, 200),
-            steps: steps.slice(0, 10).map(s => String(s).slice(0, 100)),
-            outcome: outcome === true ? 'success' : outcome === false ? 'failure' : String(outcome).slice(0, 50),
+            task: String(task || ''),
+            steps: steps.map(s => String(s)),
+            outcome: outcome === true ? 'success' : outcome === false ? 'failure' : String(outcome),
             timestamp: new Date().toISOString(),
         };
         

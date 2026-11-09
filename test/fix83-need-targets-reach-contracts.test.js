@@ -257,7 +257,8 @@ await ensureSticks(bot);`;
         assert.strictEqual(Voyager.contractCallFacts('collectLogs', [2, 'oak_log'], 'pre', 'c => x'), 'collectLogs(2, "oak_log") does not satisfy its precondition c => x');
         const inst = instrumentSrc(['craftSticks']);
         assert.match(inst, /args: __argText\(a\.slice\(1\)\)/);
-        const argText = new Function(`${inst.match(/const __argText = [^\n]+/)[0]}; return __argText;`)();
+        // fix96: __argText renders through __valText (a game object as name@x,y,z); the three lines define it
+        const argText = new Function(`${inst.match(/const __gameObj = [^\n]+/)[0]}\n${inst.match(/const __valText = [\s\S]+?\n};/)[0]}\n${inst.match(/const __argText = [^\n]+/)[0]}; return __argText;`)();
         assert.strictEqual(argText([NaN, undefined, 'oak_log', null, 2]), '[NaN,undefined,"oak_log",null,2]');
     });
 });

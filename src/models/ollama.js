@@ -15,6 +15,11 @@ const OLLAMA_DISPATCHER = new Agent({ headersTimeout: 0, bodyTimeout: 0 });
 // Off, a prompt that does not fit is an HTTP 400 naming its real token count, and a reply that runs out of
 // context ends with done_reason "length" (fix31 throws).
 export const NEVER_CUT_PROMPT = Object.freeze({ truncate: false, shift: false });
+// fix96: the error code of a call whose prompt (or prompt + reply) does not fit the model's context. It is a failure of that
+//        one call, loud, and not a broken agent: restarting rebuilds the same prompt, so the step loop must not exit on it
+//        (voyager _onStepError). The caller of a repair/refactor/contract call already fails only that call.
+export const CONTEXT_FULL = 'CONTEXT_FULL';
+function contextFull(message) { const e = new Error(message); e.code = CONTEXT_FULL; return e; }
 
 export class Ollama {
     static prefix = 'ollama';
@@ -58,12 +63,19 @@ export class Ollama {
                 const message = err instanceof Error ? err.message : String(err);
                 const overflow = parseContextOverflow(message);
                 if (overflow) {
-                    throw new Error(`!!! [fix96] ${model}: prompt does not fit: ${overflow.requestTokens} tokens, context ${overflow.contextTokens} tokens; nothing was cut and nothing was sent to the model (message chars: ${chatSectionSizes(messages)}). ${message}`);
+                    throw contextFull(`!!! [fix96] ${model}: prompt does not fit: ${overflow.requestTokens} tokens, context ${overflow.contextTokens} tokens; nothing was cut and nothing was sent to the model (message chars: ${chatSectionSizes(messages)}). ${message}`);
                 }
                 throw err instanceof Error ? err : new Error(message);
             }
 
-            if (truncated) throw new Error(`[ollama] ${model}: reply hit the num_predict cap (${truncated.eval_count} tokens) - incomplete: ${String(res).slice(0, 160)}`);   // fix31: fail loudly
+            if (truncated) {
+                // fix96: with shift off, a reply that reaches the end of the context stops there (done_reason "length", as at a
+                //        num_predict cap); which of the two it was is read from the counts Ollama returns
+                const ctx = this.params && this.params.options ? this.params.options.num_ctx : undefined;
+                if (Number.isInteger(ctx) && truncated.prompt_eval_count + truncated.eval_count >= ctx)
+                    throw contextFull(`!!! [fix96] ${model}: prompt (${truncated.prompt_eval_count} tokens) + reply (${truncated.eval_count} tokens) reached the context (${ctx} tokens); the reply is incomplete and nothing was cut (message chars: ${chatSectionSizes(messages)})`);
+                throw new Error(`[ollama] ${model}: reply hit the num_predict cap (${truncated.eval_count} tokens) - incomplete: ${String(res).slice(0, 160)}`);   // fix31: fail loudly
+            }
             const hasOpenTag = res.includes("<think>");
             const hasCloseTag = res.includes("</think>");
 
