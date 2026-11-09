@@ -3,14 +3,33 @@
 // and can miss modifications; PathState is race-prone). fs.watch on the log directory
 // sees latest.log being replaced when the server gzips the old file and creates a new one.
 // https://nodejs.org/api/fs.html#caveats — a directory watch is not a poll. Re-read from
-// the saved offset on every event and once at arm time, so a missed event is recovered
-// on the next one and an old Done line (already on disk at arm) never counts.
+// the saved offset on every event. Arm does not start at EOF: a refusal during startup
+// can land after the server has already written Done, and skipping that line waits forever.
+// The current run begins at the last "Starting minecraft server" line in latest.log. If that
+// run has already logged Done and no "Stopping server" follows it, resolve at once (exit 75).
+// Otherwise watch from that line. A Done from an earlier run that has since stopped does not count.
 import fs from 'node:fs';
 import path from 'node:path';
 
 // Vanilla dedicated server, e.g. [12:05:38] [Server thread/INFO]: Done (146.414s)!
 export const DONE_RE = /\]: Done \(\d+(?:\.\d+)?s\)!/;
 export const STOPPING_MARK = 'Stopping server';
+// The first line of a server run, e.g. [12:04:00] [Server thread/INFO]: Starting minecraft server version 1.21.4
+export const START_MARK = 'Starting minecraft server';
+
+// Byte offset of the last START_MARK line. The line is located in the log text; the offset is
+// that line's start, not a fixed tail size.
+export function offsetOfCurrentRun(buf) {
+    if (!Buffer.isBuffer(buf)) throw new Error('[fix94] latest.log bytes required');
+    const text = buf.toString('utf8');
+    const at = text.lastIndexOf(START_MARK);
+    if (at < 0) {
+        throw new Error(`[fix94] latest.log has no "${START_MARK}" line; cannot locate the current server run`);
+    }
+    const newlineAt = text.lastIndexOf('\n', at);
+    const lineStart = newlineAt < 0 ? 0 : newlineAt + 1;
+    return Buffer.byteLength(text.slice(0, lineStart));
+}
 
 export function requireBackendLogDir(settings) {
     if (!settings || typeof settings !== 'object') throw new Error('[fix94] settings required');
@@ -50,6 +69,7 @@ export function armBackendReady({ logDir }) {
     let carry = '';
     let stopping = null;
     let done = null;
+    let doneFollowedByStop = false;
     let settled = false;
     let resolveReady;
     let rejectReady;
@@ -72,10 +92,27 @@ export function armBackendReady({ logDir }) {
     }
 
     const initial = stat();
-    if (initial) {
-        ino = initial.ino;
-        offset = initial.size;
+    if (!initial) throw new Error(`[fix94] ${logPath} is missing; backend_log_dir has no latest.log`);
+    const whole = Buffer.alloc(initial.size);
+    let fd0;
+    try {
+        fd0 = fs.openSync(logPath, 'r');
+    } catch (err) {
+        if (err && err.code === 'ENOENT') {
+            throw new Error(`[fix94] ${logPath} is missing; backend_log_dir has no latest.log`);
+        }
+        throw err;
     }
+    try {
+        const n = fs.readSync(fd0, whole, 0, initial.size, 0);
+        if (n !== initial.size) {
+            throw new Error(`[fix94] short read of ${logPath}: wanted ${initial.size} bytes, got ${n}`);
+        }
+    } finally {
+        fs.closeSync(fd0);
+    }
+    ino = initial.ino;
+    offset = offsetOfCurrentRun(whole);
 
     function finish(line) {
         if (settled) return;
@@ -118,13 +155,23 @@ export function armBackendReady({ logDir }) {
             const lines = text.split('\n');
             carry = lines.pop();
             for (const line of lines) {
-                if (stopping === null && line.includes(STOPPING_MARK)) {
-                    stopping = line;
-                    resolveStopping(line);
+                if (line.includes(START_MARK)) {
+                    done = null;
+                    doneFollowedByStop = false;
                 }
-                if (done === null && DONE_RE.test(line)) done = line;
+                if (line.includes(STOPPING_MARK)) {
+                    if (stopping === null) {
+                        stopping = line;
+                        resolveStopping(line);
+                    }
+                    if (done !== null) doneFollowedByStop = true;
+                }
+                if (DONE_RE.test(line)) {
+                    done = line;
+                    doneFollowedByStop = false;
+                }
             }
-            if (done !== null) finish(done);
+            if (done !== null && doneFollowedByStop === false) finish(done);
         } finally {
             fs.closeSync(fd);
         }
