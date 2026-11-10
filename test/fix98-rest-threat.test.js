@@ -243,26 +243,30 @@ describe('fix98: statistics packet', () => {
         assert.strictEqual(model.restUnavailable, null);
     });
 
-    it('a statistics packet without the id fails only rest, and hunger and threat still serve', async () => {
+    it('a missing or unmapped time_since_rest fails only the rest need, loudly, and the bot keeps running', async () => {
         const v = mkV();
         v.agent.bot.version = VER;
         const handlers = {};
         v.agent.bot.on = () => {};
         v.agent.bot._client = { write() {}, on(name, fn) { handlers[name] = fn; } };
-        installProtocolFacts(v.agent.bot, minecraftData(VER), v.restThreat);
+        assert.doesNotThrow(() => installProtocolFacts(v.agent.bot, minecraftData(VER), v.restThreat));
         const ids = resolveRestStatIds(loadCustomStatReport(), VER);
         const logs = [];
         const orig = console.error;
         console.error = (...args) => { logs.push(args.join(' ')); };
         try {
+            assert.doesNotThrow(() => handlers.statistics({ entries: [] }));
             assert.doesNotThrow(() => handlers.statistics({
                 entries: [{ categoryId: ids.categoryId, statisticId: ids.statisticId + 1, value: 9 }],
             }));
         } finally {
             console.error = orig;
         }
-        assert.match(logs.join('\n'), /rest unavailable/);
+        const logged = logs.join('\n');
+        assert.match(logged, /rest unavailable/);
+        assert.match(logged, /did not include/);
         assert.match(v.restThreat.restUnavailable, new RegExp(REST_STATISTIC));
+        assert.strictEqual(v.restThreat.restCandidate(v.agent.bot, 1, 1), null);
         assert.strictEqual(typeof v.agent.bot.restSince, 'undefined');
         await assertHungerAndThreatStillServe(v);
         assert.match(v.restThreat.restUnavailable, new RegExp(REST_STATISTIC));
