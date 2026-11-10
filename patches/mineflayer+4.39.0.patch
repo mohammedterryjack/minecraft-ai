@@ -90,7 +90,7 @@ index 5ae5552..af28eef 100644
      return block.digTime(
        type,
 diff --git a/node_modules/mineflayer/lib/plugins/game.js b/node_modules/mineflayer/lib/plugins/game.js
-index d3291b0..6e8edac 100644
+index d3291b0..0c951c2 100644
 --- a/node_modules/mineflayer/lib/plugins/game.js
 +++ b/node_modules/mineflayer/lib/plugins/game.js
 @@ -104,7 +104,9 @@ function inject (bot, options) {
@@ -104,13 +104,17 @@ index d3291b0..6e8edac 100644
        bot.game.serverViewDistance = packet.viewDistance
      }
  
-@@ -135,6 +137,11 @@ function inject (bot, options) {
+@@ -135,6 +137,15 @@ function inject (bot, options) {
      bot.game.difficulty = difficultyNames[packet.difficulty]
    })
  
 +  // Login (play) is the first view distance. Update View Distance replaces it (protocol 1.20.3, packet_update_view_distance).
++  // The field is a varint. A non-integer is not that packet.
 +  bot._client.on('update_view_distance', (packet) => {
-+    if (Number.isInteger(packet.viewDistance)) bot.game.serverViewDistance = packet.viewDistance
++    if (!packet || !Number.isInteger(packet.viewDistance)) {
++      throw new Error(`update_view_distance viewDistance is ${JSON.stringify(packet && packet.viewDistance)}; the protocol field is a varint (minecraft-data pc/1.20.3 packet_update_view_distance, https://wiki.vg/Protocol#Update_View_Distance).`)
++    }
++    bot.game.serverViewDistance = packet.viewDistance
 +  })
 +
    bot._client.on(brandChannel, (serverBrand) => {

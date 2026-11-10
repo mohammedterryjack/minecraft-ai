@@ -6,7 +6,6 @@ export const CODE_PROMPT_DUMP = '/tmp/icefox_code_prompt.txt';
 
 export function writeCodePromptDump(system, user) {
     if (typeof system !== 'string') throw new Error('[code-prompt] system prompt must be text');
-    const userText = user === undefined ? '' : user;
-    if (typeof userText !== 'string') throw new Error('[code-prompt] user prompt must be text');
-    writeFileSync(CODE_PROMPT_DUMP, `SYSTEM:\n${system}\n\nUSER:\n${userText}\n`);
+    if (typeof user !== 'string') throw new Error(`[code-prompt] user prompt must be text, got ${user === undefined ? 'undefined' : typeof user}`);
+    writeFileSync(CODE_PROMPT_DUMP, `SYSTEM:\n${system}\n\nUSER:\n${user}\n`);
 }

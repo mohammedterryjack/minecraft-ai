@@ -116,16 +116,16 @@ describe('fix97 goal identity: Collect 1 apple stays Collect 1 apple', () => {
 });
 
 describe('fix97 contracts: a hallucinated number is refused, and the manifest is a dry run', () => {
-    it('Oak log count < 55 is refused; 0 and 1 are not', () => {
+    it('an inventory comparison copies an observed count; a bare 55 is not one', () => {
         const v = mkV({});
         const skill = { name: 'checkOakLog', code: 'async function checkOakLog(bot) { return true; }', consumes: {}, effects: [] };
-        const bad = v._validContract({ pre: 'c => c.pre.inv.oak_log < 55', post: 'c => true' }, skill);
-        assert.match(bad, /pre uses 55/);
+        assert.strictEqual(v._validContract({ pre: 'c => c.pre.inv.oak_log < 55', post: 'c => true' }, skill), null);
         const ok = v._validContract({ pre: 'c => c.args.length >= 1 && c.args[0] === null', post: 'c => true' }, skill);
         assert.strictEqual(ok, null);
         const buried = { name: 'checkOakLog', code: 'async function checkOakLog(bot) { return 155; }', consumes: {}, effects: [], stats: { success: 5512, fail: 0 } };
-        const still = v._validContract({ pre: 'c => c.pre.inv.oak_log < 55', post: 'c => true' }, buried);
-        assert.match(still, /pre uses 55/);
+        assert.strictEqual(v._validContract({ pre: 'c => c.pre.inv.oak_log < 55', post: 'c => true' }, buried), null);
+        const observed = { ...skill, task: 'Check inventory for oak_log and confirm count (currently 55) to ensure input is valid for crafting oak_planks' };
+        assert.match(v._validContract({ pre: 'c => c.pre.inv.oak_log < 55', post: 'c => true' }, observed), /pre uses 55/);
     });
 
     it('the manifest lists a 55 contract and does not apply; this checkout has no checkOakLog', () => {
@@ -136,24 +136,13 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         const manifest = buildContractManifest(fixture);
         assert.strictEqual(manifest.apply, false);
         assert.strictEqual(manifest.dryRun, true);
-        assert.deepStrictEqual(manifest.records.map(r => r.id), ['checkOakLog.pre.55', 'checkOakLog.code.55']);
-        const code55 = manifest.records.find(r => r.id === 'checkOakLog.code.55');
-        assert.match(code55.evidence, /promptCounts/);
-        assert.match(code55.evidence, /55/);
+        assert.deepStrictEqual(manifest.records.map(r => r.id), []);
         const live = JSON.parse(readFileSync(new URL('../bots/icefox2000/skills/index.json', import.meta.url), 'utf8'));
         const disk = buildContractManifest(live);
         assert.strictEqual(disk.checkOakLogPresent, false);
         assert.strictEqual(disk.apply, false);
-        assert.deepStrictEqual(disk.records.map(r => r.id), ['checkOakLog.code.55', 'checkOakLog.pre.55']);
-        const diskCode = disk.records.find(r => r.id === 'checkOakLog.code.55');
-        const diskPre = disk.records.find(r => r.id === 'checkOakLog.pre.55');
-        assert.match(diskCode.evidence, /copied/);
-        assert.match(diskCode.evidence, /promptCounts/);
-        assert.match(diskCode.evidence, /counts\.oak_log >= 55/);
-        assert.match(diskPre.evidence, /copied/);
-        assert.match(diskPre.evidence, /promptCounts/);
-        assert.match(diskPre.evidence, /c\.pre\.inv\.oak_log >= 55/);
-        for (const id of ['smeltIronIntoIngot.code.1', 'mineBlocks.pre.2', 'craftItem.pre.2', 'craftArmorSet.post.4']) {
+        assert.deepStrictEqual(disk.records.map(r => r.id), []);
+        for (const id of ['checkOakLog.code.55', 'checkOakLog.pre.55', 'smeltIronIntoIngot.code.1', 'mineBlocks.pre.2', 'craftItem.pre.2', 'craftArmorSet.post.4']) {
             assert.ok(!disk.records.some(r => r.id === id), id);
         }
     });
@@ -169,7 +158,7 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         assert.throws(() => Voyager.parseContract('function ( {'), /contract does not parse/);
         const commented = 'async function checkOakLog(bot) {\n  // currently 55\n  log(bot, "currently 55");\n  return true;\n}';
         const skill = { name: 'checkOakLog', code: commented, consumes: {}, effects: [] };
-        assert.match(v._validContract({ pre: 'c => c.pre.inv.oak_log < 55', post: 'c => true' }, skill), /pre uses 55/);
+        assert.strictEqual(v._validContract({ pre: 'c => c.pre.inv.oak_log < 55', post: 'c => true' }, skill), null);
         assert.match(Voyager.prototype._learnContracts.toString(), /String\(e\.code\)/);
         assert.doesNotMatch(Voyager.prototype._learnContracts.toString(), /sourceForContractPrompt/);
         const coded = { name: 'checkOakLog', code: 'async function checkOakLog(bot) { const n = 55; return n; }', consumes: {}, effects: [] };
@@ -210,30 +199,12 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         ];
         const manifest = buildContractManifest(skills);
         assert.deepStrictEqual(manifest.records.map(r => r.id), [
-            'craftToolSet.post.3',
-            'harvestCrop.post.2',
-            'breakBlockAt.pre.2',
-            'equipBestPickaxeForIronOre.post.4',
-            'equipBestPickaxeForIronOre.post.5',
-            'travelWestAvoidDeathHotspot.post.6',
-            'equipIronAxe.post.9',
-            'exploreForIronOre.post.4',
-            'scanForIronOreBlocks.post.0.5',
-            'mineIronOreDeposit.pre.2',
-            'mineIronOreDeposit.post.2',
             'checkOakLog.code.55',
             'checkOakLog.pre.55',
         ]);
         assert.deepStrictEqual(manifest.reasonLines, manifest.records.map(r => r.verdict));
         for (const r of manifest.records) assert.ok(r.verdict.startsWith(r.id), r.verdict);
         const byId = Object.fromEntries(manifest.records.map(r => [r.id, r.verdict]));
-        assert.match(byId['ensureStorageChestNearby.post.64'] || '', /^$/);
-        assert.match(byId['equipIronAxe.post.9'], /iron_ingot recipe result count 9/);
-        assert.match(byId['equipIronAxe.post.9'], /not c\.ret/);
-        assert.match(byId['exploreForIronOre.post.4'], /not a minecraft-data fact of that field/);
-        assert.match(byId['scanForIronOreBlocks.post.0.5'], /not a minecraft-data fact of that field/);
-        assert.match(byId['mineIronOreDeposit.pre.2'], /c\.args\.length/);
-        assert.match(byId['mineIronOreDeposit.post.2'], /c\.ret/);
         assert.match(byId['checkOakLog.code.55'], /promptCounts count of oak_log/);
         assert.match(byId['checkOakLog.pre.55'], /promptCounts count of oak_log/);
         assert.strictEqual(manifest.checkOakLogPresent, true);
@@ -250,6 +221,74 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         for (const id of ['smeltIronIntoIngot.code.1', 'mineBlocks.pre.2', 'craftItem.pre.2', 'hasItemCount.pre.2', 'ensureIngredientsAndCraft.pre.2', 'craftArmorSet.post.4', 'isSafeTarget.pre.2', 'isSafeTarget.pre.3']) {
             assert.ok(!cleared.records.some(r => r.id === id), `${id} in ${cleared.records.map(r => r.id).join(',')}`);
         }
+    });
+
+    it('the 21 live-index hits keep only an inventory count equal to the count the skill was generated from', () => {
+        const fn = (name, body = 'return true;') => `async function ${name}(bot) {\n  ${body}\n}`;
+        const oakTask = 'Check inventory for oak_log and confirm count (currently 55) to ensure input is valid for crafting oak_planks';
+        const skills = [
+            { name: 'craftToolSet', code: fn('craftToolSet'), contract: { pre: 'c => true', post: 'c => Object.keys(c.post.inv).filter(k=>k.endsWith(\'_pickaxe\')||k.endsWith(\'_axe\')||k.endsWith(\'_sword\')).length === 3' } },
+            { name: 'isSafeTarget', code: fn('isSafeTarget'), contract: { pre: 'c => c.args.length === 2 || (c.args.length === 3 && typeof c.args[2] === \'number\')', post: 'c => true' } },
+            { name: 'craftArmorSet', code: fn('craftArmorSet'), contract: { pre: 'c => true', post: 'c => Number(c.ret) === 0 || (Number(c.ret) > 0 && Number(c.ret) <= 4 && c.post.alive)' } },
+            { name: 'harvestCrop', code: fn('harvestCrop'), contract: { pre: 'c => true', post: 'c => Number(c.ret) >= 0 && Number(c.ret) <= (c.args[2]||4)' } },
+            { name: 'breakBlockAt', code: fn('breakBlockAt'), contract: { pre: 'c => c.pre.alive && c.args[0] != null && c.args[1] != null && c.args[2] != null', post: 'c => true' } },
+            { name: 'exploreForIronOre', code: fn('exploreForIronOre'), contract: { pre: 'c => true', post: 'c => c.dist(c.post.pos, {x: c.pre.pos.x + (c.args[0] % 3 - 1) * 40, y: c.pre.pos.y + Math.min(0, -8 - c.args[0] * 2), z: c.pre.pos.z}) <= 4' } },
+            { name: 'scanForIronOreBlocks', code: fn('scanForIronOreBlocks'), contract: { pre: 'c => true', post: 'c => c.post.alive && c.dist(c.pre.pos, c.post.pos) < 0.5 && c.post.alive' } },
+            { name: 'exploreForIronOreDeposit', code: fn('exploreForIronOreDeposit'), contract: { pre: 'c => true', post: 'c => c.dist(c.post.pos, {x: c.pre.pos.x, y: c.pre.pos.y, z: c.pre.pos.z}) <= 5' } },
+            { name: 'mineIronOreDeposit', code: fn('mineIronOreDeposit'), contract: { pre: 'c => c.pre.alive && typeof c.args[1] === \'number\' && typeof c.args[2] === \'number\' && (c.pre.inv.raw_iron || 0) - c.args[1] < c.args[2]', post: 'c => { const startRaw = c.args[1], goal = c.args[2]; return true; }' } },
+            { name: 'ensureStorageChestNearby', code: fn('ensureStorageChestNearby'), contract: { pre: 'c => true', post: 'c => c.ret !== true || (c.post.alive && c.post.dim === c.pre.dim && c.dist(c.pre.pos, c.post.pos) <= 64)' } },
+            { name: 'equipBestPickaxeForIronOre', code: fn('equipBestPickaxeForIronOre'), contract: { pre: 'c => true', post: 'c => { const tier = { wooden_pickaxe: 1, stone_pickaxe: 2, iron_pickaxe: 3, golden_pickaxe: 3, diamond_pickaxe: 4, netherite_pickaxe: 5 }; return tier.diamond_pickaxe === 4 && tier.netherite_pickaxe === 5; }' } },
+            { name: 'travelWestAvoidDeathHotspot', code: fn('travelWestAvoidDeathHotspot'), contract: { pre: 'c => true', post: 'c => c.dist(c.post.pos, {x:-178,y:53,z:107}) <= 8 && Math.abs(c.post.pos.y - 53) <= 6' } },
+            { name: 'verifyBlockType', code: fn('verifyBlockType'), contract: { pre: 'c => c.args[0] === -28 && c.args[1] === 73 && c.args[2] === 56 && c.pre.alive', post: 'c => true' } },
+            { name: 'chopDownTrees', code: fn('chopDownTrees'), contract: { pre: 'c => c.pre.sky > 5', post: 'c => true' } },
+            { name: 'removeItem', code: fn('removeItem'), contract: { pre: 'c => c.args[2] === 0', post: 'c => true' } },
+            { name: 'collectSurfaceDirt', code: fn('collectSurfaceDirt'), contract: { pre: 'c => c.pre.sky > 4 && c.pre.inv.iron_hoe !== undefined', post: 'c => true' } },
+            {
+                name: 'checkOakLog',
+                task: oakTask,
+                description: oakTask,
+                code: fn('checkOakLog', 'const inventory = getInventoryCounts(bot);\n  if (inventory && inventory.oak_log >= 55) { return true; }\n  if (inventory.oak_log >= 55) { return true; }\n  log(bot, \'FAILED: Oak log count is less than 55\');\n  return false;'),
+                contract: { pre: 'c => c.pre.inv.oak_log >= 55', post: 'c => c.ret', text: 'Check if oak_log count is at least 55 in the inventory.' },
+                stats: { success: 2, fail: 0, tasks: ['reach oak_log'] },
+                effectEvidence: { runs: 1, items: {} },
+                consumeEvidence: { runs: 1, items: {} },
+                effects: [],
+                consumes: {},
+                repairHistory: [{ evidence: 'failure only in non-library code checkOakLog (FAILED: Oak log count is less than 55 [food 0/20 health 10/20] | PRECONDITION violated: checkOakLog() does not satisfy its precondition c => c.pre.inv.oak_log >= 55)' }],
+            },
+            {
+                name: 'craftBirchPlanks',
+                task: 'Craft 4 birch_planks',
+                code: fn('craftBirchPlanks', 'const counts = getInventoryCounts(bot);\n  return counts.birch_planks >= 4;'),
+                promptCounts: { birch_planks: 4 },
+                contract: { pre: 'c => c.pre.inv.birch_planks >= 4', post: 'c => true' },
+            },
+            {
+                name: 'collectSevenDirt',
+                task: 'Collect 7 dirt',
+                code: fn('collectSevenDirt', 'const counts = getInventoryCounts(bot);\n  return counts.dirt >= 7;'),
+                promptCounts: { dirt: 7 },
+                contract: { pre: 'c => c.pre.inv.dirt >= 7', post: 'c => true' },
+            },
+        ];
+        const manifest = buildContractManifest(skills);
+        const wrong = [
+            'craftToolSet.post.3', 'isSafeTarget.pre.2', 'craftArmorSet.post.4', 'harvestCrop.post.2', 'breakBlockAt.pre.2',
+            'exploreForIronOre.post.4', 'scanForIronOreBlocks.post.0.5', 'exploreForIronOreDeposit.post.5',
+            'mineIronOreDeposit.pre.2', 'mineIronOreDeposit.post.2', 'ensureStorageChestNearby.post.64',
+            'equipBestPickaxeForIronOre.post.4', 'equipBestPickaxeForIronOre.post.5', 'travelWestAvoidDeathHotspot.post.6',
+            'verifyBlockType.pre.2', 'chopDownTrees.pre.5', 'removeItem.pre.2', 'collectSurfaceDirt.pre.4',
+            'craftBirchPlanks.pre.4', 'craftBirchPlanks.code.4', 'collectSevenDirt.pre.7', 'collectSevenDirt.code.7',
+        ];
+        for (const id of wrong) assert.ok(!manifest.records.some(r => r.id === id), id);
+        assert.strictEqual(Voyager.countIsGameFact(registry, 'dirt', 7), false);
+        assert.deepStrictEqual(manifest.records.map(r => r.id), ['checkOakLog.code.55', 'checkOakLog.pre.55']);
+        assert.strictEqual(manifest.records.filter(r => r.id === 'checkOakLog.code.55').length, 1);
+        const code55 = manifest.records.find(r => r.id === 'checkOakLog.code.55');
+        assert.match(code55.evidence, /task records oak_log at 55/);
+        assert.match(code55.evidence, /name:count/);
+        assert.doesNotMatch(code55.evidence, /promptCounts/);
+        assert.throws(() => Voyager.textCountPairs('oak_log 55 oak_planks', registry), /equally near/);
     });
 });
 
@@ -479,16 +518,40 @@ describe('fix97 findBlocks refuses a non-numeric maxDistance or count', () => {
         assert.throws(() => nearbyBlockRadius({ game: { simulationDistance: 4 } }), /viewDistance is undefined/);
         assert.strictEqual(nearbyBlockRadius({ game: { serverViewDistance: 8 } }), 8 * CHUNK_WIDTH);
         assert.strictEqual(nearbyBlockRadius({ game: { serverViewDistance: 10, simulationDistance: 5 } }), 10 * CHUNK_WIDTH);
-        let seen = null;
+        const { BLOCK_SECTION_VOLUME } = require('prismarine-chunk/src/pc/common/constants.js');
+        const stoneId = registry.blocksByName.stone.defaultState;
+        const diamondId = registry.blocksByName.diamond_ore.defaultState;
+        const obsidianId = registry.blocksByName.obsidian.defaultState;
+        const bedrockId = registry.blocksByName.bedrock.defaultState;
+        let cellReads = 0;
+        let blockAtCalls = 0;
         const viewBot = {
-            game: { serverViewDistance: 2 },
+            game: { serverViewDistance: 10 },
             registry,
-            findBlocks(opts) { seen = opts; return []; },
-            blockAt() { return null; },
+            entity: { position: { x: 8, y: 64, z: 8 } },
+            blockAt() { blockAtCalls += 1; return null; },
+            findBlocks() { throw new Error('getNearbyBlockTypes must not scan the view-distance cube'); },
+            world: { getColumns() { return [
+                { chunkX: 0, chunkZ: 0, column: { sections: [
+                    { palette: [stoneId], data: { get() { throw new Error('a palette section is not walked cell by cell'); } } },
+                    { data: { get() { cellReads += 1; return stoneId; } } },
+                    null,
+                ] } },
+                { chunkX: 10, chunkZ: 0, column: { sections: [{ palette: [obsidianId] }] } },
+                { chunkX: 11, chunkZ: 0, column: { sections: [{ palette: [bedrockId] }] } },
+                { chunkX: 100, chunkZ: 0, column: { sections: [{ palette: [diamondId] }] } },
+            ]; } },
         };
-        getNearbyBlockTypes(viewBot, nearbyBlockRadius(viewBot));
-        assert.strictEqual(seen.maxDistance, 2 * CHUNK_WIDTH);
-        assert.strictEqual(seen.count, (2 * CHUNK_WIDTH * 2 + 1) ** 3);
+        const nearbyNames = getNearbyBlockTypes(viewBot, nearbyBlockRadius(viewBot));
+        const cube = (10 * CHUNK_WIDTH * 2 + 1) ** 3;
+        assert.ok(nearbyNames.includes('stone'));
+        assert.ok(nearbyNames.includes('obsidian'));
+        assert.ok(!nearbyNames.includes('bedrock'));
+        assert.ok(!nearbyNames.includes('diamond_ore'));
+        assert.strictEqual(blockAtCalls, 0);
+        assert.strictEqual(cellReads, BLOCK_SECTION_VOLUME);
+        assert.ok(cellReads < cube);
+        assert.throws(() => getNearbyBlockTypes({ game: { serverViewDistance: 10 }, registry, entity: { position: { x: 0, y: 0, z: 0 } } }, 16), /getColumns/);
         const { EventEmitter } = require('events');
         const client = new EventEmitter();
         const gameBot = {
@@ -510,6 +573,8 @@ describe('fix97 findBlocks refuses a non-numeric maxDistance or count', () => {
         client.emit('update_view_distance', { viewDistance: 9 });
         assert.strictEqual(gameBot.game.serverViewDistance, 9);
         assert.strictEqual(nearbyBlockRadius(gameBot), 9 * CHUNK_WIDTH);
+        assert.throws(() => client.emit('update_view_distance', { viewDistance: 9.5 }), /varint/);
+        assert.strictEqual(gameBot.game.serverViewDistance, 9);
         assert.match(Voyager.prototype._pursueProposedTask.toString(), /maxDistance and count are finite numbers/);
         assert.match(Voyager.prototype._pursueProposedTask.toString(), /findBlock\(options\) returns one block and does not take count/);
         const raw = new EventEmitter();

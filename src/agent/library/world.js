@@ -7,7 +7,7 @@ import { itemSourceBlocks } from '../../utils/item_sources.js';
 
 const require = createRequire(import.meta.url);
 // A chunk is 16 blocks on a side (prismarine-chunk; https://minecraft.wiki/w/Chunk).
-const { CHUNK_WIDTH } = require('prismarine-chunk/src/pc/common/constants.js');
+const { CHUNK_WIDTH, BLOCK_SECTION_VOLUME } = require('prismarine-chunk/src/pc/common/constants.js');
 
 
 // fix42: getAllFreeSpaces returns all valid positions (for retry logic when placeBlock fails at one cell)
@@ -539,21 +539,73 @@ export function getNearbyBlocks(bot, distance) {
     return getNearestBlocks(bot, null, distance, positionsWithin(distance));
 }
 
+// View distance is a square of chunks around the player (Chebyshev), not a sphere of blocks.
+// https://minecraft.wiki/w/Render_distance
+function columnsInView(bot, chunkRadius) {
+    const world = bot && bot.world;
+    if (!world || typeof world.getColumns !== 'function') {
+        throw new Error('getNearbyBlockTypes: bot.world.getColumns is missing. Block types are the palettes of the loaded chunk columns (prismarine-world), not a walk of the view-distance cube.');
+    }
+    const pos = bot.entity && bot.entity.position;
+    if (!pos || !Number.isFinite(pos.x) || !Number.isFinite(pos.z)) {
+        throw new Error('getNearbyBlockTypes: bot.entity.position is missing. The view distance is a square of chunks around the player (https://minecraft.wiki/w/Render_distance).');
+    }
+    const centerX = Math.floor(pos.x / CHUNK_WIDTH);
+    const centerZ = Math.floor(pos.z / CHUNK_WIDTH);
+    const columns = [];
+    for (const col of world.getColumns()) {
+        if (!col || !Number.isInteger(Number(col.chunkX)) || !Number.isInteger(Number(col.chunkZ)) || !col.column) {
+            throw new Error(`getNearbyBlockTypes: a loaded column has no chunk coordinates (${JSON.stringify(col && { chunkX: col.chunkX, chunkZ: col.chunkZ })}).`);
+        }
+        const cx = Number(col.chunkX), cz = Number(col.chunkZ);
+        if (Math.max(Math.abs(cx - centerX), Math.abs(cz - centerZ)) <= chunkRadius) columns.push(col.column);
+    }
+    return columns;
+}
+
+// Indirect and single-value sections store the block state ids in the palette. A direct section has no local palette;
+// its state ids are the cell values, so the bound is that section's volume, not the view-distance cube.
+function stateIdsInSection(section) {
+    if (!section) return [];
+    const data = section.data;
+    if (Array.isArray(section.palette)) return section.palette;
+    if (data && Array.isArray(data.palette)) return data.palette;
+    if (data && typeof data.value === 'number') return [data.value];
+    if (data && typeof data.get === 'function') {
+        const ids = [];
+        const seen = new Set();
+        for (let i = 0; i < BLOCK_SECTION_VOLUME; i++) {
+            const id = data.get(i);
+            if (typeof id !== 'number') throw new Error(`getNearbyBlockTypes: section cell ${i} is not a state id`);
+            if (!seen.has(id)) { seen.add(id); ids.push(id); }
+        }
+        return ids;
+    }
+    throw new Error('getNearbyBlockTypes: a loaded section has no palette and no block storage');
+}
+
 export function getNearbyBlockTypes(bot, distance) {
     /**
-     * Get a list of all nearby block names.
-     * @param {Bot} bot - The bot to get nearby blocks for.
-     * @param {number} distance - Radius in blocks. A finite number. Not a list of block names.
-     * @returns {string[]} - A list of all nearby blocks.
+     * Block names in the loaded chunk sections inside the view distance.
+     * @param {Bot} bot - The bot. Its world columns and registry supply the names.
+     * @param {number} distance - Radius in blocks, the server view distance times the chunk width.
+     * @returns {string[]} - Block names from those sections' palettes.
      * @example
-     * let blocks = world.getNearbyBlockTypes(bot, 16);
+     * let blocks = world.getNearbyBlockTypes(bot, world.nearbyBlockRadius(bot));
      **/
     requireScanNumber('getNearbyBlockTypes', 'distance', distance);
-    let blocks = getNearbyBlocks(bot, distance);
-    let found = [];
-    for (let i = 0; i < blocks.length; i++) {
-        if (!found.includes(blocks[i].name)) {
-            found.push(blocks[i].name);
+    const chunkRadius = Math.floor(distance / CHUNK_WIDTH);
+    const found = [];
+    for (const column of columnsInView(bot, chunkRadius)) {
+        if (!Array.isArray(column.sections)) throw new Error('getNearbyBlockTypes: a loaded column has no sections');
+        for (const section of column.sections) {
+            for (const id of stateIdsInSection(section)) {
+                const registry = bot.registry;
+                if (!registry || !registry.blocksByStateId) throw new Error('getNearbyBlockTypes: bot.registry.blocksByStateId is missing');
+                const block = registry.blocksByStateId[id];
+                if (!block || typeof block.name !== 'string') throw new Error(`getNearbyBlockTypes: state id ${id} is not in the registry`);
+                if (!found.includes(block.name)) found.push(block.name);
+            }
         }
     }
     return found;
