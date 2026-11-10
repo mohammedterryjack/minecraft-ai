@@ -28,7 +28,8 @@ import minecraftData from 'minecraft-data';
 import { Ollama, CONTEXT_FULL } from '../models/ollama.js';
 import { setCallDurationStore } from '../models/call_durations.js';
 import { setMovementStore, learnedKinds, recordStep, recordCut, stepBound, noteUnbounded } from '../utils/movement_model.js';
-import { signatureOf, depsOf, missingCalls, installViolations, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf, thrownIn, declaredNames, skillSourceViolations, splitGeneratedCode, oneFunctionFeedback, entryCallFeedback, markerCallsMissing, markerGateNames, collapseRepeats, parsesAsScript, pastedLibrarySkills } from './skill_graph.js';
+import { signatureOf, depsOf, missingCalls, installViolations, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf, thrownIn, declaredNames, skillSourceViolations, splitGeneratedCode, oneFunctionFeedback, entryCallFeedback, markerCallsMissing, markerGateNames, collapseRepeats, parsesAsScript, pastedLibrarySkills, factKey, groupVaryingLines, structuredTrace } from './skill_graph.js';
+import { writeCodePromptDump } from '../models/code_prompt_dump.js';
 import { getBareAPI, collectBareApiUsedInSource, PRECONDITION_UNMET_BINDING } from './coder.js';   // fix40: unified bare-name API helper
 import { withStallPhase } from '../utils/event_loop_guard.js';
 import { watchdogEvidencePath } from '../utils/main_thread_watchdog.js';
@@ -98,6 +99,61 @@ export function parseJSON(text) {
 export function extractFeedback(output) {
     if (arguments.length !== 1) throw new Error(`[fix96] extractFeedback takes the output only (nothing is cut), got ${arguments.length} arguments`);
     return collapseRepeats(String(output === undefined || output === null ? '' : output).split('\n')).join('\n');
+}
+// fix97: the code-retry prompt is this text. compose-retry #78 (fix96 1c2f9c0, Collect 1 stripped_birch_wood) sent
+// 181705 chars, of which the retry section was 170464 (94%), and Ollama counted 58984 tokens against num_ctx 8192.
+// The section was attempt 1's execution output, the 789-call trace, the inventory-full fact and the behaviour log,
+// each repeating the same lines. collapseRepeats only merges consecutive identical lines, so 60 identical
+// collectLogs FAILs interleaved with other calls, and pathfinder lines that differ by coordinates, all stayed.
+// This builds the same facts once: one trace entry per distinct call (count, outcome, first and last error), then
+// output and behaviour lines whose words are already in that trace or in the inventory fact are not pasted again.
+// Nothing is sliced. A line that says something the trace does not say is kept, with its own repeats counted.
+export function codeRetryFeedback({ cut, output, trace, critique, invFull, behaviorLog }) {
+    if (typeof critique !== 'string') throw new Error('[fix97] code retry feedback needs the critic text');
+    if (typeof output !== 'string') throw new Error('[fix97] code retry feedback needs the execution output');
+    if (typeof behaviorLog !== 'string') throw new Error('[fix97] code retry feedback needs the behaviour log');
+    if (!(trace === null || Array.isArray(trace))) throw new Error('[fix97] code retry feedback needs the execution trace, or null when the attempt produced none');
+    if (invFull !== null && invFull !== undefined && typeof invFull !== 'string') throw new Error('[fix97] code retry inventory fact must be text or null');
+    const covered = new Set();
+    const cover = (text) => { for (const line of String(text).split('\n')) { const k = factKey(line); if (k) covered.add(k); } };
+    const traceTextOut = Array.isArray(trace) ? structuredTrace(trace) : '';
+    cover(traceTextOut);
+    if (Array.isArray(trace)) {
+        for (const r of trace) {
+            if (r && Array.isArray(r.ownFail)) for (const line of r.ownFail) if (typeof line === 'string') covered.add(factKey(line));
+            if (r && r.err) covered.add(factKey(String(r.err)));
+        }
+    }
+    const inv = typeof invFull === 'string' ? invFull : '';
+    if (inv.length) cover(inv);
+    if (cut) { cover(String(cut)); cover(`Attempt ${cut}`); }
+    const already = (k) => {
+        if (covered.has(k)) return true;
+        for (const c of covered) if (c.startsWith(k) || k.startsWith(c)) return true;
+        return false;
+    };
+    const fresh = (text) => {
+        const kept = [];
+        for (const line of String(text).split('\n')) {
+            if (!line.trim()) continue;
+            const k = factKey(line);
+            if (already(k)) continue;
+            if (inv.length && /inventory full/i.test(line) && /empty slots/i.test(line)) continue;
+            kept.push(line);
+        }
+        for (const line of kept) covered.add(factKey(line));
+        return groupVaryingLines(kept.join('\n'));
+    };
+    const outputFacts = fresh(output);
+    const behaviorFacts = fresh(behaviorLog);
+    const parts = [];
+    if (cut) parts.push(`Attempt ${cut}`);
+    if (traceTextOut) parts.push(`Execution trace:\n${traceTextOut}`);
+    if (outputFacts) parts.push(`Execution output:\n${outputFacts}`);
+    if (critique.length) parts.push(`Critic: ${critique}`);
+    if (inv.length) parts.push(`Inventory fact: ${inv}`);
+    if (behaviorFacts) parts.push(`Chat/behaviour log:\n${behaviorFacts}`);
+    return parts.join('\n');
 }
 let NAMES = null;
 function knownNames() {
@@ -220,6 +276,8 @@ function registryVersion(v) {
 let VERSION = registryVersion(settings.minecraft_version);
 // fix46: test-only setter for VERSION (parseVerboseGoal requires VERSION to be set)
 export function _setVersionForTest(v) { VERSION = v; }
+// How many of an item each recipe consumes. Built once per registry; itemFacts reads it for the item being grounded.
+const recipeUseCounts = new WeakMap();
 
 // fix49: parse "ensure X" goals - places a block/item nearby (furnace, crafting_table, chest, etc.)
 // The goal item must be placed, not just in inventory - so satisfaction requires the item to exist as a block nearby
@@ -1409,32 +1467,134 @@ Use only c; no other globals.`;
         return out;
     }
     // A comparison whose literal equals the observed count of an item that comparison names. Comments and strings are not literals.
-    static copiedCountComparisons(code, entries) {
+    // 0 and 1 are not a copied snapshot. A number that is a stack size, a recipe result, or a recipe's use of that item is
+    // game data for the count, not a snapshot. `const need = 55; counts.oak_log >= need` and `const n = counts.oak_log; n >= 55`
+    // are the same comparison: the binding is resolved in its scope before the two sides are compared.
+    static copiedCountComparisons(code, entries, registry) {
+        if (!registry || !registry.itemsByName) throw new Error('[fix97] copied-count check needs the game data registry');
+        if (!Array.isArray(entries)) throw new Error('[fix97] copied-count check needs the observed counts');
         const ast = Voyager.parseSkill(code);
         const COMPARE = new Set(['<', '<=', '>', '>=', '==', '===', '!=', '!==']);
         const hits = [];
-        const walk = (n, parent) => {
-            if (!n || typeof n.type !== 'string') return;
-            if (n.type === 'Literal' && typeof n.value === 'number' && parent && parent.type === 'BinaryExpression' && COMPARE.has(parent.operator)) {
-                const other = parent.left === n ? parent.right : parent.left;
-                const mentioned = new Set(Voyager.namesInAst(other));
-                for (const e of entries) if (e.n === n.value && mentioned.has(e.item)) hits.push({ n: n.value, item: e.item, source: e.source, op: parent.operator });
+        const scopes = [];
+        const functionScopes = [];
+        const push = () => { scopes.push(new Map()); };
+        const lookup = (name) => { for (let i = scopes.length - 1; i >= 0; i--) if (scopes[i].has(name)) return scopes[i].get(name); return null; };
+        const bind = (name, value, kind) => {
+            const target = kind === 'var' ? functionScopes[functionScopes.length - 1] : scopes[scopes.length - 1];
+            target.set(name, value);
+        };
+        const empty = () => ({ n: null, items: new Set() });
+        const resolve = (node) => {
+            if (!node) return empty();
+            if (node.type === 'Literal' && typeof node.value === 'number') return { n: node.value, items: new Set() };
+            if (node.type === 'Identifier') {
+                const b = lookup(node.name);
+                if (b) return { n: b.n, items: new Set(b.items) };
+                return empty();
             }
-            for (const v of Object.values(n)) {
-                if (Array.isArray(v)) { for (const x of v) walk(x, n); }
-                else if (v && typeof v === 'object' && typeof v.type === 'string') walk(v, n);
+            if (node.type === 'ChainExpression') return resolve(node.expression);
+            if (node.type === 'MemberExpression' || node.type === 'CallExpression') return { n: null, items: new Set(Voyager.namesInAst(node)) };
+            return { n: null, items: new Set(Voyager.namesInAst(node)) };
+        };
+        const grounded = (item, n) => {
+            if (n === 0 || n === 1) return true;
+            return Voyager.itemFacts(registry, item).some(f => f.n === n && (f.kind === 'stack' || f.kind === 'recipeResult' || f.kind === 'ingredient'));
+        };
+        const consider = (expr) => {
+            if (!expr || expr.type !== 'BinaryExpression' || !COMPARE.has(expr.operator)) return;
+            const L = resolve(expr.left), R = resolve(expr.right);
+            const pairs = [];
+            if (typeof L.n === 'number') pairs.push([L.n, R.items]);
+            if (typeof R.n === 'number') pairs.push([R.n, L.items]);
+            for (const [n, items] of pairs) {
+                for (const e of entries) {
+                    if (e.n !== n || !items.has(e.item)) continue;
+                    if (grounded(e.item, n)) continue;
+                    hits.push({ n, item: e.item, source: e.source, op: expr.operator });
+                }
             }
         };
-        walk(ast, null);
+        const walk = (n) => {
+            if (!n || typeof n.type !== 'string') return;
+            if (n.type === 'FunctionDeclaration' || n.type === 'FunctionExpression' || n.type === 'ArrowFunctionExpression') {
+                push();
+                functionScopes.push(scopes[scopes.length - 1]);
+                for (const p of n.params || []) {
+                    if (p.type === 'AssignmentPattern') {
+                        walk(p.right);
+                        if (p.left.type === 'Identifier') bind(p.left.name, resolve(p.right), 'let');
+                    } else if (p.type === 'Identifier') bind(p.name, empty(), 'let');
+                }
+                walk(n.body);
+                functionScopes.pop();
+                scopes.pop();
+                return;
+            }
+            if (n.type === 'BlockStatement') {
+                push();
+                for (const s of n.body) walk(s);
+                scopes.pop();
+                return;
+            }
+            if (n.type === 'VariableDeclaration') {
+                for (const d of n.declarations) {
+                    if (d.init) walk(d.init);
+                    if (d.id && d.id.type === 'Identifier') bind(d.id.name, resolve(d.init), n.kind);
+                }
+                return;
+            }
+            if (n.type === 'AssignmentExpression') {
+                walk(n.right);
+                if (n.left.type === 'Identifier') {
+                    const existing = lookup(n.left.name);
+                    if (existing) {
+                        const value = resolve(n.right);
+                        existing.n = value.n;
+                        existing.items = value.items;
+                    }
+                }
+                return;
+            }
+            consider(n);
+            for (const v of Object.values(n)) {
+                if (Array.isArray(v)) { for (const x of v) walk(x); }
+                else if (v && typeof v === 'object' && typeof v.type === 'string') walk(v);
+            }
+        };
+        push();
+        functionScopes.push(scopes[0]);
+        walk(ast);
         return hits;
     }
     static snapshotThresholdFeedback(code, counts) {
         if (counts === null || typeof counts !== 'object' || Array.isArray(counts)) throw new Error('[fix97] snapshot check needs the prompt inventory counts');
+        const registry = minecraftData(VERSION);
+        if (!registry || !registry.itemsByName) throw new Error(`[fix97] snapshot check needs game data for ${VERSION}`);
         const entries = Object.entries(counts).map(([item, n]) => {
             if (typeof n !== 'number') throw new Error(`[fix97] prompt count of ${item} is not a number`);
             return { item, n, source: 'promptCounts' };
         });
-        return Voyager.copiedCountComparisons(code, entries).map(h => `\`${h.item} ${h.op} ${h.n}\` copies ${h.item}'s count from the state in this prompt. That count is what is held right now. Read it with getInventoryCounts(bot) when the function runs.`);
+        return Voyager.copiedCountComparisons(code, entries, registry).map(h => `\`${h.item} ${h.op} ${h.n}\` copies ${h.item}'s count from the state in this prompt. That count is what is held right now. Read it with getInventoryCounts(bot) when the function runs.`);
+    }
+    // c.args is the call's arguments after bot. required is how many of those have no default. arity is all of them
+    // when the function has no rest parameter.
+    static skillArgCounts(skill) {
+        if (!skill || typeof skill.code !== 'string' || typeof skill.name !== 'string') throw new Error('[fix97] skillArgCounts needs the skill name and code');
+        const ast = Voyager.parseSkill(skill.code);
+        let fn = null;
+        Voyager.walkAst(ast, n => {
+            if ((n.type === 'FunctionDeclaration' || n.type === 'FunctionExpression') && n.id && n.id.name === skill.name) fn = n;
+        });
+        if (!fn) return null;
+        const params = fn.params.slice(1);
+        let rest = false, required = 0, arity = 0;
+        for (const p of params) {
+            if (p.type === 'RestElement') { rest = true; break; }
+            arity += 1;
+            if (p.type !== 'AssignmentPattern') required += 1;
+        }
+        return { required, arity, rest };
     }
     static memberPath(node, param) {
         if (!node || !param) return null;
@@ -1482,6 +1642,35 @@ Use only c; no other globals.`;
         if (!registry || !registry.itemsByName || !registry.blocksByName) throw new Error('[fix97] game data registry required');
         return Object.hasOwn(registry.itemsByName, name) ? registry.itemsByName[name] : null;
     }
+    // Distinct counts of this item id used as an ingredient, across every recipe. The result id's own recipe is not the
+    // only one: a stick's recipe produces 4 sticks from planks, and fences consume 2 sticks.
+    static recipesUsing(registry) {
+        let map = recipeUseCounts.get(registry);
+        if (map) return map;
+        map = new Map();
+        const recipes = registry.recipes;
+        if (recipes && typeof recipes === 'object') {
+            for (const recs of Object.values(recipes)) {
+                if (!Array.isArray(recs)) continue;
+                for (const r of recs) {
+                    const cells = [];
+                    if (Array.isArray(r.ingredients)) cells.push(...r.ingredients);
+                    if (Array.isArray(r.inShape)) for (const row of r.inShape) if (Array.isArray(row)) cells.push(...row);
+                    const tally = new Map();
+                    for (const cell of cells) {
+                        if (typeof cell !== 'number') continue;
+                        tally.set(cell, (tally.has(cell) ? tally.get(cell) : 0) + 1);
+                    }
+                    for (const [id, count] of tally) {
+                        if (!map.has(id)) map.set(id, new Set());
+                        map.get(id).add(count);
+                    }
+                }
+            }
+        }
+        recipeUseCounts.set(registry, map);
+        return map;
+    }
     // Facts of one item. Each fact names the field it can ground. A stack size is a count of that item, not every literal.
     static itemFacts(registry, name) {
         const facts = [];
@@ -1510,6 +1699,13 @@ Use only c; no other globals.`;
                         if (!ing || typeof ing.name !== 'string') continue;
                         facts.push({ n: count, kind: 'ingredient', item: ing.name, detail: `${name} recipe uses ${count} ${ing.name}` });
                     }
+                }
+            }
+            const used = Voyager.recipesUsing(registry).get(item.id);
+            if (used) {
+                for (const count of used) {
+                    if (facts.some(f => f.kind === 'ingredient' && f.item === name && f.n === count)) continue;
+                    facts.push({ n: count, kind: 'ingredient', item: name, detail: `a recipe uses ${count} ${name}` });
                 }
             }
         }
@@ -1584,7 +1780,7 @@ Use only c; no other globals.`;
     static unsupportedContractDetails(src, skill, registry) {
         if (!skill || typeof skill.code !== 'string') throw new Error('[fix97] unsupportedContractNumbers: skill code required');
         const entries = Voyager.observedCountEntries(skill);
-        const copied = Voyager.copiedCountComparisons(skill.code, entries);
+        const copied = Voyager.copiedCountComparisons(skill.code, entries, registry);
         const copiedNums = new Set(copied.map(h => h.n));
         const codeNumbers = new Set(Voyager.numericLiterals(Voyager.parseSkill(skill.code)).filter(n => !copiedNums.has(n)));
         const observedNums = new Set(entries.map(e => e.n));
@@ -1594,9 +1790,11 @@ Use only c; no other globals.`;
         }).filter(n => !observedNums.has(n)));
         const facts = Voyager.skillFacts(registry, skill, src);
         const hits = [];
+        const argCounts = Voyager.skillArgCounts(skill);
         for (const use of Voyager.contractLiteralUses(src)) {
             const n = use.n;
             if (n === 0 || n === 1) continue;
+            if (argCounts && use.path && use.path.length === 2 && use.path[0] === 'args' && use.path[1] === 'length' && (n === argCounts.required || (!argCounts.rest && n === argCounts.arity))) continue;
             const matched = facts.filter(f => f.n === n && Voyager.factMatches(f, use.path));
             if (matched.length) continue;
             const pathItem = use.path && use.path.length ? use.path[use.path.length - 1] : null;
@@ -2883,7 +3081,7 @@ Use only c; no other globals.`;
                 legs: bot.inventory.slots[7] ? bot.inventory.slots[7].name : 'empty',
                 feet: bot.inventory.slots[8] ? bot.inventory.slots[8].name : 'empty',
             },
-            nearby_blocks: world.getNearbyBlockTypes(bot, world.NEARBY_BLOCK_RADIUS),
+            nearby_blocks: world.getNearbyBlockTypes(bot, world.nearbyBlockRadius(bot)),
             nearby_entities: world.getNearbyEntityTypes(bot),
             known_chests: this._getChestFacts(),
             threats: this._threats(),
@@ -5021,6 +5219,9 @@ Use only c; no other globals.`;
         // fix33: CodeModel.sendRequest handles paid→free fallback internally; no pre/post quota check here
         const cm = this.agent.prompter.code_model;
         const t0 = Date.now(); console.log(`[timing] ${new Date().toISOString().slice(11,19)}Z composer call #${callNum} start kind=${meta.kind} (prompt ${system.length + user.length} chars)`);
+        // The code model is called here, not through promptCoding, so the dump that path writes never ran.
+        // compose-retry #78 overflowed and the prompt was not on disk. Write it before the request, including when the request throws.
+        writeCodePromptDump(system, user);
         // fix35: overlap CPU-only maintenance with code-model wait (flush debounced saves, extract shared fragments)
         this._overlapCpuMaintenance();
         // fix37/fix93: one practice controller covers this wait and any local wait already in flight
@@ -7097,7 +7298,7 @@ Interrupts: the bot may be interrupted at any time (danger, getting stuck, a pla
 
         // fix37 (D): include inventory-full fact from replay failure in feedback for code gen
         // fix38: use extractFeedback to preserve FAILED lines
-        let feedback = rp?.cut ? `Replay of ${rp.name} failed: ${rp.cut}\nExecution output:\n${extractFeedback(rp.output)}${rp.invFullFact ? `\nInventory fact: ${rp.invFullFact}` : ''}` : '';
+        let feedback = rp?.cut ? codeRetryFeedback({ cut: rp.cut, output: String(rp.output || ''), trace: null, critique: `Replay of ${rp.name} failed`, invFull: rp.invFullFact || '', behaviorLog: '' }) : '';
         let lastCode = '', anyCut = rp?.cut || '', prevCrit = null, lastTrace = null, duplicateStuck = false;
         // fix37: duplicate-reply detection state
         let prevReplyHash = null, consecutiveDupes = 0;
@@ -7285,7 +7486,7 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             const invFullFact = !verdict.success ? this._detectInventoryFullFailure(task, before, after, output) : null;
             if (invFullFact) console.log(`[voyager] attempt ${i} INVENTORY FULL DETECTED: ${invFullFact}`);
 
-            feedback = `${cut ? `Attempt ${cut}\n` : ''}Execution output:\n${extractFeedback(output)}\nCritic: ${verdict.critique}${invFullFact ? `\nInventory fact: ${invFullFact}` : ''}\nChat/behaviour log: ${this.agent.bot.modes.flushBehaviorLog()}`;   // fix38: preserve FAILED lines
+            feedback = codeRetryFeedback({ cut, output, trace: attemptTrace, critique: String(verdict.critique || ''), invFull: invFullFact, behaviorLog: this.agent.bot.modes.flushBehaviorLog() });
             lastCode = code;
             if (lastTry) { if (i < MAX_ATTEMPTS) console.log(`[voyager] stopping after attempt ${i}: ${same ? 'critique unchanged from the previous attempt' : `${cut} (travel/death cut-off)`}`); break; }
         }

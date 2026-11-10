@@ -574,6 +574,76 @@ export function traceText(trace) {
     if (trace.untraced > 0) text.push(`(${trace.untraced} further call(s) ran after the trace's ${trace.length} records and were not recorded)`);
     return text.join('\n');
 }
+// Numbers are the part of a line that changes between repeats: coordinates, timestamps, distances, vitals.
+// The words are the fact. Two lines with the same words are the same fact.
+export function factKey(line) {
+    return String(line).replace(/-?\d+(?:\.\d+)?/g, '#').replace(/\s+/g, ' ').trim();
+}
+// Every line is kept as a fact. Lines that differ only by numbers are one fact: the count, the first line, and the last line.
+// Interleaved repeats are the same fact. Nothing is cut.
+export function groupVaryingLines(text) {
+    const lines = String(text || '').split('\n').filter(l => l.trim().length > 0);
+    const groups = new Map();
+    const order = [];
+    for (const line of lines) {
+        const key = factKey(line);
+        if (!key) continue;
+        let g = groups.get(key);
+        if (!g) { g = []; groups.set(key, g); order.push(key); }
+        g.push(line);
+    }
+    return order.map(k => {
+        const g = groups.get(k);
+        if (g.length === 1) return g[0];
+        if (g[0] === g[g.length - 1]) return `${g[0]} (x${g.length})`;
+        return `${g[0]} (x${g.length}, last: ${g[g.length - 1]})`;
+    }).join('\n');
+}
+function callErrorText(r) {
+    const lines = [];
+    if (r.err) lines.push(String(r.err));
+    if (Array.isArray(r.ownFail)) lines.push(...r.ownFail.filter(l => typeof l === 'string' && l.length > 0));
+    return groupVaryingLines(lines.join('\n')).split('\n').join(' | ');
+}
+function callHead(trace, r) {
+    const parent = Number.isInteger(r.parent) && r.parent >= 0 && r.parent < trace.length ? trace[r.parent].name : '';
+    const args = r.args.replace(/^\[|\]$/g, '');
+    const outcome = r.err ? `threw ${r.err}` : `${r.ret}${r.ok ? '' : ' FAIL'}`;
+    return `${parent ? parent + ' > ' : ''}${r.name}(${args}) -> ${outcome}`;
+}
+function callSignature(trace, r) {
+    const parent = Number.isInteger(r.parent) && r.parent >= 0 && r.parent < trace.length ? trace[r.parent].name : '';
+    const outcome = r.err ? 'threw' : (r.ok ? 'ok' : 'fail');
+    return `${parent}|${r.name}|${factKey(r.args)}|${outcome}`;
+}
+// One entry per distinct call. The same call interleaved with others, or repeated with different coordinates, is one
+// entry: how many times it ran, and the first and last error. The count is the calls that are not printed one by one.
+export function structuredTrace(trace) {
+    if (!Array.isArray(trace)) throw new Error('structuredTrace: trace array required');
+    const groups = new Map();
+    const order = [];
+    for (let i = 0; i < trace.length; i++) {
+        const r = trace[i];
+        if (!r || typeof r.name !== 'string' || r.name.length === 0) throw new Error(`structuredTrace: record ${i} has no name`);
+        if (typeof r.args !== 'string') throw new Error(`structuredTrace: ${r.name} args are not text`);
+        const key = callSignature(trace, r);
+        let g = groups.get(key);
+        if (!g) { g = []; groups.set(key, g); order.push(key); }
+        g.push(r);
+    }
+    const lines = order.map(key => {
+        const recs = groups.get(key);
+        const first = recs[0], last = recs[recs.length - 1];
+        const head = callHead(trace, first);
+        const e1 = callErrorText(first), e2 = callErrorText(last);
+        const count = recs.length > 1 ? ` (x${recs.length})` : '';
+        const same = callHead(trace, first) === callHead(trace, last) && e1 === e2;
+        if (same) return `${head}${count}${e1 ? ' | ' + e1 : ''}`;
+        return `${head}${count} | first: ${e1 || head} | last: ${callHead(trace, last)}${e2 ? ' | ' + e2 : ''}`;
+    });
+    if (trace.untraced > 0) lines.push(`(${trace.untraced} further call(s) ran after the trace's ${trace.length} records and were not recorded)`);
+    return lines.join('\n');
+}
 // credit assignment: blame the deepest failing call; a failing leaf (hand-written primitive, no skill deps) is never edited,
 // so responsibility moves to its caller (PSN calling_pattern_issues -> caller_fix); otherwise the callee itself (callee_fix).
 // fix11 (B5): prefer failures that propagated (every ancestor up to a root also failed); failures a caller caught and

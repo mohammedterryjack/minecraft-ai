@@ -427,7 +427,9 @@ export class Coder {
         const bad = n => n && (n.type === 'ArrayExpression' || n.type === 'ObjectExpression');
         const kind = n => n.type === 'ArrayExpression' ? 'array' : 'object';
         const positional = {};
-        for (const fn of getBareAPI().byName ? Object.values(getBareAPI().byName) : []) {
+        const bare = getBareAPI();
+        if (!bare.byName) throw new Error('[coder] bare API has no byName index');
+        for (const fn of Object.values(bare.byName)) {
             if (fn.numericArgs && Object.keys(fn.numericArgs).length) positional[fn.name] = fn.numericArgs;
         }
         const errs = [];
