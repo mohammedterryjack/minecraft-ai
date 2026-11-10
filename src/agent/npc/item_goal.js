@@ -314,8 +314,8 @@ export class ItemGoal {
         let next = next_info.node;
         let quantity = next_info.quantity;
 
-        // A block target is reachable only when a pathfinder search of that block succeeds. The position is
-        // read from the live exposed index (perceivedPosition awaits it). A missing cache entry is not "unreachable".
+        // A block target is reachable only when pathToBlock returns success. That search steps until success
+        // or noPath; a partial slice is not a status this line can see. The position is the live exposed index.
         const seenAt = next.type === 'block' ? await world.perceivedPosition(this.agent.bot, next.source) : null;
         const path = seenAt ? await world.pathToBlock(this.agent.bot, seenAt) : null;
         const blockUnreachable = next.type === 'block' && !(seenAt && path.status === 'success');

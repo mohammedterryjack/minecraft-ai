@@ -1044,6 +1044,33 @@ describe('fix97 reachability is a pathfinder search per target', () => {
         const direct = await pathToBlock(v.agent.bot, { x: 8, y: 12, z: 4 });
         assert.strictEqual(direct.status, 'success');
     });
+    it('a target that takes more than one tick of search ends in success', async () => {
+        const turns = [];
+        let turn = 0;
+        const bot = {
+            game: { gameMode: 'survival' },
+            entity: { eyeHeight: 1.62, position: { x: 0, y: 64, z: 0 } },
+            world: {},
+            waitForTicks: async () => { turn += 1; },
+            pathfinder: {
+                movements: {},
+                tickTimeout: 40,
+                getPathTo() { throw new Error('getPathTo takes one slice'); },
+                getPathFromTo: function * () {
+                    turns.push(turn);
+                    yield { result: { status: 'partial', path: [] } };
+                    turns.push(turn);
+                    yield { result: { status: 'partial', path: [] } };
+                    turns.push(turn);
+                    yield { result: { status: 'success', path: [{ x: 8 }] } };
+                },
+            },
+        };
+        const result = await pathToBlock(bot, { x: 30, y: 64, z: 0 });
+        assert.strictEqual(result.status, 'success');
+        assert.deepStrictEqual(turns, [0, 1, 2], 'each partial slice yields before the next tickTimeout slice');
+        assert.strictEqual(turn, 2);
+    });
 });
 
 describe('fix97 observe on a view-distance world', () => {
@@ -1089,17 +1116,48 @@ describe('fix97 observe on a view-distance world', () => {
         const secondMs = performance.now() - t1;
         const stats = perceivedStats(bot);
         const build = perceivedBuildStats(bot);
+        const { BLOCK_SECTION_VOLUME } = require('prismarine-chunk/src/pc/common/constants.js');
         assert.ok(state.nearby_blocks.includes('grass_block'));
         assert.ok(state.nearby_blocks.includes('oak_log'));
         assert.ok(state.nearby_blocks.includes('oak_leaves'));
         assert.ok(!state.nearby_blocks.includes('bedrock'));
         assert.ok(!state.nearby_blocks.includes('deepslate'));
+        assert.ok(!state.nearby_blocks.includes('stone'), 'cave stone is not perceived from the surface');
+        assert.ok(!state.nearby_blocks.includes('diamond_ore'));
+        assert.ok(stats.sectionsReached > 0 && stats.sectionsReached < build.sectionsBuilt);
+        assert.ok(stats.candidates > 0 && stats.candidates < BLOCK_SECTION_VOLUME, `candidates ${stats.candidates}`);
+        assert.ok(stats.raycasts > 0 && stats.raycasts < BLOCK_SECTION_VOLUME, `raycasts ${stats.raycasts}`);
         assert.deepStrictEqual(second.nearby_blocks, state.nearby_blocks);
         assert.strictEqual(stats.cellReads, 0);
         assert.strictEqual(build.cellReads, built.cellReads);
         assert.strictEqual(built.chunks, (viewDistance * 2 + 1) ** 2);
         assert.ok(ms < 2000, `observe took ${ms} ms`);
         assert.ok(secondMs < 2000, `second observe took ${secondMs} ms`);
-        console.log(`[fix97] layered view-distance ${viewDistance}: index ${built.chunks} chunks in ${built.ms.toFixed(1)} ms (${perChunk.toFixed(2)} ms/chunk, max ${maxChunk.toFixed(2)}), cell reads ${built.cellReads}, sections ${built.sectionsBuilt} skipped ${built.sectionsSkipped}, heap +${((heapAfterIndex - heapBefore) / 1e6).toFixed(1)} MB; observe ${ms.toFixed(1)} ms then ${secondMs.toFixed(1)} ms, candidates ${stats.candidates}, raycasts ${stats.raycasts}, names ${state.nearby_blocks.join(',')}`);
+        console.log(`[fix97] layered view-distance ${viewDistance}: index ${built.chunks} chunks in ${built.ms.toFixed(1)} ms (${perChunk.toFixed(2)} ms/chunk, max ${maxChunk.toFixed(2)}), cell reads ${built.cellReads}, sections ${built.sectionsBuilt} skipped ${built.sectionsSkipped}, heap +${((heapAfterIndex - heapBefore) / 1e6).toFixed(1)} MB; observe ${ms.toFixed(1)} ms then ${secondMs.toFixed(1)} ms, sections reached ${stats.sectionsReached}, candidates ${stats.candidates}, raycasts ${stats.raycasts}, names ${state.nearby_blocks.join(',')}`);
+    });
+
+    it('a cave the bot is standing in is perceived, and a dug shaft makes that cave visible from the surface', async () => {
+        const viewDistance = 2;
+        const world = await buildLayeredWorld(registry, viewDistance, true);
+        const make = (x, y, z) => ({
+            game: { serverViewDistance: viewDistance, gameMode: 'survival' },
+            registry,
+            entity: { position: new Vec3(x, y, z), eyeHeight: 1.62 },
+            world,
+        });
+        const surface = make(5.5, 64, 5.5);
+        await indexPerceivedChunks(surface);
+        const above = getNearbyBlockTypes(surface);
+        assert.ok(above.includes('grass_block'));
+        assert.ok(!above.includes('stone'), `surface saw ${above.join(',')}`);
+        const inside = make(5.5, 21, 5.5);
+        await indexPerceivedChunks(inside);
+        const cave = getNearbyBlockTypes(inside);
+        assert.ok(cave.includes('stone'), `cave saw ${cave.join(',')}`);
+        assert.ok(!cave.includes('grass_block'), `cave saw ${cave.join(',')}`);
+        for (let y = 23; y <= 63; y++) world.setBlockStateId(new Vec3(5, y, 5), 0);
+        const opened = getNearbyBlockTypes(surface);
+        assert.ok(opened.includes('stone'), `shaft saw ${opened.join(',')}`);
+        assert.ok(opened.includes('grass_block'));
     });
 });
