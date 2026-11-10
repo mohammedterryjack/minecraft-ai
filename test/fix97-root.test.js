@@ -14,7 +14,7 @@
 import { describe, it, before } from 'node:test';
 import assert from 'node:assert';
 import { createRequire } from 'node:module';
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync, rmSync } from 'node:fs';
 import { edibleNames, planFoodAcquisition } from '../src/agent/food_backchain.js';
 import { applyContractResets, applyCallRecordMigrations, buildContractManifest } from '../scripts/fix97_contract_manifest.js';
 import { nestedBotMemberError, getBareAPI, Coder } from '../src/agent/coder.js';
@@ -394,6 +394,46 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         assert.strictEqual(Voyager.callSucceeded({ rv: undefined, postHeld: true }, readsReturn), false);
         assert.strictEqual(Voyager.callSucceeded({ rv: undefined, err: 'boom', postHeld: true }, skill), false);
         assert.strictEqual(Voyager.callSucceeded({ rv: undefined, postHeld: true }, skill), true);
+        assert.strictEqual(Voyager.callSucceeded({ rv: undefined, fail: true, postHeld: true }, skill), false);
+    });
+
+    it('tossClutter([3]) returns false with its post held, so fail keeps the call out of the record and the post is not a violation', () => {
+        const v = mkV({});
+        v.agent.name = 'fix97-falseret';
+        const queued = [];
+        v._queueContractFix = (_e, why) => queued.push(why);
+        v._saveSkills = () => {};
+        const skills = JSON.parse(gunzipSync(readFileSync(new URL('./fixtures/icefox-live-index.json.gz', import.meta.url))));
+        const skill = structuredClone(skills.find(s => s.name === 'tossClutter'));
+        delete skill.stats.calls;
+        v.skills = [skill];
+        const st = (held, free) => ({ inv: { stick: 1 }, pos: { x: 0, y: 64, z: 0 }, eq: { heldItem: held }, game: {}, hp: 20, food: 20, alive: true, free, dim: 'overworld' });
+        const held = { name: 'tossClutter', argv: [3], rv: false, fail: true, s0: st(null, 5), s1: st(null, 6), delta: {}, parent: -1, depth: 0 };
+        v._checkContracts([held], false);
+        assert.strictEqual(Object.hasOwn(skill.stats, 'calls'), false);
+        assert.strictEqual(held.ownFail, undefined);
+        assert.deepStrictEqual(queued, []);
+        const missed = { name: 'tossClutter', argv: [3], rv: false, fail: true, s0: st(null, 5), s1: st(null, 5), delta: {}, parent: -1, depth: 0 };
+        v._checkContracts([missed], false);
+        assert.strictEqual(Object.hasOwn(skill.stats, 'calls'), false);
+        assert.strictEqual(missed.ownFail, undefined);
+        assert.deepStrictEqual(queued, []);
+        assert.strictEqual(existsSync(`./bots/${v.agent.name}/violated_contracts.jsonl`), false);
+        assert.strictEqual(Voyager.callSucceeded({ rv: false, fail: true, postHeld: true }, skill), false);
+        assert.strictEqual(Voyager.callSucceeded({ rv: null, fail: true, postHeld: true }, skill), false);
+        assert.strictEqual(Voyager.callSucceeded({ rv: 0, fail: true, postHeld: true }, skill), false);
+        rmSync(`./bots/${v.agent.name}`, { recursive: true, force: true });
+    });
+
+    it('c.ret detection throws when the contract destructures its parameter or reads it with a computed key', () => {
+        assert.strictEqual(Voyager.contractDeclaresReturn({ post: 'c => c.ret === true' }), true);
+        assert.strictEqual(Voyager.contractDeclaresReturn({ post: "c => c['ret'] === true" }), true);
+        assert.strictEqual(Voyager.contractDeclaresReturn({ post: 'c => c.post.alive' }), false);
+        assert.strictEqual(Voyager.contractDeclaresReturn({ post: 'c => c.post.inv[c.args[0]] > 0' }), false);
+        assert.throws(() => Voyager.contractDeclaresReturn({ post: '({ ret }) => ret' }), /destructur/);
+        assert.throws(() => Voyager.contractDeclaresReturn({ post: 'c => { const { ret } = c; return ret; }' }), /destructur/);
+        assert.throws(() => Voyager.contractDeclaresReturn({ post: 'c => { for (const { ret } of c) return ret; }' }), /destructur/);
+        assert.throws(() => Voyager.contractDeclaresReturn({ post: 'c => c[name]' }), /computed key/);
     });
 
     it('a failed call is not a sample, so craftItem(null) and mineBlocks(oak_log, oak_log) do not refuse their pres', () => {
@@ -495,6 +535,16 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         assert.deepStrictEqual(applyCallRecordMigrations([kept]), []);
         assert.strictEqual(v._validContract(kept.contract, kept), null);
         assert.strictEqual(Object.hasOwn(kept, 'contractEval'), false);
+        const wrongFlags = {
+            name: 'craftItem',
+            stats: { calls: [{ arity: 1, types: ['number'], values: [3], shape: Voyager.CALL_SHAPE, succeeded: false, violated: false }] },
+        };
+        assert.strictEqual(Voyager.isRecordedCall(wrongFlags.stats.calls[0]), false);
+        assert.throws(() => Voyager.recordedCalls(wrongFlags), /unmigrated record/);
+        const resetFlags = applyCallRecordMigrations([wrongFlags]);
+        assert.strictEqual(resetFlags.length, 1);
+        assert.strictEqual(resetFlags[0].kind, 'reset');
+        assert.strictEqual(Object.hasOwn(wrongFlags.stats, 'calls'), false);
     });
 
     it('parses a skill as a module and a contract as a parenthesized expression, and a comment or string is not a numeric literal', () => {

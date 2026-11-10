@@ -13,9 +13,10 @@
  * is a reset: contract, contractPrev, and contractFail are cleared and the code stays.
  * The predicate list is derived from the AST of each skill. No skill name is hard-coded.
  * Stored stats.calls are one record per distinct value. A record is a recorded call only when
- * its shape is CALL_SHAPE and it has boolean succeeded and violated flags. Anything else,
- * including a value-list example relabelled as CALL_SHAPE, is reset. Duplicate recorded
- * signatures collapse to one example. A calls value that is not a list is reset.
+ * its shape is CALL_SHAPE, succeeded is true, and violated is false. Anything else, including
+ * a value-list example relabelled as CALL_SHAPE and a record whose flags are the wrong booleans,
+ * is reset. Duplicate recorded signatures collapse to one example. A calls value that is not a
+ * list is reset.
  * The skill names and signatures come from the scan. Nothing is rewritten unless --apply is passed.
  *
  *   node scripts/fix97_contract_manifest.js --bots-dir=bots/icefox2000
@@ -79,17 +80,15 @@ function callSignature(call) {
     return `${call.arity}:${call.types.join(',')}`;
 }
 
-// A recorded call is a CALL_SHAPE that was stored with the outcome flags. A value-list example,
-// or one relabelled as CALL_SHAPE without those flags, is not a recorded call.
+// A recorded call is a CALL_SHAPE with succeeded true and violated false. The same predicate
+// as Voyager.isRecordedCall. A value-list example, a relabelled example, or a record whose
+// flags are missing or not that pair, is not a recorded call.
 function isRecordedCall(call) {
-    if (callSignature(call) === null) return false;
-    if (call.shape !== CALL_SHAPE) return false;
-    if (typeof call.succeeded !== 'boolean' || typeof call.violated !== 'boolean') return false;
-    return true;
+    return Voyager.isRecordedCall(call);
 }
 
 // Scan-derived. A calls value that is not a list is a reset. A record that is not a recorded
-// CALL_SHAPE with succeeded and violated flags is reset, not relabelled. Several recorded
+// CALL_SHAPE with succeeded true and violated false is reset, not relabelled. Several recorded
 // calls of one signature collapse to the first example.
 export function callRecordMigrations(skills) {
     if (!Array.isArray(skills)) throw new Error('[fix97] skill index must be an array');
@@ -115,7 +114,7 @@ export function callRecordMigrations(skills) {
                 skill: skill.name,
                 kind: 'reset',
                 count: unflagged.length,
-                reason: `${skill.name} has ${unflagged.length} call record(s) that are not a recorded ${CALL_SHAPE} with succeeded and violated flags. They are dropped, and the contract is pending its first recorded call when none remain`,
+                reason: `${skill.name} has ${unflagged.length} call record(s) that are not a recorded ${CALL_SHAPE} with succeeded true and violated false. They are dropped, and the contract is pending its first recorded call when none remain`,
             });
         }
         const groups = new Map();

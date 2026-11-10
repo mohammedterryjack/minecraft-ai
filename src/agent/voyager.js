@@ -50,8 +50,9 @@ export const MISROUTED = 'misrouted';
 // One stored call per distinct arity and argument types. The values are one example of that signature
 // (objects are already null in c.args). A different value of the same type is the same record, so a
 // count or a coordinate cannot grow the list. The previous record, one entry per distinct value, is
-// CALL_SHAPE_VALUES. A stored record is a recorded call only when it has this shape and boolean
-// succeeded and violated flags. A value-list example, including one relabelled as CALL_SHAPE, is reset.
+// CALL_SHAPE_VALUES. A stored record is a recorded call only when it has this shape, succeeded is
+// true, and violated is false. A boolean flag with any other value, or a value-list example
+// relabelled as CALL_SHAPE, is reset.
 export const CALL_SHAPE_VALUES = 'one record per distinct arity, argument types, and values';
 export const CALL_SHAPE = 'one record per distinct arity and argument types, with one value example';
 // A learned contract that reads c.args is judged only against calls that succeeded with no contract
@@ -1935,14 +1936,64 @@ Use only c; no other globals.`;
         return Voyager.nodeReads(root, param, new Set(['args']));
     }
     // A return value is evidence only when the contract reads c.ret. A missing contract does not.
+    // Destructuring the parameter, or a computed key on the parameter, does not answer that
+    // question: both throw. A literal key (c.ret, c['ret']) is a name. A computed key further
+    // along a known path (c.delta[item]) is not c.ret.
     static contractDeclaresReturn(contract) {
         if (contract === null || typeof contract !== 'object' || Array.isArray(contract)) return false;
         for (const key of ['pre', 'post']) {
             if (typeof contract[key] !== 'string') continue;
-            const { root, param } = Voyager.contractParam(contract[key]);
-            if (Voyager.nodeReads(root, param, new Set(['ret']))) return true;
+            if (Voyager.contractReadsReturn(contract[key])) return true;
         }
         return false;
+    }
+    static contractReadsReturn(src) {
+        const ast = Voyager.parseContract(src);
+        const root = ast.body[0].expression;
+        if (!root || (root.type !== 'ArrowFunctionExpression' && root.type !== 'FunctionExpression')) {
+            throw new Error(`[fix97] contract is not a function: ${src}`);
+        }
+        if (!root.params || root.params.length === 0) return false;
+        const p0 = root.params[0];
+        if (p0.type !== 'Identifier') {
+            throw new Error(`[fix97] contract parameter is ${p0.type}; destructuring hides whether it reads c.ret (${src})`);
+        }
+        const param = p0.name;
+        const unwrap = n => (n && n.type === 'ChainExpression' ? n.expression : n);
+        let found = false;
+        const walk = (n) => {
+            if (!n || typeof n.type !== 'string') return;
+            if (n.type === 'VariableDeclarator' || n.type === 'AssignmentExpression') {
+                const id = n.type === 'VariableDeclarator' ? n.id : n.left;
+                const init = unwrap(n.type === 'VariableDeclarator' ? n.init : n.right);
+                if (id && (id.type === 'ObjectPattern' || id.type === 'ArrayPattern') && init && init.type === 'Identifier' && init.name === param) {
+                    throw new Error(`[fix97] contract destructures ${param}; c.ret cannot be decided (${src})`);
+                }
+            }
+            if (n.type === 'ForOfStatement' || n.type === 'ForInStatement') {
+                const right = unwrap(n.right);
+                const declared = n.left && n.left.type === 'VariableDeclaration' && n.left.declarations.length === 1 ? n.left.declarations[0].id : n.left;
+                if (declared && (declared.type === 'ObjectPattern' || declared.type === 'ArrayPattern') && right && right.type === 'Identifier' && right.name === param) {
+                    throw new Error(`[fix97] contract destructures ${param}; c.ret cannot be decided (${src})`);
+                }
+            }
+            if (n.type === 'MemberExpression' && n.computed && n.property && n.property.type !== 'Literal') {
+                const object = unwrap(n.object);
+                if (object && object.type === 'Identifier' && object.name === param) {
+                    throw new Error(`[fix97] contract reads ${param} with a computed key; c.ret cannot be decided (${src})`);
+                }
+            }
+            if (n.type === 'MemberExpression') {
+                const path = Voyager.memberPath(n, param);
+                if (path && path[0] === 'ret') found = true;
+            }
+            for (const v of Object.values(n)) {
+                if (Array.isArray(v)) { for (const x of v) walk(x); }
+                else if (v && typeof v === 'object' && typeof v.type === 'string') walk(v);
+            }
+        };
+        walk(root.body);
+        return found;
     }
     // Top-level && pieces that mention only c.args. A false piece is the contract contradicting that call.
     // A piece that also reads pre, post, delta, ret, game, or dist is about the world, not the arguments.
@@ -1990,14 +2041,16 @@ Use only c; no other globals.`;
         if (!a || !b || !Array.isArray(a.types) || !Array.isArray(b.types)) throw new Error('[fix97] a recorded call shape is missing types');
         return a.arity === b.arity && a.types.length === b.types.length && a.types.every((t, i) => t === b.types[i]);
     }
-    // Success is what was observed. skill_graph threw() sets err (and rv false). settle() leaves
-    // rv undefined and fail false when the function returns nothing. The call succeeded when it
-    // did not throw and, if the contract has a post, that post held. A return value is evidence
-    // only when the contract reads c.ret. A violated pre or post is a separate fact (outcome.violated).
+    // Success is what was observed. skill_graph threw() sets err (and rv false). settle() sets
+    // fail when the function returns false, null, or 0, and leaves rv undefined and fail false
+    // when it returns nothing. The call succeeded when it did not throw, fail is not set, and,
+    // if the contract has a post, that post held. A return value is evidence only when the
+    // contract reads c.ret. A violated pre or post is a separate fact (outcome.violated).
     static callSucceeded(record, skill) {
         if (record === null || typeof record !== 'object' || Array.isArray(record)) throw new Error('[fix97] call record required');
         if (skill === null || typeof skill !== 'object' || Array.isArray(skill)) throw new Error('[fix97] callSucceeded needs the skill');
         if (Object.hasOwn(record, 'err')) return false;
+        if (record.fail === true) return false;
         const post = skill.contract !== null && typeof skill.contract === 'object' && typeof skill.contract.post === 'string' ? skill.contract.post : null;
         if (post !== null && record.postHeld !== true) return false;
         if (Voyager.contractDeclaresReturn(skill.contract)) {
@@ -2008,11 +2061,27 @@ Use only c; no other globals.`;
     static callText(args) {
         return `(${args.map(x => typeof x === 'number' || x === undefined ? String(x) : JSON.stringify(x)).join(', ')})`;
     }
+    // A recorded call is CALL_SHAPE with succeeded true and violated false. The same predicate
+    // as scripts/fix97_contract_manifest.js isRecordedCall. Anything else is an unmigrated
+    // record: the manifest resets it, and a reader that still sees it throws.
+    static isRecordedCall(call) {
+        if (call === null || typeof call !== 'object' || Array.isArray(call)) return false;
+        if (typeof call.arity !== 'number' || !Array.isArray(call.types) || !Array.isArray(call.values)) return false;
+        if (call.types.length !== call.arity || call.values.length !== call.arity) return false;
+        if (call.shape !== CALL_SHAPE) return false;
+        if (call.succeeded !== true || call.violated !== false) return false;
+        return true;
+    }
     static recordedCalls(skill) {
         if (!skill || !skill.stats) return [];
         if (typeof skill.stats !== 'object' || Array.isArray(skill.stats)) throw new Error(`[fix97] ${skill.name} stats is not an object`);
         if (!Object.hasOwn(skill.stats, 'calls')) return [];
         if (!Array.isArray(skill.stats.calls)) throw new Error(`[fix97] ${skill.name} stats.calls is not a list of call shapes`);
+        for (const call of skill.stats.calls) {
+            if (Voyager.isRecordedCall(call) !== true) {
+                throw new Error(`[fix97] ${skill.name} stats.calls has an unmigrated record ${JSON.stringify(call)}; a recorded call is ${CALL_SHAPE} with succeeded true and violated false`);
+            }
+        }
         return skill.stats.calls;
     }
     // outcome.succeeded and outcome.violated are required. A call that failed, or whose pre or post
@@ -2921,13 +2990,13 @@ Use only c; no other globals.`;
             let violated = false;
             let postHeld = false;
             if (e && e.contract) {
-            const declaresReturn = Voyager.contractDeclaresReturn(e.contract);
             const c = this._contractCtx({ args: r.argv, ret: r.rv, pre: r.s0, post: r.s1, delta: r.delta });
             for (const k of ['pre', 'post']) {
-                // A false return is the skill signaling failure only when the contract reads c.ret.
-                // Otherwise the post is still observed: a function that returns nothing, or false,
-                // can satisfy a post that does not read c.ret.
-                if (k === 'post' && r.rv === false && declaresReturn) continue;
+                // fix51: rv === false is the skill returning failure. settle() sets fail for false, null, and 0.
+                // The post is not a violation, whether or not the contract reads c.ret: no VIOLATED line,
+                // no violated_contracts.jsonl, no POSTCONDITION ownFail, and no contract repair.
+                // postHeld stays false. callSucceeded reads record.fail.
+                if (k === 'post' && r.rv === false) continue;
                 let ok;
                 try { ok = this._compileContract(e.contract[k])(c); }
                 catch (err) {
