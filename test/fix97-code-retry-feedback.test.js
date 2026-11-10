@@ -14,18 +14,27 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { readFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
 import * as cd from '../src/models/call_durations.js';
 import { collapseRepeats, structuredTrace } from '../src/agent/skill_graph.js';
 import { codeRetryFeedback } from '../src/agent/voyager.js';
 import { CODE_PROMPT_DUMP, writeCodePromptDump } from '../src/models/code_prompt_dump.js';
+import { CODE_RETRY_78, observedChatWork } from '../src/models/code_retry_observation.js';
 
-const require = createRequire(import.meta.url);
 const profile = JSON.parse(readFileSync(new URL('../profiles/mo_bot.json', import.meta.url), 'utf8'));
 const NUM_CTX = profile.code_model.params.options.num_ctx;
-const LIVE_CHARS = 181705;
-const LIVE_TOKENS = 58984;
-const KEY = 'qwen2.5-coder:7b /api/chat';
+const KEY = `${profile.code_model.model} /api/chat`;
+
+// Same path as the live bound: workOf reads prompt_eval_count, recordCall stores chars/that as cpt,
+// callBound estimates ceil(chars / cpt). The cpt is CODE_RETRY_78, the one live count. No local tokenizer.
+function learnLiveDensity() {
+    const work = observedChatWork();
+    if (work.pTok !== CODE_RETRY_78.promptTokens) throw new Error(`workOf did not keep prompt_eval_count ${CODE_RETRY_78.promptTokens}`);
+    cd.setCallDurationStore({});
+    cd.recordCall(KEY, work.pMs + work.gMs, CODE_RETRY_78.totalChars, work);
+    const learned = cd.callDurationStore()[KEY].cpt;
+    if (learned !== CODE_RETRY_78.totalChars / CODE_RETRY_78.promptTokens) throw new Error(`cpt ${learned} is not the live count`);
+    return learned;
+}
 
 function tokensOf(system, user) {
     const shape = cd.requestShape('/api/chat', {
@@ -34,7 +43,8 @@ function tokensOf(system, user) {
     });
     const bound = cd.callBound(KEY, shape);
     if (typeof bound.pTok !== 'number') throw new Error(bound.why);
-    return bound.pTok;
+    const cpt = cd.callDurationStore()[KEY].cpt;
+    return { tokens: bound.pTok, chars: shape.chars, roundedUpBy: bound.pTok - (shape.chars / cpt) };
 }
 
 function record(name, args, ok, ownFail, parent = -1) {
@@ -43,11 +53,14 @@ function record(name, args, ok, ownFail, parent = -1) {
 
 describe('fix97 code-retry feedback is compact by construction', () => {
     it('789 calls, 60 interleaved collectLogs FAILs, pathfinder spam and a full inventory fit num_ctx, and every distinct fact stays', () => {
-        assert.strictEqual(NUM_CTX, 8192);
-        cd.setCallDurationStore({});
-        cd.recordCall(KEY, 1, LIVE_CHARS, { pTok: LIVE_TOKENS, pMs: 1, gTok: 1, gMs: 1 });
-        const sameShape = cd.requestShape('/api/chat', { messages: [{ role: 'user', content: 'x'.repeat(LIVE_CHARS) }], options: { num_ctx: NUM_CTX } });
-        assert.strictEqual(cd.callBound(KEY, sameShape).pTok, LIVE_TOKENS);
+        const sections = [CODE_RETRY_78.systemChars, CODE_RETRY_78.skillsChars, CODE_RETRY_78.preludeChars, CODE_RETRY_78.stateChars, CODE_RETRY_78.historyChars, CODE_RETRY_78.retryChars, CODE_RETRY_78.framingChars];
+        assert.strictEqual(sections.reduce((sum, n) => sum + n, 0), CODE_RETRY_78.totalChars);
+        assert.strictEqual(CODE_RETRY_78.totalChars - CODE_RETRY_78.userChars, CODE_RETRY_78.systemMessageChars);
+        assert.strictEqual(NUM_CTX, CODE_RETRY_78.contextTokens);
+        const cpt = learnLiveDensity();
+        const sameShape = cd.requestShape('/api/chat', { messages: [{ role: 'user', content: 'x'.repeat(CODE_RETRY_78.totalChars) }], options: { num_ctx: NUM_CTX } });
+        assert.strictEqual(cd.callBound(KEY, sameShape).pTok, CODE_RETRY_78.promptTokens);
+        assert.strictEqual(cd.callDurationStore()[KEY].cpt, cpt);
 
         const trace = [];
         let collects = 0;
@@ -127,13 +140,16 @@ describe('fix97 code-retry feedback is compact by construction', () => {
         assert.strictEqual(calls, 789);
         assert.ok(structuredTrace(trace).split('\n').length < 10);
 
-        const system = 's'.repeat(3721 + 2192 + 3760);
-        const user = `Task: Collect 1 stripped_birch_wood\n--- feedback from last attempt ---\n${feedback}\n`;
-        const rawUser = `Task: Collect 1 stripped_birch_wood\n--- feedback from last attempt ---\n${raw}\n`;
+        const system = 's'.repeat(CODE_RETRY_78.systemMessageChars);
+        const user = `Task: ${CODE_RETRY_78.task}\n--- feedback from last attempt ---\n${feedback}\n`;
+        const rawUser = `Task: ${CODE_RETRY_78.task}\n--- feedback from last attempt ---\n${raw}\n`;
         const fitted = tokensOf(system, user);
         const unfitted = tokensOf(system, rawUser);
-        assert.ok(unfitted > NUM_CTX, `the uncollapsed retry was ${unfitted} tokens`);
-        assert.ok(fitted < NUM_CTX, `retry prompt ${fitted} tokens, num_ctx ${NUM_CTX}, feedback ${feedback.length} chars`);
+        const overflowMargin = unfitted.tokens - NUM_CTX;
+        const fitMargin = NUM_CTX - fitted.tokens;
+        assert.ok(overflowMargin > 0, `the uncollapsed retry was ${unfitted.tokens} tokens, ${overflowMargin} over num_ctx ${NUM_CTX}`);
+        // callBound ceils. The spare tokens have to clear that rounding, or a prompt that only fits by the ceil still overflows.
+        assert.ok(fitMargin > fitted.roundedUpBy, `retry prompt ${fitted.tokens} tokens, margin ${fitMargin}, ceil added ${fitted.roundedUpBy}, num_ctx ${NUM_CTX}, feedback ${feedback.length} chars`);
     });
 
     it('the compose-retry prompt is dumped before the code model is called, including when the call throws', async () => {
@@ -142,12 +158,12 @@ describe('fix97 code-retry feedback is compact by construction', () => {
         const { Voyager } = await import('../src/agent/voyager.js');
         const v = Object.create(Voyager.prototype);
         let dumpedDuringSend = '';
-        v.agent = { prompter: { code_model: { sendRequest: async () => { dumpedDuringSend = readFileSync(CODE_PROMPT_DUMP, 'utf8'); throw new Error('request (58984 tokens) exceeds the available context size (8192 tokens)'); } } } };
+        v.agent = { prompter: { code_model: { sendRequest: async () => { dumpedDuringSend = readFileSync(CODE_PROMPT_DUMP, 'utf8'); throw new Error(`request (${CODE_RETRY_78.promptTokens} tokens) exceeds the available context size (${CODE_RETRY_78.contextTokens} tokens)`); } } } };
         v._overlapCpuMaintenance = () => {};
         v._ensureInferCover = () => ({ enter() {}, async leave() {} });
         const system = 'SYSTEM-OVERFLOW';
         const user = 'USER-OVERFLOW collectLogs birch_log';
-        await assert.rejects(() => v._ask(system, user, { kind: 'compose-retry', components: { system: system.length, user: user.length } }), /58984 tokens/);
+        await assert.rejects(() => v._ask(system, user, { kind: 'compose-retry', components: { system: system.length, user: user.length } }), new RegExp(`${CODE_RETRY_78.promptTokens} tokens`));
         assert.match(dumpedDuringSend, /SYSTEM-OVERFLOW/);
         assert.match(dumpedDuringSend, /USER-OVERFLOW collectLogs birch_log/);
         assert.match(readFileSync(CODE_PROMPT_DUMP, 'utf8'), /USER-OVERFLOW collectLogs birch_log/);

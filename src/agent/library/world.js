@@ -499,24 +499,26 @@ function positionsWithin(distance) {
     return span * span * span;
 }
 
-// Login (play) sends viewDistance and simulationDistance as chunk radii (varints).
-// https://wiki.vg/Protocol#Login_.28play.29 — Minecraft 1.20.4 uses the 1.20.3 protocol, where both fields follow maxPlayers.
-// https://minecraft.wiki/w/Render_distance — the view distance is how many chunks from the player are sent.
-// Later packets update them: update_view_distance (viewDistance) and simulation_distance (distance).
-// Mineflayer stores the login view distance on bot.game.serverViewDistance and, with the game.js patch, the
-// simulation distance and both update packets. The client settings view distance is the request, not the grant.
+// The client only holds the chunks inside the server's view distance. Login (play) sends that radius as
+// viewDistance, a varint after maxPlayers (minecraft-data pc/1.20.3 protocol.json packet_login; Minecraft 1.20.4
+// uses protocol 1.20.3). Set Center Chunk (packet_update_view_position: chunkX, chunkZ) moves the center, and
+// Update View Distance (packet_update_view_distance: viewDistance) replaces the radius.
+// https://wiki.vg/Protocol#Login_.28play.29
+// https://wiki.vg/Protocol#Set_Center_Chunk
+// https://wiki.vg/Protocol#Update_View_Distance
+// https://minecraft.wiki/w/Render_distance
+// findBlocks reads loaded chunks, so the scan radius is that view distance in chunks times the chunk width.
+// bot.settings.viewDistance is the client's request, not the radius the server granted.
 function serverChunkRadius(bot) {
     const game = bot && bot.game;
     if (!game || typeof game !== 'object') {
-        throw new Error('nearbyBlockRadius: bot.game is missing. The server sends viewDistance and simulationDistance in the login play packet (https://wiki.vg/Protocol#Login_.28play.29).');
+        throw new Error('nearbyBlockRadius: bot.game is missing. The server sends viewDistance in the login play packet (https://wiki.vg/Protocol#Login_.28play.29).');
     }
     const view = game.serverViewDistance;
-    const sim = game.simulationDistance;
-    const granted = Number.isInteger(view) && view > 0 ? view : Number.isInteger(sim) && sim > 0 ? sim : null;
-    if (granted === null) {
-        throw new Error(`nearbyBlockRadius: server viewDistance (${JSON.stringify(view)}) and simulationDistance (${JSON.stringify(sim)}) are not positive integers. Both are varints on the login play packet (wiki.vg Protocol, Login (play); https://minecraft.wiki/w/Render_distance). bot.settings.viewDistance is the client request, not the distance the server granted.`);
+    if (!Number.isInteger(view) || view <= 0) {
+        throw new Error(`nearbyBlockRadius: server viewDistance is ${JSON.stringify(view)}. The client holds the chunks within the view distance from login (play) and update_view_distance (https://wiki.vg/Protocol#Update_View_Distance, https://minecraft.wiki/w/Render_distance). bot.settings.viewDistance is the client request, not the distance the server granted.`);
     }
-    return granted;
+    return view;
 }
 
 // Block radius of the chunks the server has granted. Callers pass it. There is no default.

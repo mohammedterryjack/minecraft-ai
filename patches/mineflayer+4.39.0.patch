@@ -90,35 +90,27 @@ index 5ae5552..af28eef 100644
      return block.digTime(
        type,
 diff --git a/node_modules/mineflayer/lib/plugins/game.js b/node_modules/mineflayer/lib/plugins/game.js
-index d3291b0..76be2dc 100644
+index d3291b0..6e8edac 100644
 --- a/node_modules/mineflayer/lib/plugins/game.js
 +++ b/node_modules/mineflayer/lib/plugins/game.js
-@@ -104,9 +104,13 @@ function inject (bot, options) {
+@@ -104,7 +104,9 @@ function inject (bot, options) {
      if (packet.enableRespawnScreen) {
        bot.game.enableRespawnScreen = packet.enableRespawnScreen
      }
 -    if (packet.viewDistance) {
-+    // viewDistance and simulationDistance are chunk radii (wiki.vg Login (play)). 0 is a sent value, not "absent".
++    // viewDistance is the chunk radius the server will send (Login (play), varint). 0 is a sent value.
++    // A truthy check dropped 0, and nothing applied a later update_view_distance.
 +    if (Number.isInteger(packet.viewDistance)) {
        bot.game.serverViewDistance = packet.viewDistance
      }
-+    if (Number.isInteger(packet.simulationDistance)) {
-+      bot.game.simulationDistance = packet.simulationDistance
-+    }
  
-     bot.emit('login')
-     bot.emit('game')
-@@ -135,6 +139,15 @@ function inject (bot, options) {
+@@ -135,6 +137,11 @@ function inject (bot, options) {
      bot.game.difficulty = difficultyNames[packet.difficulty]
    })
  
-+  // The login packet is the first grant. The server can change either radius later
-+  // (update_view_distance.viewDistance, simulation_distance.distance; protocol 1.20.3).
++  // Login (play) is the first view distance. Update View Distance replaces it (protocol 1.20.3, packet_update_view_distance).
 +  bot._client.on('update_view_distance', (packet) => {
 +    if (Number.isInteger(packet.viewDistance)) bot.game.serverViewDistance = packet.viewDistance
-+  })
-+  bot._client.on('simulation_distance', (packet) => {
-+    if (Number.isInteger(packet.distance)) bot.game.simulationDistance = packet.distance
 +  })
 +
    bot._client.on(brandChannel, (serverBrand) => {
