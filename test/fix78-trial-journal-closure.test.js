@@ -40,7 +40,7 @@ function codePathRig(dir) {
     v.agent = { bot: { currentWindow: null, version: '1.21.4', food: 20, health: 20, game: { maxHealth: 20, maxFood: 20 } }, prompter: { profile: { coding: 'Write one function.\n$SELF_PROMPT\n$MEMORY\n$STATS\n$INVENTORY\n$CODE_DOCS\n$EXAMPLES' }, coding_examples: [], replaceStrings: async s => s },
         coder: { userGeneratedCodeLintBlockers: () => null } };
     v.vitals = new VitalsModel({ regen: {}, runs: {}, foodSamples: { drop: { n: 0, sum: 0 }, rise: { n: 0, sum: 0 } } });
-    v.observe = () => ({ inventory: {}, equipment: eq, nearby_blocks: [] });
+    v.observe = () => ({ inventory: {}, equipment: eq, nearby_blocks: [], position: '0, 64, 0', biome: 'plains', time: 'day', health_value: 20, health_max: 20, food_value: 20, food_max: 20, inventory_slots: '0/36', empty_inventory_slots: 36, threats: 'none' });
     v._compactState = () => 'state';
     v._subgoalTask = () => null;
     v._takePlan = async () => ({ task: 'Do a fresh thing', reasoning: 'r' });

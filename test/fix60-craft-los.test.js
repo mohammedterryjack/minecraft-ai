@@ -42,6 +42,7 @@ function mockBot(world, feet, pathfinder) {
     Object.assign(pathfinder, { isMoving: () => false, isMining: () => false, isBuilding: () => false });
     return Object.assign(new EventEmitter(), {
         registry, world, output: '', interrupt_code: false,
+        game: { gameMode: 'survival' },
         entity: { position: feet.clone(), eyeHeight: 1.62 },
         inventory: { items: () => [] },
         canSeeBlock(block) {   // mineflayer's own implementation (blocks.js)
@@ -145,7 +146,7 @@ describe('fix60: a library-owned failure is not blamed on the learned callers', 
     });
     it('_checkContracts marks preHeld when the precondition evaluates true', () => {
         const v = readFileSync('./src/agent/voyager.js', 'utf8');
-        assert.ok(v.includes("if (ok !== false) { if (k === 'pre') r.preHeld = true; continue; }"));
+        assert.ok(v.includes("if (ok !== false) { if (k === 'pre') r.preHeld = true; if (k === 'post') postHeld = true; continue; }"));
     });
 });
 

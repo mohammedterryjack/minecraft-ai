@@ -168,8 +168,7 @@ describe('fix84: a full inventory whose held kinds are reserved is broken by a s
         const freeing = bestSlotFreeingCraft(registry, id => Recipe.find(id), inv);
         assert.ok(freeing && freeing.freed >= 1, 'the held coal and stick craft into one slot');
         const holder = skill('holds', {
-            consumeEvidence: evidence(),
-            useEvidence: evidence({
+            consumeEvidence: evidence({
                 dragon_egg: { runs: 1, max: inv.dragon_egg },
                 coal: { runs: 1, max: 1 },
                 stick: { runs: 1, max: 1 },
@@ -199,12 +198,10 @@ describe('fix84: surplus counts are not a slot plan; the smaller emptyable stack
         const inv = { cobblestone: 35 * registry.itemsByName.cobblestone.stackSize, diamond: 10 };
         const consumer = skill('useCobble', {
             consumeEvidence: { runs: 2, items: { cobblestone: { runs: 2, max: keep } } },
-            useEvidence: evidence(),
         });
         const toss = skill('tossClutter', {
             code: 'async function tossClutter(bot) { return true; }',
             consumeEvidence: evidence(),
-            useEvidence: evidence(),
             contract: { pre: 'c => true', post: 'c => c.post.free > c.pre.free', text: 'empty slots increase' },
         });
         const surplus = surplusFromConsumption([consumer, toss], inv);
@@ -225,8 +222,7 @@ describe('fix84: a full inventory with nothing that frees a whole slot throws', 
         const inv = { dragon_egg: 36 * registry.itemsByName.dragon_egg.stackSize };
         assert.strictEqual(bestSlotFreeingCraft(registry, id => Recipe.find(id), inv), null);
         const holder = skill('holds', {
-            consumeEvidence: evidence(),
-            useEvidence: evidence({ dragon_egg: { runs: 1, max: inv.dragon_egg } }),
+            consumeEvidence: evidence({ dragon_egg: { runs: 1, max: inv.dragon_egg } }),
         });
         const v = mkV({ inv, nearby: [], skills: [holder], runs: {} });
         await assert.rejects(quiet(() => drive(v, 'Collect 1 oak_log')), /\[fix92\] LOUD: no whole-slot plan frees 1 slot\(s\) for 1 oak_log/);

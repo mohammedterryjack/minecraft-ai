@@ -91,7 +91,19 @@ describe('fix87: no block of a registry type within search range is a reach need
     });
 
     function plannerBot() {
-        return { version: VER, registry, recipesAll: (id) => Recipe.find(id), inventory: { emptySlotCount: () => 4 } };
+        return {
+            version: VER, registry, recipesAll: (id) => Recipe.find(id), inventory: { emptySlotCount: () => 4 },
+            game: { gameMode: 'survival' },
+            entity: { eyeHeight: 1.62, position: { x: 0, y: 64, z: 0 } },
+            world: {},
+            waitForTicks: async () => {},
+            pathfinder: {
+                movements: {},
+                tickTimeout: 40,
+                getPathTo: () => ({ status: 'success', cost: 1 }),
+                getPathFromTo: function * () { yield { result: { status: 'success', cost: 1 } }; },
+            },
+        };
     }
     function vWith(bot) {
         const v = Object.create(Voyager.prototype);
@@ -131,7 +143,7 @@ describe('fix87: no block of a registry type within search range is a reach need
         assert.strictEqual(Object.hasOwn(unknown, 'need'), false);
     });
 
-    it('Collect oak_log with no source nearby chains to reach oak_log; a nearby log, and a craft, do not', () => {
+    it('Collect oak_log with no source nearby chains to reach oak_log; a nearby log, and a craft, do not', async () => {
         const v = vWith(plannerBot());
         const absent = { inventory: {}, nearby_blocks: [] };
         const needs = v._failureNeeds('Collect 1 oak_log', null, null, absent);
@@ -141,7 +153,9 @@ describe('fix87: no block of a registry type within search range is a reach need
         v._chainNeeds('Collect 1 oak_log', needs, absent);
         assert.strictEqual(v.progress.subgoals[0].task, 'reach oak_log');
 
-        const present = v._failureNeeds('Collect 1 oak_log', null, null, { inventory: {}, nearby_blocks: ['oak_log'] });
+        const here = { inventory: {}, nearby_blocks: ['oak_log'], perceived_at: { oak_log: { x: 1, y: 64, z: 1 } } };
+        await v._judgeTargets(here, ['oak_log'], true);
+        const present = v._failureNeeds('Collect 1 oak_log', null, null, here);
         assert.strictEqual(present, null);
 
         // sticks also drop from leaves. With nothing nearby that collect is cheaper than crafting, so the need is

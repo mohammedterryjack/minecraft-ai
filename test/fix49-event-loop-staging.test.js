@@ -1,5 +1,5 @@
 /**
- * fix49: event-loop stall threshold is the keep-alive kick bound; Nyquist poll; phase stack on STALL.
+ * fix49: event-loop STALL threshold is a pending keep-alive; Nyquist poll; phase stack on STALL.
  */
 import { describe, it, before, afterEach } from 'node:test';
 import assert from 'node:assert';
@@ -10,29 +10,32 @@ import {
     stallThresholdMs,
     runStallPollTickForTest,
     withStallPhase,
+    KEEP_ALIVE_INTERVAL_MS,
     KEEP_ALIVE_KICK_MS,
 } from '../src/utils/event_loop_guard.js';
 import { collectBareApiUsedInSource } from '../src/agent/coder.js';
 
-describe('fix49: server keep_alive stall threshold', () => {
+describe('fix49: the STALL threshold is a pending keep-alive', () => {
     let _testBot;
     afterEach(() => {
         if (_testBot) stopEventLoopStallGuard(_testBot);
         _testBot = null;
     });
 
-    it('stallThresholdMs is the kick bound as soon as the guard starts, before any keep_alive', () => {
+    it('stallThresholdMs is the keep-alive interval, before any keep_alive', () => {
+        assert.throws(() => stallThresholdMs(null), /bot required/);
         const bus = new EventEmitter();
         const bot = { _client: bus };
-        assert.throws(() => stallThresholdMs(bot), /kick bound/);
+        assert.strictEqual(stallThresholdMs(bot), KEEP_ALIVE_INTERVAL_MS);
+        assert.notStrictEqual(KEEP_ALIVE_INTERVAL_MS, KEEP_ALIVE_KICK_MS);
         _testBot = bot;
         startEventLoopStallGuard(bot);
-        assert.strictEqual(stallThresholdMs(bot), KEEP_ALIVE_KICK_MS);
+        assert.strictEqual(stallThresholdMs(bot), KEEP_ALIVE_INTERVAL_MS);
         bus.emit('keep_alive', { keepAliveId: 1 });
-        assert.strictEqual(stallThresholdMs(bot), KEEP_ALIVE_KICK_MS);
+        assert.strictEqual(stallThresholdMs(bot), KEEP_ALIVE_INTERVAL_MS);
     });
 
-    it('a keep_alive gap shorter than the server interval leaves the threshold at the kick bound', () => {
+    it('a keep_alive gap does not replace the keep-alive interval', () => {
         const bus = new EventEmitter();
         const bot = { _client: bus };
         _testBot = bot;
@@ -44,7 +47,7 @@ describe('fix49: server keep_alive stall threshold', () => {
             bus.emit('keep_alive', { keepAliveId: 1 });
             now += 37;
             bus.emit('keep_alive', { keepAliveId: 2 });
-            assert.strictEqual(stallThresholdMs(bot), KEEP_ALIVE_KICK_MS);
+            assert.strictEqual(stallThresholdMs(bot), KEEP_ALIVE_INTERVAL_MS);
         } finally {
             Date.now = realNow;
         }
@@ -62,7 +65,7 @@ describe('fix49: STALL logs capture phase stack at stall time (synthetic)', () =
             await withStallPhase('outer:phase', async () => {
                 await withStallPhase('inner:blocking', async () => {
                     bot.__stallEventLoopHist = {
-                        max: 50e6,
+                        max: KEEP_ALIVE_INTERVAL_MS * 1e6,
                         reset() {},
                     };
                     runStallPollTickForTest(bot);

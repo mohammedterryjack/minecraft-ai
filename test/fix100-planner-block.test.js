@@ -30,6 +30,10 @@ const TERMINATE_EXIT_CHILD = fileURLToPath(new URL('./fixtures/fix100-terminate-
 const START_AFTER_KEEPALIVE_MS = 13_000;
 const BLOCK_MS = 20_000;
 const INV = { oak_log: 23, diorite: 105, andesite: 60, raw_copper: 8, iron_helmet: 3, raw_iron: 85, torch: 80, oak_sapling: 18, granite: 64, coal: 15, stick: 1, cobbled_deepslate: 5, dark_oak_planks: 1, oak_button: 1, jukebox: 1, iron_sword: 1, music_disc_11: 1, honey_block: 1, cobblestone: 337, netherrack: 1, dirt: 261, birch_log: 6, oak_planks: 1 };
+// e334ec8, this fixture, cheapest of every edible: about 22_000 plan() expansions and 21_637 smelt lookups.
+// b4bd499 planned every furnace input on every branch: 2_849_202 expansions and 2_645_827 smelt lookups.
+const MAIN_PLAN_EXPANSIONS = 22000;
+const MAIN_SMELT_GETS = 21637;
 
 let Voyager;
 before(async () => {
@@ -86,39 +90,44 @@ describe('fix100 planner', () => {
         assert.ok(foods.length >= 40);
         const runs = [];
         for (const n of [1080, 5000]) {
-            const { goalStats, recipeEdges } = history(n, items);
-            let scans = 0;
-            const proxied = new Proxy(goalStats, { ownKeys(t) { scans++; return Reflect.ownKeys(t); } });
-            let recipeCalls = 0, edgeCalls = 0, smeltGets = 0;
-            const v = Object.create(Voyager.prototype);
-            v.agent = { bot: { version: VER, registry, recipesAll: (id) => { recipeCalls++; return Recipe.find(id); }, inventory: { emptySlotCount: () => 1 } } };
-            v.skills = [];
-            v.progress = { subgoals: [], decomposed: {}, failed: [], completedAt: {}, completed: [], blockers: [], recipeEdges, goalStats: proxied, goalFailStates: [] };
-            v._saveProgress = () => {};
-            v._producers = () => [];
-            const origIndex = v._learnedSmeltIndex.bind(v);
-            v._learnedSmeltIndex = () => {
-                const map = origIndex();
-                const origGet = map.get.bind(map);
-                map.get = (key) => { smeltGets++; return origGet(key); };
-                return map;
-            };
-            const origEdge = v._edgeSuccess.bind(v);
-            v._edgeSuccess = (item, verb) => { edgeCalls++; return origEdge(item, verb); };
-            const state = { inventory: { ...INV }, nearby_blocks: [] };
-            const t0 = performance.now();
-            const planner = v._obtainPlanner(state);
-            const built = performance.now() - t0;
-            const scansAtBuild = scans;
-            const t1 = performance.now();
-            const choice = planner.cheapest(foods, 1, { ...INV });
-            const cheapMs = performance.now() - t1;
-            const scansAfter = scans;
-            const indexed = indexLists(origIndex());
-            runs.push({ n, item: choice.item, scansAtBuild, scansAfter, smeltGets, recipeCalls, edgeCalls, built, cheapMs, indexed });
-            console.log(`[fix100] N=${n} build ${built.toFixed(1)}ms cheapest ${cheapMs.toFixed(1)}ms scans ${scansAtBuild}->${scansAfter} smeltGets ${smeltGets} recipes ${recipeCalls} edgeSuccess ${edgeCalls} item ${choice.item}`);
+            for (const feasible of n === 1080 ? [false, true] : [false]) {
+                const { goalStats, recipeEdges } = history(n, items);
+                let scans = 0;
+                const proxied = new Proxy(goalStats, { ownKeys(t) { scans++; return Reflect.ownKeys(t); } });
+                let recipeCalls = 0, edgeCalls = 0, smeltGets = 0;
+                const v = Object.create(Voyager.prototype);
+                v.agent = { bot: { version: VER, registry, recipesAll: (id) => { recipeCalls++; return Recipe.find(id); }, inventory: { emptySlotCount: () => 1 } } };
+                v.skills = [];
+                v.progress = { subgoals: [], decomposed: {}, failed: [], completedAt: {}, completed: [], blockers: [], recipeEdges, goalStats: proxied, goalFailStates: [] };
+                v._saveProgress = () => {};
+                v._producers = () => [];
+                const origIndex = v._learnedSmeltIndex.bind(v);
+                v._learnedSmeltIndex = () => {
+                    const map = origIndex();
+                    const origGet = map.get.bind(map);
+                    map.get = (key) => { smeltGets++; return origGet(key); };
+                    return map;
+                };
+                const origEdge = v._edgeSuccess.bind(v);
+                v._edgeSuccess = (item, verb) => { edgeCalls++; return origEdge(item, verb); };
+                const state = { inventory: { ...INV }, nearby_blocks: [] };
+                const t0 = performance.now();
+                const planner = v._obtainPlanner(state);
+                const built = performance.now() - t0;
+                const scansAtBuild = scans;
+                const t1 = performance.now();
+                const choice = planner.cheapest(foods, 1, { ...INV }, feasible);
+                const cheapMs = performance.now() - t1;
+                const scansAfter = scans;
+                const indexed = indexLists(origIndex());
+                const planCalls = planner.planCalls();
+                runs.push({ n, feasible, item: choice.item, scansAtBuild, scansAfter, smeltGets, planCalls, recipeCalls, edgeCalls, built, cheapMs, indexed });
+                console.log(`[fix100] N=${n} feasible=${feasible} build ${built.toFixed(1)}ms cheapest ${cheapMs.toFixed(1)}ms scans ${scansAtBuild}->${scansAfter} plans ${planCalls} smeltGets ${smeltGets} recipes ${recipeCalls} edgeSuccess ${edgeCalls} item ${choice.item}`);
+            }
         }
-        const [small, big] = runs;
+        const small = runs.find(r => r.n === 1080 && r.feasible === false);
+        const big = runs.find(r => r.n === 5000 && r.feasible === false);
+        const reachable = runs.find(r => r.n === 1080 && r.feasible === true);
         assert.strictEqual(small.scansAtBuild, 1);
         assert.strictEqual(big.scansAtBuild, 1);
         assert.strictEqual(small.scansAfter, 1, 'cheapest rescanned goalStats');
@@ -131,6 +140,15 @@ describe('fix100 planner', () => {
         assert.deepStrictEqual(small.indexed, smeltOracle(history(1080, items).goalStats));
         assert.deepStrictEqual(big.indexed, smeltOracle(history(5000, items).goalStats));
         assert.deepStrictEqual(small.indexed, big.indexed);
+        assert.strictEqual(small.planCalls, big.planCalls);
+        assert.ok(small.planCalls <= MAIN_PLAN_EXPANSIONS, `feasible=false plan() ${small.planCalls} above main's ${MAIN_PLAN_EXPANSIONS}`);
+        assert.ok(small.smeltGets <= MAIN_SMELT_GETS, `feasible=false smeltGets ${small.smeltGets} above main's ${MAIN_SMELT_GETS}`);
+        assert.ok(reachable.planCalls <= MAIN_PLAN_EXPANSIONS, `feasible=true plan() ${reachable.planCalls} above main's ${MAIN_PLAN_EXPANSIONS}`);
+        assert.ok(reachable.smeltGets <= MAIN_SMELT_GETS, `feasible=true smeltGets ${reachable.smeltGets} above main's ${MAIN_SMELT_GETS}`);
+        assert.strictEqual(small.item, 'carrot');
+        assert.strictEqual(reachable.item, 'beef');
+        assert.strictEqual(reachable.scansAtBuild, 1);
+        assert.strictEqual(reachable.scansAfter, 1);
     });
 });
 

@@ -10,6 +10,7 @@
  */
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert';
+import { createRequire } from 'node:module';
 import { readFileSync, rmSync } from 'node:fs';
 import { Voyager } from '../src/agent/voyager.js';
 import { Coder, getBareAPI } from '../src/agent/coder.js';
@@ -22,7 +23,18 @@ const REACHED = 'reached the code-model repair';
 
 let coderP = null;
 async function rig({ draw }) {
-    coderP ||= (async () => { const c = new Coder({ name: NAME }); while (!c.code_lint_template || !c.code_template) await new Promise(r => setImmediate(r)); return c; })();
+    coderP ||= (async () => {
+        // The fixture's getNearestBlock distances are in blocks. Login (play) viewDistance is chunks
+        // (https://wiki.vg/Protocol#Login_.28play.29); one chunk is CHUNK_WIDTH (prismarine-chunk).
+        const { CHUNK_WIDTH } = createRequire(import.meta.url)('prismarine-chunk/src/pc/common/constants.js');
+        const scans = [...LIVE_ENSURE_FURNACE.matchAll(/getNearestBlock\([^)]*,\s*(\d+)\)/g)].map(m => Number(m[1]));
+        if (scans.length === 0) throw new Error('ensureFurnace fixture has no numeric getNearestBlock distance');
+        const chunks = Math.ceil(Math.max(...scans) / CHUNK_WIDTH);
+        if (!Number.isInteger(chunks) || chunks <= 0) throw new Error(`view distance in chunks is ${chunks} (CHUNK_WIDTH ${CHUNK_WIDTH})`);
+        const c = new Coder({ name: NAME, bot: { game: { serverViewDistance: chunks, simulationDistance: chunks } } });
+        while (!c.code_lint_template || !c.code_template) await new Promise(r => setImmediate(r));
+        return c;
+    })();
     const coder = await coderP;
     const v = Object.create(Voyager.prototype);
     v.agent = { coder, prompter: { code_model: { fallback: true } } };

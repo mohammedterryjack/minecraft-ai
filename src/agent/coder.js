@@ -12,7 +12,7 @@ import pf from 'mineflayer-pathfinder';
 import { logPromptBreakdown } from './prompt_utils.js';
 import { withStallPhase, pushStallPhase, popStallPhase, getStallPhaseStack } from '../utils/event_loop_guard.js';
 import { mainThreadWatchdogStarted, publishMainThreadCode, finishMainThreadCode } from '../utils/main_thread_watchdog.js';
-import { wrapBotForApiTiming } from '../utils/bot_api_timing.js';
+import { wrapBotForApiTiming, FIND_BLOCKS_NUMERIC_OPTIONS } from '../utils/bot_api_timing.js';
 import { markPreconditionUnmet } from './precondition.js';
 
 // fix38: expose pathfinder goals to generated code (fail loud if missing)
@@ -87,14 +87,31 @@ export function missingCountArithmetic(code) {
 }
 // fix74: internal sandbox binding of markPreconditionUnmet (see _stageCode endowments); seeded primitives call it by this name
 export const PRECONDITION_UNMET_BINDING = '__mcPreconditionUnmet__';
+// The parameter list and the JSDoc @param types on the function itself. Defaults are not shown: the model copied them.
+export function parameterList(fn) {
+    const str = fn.toString();
+    const match = str.match(/function\s+\w+\s*\(([^)]*)\)/);
+    if (!match) return null;
+    const types = new Map();
+    for (const m of str.matchAll(/@param\s+\{([^}]+)\}\s+(\w+)/g)) types.set(m[2], m[1]);
+    return match[1].split(',').map(p => p.trim()).filter(Boolean).map(p => {
+        const name = p.split('=')[0].trim();
+        return { name, type: types.has(name) ? types.get(name) : null };
+    });
+}
+function numberType(type) {
+    return typeof type === 'string' && type.split('|').map(s => s.trim()).includes('number');
+}
+
 export function getBareAPI() {
     if (_bareAPICache) return _bareAPICache;
     const extractSig = (fn, modName) => {
-        const str = fn.toString();
-        const match = str.match(/function\s+\w+\s*\(([^)]*)\)/);
-        if (!match) return null;
-        const params = match[1].trim();
-        return { name: fn.name, sig: `${fn.name}(${params})`, source: modName };
+        const params = parameterList(fn);
+        if (!params) return null;
+        const shown = params.map(p => p.type ? `${p.name}: ${p.type}` : p.name).join(', ');
+        const numericArgs = {};
+        params.forEach((p, i) => { if (numberType(p.type)) numericArgs[i] = p.name; });
+        return { name: fn.name, sig: `${fn.name}(${shown})`, source: modName, numericArgs };
     };
     // fix41: collect ALL function keys first, then try extractSig; fallback to name() if regex misses
     const skillKeys = Object.keys(skills).filter(k => typeof skills[k] === 'function' && k !== 'log');
@@ -121,6 +138,48 @@ export function botMembers(bot) {
             out.set(k, 'value' in d && typeof d.value === 'function');
         }
     return out;
+}
+function memberValue(obj, key) {
+    for (let o = obj; o && o !== Object.prototype; o = Object.getPrototypeOf(o)) {
+        if (!Object.prototype.hasOwnProperty.call(o, key)) continue;
+        const d = Object.getOwnPropertyDescriptor(o, key);
+        if (!d) continue;
+        if ('value' in d) return d.value;
+        if (typeof d.get === 'function') return obj[key];
+    }
+    return undefined;
+}
+// fix97: bot.inventory.hasItem is a MemberExpression whose object is bot.inventory, not bot.
+// The direct-bot check never saw hasItem. Walk the chain and name the closest real member of the object we reached.
+function botMemberChain(node) {
+    const parts = [];
+    let cur = node;
+    while (cur && cur.type === 'MemberExpression' && !cur.computed && cur.property && cur.property.type === 'Identifier') {
+        parts.unshift(cur.property.name);
+        cur = cur.object;
+    }
+    if (!cur || cur.type !== 'Identifier' || cur.name !== 'bot') return null;
+    return parts;
+}
+export function nestedBotMemberError(bot, node, assigned, nodes) {
+    const parts = botMemberChain(node);
+    if (!parts || parts.length < 2) return null;
+    let obj = bot;
+    for (let i = 0; i < parts.length; i++) {
+        const key = parts[i];
+        if (obj === null || (typeof obj !== 'object' && typeof obj !== 'function')) return null;
+        const known = botMembers(obj).has(key) || (i === 0 && assigned.has(key));
+        if (!known) {
+            // bot.recipes is already reported by the direct bot.member check. Only a missing member of a real object
+            // (bot.inventory.hasItem) is new.
+            if (i === 0) return null;
+            const isCall = i === parts.length - 1 && nodes.some(c => c.type === 'CallExpression' && c.callee === node);
+            const closest = nearestBotMember(obj, key, isCall).map(k => `bot.${[...parts.slice(0, i), k].join('.')}`);
+            return `bot.${parts.slice(0, i + 1).join('.')} does not exist (closest real members: ${closest.join(', ')})`;
+        }
+        if (i < parts.length - 1) obj = memberValue(obj, key);
+    }
+    return null;
 }
 export function nearestBotMember(bot, name, isCall) {
     const words = s => s.split(/(?=[A-Z])/).map(w => w.toLowerCase());
@@ -350,7 +409,64 @@ export class Coder {
         }
         const missingCounts = missingCountArithmetic(code);   // fix83
         if (missingCounts.length) return missingCounts.join('\n');
-        return this._apiGate(code, knownNames);
+        // fix97: feedback only. The code string is not rewritten. An array or object literal for maxDistance/count
+        // (or the distance/count arguments that become those options) is how mineIronOres scanned every block.
+        const shape = this._nonNumericScanOptionLint(code);
+        const gate = this._apiGate(code, knownNames);
+        const parts = [];
+        if (shape) parts.push(shape);
+        if (gate) parts.push(gate);
+        return parts.length ? parts.join('\n') : null;
+    }
+
+    // fix97: array and object literals are not distances or counts. Identifiers are left to the runtime check.
+    _nonNumericScanOptionLint(code) {
+        let ast;
+        try { ast = acorn.parse(code, { ecmaVersion: 'latest', sourceType: 'module', allowAwaitOutsideFunction: true }); }
+        catch (e) { return `Syntax error (cannot parse): ${e.message}`; }
+        const bad = n => n && (n.type === 'ArrayExpression' || n.type === 'ObjectExpression');
+        const kind = n => n.type === 'ArrayExpression' ? 'array' : 'object';
+        const positional = {};
+        const bare = getBareAPI();
+        if (!bare.byName) throw new Error('[coder] bare API has no byName index');
+        for (const fn of Object.values(bare.byName)) {
+            if (fn.numericArgs && Object.keys(fn.numericArgs).length) positional[fn.name] = fn.numericArgs;
+        }
+        const errs = [];
+        const walk = (node) => {
+            if (!node || typeof node.type !== 'string') return;
+            if (node.type === 'CallExpression') {
+                let name = null;
+                if (node.callee.type === 'Identifier') name = node.callee.name;
+                else if (node.callee.type === 'MemberExpression' && !node.callee.computed && node.callee.property.type === 'Identifier') name = node.callee.property.name;
+                if (name === 'findBlocks' || name === 'findBlock') {
+                    const first = node.arguments[0];
+                    if (first && first.type === 'ObjectExpression') {
+                        for (const p of first.properties) {
+                            if (p.type !== 'Property' || p.computed || p.key.type !== 'Identifier') continue;
+                            if (!FIND_BLOCKS_NUMERIC_OPTIONS.includes(p.key.name)) continue;
+                            if (!bad(p.value)) continue;
+                            errs.push(`${name} option ${p.key.name} is an ${kind(p.value)} literal, not a finite number. matching may be an array of block ids; maxDistance and count are numbers`);
+                        }
+                    }
+                }
+                const slots = positional[name];
+                if (slots) {
+                    for (const [idx, label] of Object.entries(slots)) {
+                        const arg = node.arguments[Number(idx)];
+                        if (!bad(arg)) continue;
+                        errs.push(`${name} ${label} is an ${kind(arg)} literal, not a finite number. Block names are block_types or the predicate; distance and count are numbers`);
+                    }
+                }
+            }
+            for (const k in node) {
+                const v = node[k];
+                if (Array.isArray(v)) v.forEach(walk);
+                else if (v && typeof v.type === 'string') walk(v);
+            }
+        };
+        walk(ast);
+        return errs.length ? errs.join('\n') : null;
     }
 
     // fix32: static API gate on freshly generated code: every bot.<member> must exist on the live bot (or be assigned
@@ -391,6 +507,10 @@ export class Coder {
                 errs.add(`writing bot.${n.left.property.name} is forbidden in generated code (runtime-owned; seeded ensure* sets it)`);
             if (n.type === 'MemberExpression' && !n.computed && n.object.type === 'Identifier' && n.object.name === 'bot' && n.property.type === 'Identifier' && !(n.property.name in bot) && !assigned.has(n.property.name))
                 errs.add(`bot.${n.property.name} does not exist on the live bot (closest real members: ${nearestBotMember(bot, n.property.name, nodes.some(c => c.type === 'CallExpression' && c.callee === n)).map(k => 'bot.' + k).join(', ')})`);
+            if (n.type === 'MemberExpression') {
+                const nested = nestedBotMemberError(bot, n, assigned, nodes);
+                if (nested) errs.add(nested);
+            }
             if (n.type === 'CallExpression') {
                 if (n.callee.type === 'Identifier' && !declared.has(n.callee.name) && !sandbox.has(n.callee.name) && !(n.callee.name in globalThis))
                     errs.add(`${n.callee.name}() is not defined (not a skill, not declared in the code)`);
@@ -583,59 +703,67 @@ export class Coder {
     }
 
     /**
-     * Warn on large-radius block/entity scans (numeric maxDistance or similar).
-     */
-    /**
+     * Warn when a scan asks for blocks past the server view distance, or entities past the
+     * simulation distance. Both are chunk radii from Login (play), converted to blocks.
+     * maxBlocks is a count, not a distance, so it is not compared.
      * @param {string} code
      * @param {number} preludeLines
-     * @param {number} warnDistMs numeric literal threshold (the keep-alive kick bound the stall guard sets)
      */
-    _largeWorldScanLint(code, preludeLines, warnDistMs) {
-        if (typeof warnDistMs !== 'number' || !Number.isFinite(warnDistMs) || warnDistMs <= 0) {
-            throw new Error('[coder] _largeWorldScanLint: warnDistMs must be a positive finite number');
-        }
+    _largeWorldScanLint(code, preludeLines) {
         let ast;
         try {
             ast = acorn.parse(code, { ecmaVersion: 'latest', sourceType: 'module', allowAwaitOutsideFunction: true, locations: true });
         } catch (e) {
             throw new Error(`[coder] _largeWorldScanLint: parse failed: ${e && e.message ? e.message : String(e)}`);
         }
-        const warnDist = warnDistMs;
+        const bot = this.agent && this.agent.bot;
+        const blockScans = new Set(['findBlock', 'findBlocks']);
         const out = [];
-        const scanCalleeNames = new Set(['findBlock', 'findBlocks', 'nearestEntity']);
+        let blockRadius = null;
+        let entityRadius = null;
+        const blocks = () => {
+            if (blockRadius === null) blockRadius = world.nearbyBlockRadius(bot);
+            return blockRadius;
+        };
+        const entities = () => {
+            if (entityRadius === null) entityRadius = world.simulationBlockRadius(bot);
+            return entityRadius;
+        };
+        const past = (n, radius, what, chunks) => `${n} blocks is past the server ${what} (${chunks} chunks, ${radius} blocks)`;
         const walk = (node) => {
             if (!node || typeof node.type !== 'string') return;
             if (node.type === 'CallExpression') {
                 let reportLine = null;
                 let detail = '';
                 const callee = node.callee;
-                if (callee?.type === 'MemberExpression' && !callee.computed && callee.object?.type === 'Identifier' && callee.object.name === 'bot' && callee.property?.type === 'Identifier' && scanCalleeNames.has(callee.property.name)) {
+                if (callee?.type === 'MemberExpression' && !callee.computed && callee.object?.type === 'Identifier' && callee.object.name === 'bot' && callee.property?.type === 'Identifier' && (blockScans.has(callee.property.name) || callee.property.name === 'nearestEntity')) {
+                    const entity = callee.property.name === 'nearestEntity';
+                    const what = entity ? 'simulation distance' : 'view distance';
+                    const consider = (n, line, where) => {
+                        if (n === null) return;
+                        const radius = entity ? entities() : blocks();
+                        const chunks = entity ? bot.game.simulationDistance : bot.game.serverViewDistance;
+                        if (n > radius) {
+                            reportLine = line;
+                            detail = `${where}=${past(n, radius, what, chunks)}`;
+                        }
+                    };
                     const first = node.arguments[0];
                     if (first?.type === 'ObjectExpression') {
                         for (const p of first.properties) {
-                            if (p.type !== 'Property' || p.key?.type !== 'Identifier') continue;
-                            const kn = p.key.name;
-                            if (kn !== 'maxDistance' && kn !== 'maxBlocks') continue;
-                            const n = this._getNumericLiteral(p.value);
-                            if (n !== null && n >= warnDist) {
-                                reportLine = p.value.loc.start.line;
-                                detail = `bot.${callee.property.name} option ${kn}=${n} (>= keep-alive kick bound ${warnDist}ms as stall-risk distance)`;
-                            }
+                            if (p.type !== 'Property' || p.key?.type !== 'Identifier' || p.key.name !== 'maxDistance') continue;
+                            consider(this._getNumericLiteral(p.value), p.value.loc.start.line, `bot.${callee.property.name} option maxDistance`);
                         }
                     }
-                    if (callee.property.name === 'nearestEntity' && node.arguments.length >= 2) {
-                        const n = this._getNumericLiteral(node.arguments[1]);
-                        if (n !== null && n >= warnDist) {
-                            reportLine = node.arguments[1].loc.start.line;
-                            detail = `bot.nearestEntity second arg maxDistance=${n} (>= keep-alive kick bound ${warnDist}ms as stall-risk distance)`;
-                        }
+                    if (entity && node.arguments.length >= 2) {
+                        consider(this._getNumericLiteral(node.arguments[1]), node.arguments[1].loc.start.line, 'bot.nearestEntity second arg maxDistance');
                     }
                 }
                 if (callee?.type === 'Identifier' && callee.name === 'getNearestBlock' && node.arguments.length >= 3) {
                     const n = this._getNumericLiteral(node.arguments[2]);
-                    if (n !== null && n >= warnDist) {
+                    if (n !== null && n > blocks()) {
                         reportLine = node.arguments[2].loc.start.line;
-                        detail = `getNearestBlock distance=${n} (>= keep-alive kick bound ${warnDist}ms as stall-risk distance)`;
+                        detail = `getNearestBlock distance=${past(n, blockRadius, 'view distance', bot.game.serverViewDistance)}`;
                     }
                 }
                 if (reportLine !== null && reportLine > preludeLines) {
@@ -905,24 +1033,10 @@ export class Coder {
             return header + errors.join('');
         }
 
-        const bot = this.agent.bot;
-        const stallMs =
-            bot &&
-            typeof bot.__eventLoopStallThresholdMs === 'number' &&
-            Number.isFinite(bot.__eventLoopStallThresholdMs) &&
-            bot.__eventLoopStallThresholdMs > 0
-                ? bot.__eventLoopStallThresholdMs
-                : null;
-        if (stallMs === null) {
-            warnings.push(
-                'WARNING: large-radius scan stall-risk check is OFF until the event-loop guard sets the keep-alive kick bound.\n'
-            );
-        }
-        const largeScanWarnings = stallMs === null ? [] : this._largeWorldScanLint(code, preludeLines, stallMs);
+        const largeScanWarnings = this._largeWorldScanLint(code, preludeLines);
         if (largeScanWarnings.length > 0) {
-            const wd = stallMs;
-            let w = `WARNING: Large-radius block/world scan (numeric distance >= ${wd} — the keep-alive kick bound used for stall detection) may block the event loop.\n`;
-            w += 'Prefer smaller maxDistance, chunk-aware iteration, or yield with await between batches.\n';
+            let w = 'WARNING: Scan distance is past the chunks the server sends (view distance) or ticks (simulation distance).\n';
+            w += 'A maxDistance in blocks that is larger than that radius reads chunks the client does not have.\n';
             for (const x of largeScanWarnings) {
                 w += `  Line ${x.line}: ${x.detail}\n`;
             }

@@ -9,10 +9,14 @@
  * and sets keepAliveTime to now. The kick therefore lands 15–30s after a keepalive.
  * minecraft.wiki, Java Edition protocol, Keep Alive (clientbound); wiki.vg Keep Alive.
  *
- * The beat period is the Nyquist poll, half of the 15000 ms interval. The armed silence
- * limit is the kick bound (15000 × 2). A healthy loop beats inside that bound, so the beat
+ * The beat period is the Nyquist poll, half of KEEP_ALIVE_INTERVAL_MS. The armed silence
+ * limit is the kick bound (KEEP_ALIVE_INTERVAL_MS × 2). A healthy loop beats inside that bound, so the beat
  * is not added on top of it: adding it would leave the process alive after the server had
- * already kicked the client.
+ * already kicked the client. That bound is the watchdog only.
+ *
+ * The STALL log is the same keepConnectionAlive interval: a delay of KEEP_ALIVE_INTERVAL_MS
+ * means a keep-alive is pending (now - keepAliveTime >= 15000L either sends one or
+ * disconnects a pending one). It is not the kick, which is that interval twice.
  *
  * fix100: each keep_alive the client processes is stamped for the watchdog. The kill deadline
  * is that stamp plus the kick bound (the server's own rule). The beat stays evidence of the
@@ -68,16 +72,14 @@ export function watchdogBeatPeriodMs() {
 }
 
 /**
- * The stall threshold is the server kick bound. It does not depend on observed gaps.
+ * The STALL log fires when one turn was delayed by a keep-alive interval: a keep-alive is
+ * pending. keepConnectionAlive compares against KEEP_ALIVE_INTERVAL_MS. The kick, that
+ * interval twice, is the watchdog's silence limit and is not this log.
  * @param {import('mineflayer').Bot} bot
  */
 export function stallThresholdMs(bot) {
     if (!bot) throw new Error('[event_loop_guard] bot required');
-    const t = bot.__eventLoopStallThresholdMs;
-    if (t !== KEEP_ALIVE_KICK_MS) {
-        throw new Error(`[event_loop_guard] stall threshold is ${t}, not the keep-alive kick bound ${KEEP_ALIVE_KICK_MS}ms`);
-    }
-    return t;
+    return KEEP_ALIVE_INTERVAL_MS;
 }
 
 /** Silence that arms SIGKILL: the keep-alive kick bound, 15000 ms × 2. */
@@ -140,8 +142,7 @@ export function runStallPollTickForTest(bot) {
 
 function _stallPollTick(bot) {
     if (mainThreadWatchdogStarted()) beatMainThreadWatchdog();   // fix64: this tick running at all is the heartbeat
-    const threshold = bot.__eventLoopStallThresholdMs;
-    if (typeof threshold !== 'number' || !Number.isFinite(threshold) || threshold <= 0) return;
+    const threshold = stallThresholdMs(bot);
     const h = bot.__stallEventLoopHist;
     if (!h) return;
     const maxNs = h.max;
@@ -149,13 +150,13 @@ function _stallPollTick(bot) {
     const maxMs = maxNs / 1e6;
     if (maxMs >= threshold) {
         const ctx = captureStallContext(bot);
-        console.error(`[event-loop] STALL: event loop delayed ${maxMs.toFixed(0)}ms (>= ${threshold}ms keep-alive kick bound) phase_stack="${ctx.phaseStr}" skill="${ctx.skill}" stack="${ctx.stack}"`);
+        console.error(`[event-loop] STALL: event loop delayed ${maxMs.toFixed(0)}ms (>= ${threshold}ms, a keep-alive is pending: keepConnectionAlive compares against ${KEEP_ALIVE_INTERVAL_MS}ms) phase_stack="${ctx.phaseStr}" skill="${ctx.skill}" stack="${ctx.stack}"`);
     }
 }
 
 /**
- * Arm once. The threshold is the kick bound and the poll is the beat period.
- * A keep_alive gap does not reach here.
+ * Arm once. The STALL log is a pending keep-alive (KEEP_ALIVE_INTERVAL_MS).
+ * The poll is the watchdog beat. A keep_alive gap does not reach here.
  * @param {import('mineflayer').Bot} bot
  */
 function _scheduleStallPoll(bot) {
@@ -165,7 +166,7 @@ function _scheduleStallPoll(bot) {
         clearInterval(bot.__stallPollInterval);
         bot.__stallPollInterval = null;
     }
-    console.log(`[event-loop] stall guard ARMED: threshold is the keep-alive kick bound (currently ${thresholdMs}ms = ${KEEP_ALIVE_INTERVAL_MS}×2); poll every ${pollMs}ms (Nyquist: interval/2)`);
+    console.log(`[event-loop] stall guard ARMED: STALL when a keep-alive is pending (currently ${thresholdMs}ms, keepConnectionAlive interval); poll every ${pollMs}ms (watchdog beat)`);
 
     if (!bot.__stallEventLoopHist) {
         bot.__stallEventLoopHist = monitorEventLoopDelay({ resolution: 20 });
@@ -184,9 +185,11 @@ function _scheduleStallPoll(bot) {
 }
 
 /**
- * Arm once per bot at the keep-alive kick bound. The keep_alive handler stamps the moment the
- * packet was processed (process.hrtime). It does not learn the interval from the gap: Date.now()
- * there included the bot's own stalls and the maximum only climbed.
+ * Arm once per bot. The STALL log is KEEP_ALIVE_INTERVAL_MS (a keep-alive is pending).
+ * The watchdog silence limit is the kick, that interval twice. Inbound keep_alive times
+ * are not read: Date.now() there included the bot's own stalls and the maximum only climbed.
+ * The keep_alive handler stamps the moment the packet was processed (process.hrtime) for
+ * the watchdog. The interval stays KEEP_ALIVE_INTERVAL_MS.
  * @param {import('mineflayer').Bot} bot
  */
 export function startEventLoopStallGuard(bot) {
@@ -206,7 +209,6 @@ export function startEventLoopStallGuard(bot) {
         get: () => (_psnStack === '(none)' ? '' : _psnStack),
         set: (v) => { _psnStack = v ? String(v) : '(none)'; _publishEvidence(); },
     });
-    bot.__eventLoopStallThresholdMs = KEEP_ALIVE_KICK_MS;
     // The packet was processed on this turn. Stamp hrtime; the interval stays KEEP_ALIVE_INTERVAL_MS.
     const onKeepAlive = () => {
         if (mainThreadWatchdogStarted()) noteMainThreadKeepAlive();
@@ -232,10 +234,7 @@ export function stopEventLoopStallGuard(bot) {
         bot._client.removeListener('keep_alive', bot.__watchdogKeepAlive);
         bot.__watchdogKeepAlive = null;
     }
-    if (bot) {
-        bot.__eventLoopStallGuardHooked = false;
-        bot.__eventLoopStallThresholdMs = null;
-    }
+    if (bot) bot.__eventLoopStallGuardHooked = false;
 }
 
 /**

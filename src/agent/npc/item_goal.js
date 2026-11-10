@@ -314,9 +314,13 @@ export class ItemGoal {
         let next = next_info.node;
         let quantity = next_info.quantity;
 
-        // Prevent unnecessary attempts to obtain blocks that are not nearby
-        if (next.type === 'block' && !world.getNearbyBlockTypes(this.agent.bot).includes(next.source) ||
-                next.type === 'hunt' && !world.getNearbyEntityTypes(this.agent.bot).includes(next.source)) {
+        // A block target is reachable only when pathToBlock returns success. That search steps until success
+        // or noPath; a partial slice is not a status this line can see. The position is the live exposed index.
+        const seenAt = next.type === 'block' ? await world.perceivedPosition(this.agent.bot, next.source) : null;
+        const path = seenAt ? await world.pathToBlock(this.agent.bot, seenAt) : null;
+        const blockUnreachable = next.type === 'block' && !(seenAt && path.status === 'success');
+        const huntUnseen = next.type === 'hunt' && !world.getNearbyEntityTypes(this.agent.bot).includes(next.source);
+        if (blockUnreachable || huntUnseen) {
             next.fails += 1;
 
             // If the bot has failed to obtain the block before, explore

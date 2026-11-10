@@ -142,7 +142,9 @@ describe('fix99: the watchdog limit is the keep-alive kick bound', () => {
                 now += gap;
                 bot._client.emit('keep_alive');
             }
-            assert.strictEqual(stallThresholdMs(bot), KEEP_ALIVE_KICK_MS);
+            // The gap does not move the watchdog. The STALL log is a pending keep-alive, not this kick bound.
+            assert.strictEqual(stallThresholdMs(bot), KEEP_ALIVE_INTERVAL_MS);
+            assert.notStrictEqual(stallThresholdMs(bot), KEEP_ALIVE_KICK_MS);
             assert.strictEqual(watchdogSilenceLimitMs(), KEEP_ALIVE_KICK_MS);
             assert.strictEqual(KEEP_ALIVE_KICK_MS, KEEP_ALIVE_INTERVAL_MS * 2);
             assert.strictEqual(watchdogBeatPeriodMs(), Math.floor(KEEP_ALIVE_INTERVAL_MS / 2));

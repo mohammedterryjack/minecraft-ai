@@ -24,6 +24,7 @@ import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert';
 import { mkdirSync, writeFileSync, rmSync, existsSync, readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
+import { createRequire } from 'module';
 
 let DEPS_AVAILABLE = true;
 let DEPS_ERROR = null;
@@ -54,8 +55,16 @@ const TEST_BOT_DIR = `./bots/${TEST_BOT_NAME}`;
 
 function createMockBot() {
     const mockPosition = { x: 100, y: 64, z: 200, floored: () => ({ x: 100, y: 64, z: 200 }), distanceTo: () => 10 };
+    // mineflayer sets the player's eyeHeight from this constant (lib/plugins/entities.js). GoalLookAtBlock measures reach from it.
+    const require = createRequire(import.meta.url);
+    const entitiesSrc = readFileSync(require.resolve('mineflayer/lib/plugins/entities.js'), 'utf8');
+    const eyeMatch = entitiesSrc.match(/const PLAYER_EYEHEIGHT = ([0-9.]+)/);
+    if (!eyeMatch) throw new Error('mineflayer PLAYER_EYEHEIGHT is not in lib/plugins/entities.js');
+    const eyeHeight = Number(eyeMatch[1]);
+    const { CHUNK_WIDTH, SECTION_HEIGHT } = require('prismarine-chunk/src/pc/common/constants.js');
     const mockEntity = {
         position: mockPosition,
+        eyeHeight,
         velocity: { x: 0, y: 0, z: 0 },
         onGround: true,
         isInWater: false,
@@ -73,14 +82,46 @@ function createMockBot() {
     };
     mockInventory.slots[36] = { name: 'stone_pickaxe', count: 1 };
     
+    const stoneStateId = 1;
     const mockRegistry = {
         itemsByName: { oak_log: { id: 1 }, cobblestone: { id: 2 }, stone_pickaxe: { id: 3 }, iron_pickaxe: { id: 4 } },
         blocksByName: { oak_log: { id: 1 }, cobblestone: { id: 2 }, crafting_table: { id: 58 }, stone: { id: 3 } },
+        blocksByStateId: { [stoneStateId]: { name: 'stone', metadata: 0, boundingBox: 'block', transparent: false } },
         entitiesByName: { cow: { id: 92 }, pig: { id: 90 } },
     };
-    
+    // Login (play) grants viewDistance in chunks. observe() reads it; the client settings value is not a grant.
+    // The view square shares one stone section and one air section. The eye stands in the air, on the stone.
+    const game = { minY: -64, height: 384, maxHealth: 20, maxFood: 20, serverViewDistance: 10, gameMode: 'survival', dimension: 'overworld' };
+    const sectionCount = game.height / SECTION_HEIGHT;
+    if (!Number.isInteger(sectionCount)) throw new Error('mock world height is not a whole number of sections');
+    const eyeSection = (mockPosition.y - game.minY) >> 4;
+    const stoneSection = { palette: [stoneStateId], data: { value: stoneStateId } };
+    const airSection = { palette: [0], data: { value: 0 } };
+    const stoodX = Math.floor(mockPosition.x / CHUNK_WIDTH);
+    const stoodZ = Math.floor(mockPosition.z / CHUNK_WIDTH);
+    const columns = [];
+    for (let dz = -game.serverViewDistance; dz <= game.serverViewDistance; dz++) {
+        for (let dx = -game.serverViewDistance; dx <= game.serverViewDistance; dx++) {
+            columns.push({
+                chunkX: stoodX + dx,
+                chunkZ: stoodZ + dz,
+                column: { minY: game.minY, sections: Array.from({ length: sectionCount }, (_, si) => (si < eyeSection ? stoneSection : airSection)) },
+            });
+        }
+    }
     const mockWorld = {
         getBiome: () => ({ name: 'forest' }),
+        getColumns: () => columns,
+        on() {},
+        raycast(from, dir, range) {
+            for (let t = 0; t <= range + 0.05; t += 0.05) {
+                const x = Math.floor(from.x + dir.x * t);
+                const y = Math.floor(from.y + dir.y * t);
+                const z = Math.floor(from.z + dir.z * t);
+                if (y < mockPosition.y) return { position: { x, y, z } };
+            }
+            return null;
+        },
     };
     
     return {
@@ -89,7 +130,7 @@ function createMockBot() {
         inventory: mockInventory,
         health: 18,
         food: 15,
-        game: { minY: -64, height: 384, maxHealth: 20, maxFood: 20 },
+        game,
         time: { timeOfDay: 6000 },
         registry: mockRegistry,
         version: '1.20.4',

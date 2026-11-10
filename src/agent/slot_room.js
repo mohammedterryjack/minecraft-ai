@@ -212,10 +212,13 @@ function analysedSkills(skills) {
     return out;
 }
 
-// verified max only when the item was seen on every measured run. Missing or malformed evidence throws:
-// a kind is reserve 0 only after a completed analysis found no use.
+// verified max only when the item was seen on every measured run.
+// consumeEvidence is written by recordConsumeEvidence. A skill with no record has no verified spend
+// (consume_evidence.js). Malformed evidence throws. useEvidence is not a field: nothing recorded it,
+// and a missing value must not be treated as a measured zero.
 function readEvidence(skill, field) {
-    if (!Object.hasOwn(skill, field)) throw new Error(`[fix92] LOUD: incomplete ${field} for ${skill.name}: missing`);
+    if (field !== 'consumeEvidence') throw new Error(`[fix97] LOUD: ${field} is not recorded; reserves come from consumeEvidence and the plan`);
+    if (!Object.hasOwn(skill, field)) return {};
     const ev = skill[field];
     if (ev === null || typeof ev !== 'object' || Array.isArray(ev)) throw new Error(`[fix92] LOUD: incomplete ${field} for ${skill.name}: ${JSON.stringify(ev)}`);
     if (!Number.isInteger(ev.runs) || ev.runs < 1) throw new Error(`[fix92] LOUD: incomplete ${field} for ${skill.name}: runs ${JSON.stringify(ev.runs)}`);
@@ -276,10 +279,9 @@ export function capacityPlan({ registry, skills, stacks, slotsNeeded, goalItem, 
     const counts = countsOf(stacks);
     const keep = new Map();
     for (const s of analysedSkills(skills)) {
+        if (Object.hasOwn(s, 'useEvidence')) throw new Error(`[fix97] LOUD: ${s.name} has useEvidence, which is not recorded. Spends are consumeEvidence; tools and recipe ingredients come from the plan.`);
         const consumed = readEvidence(s, 'consumeEvidence');
-        const used = readEvidence(s, 'useEvidence');
         for (const [item, max] of Object.entries(consumed)) bumpReserve(keep, item, max, 'learned');
-        for (const [item, max] of Object.entries(used)) bumpReserve(keep, item, max, 'learned');
     }
     const pre = prerequisites(goalItem, goalCount, { ...counts });
     if (!pre || !Array.isArray(pre.ingredients)) throw new Error(`[fix92] prerequisites(${goalItem}) returned no ingredient list`);
