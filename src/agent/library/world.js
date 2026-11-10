@@ -574,7 +574,10 @@ export function withinInteractionRange(bot, pos) {
 // mineflayer-pathfinder index.js getPathTo (lines 64-71) takes only the first yield of getPathFromTo.
 // lib/astar.js compute() returns 'partial' when that slice exceeds tickTimeout (index.js:41) and 'timeout'
 // when the whole search exceeds thinkTimeout (index.js:40, astar.js:73). 'noPath' is the open set exhausted
-// (astar.js:121). A partial or timeout result has not been searched. The loaded world is the bound.
+// (astar.js:121). partial means the search is not finished yet. It is not reachable and it is not unreachable.
+// pathToBlock keeps stepping getPathFromTo, one tickTimeout slice then a yield, until the status is success
+// or noPath. Callers only see those two. A partial that arrives as a finished answer is a search that stopped
+// early: that throws, and nothing records it as a reach result.
 function lookGoal(bot, position) {
     if (!bot || !bot.pathfinder || typeof bot.pathfinder.getPathTo !== 'function') {
         throw new Error('reachability: bot.pathfinder.getPathTo is missing (mineflayer-pathfinder index.js).');
@@ -652,6 +655,8 @@ export async function pathToBlock(bot, position) {
         const result = step.value && step.value.result;
         if (!result || typeof result.status !== 'string') throw new Error(`reachability: getPathFromTo yielded ${JSON.stringify(result && result.status)}.`);
         if (result.status === 'success' || result.status === 'noPath') return result;
+        // Not yet known. The next gen.next() is another tickTimeout slice (index.js:41); it does not run
+        // until the event loop has had a turn, so the search never blocks for more than one slice.
         if (result.status === 'partial') {
             await yieldSearchTurn(bot);
             step = gen.next();
@@ -691,8 +696,56 @@ function cellStateId(section, index, where) {
 }
 
 const FACES = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
+const FACE_COUNT = FACES.length;
+// One section face is 16×16 cells. ChunkOcclusionDataBuilder.build (yarn 1.20.4,
+// net.minecraft.client.render.chunk) fills every face pair when fewer blocks than that are closed:
+// a separator needs a whole face. The section is cubic, so every face has CHUNK_WIDTH * SECTION_HEIGHT cells.
+const FACE_AREA = CHUNK_WIDTH * SECTION_HEIGHT;
+const ALL_FACES = (1 << FACE_COUNT) - 1;
 const perceivedIndex = new WeakMap();
 const perceivedStat = new WeakMap();
+
+// Six exit masks, one per entry face. A JS shift is 32 bits, and 6×6 pairs do not fit in one.
+// ChunkOcclusionData.isVisibleThrough(from, to). from < 0 is the section the eye is inside.
+function closedConn() {
+    return [0, 0, 0, 0, 0, 0];
+}
+
+function openConn() {
+    return [ALL_FACES, ALL_FACES, ALL_FACES, ALL_FACES, ALL_FACES, ALL_FACES];
+}
+
+function connClosed(conn) {
+    for (let face = 0; face < FACE_COUNT; face++) if (conn[face] !== 0) return false;
+    return true;
+}
+
+function connects(conn, from, to) {
+    if (from < 0) return true;
+    return (conn[from] & (1 << to)) !== 0;
+}
+
+// WorldRenderer.setupTerrain queues a neighbour only on the side of this section the camera has not already
+// passed, so the walk moves away from the eye (Checchi, https://tomcc.github.io/2014/08/31/visibility-1.html).
+function facesAway(eye, originX, originY, originZ, face) {
+    const [fx, fy, fz] = FACES[face];
+    if (fx > 0) return eye.x < originX + CHUNK_WIDTH;
+    if (fx < 0) return eye.x >= originX;
+    if (fy > 0) return eye.y < originY + SECTION_HEIGHT;
+    if (fy < 0) return eye.y >= originY;
+    if (fz > 0) return eye.z < originZ + CHUNK_WIDTH;
+    return eye.z >= originZ;
+}
+
+function faceLooksAtEye(eye, cell, face) {
+    const [fx, fy, fz] = FACES[face];
+    if (fx > 0) return eye.x > cell.x + 1;
+    if (fx < 0) return eye.x < cell.x;
+    if (fy > 0) return eye.y > cell.y + 1;
+    if (fy < 0) return eye.y < cell.y;
+    if (fz > 0) return eye.z > cell.z + 1;
+    return eye.z < cell.z;
+}
 
 // A full opaque cube hides the face against it. Air and every other non-full or transparent block does not.
 // prismarine-block: boundingBox 'block' is a full cube; transparent blocks (glass, leaves) do not occlude.
@@ -751,11 +804,15 @@ function stateAt(index, x, y, z, view) {
     return cellStateId(section, cell, `chunk ${cx},${cz} section ${si}`);
 }
 
-// Perceived blocks are the exposed faces of loaded chunks inside the server view distance
-// (https://minecraft.wiki/w/Render_distance). Buried cells never gain a face, so they are indexed once when the
-// chunk loads and not read again on the next step. mineflayer forwards chunkColumnLoad, chunkColumnUnload, and
-// blockUpdate from the world (mineflayer lib/plugins/blocks.js forwardedEvents; prismarine-world worldsync.js).
-// observe() raycasts the indexed faces. It does not walk sections.
+// Perceived blocks are the exposed faces the eye can reach through the section visibility graph.
+// Checchi, "The Advanced Cave Culling Algorithm" (https://tomcc.github.io/2014/08/31/visibility-1.html):
+// flood-fill the non-opaque cells of a 16³ section once and record which of its 6 faces connect.
+// ChunkOcclusionDataBuilder / ChunkOcclusionData (yarn 1.20.4, net.minecraft.client.render.chunk) is that graph.
+// observe() BFS-es sections from the eye, steps through a connected face pair, and only away from the eye,
+// inside the loaded view square (https://minecraft.wiki/w/Render_distance). A buried cave section is never a
+// candidate. The graph is built when the chunk loads, one column per turn, and rebuilt for a section on
+// blockUpdate. mineflayer forwards chunkColumnLoad, chunkColumnUnload, and blockUpdate from the world
+// (mineflayer lib/plugins/blocks.js forwardedEvents; prismarine-world worldsync.js).
 function viewContext(bot) {
     const eye = eyeOf(bot);
     const registry = bot.registry;
@@ -855,16 +912,161 @@ function facePositions(minX, originY, minZ, face) {
     return out;
 }
 
-function putCell(cells, x, y, z, id, bit) {
+function putCell(sec, x, y, z, id, bit) {
     if (id === 0) return;
     const pack = `${x},${y},${z}`;
-    const prev = cells.get(pack);
+    const prev = sec.cells.get(pack);
     if (prev) { prev.mask |= bit; return; }
-    cells.set(pack, { x, y, z, id, mask: bit });
+    sec.cells.set(pack, { x, y, z, id, mask: bit });
+    sec.states.add(id);
+}
+
+function emptySection(conn) {
+    return { conn, reach: null, cells: new Map(), states: new Set() };
+}
+
+// Face bits of one flood, and the cells in it. Started only from a section face, matching
+// ChunkOcclusionDataBuilder's edge points: an interior pocket touches no face and stores 0.
+function floodOpen(open, start, visited, queue) {
+    let qh = 0;
+    let qt = 0;
+    queue[qt++] = start;
+    visited[start] = 1;
+    let faces = 0;
+    const cells = [];
+    while (qh < qt) {
+        const cur = queue[qh++];
+        cells.push(cur);
+        const x = cur & 15;
+        const z = (cur >> 4) & 15;
+        const y = cur >> 8;
+        if (x === 0) faces |= 1 << 1;
+        if (x === CHUNK_WIDTH - 1) faces |= 1 << 0;
+        if (y === 0) faces |= 1 << 3;
+        if (y === SECTION_HEIGHT - 1) faces |= 1 << 2;
+        if (z === 0) faces |= 1 << 5;
+        if (z === CHUNK_WIDTH - 1) faces |= 1 << 4;
+        for (let face = 0; face < FACE_COUNT; face++) {
+            const [fx, fy, fz] = FACES[face];
+            const nx = x + fx, ny = y + fy, nz = z + fz;
+            if (nx < 0 || ny < 0 || nz < 0 || nx >= CHUNK_WIDTH || ny >= SECTION_HEIGHT || nz >= CHUNK_WIDTH) continue;
+            const ni = (ny << 8) | (nz << 4) | nx;
+            if (!open[ni] || visited[ni]) continue;
+            visited[ni] = 1;
+            queue[qt++] = ni;
+        }
+    }
+    return { faces, cells };
+}
+
+function connectFaceBits(conn, faces) {
+    for (let a = 0; a < FACE_COUNT; a++) {
+        if ((faces & (1 << a)) === 0) continue;
+        for (let b = 0; b < FACE_COUNT; b++) if (faces & (1 << b)) conn[a] |= 1 << b;
+    }
+}
+
+// The face-connectivity set of one section, plus a per-cell mask of the faces that cell's air can reach.
+function visibilityGraph(ids, registry, openCache) {
+    let opaque = 0;
+    const open = new Uint8Array(BLOCK_SECTION_VOLUME);
+    for (let i = 0; i < BLOCK_SECTION_VOLUME; i++) {
+        const isOpen = nonOccluding(registry, ids[i], openCache);
+        open[i] = isOpen ? 1 : 0;
+        if (!isOpen) opaque += 1;
+    }
+    if (opaque === 0 || opaque < FACE_AREA) return { conn: openConn(), reach: null };
+    if (opaque === BLOCK_SECTION_VOLUME) return { conn: closedConn(), reach: null };
+    const reach = new Uint8Array(BLOCK_SECTION_VOLUME);
+    const visited = new Uint8Array(BLOCK_SECTION_VOLUME);
+    const queue = new Int32Array(BLOCK_SECTION_VOLUME);
+    const conn = closedConn();
+    const start = (i) => {
+        if (!open[i] || visited[i]) return;
+        const flooded = floodOpen(open, i, visited, queue);
+        connectFaceBits(conn, flooded.faces);
+        for (const cell of flooded.cells) reach[cell] = flooded.faces;
+    };
+    for (let y = 0; y < SECTION_HEIGHT; y += SECTION_HEIGHT - 1) {
+        for (let z = 0; z < CHUNK_WIDTH; z++) for (let x = 0; x < CHUNK_WIDTH; x++) start((y << 8) | (z << 4) | x);
+    }
+    for (let z = 0; z < CHUNK_WIDTH; z += CHUNK_WIDTH - 1) {
+        for (let y = 0; y < SECTION_HEIGHT; y++) for (let x = 0; x < CHUNK_WIDTH; x++) start((y << 8) | (z << 4) | x);
+    }
+    for (let x = 0; x < CHUNK_WIDTH; x += CHUNK_WIDTH - 1) {
+        for (let y = 0; y < SECTION_HEIGHT; y++) for (let z = 0; z < CHUNK_WIDTH; z++) start((y << 8) | (z << 4) | x);
+    }
+    return { conn, reach };
 }
 
 function rememberWaiters(idx, selfKey) {
     for (const list of idx.waiters.values()) list.delete(selfKey);
+}
+
+function indexSection(idx, ctx, cx, cz, si, column) {
+    const selfKey = `${cx},${cz}`;
+    const { originY, where } = sectionWhere(cx, cz, column, si);
+    const info = sectionInfo(column, si, where, ctx.registry, idx.open);
+    idx.sectionsBuilt += 1;
+    const minX = cx * CHUNK_WIDTH, minZ = cz * CHUNK_WIDTH;
+    if (info.kind === 'air') {
+        idx.sectionsSkipped += 1;
+        return emptySection(openConn());
+    }
+    const sec = emptySection(closedConn());
+    if (info.kind === 'solid' || info.kind === 'clear') {
+        sec.conn = info.kind === 'clear' ? openConn() : closedConn();
+        let opened = false;
+        for (let face = 0; face < FACE_COUNT; face++) {
+            const [fx, fy, fz] = FACES[face];
+            const probe = neighborSection(ctx, minX + (fx > 0 ? CHUNK_WIDTH - 1 : 0) + fx, originY + (fy > 0 ? SECTION_HEIGHT - 1 : 0) + fy, minZ + (fz > 0 ? CHUNK_WIDTH - 1 : 0) + fz, idx, selfKey);
+            if (probe.kind === 'solid' || probe.kind === 'hidden') continue;
+            const positions = facePositions(minX, originY, minZ, face);
+            if (info.kind === 'solid' && (probe.kind === 'air' || probe.kind === 'clear')) {
+                opened = true;
+                for (const [x, y, z] of positions) putCell(sec, x, y, z, info.id, 1 << face);
+                continue;
+            }
+            for (const [x, y, z] of positions) {
+                if (info.kind === 'solid' && !faceOpen(ctx, idx, selfKey, x, y, z, fx, fy, fz, null)) continue;
+                if (info.kind === 'clear') {
+                    const id = readIndexedCell(ctx, x, y, z, idx);
+                    if (id === 0 || !faceOpen(ctx, idx, selfKey, x, y, z, fx, fy, fz, null)) continue;
+                    opened = true;
+                    putCell(sec, x, y, z, id, 1 << face);
+                    continue;
+                }
+                opened = true;
+                putCell(sec, x, y, z, info.id, 1 << face);
+            }
+        }
+        if (!opened) idx.sectionsSkipped += 1;
+        return sec;
+    }
+    const ids = new Int32Array(BLOCK_SECTION_VOLUME);
+    for (let i = 0; i < BLOCK_SECTION_VOLUME; i++) {
+        idx.cellReads += 1;
+        ids[i] = cellStateId(info.section, i, where);
+    }
+    const graph = visibilityGraph(ids, ctx.registry, idx.open);
+    sec.conn = graph.conn;
+    sec.reach = graph.reach;
+    const own = { ids, minX, originY, minZ };
+    let opened = false;
+    for (let i = 0; i < BLOCK_SECTION_VOLUME; i++) {
+        const id = ids[i];
+        if (id === 0) continue;
+        const local = localCell(i);
+        const x = minX + local.x, y = originY + local.y, z = minZ + local.z;
+        for (let face = 0; face < FACE_COUNT; face++) {
+            const [fx, fy, fz] = FACES[face];
+            if (!faceOpen(ctx, idx, selfKey, x, y, z, fx, fy, fz, own)) continue;
+            opened = true;
+            putCell(sec, x, y, z, id, 1 << face);
+        }
+    }
+    if (!opened) idx.sectionsSkipped += 1;
+    return sec;
 }
 
 function buildColumn(idx, ctx, cx, cz) {
@@ -876,54 +1078,10 @@ function buildColumn(idx, ctx, cx, cz) {
         throw new Error(`nearby blocks: chunk ${cx},${cz} has no minY or sections.`);
     }
     rememberWaiters(idx, selfKey);
-    const cells = new Map();
     const started = performance.now();
-    const minX = cx * CHUNK_WIDTH, minZ = cz * CHUNK_WIDTH;
-    for (let si = 0; si < column.sections.length; si++) {
-        const { originY, where } = sectionWhere(cx, cz, column, si);
-        const info = sectionInfo(column, si, where, ctx.registry, idx.open);
-        idx.sectionsBuilt += 1;
-        if (info.kind === 'air') { idx.sectionsSkipped += 1; continue; }
-        if (info.kind === 'solid') {
-            let opened = false;
-            for (let face = 0; face < FACES.length; face++) {
-                const [fx, fy, fz] = FACES[face];
-                const probe = neighborSection(ctx, minX + (fx > 0 ? CHUNK_WIDTH - 1 : 0) + fx, originY + (fy > 0 ? SECTION_HEIGHT - 1 : 0) + fy, minZ + (fz > 0 ? CHUNK_WIDTH - 1 : 0) + fz, idx, selfKey);
-                if (probe.kind === 'solid' || probe.kind === 'hidden') continue;
-                const positions = facePositions(minX, originY, minZ, face);
-                if (probe.kind === 'air' || probe.kind === 'clear') {
-                    opened = true;
-                    for (const [x, y, z] of positions) putCell(cells, x, y, z, info.id, 1 << face);
-                    continue;
-                }
-                for (const [x, y, z] of positions) {
-                    if (!faceOpen(ctx, idx, selfKey, x, y, z, fx, fy, fz, null)) continue;
-                    opened = true;
-                    putCell(cells, x, y, z, info.id, 1 << face);
-                }
-            }
-            if (!opened) idx.sectionsSkipped += 1;
-            continue;
-        }
-        const ids = new Int32Array(BLOCK_SECTION_VOLUME);
-        for (let i = 0; i < BLOCK_SECTION_VOLUME; i++) {
-            idx.cellReads += 1;
-            ids[i] = cellStateId(info.section, i, where);
-        }
-        const own = { ids, minX, originY, minZ };
-        for (let i = 0; i < BLOCK_SECTION_VOLUME; i++) {
-            const id = ids[i];
-            if (id === 0) continue;
-            const local = localCell(i);
-            const x = minX + local.x, y = originY + local.y, z = minZ + local.z;
-            for (let face = 0; face < FACES.length; face++) {
-                const [fx, fy, fz] = FACES[face];
-                if (!faceOpen(ctx, idx, selfKey, x, y, z, fx, fy, fz, own)) continue;
-                putCell(cells, x, y, z, id, 1 << face);
-            }
-        }
-    }
-    idx.columns.set(selfKey, { cells });
+    const sections = new Array(column.sections.length);
+    for (let si = 0; si < column.sections.length; si++) sections[si] = indexSection(idx, ctx, cx, cz, si, column);
+    idx.columns.set(selfKey, { sections });
     idx.chunkMs.push(performance.now() - started);
 }
 
@@ -1029,28 +1187,20 @@ function onColumnUnload(bot, idx, corner) {
     scheduleIndex(bot, idx);
 }
 
-function recomputeCell(idx, ctx, x, y, z) {
+function reindexSectionAt(idx, ctx, x, y, z, done) {
     const cx = Math.floor(x / CHUNK_WIDTH), cz = Math.floor(z / CHUNK_WIDTH);
-    const built = idx.columns.get(`${cx},${cz}`);
-    if (!built || !ctx.columns.has(`${cx},${cz}`)) return;
-    const col = ctx.columns.get(`${cx},${cz}`);
+    const key = `${cx},${cz}`;
+    const built = idx.columns.get(key);
+    const col = ctx.columns.get(key);
+    if (!built || !col) return;
     const column = col.column;
+    if (!Number.isInteger(column.minY) || !Array.isArray(column.sections)) return;
     const si = (y - column.minY) >> 4;
-    if (!Number.isInteger(column.minY) || si < 0 || si >= column.sections.length) return;
-    const { originY, where } = sectionWhere(cx, cz, column, si);
-    const info = sectionInfo(column, si, where, ctx.registry, idx.open);
-    const pack = `${x},${y},${z}`;
-    if (info.kind === 'air') { built.cells.delete(pack); return; }
-    let id = info.kind === 'solid' ? info.id : readIndexedCell(ctx, x, y, z, idx);
-    if (id === 0) { built.cells.delete(pack); return; }
-    let mask = 0;
-    const selfKey = `${cx},${cz}`;
-    for (let face = 0; face < FACES.length; face++) {
-        const [fx, fy, fz] = FACES[face];
-        if (faceOpen(ctx, idx, selfKey, x, y, z, fx, fy, fz, null)) mask |= 1 << face;
-    }
-    if (mask === 0) built.cells.delete(pack);
-    else built.cells.set(pack, { x, y, z, id, mask });
+    if (si < 0 || si >= column.sections.length) return;
+    const token = `${key}:${si}`;
+    if (done.has(token)) return;
+    done.add(token);
+    built.sections[si] = indexSection(idx, ctx, cx, cz, si, column);
 }
 
 function onBlockUpdate(bot, idx, oldBlock, newBlock) {
@@ -1059,8 +1209,9 @@ function onBlockUpdate(bot, idx, oldBlock, newBlock) {
         throw new Error('nearby blocks: blockUpdate has no position (prismarine-world worldsync.js _emitBlockUpdate).');
     }
     const ctx = viewContext(bot);
-    recomputeCell(idx, ctx, pos.x, pos.y, pos.z);
-    for (const [fx, fy, fz] of FACES) recomputeCell(idx, ctx, pos.x + fx, pos.y + fy, pos.z + fz);
+    const done = new Set();
+    reindexSectionAt(idx, ctx, pos.x, pos.y, pos.z, done);
+    for (const [fx, fy, fz] of FACES) reindexSectionAt(idx, ctx, pos.x + fx, pos.y + fy, pos.z + fz, done);
 }
 
 function ensureIndex(bot) {
@@ -1113,58 +1264,128 @@ export function perceivedBuildStats(bot) {
     return indexReport(idx);
 }
 
-function nearestFace(eye, cell) {
-    let best = null;
-    let bestD = Infinity;
-    for (let face = 0; face < FACES.length; face++) {
-        if ((cell.mask & (1 << face)) === 0) continue;
-        const [fx, fy, fz] = FACES[face];
-        const point = { x: cell.x + 0.5 + fx * 0.5, y: cell.y + 0.5 + fy * 0.5, z: cell.z + 0.5 + fz * 0.5 };
-        const d = dist2(eye.x, eye.y, eye.z, point.x, point.y, point.z);
-        if (d < bestD) { bestD = d; best = point; }
+function componentFaces(sec, localIndex) {
+    if (sec.reach) return sec.reach[localIndex];
+    if (connClosed(sec.conn)) return 0;
+    return ALL_FACES;
+}
+
+function reachedSections(ctx, idx) {
+    const stoodKey = standingKey(ctx);
+    const stood = ctx.columns.get(stoodKey);
+    const built = idx.columns.get(stoodKey);
+    if (!stood || !built) throw missingStanding(ctx);
+    const column = stood.column;
+    const si = (Math.floor(ctx.eye.y) - column.minY) >> 4;
+    if (!Number.isInteger(column.minY) || si < 0 || si >= column.sections.length || !built.sections[si]) {
+        throw new Error(`nearby blocks: the eye at y ${ctx.eye.y} is outside the indexed sections of chunk ${ctx.stoodX},${ctx.stoodZ}.`);
     }
-    return best;
+    const originX = ctx.stoodX * CHUNK_WIDTH;
+    const originY = column.minY + si * SECTION_HEIGHT;
+    const originZ = ctx.stoodZ * CHUNK_WIDTH;
+    const lx = Math.floor(ctx.eye.x) - originX;
+    const ly = Math.floor(ctx.eye.y) - originY;
+    const lz = Math.floor(ctx.eye.z) - originZ;
+    if (lx < 0 || ly < 0 || lz < 0 || lx >= CHUNK_WIDTH || ly >= SECTION_HEIGHT || lz >= CHUNK_WIDTH) {
+        throw new Error(`nearby blocks: the eye (${ctx.eye.x}, ${ctx.eye.y}, ${ctx.eye.z}) is not inside its section.`);
+    }
+    const exits = componentFaces(built.sections[si], (ly << 8) | (lz << 4) | lx);
+    const queue = [{ cx: ctx.stoodX, cz: ctx.stoodZ, si, entry: -1, exits }];
+    const seen = new Set([built.sections[si]]);
+    const reached = [];
+    for (let q = 0; q < queue.length; q++) {
+        const cur = queue[q];
+        const key = `${cur.cx},${cur.cz}`;
+        const rec = idx.columns.get(key);
+        const col = ctx.columns.get(key);
+        const sec = rec && rec.sections[cur.si];
+        if (!sec || !col) continue;
+        const secOriginY = col.column.minY + cur.si * SECTION_HEIGHT;
+        const secOriginX = cur.cx * CHUNK_WIDTH;
+        const secOriginZ = cur.cz * CHUNK_WIDTH;
+        reached.push({ sec, originX: secOriginX, originY: secOriginY, originZ: secOriginZ });
+        for (let face = 0; face < FACE_COUNT; face++) {
+            if (cur.entry < 0) {
+                if ((cur.exits & (1 << face)) === 0) continue;
+            } else if (!connects(sec.conn, cur.entry, face)) continue;
+            if (!facesAway(ctx.eye, secOriginX, secOriginY, secOriginZ, face)) continue;
+            const [fx, fy, fz] = FACES[face];
+            const ncx = cur.cx + fx;
+            const ncz = cur.cz + fz;
+            const nsi = cur.si + fy;
+            if (fx !== 0 || fz !== 0) {
+                if (!inView(ctx, ncx, ncz)) continue;
+            }
+            const nkey = `${ncx},${ncz}`;
+            const ncol = ctx.columns.get(nkey);
+            const nbuilt = idx.columns.get(nkey);
+            if (!ncol || !nbuilt || !Array.isArray(ncol.column.sections)) continue;
+            if (nsi < 0 || nsi >= ncol.column.sections.length || !nbuilt.sections[nsi]) continue;
+            const nsec = nbuilt.sections[nsi];
+            if (seen.has(nsec)) continue;
+            seen.add(nsec);
+            queue.push({ cx: ncx, cz: ncz, si: nsi, entry: face ^ 1, exits: 0 });
+        }
+    }
+    return reached;
 }
 
 function confirmVisible(bot, ctx, idx, onlyName) {
-    const exposed = [];
-    for (let dz = -ctx.radius; dz <= ctx.radius; dz++) {
-        for (let dx = -ctx.radius; dx <= ctx.radius; dx++) {
-            const built = idx.columns.get(`${ctx.stoodX + dx},${ctx.stoodZ + dz}`);
-            if (!built) continue;
-            for (const cell of built.cells.values()) {
-                if (onlyName) {
-                    const block = ctx.registry.blocksByStateId[cell.id];
-                    if (!block || block.name !== onlyName) continue;
-                }
-                exposed.push(cell);
-            }
-        }
-    }
     const eye = ctx.eye;
-    exposed.sort((a, b) => dist2(eye.x, eye.y, eye.z, a.x + 0.5, a.y + 0.5, a.z + 0.5) - dist2(eye.x, eye.y, eye.z, b.x + 0.5, b.y + 0.5, b.z + 0.5));
     const confirmed = new Set();
     const found = [];
+    let candidates = 0;
     let raycasts = 0;
     const eyeVec = new Vec3(eye.x, eye.y, eye.z);
-    for (const cell of exposed) {
-        if (!onlyName && confirmed.has(cell.id)) continue;
-        const face = nearestFace(eye, cell);
-        if (!face) continue;
-        const dir = new Vec3(face.x - eye.x, face.y - eye.y, face.z - eye.z);
-        const range = Math.sqrt(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
-        if (!(range > 0)) continue;
-        raycasts += 1;
-        const hit = bot.world.raycast(eyeVec, dir.normalize(), range);
-        if (!hit || !hit.position || hit.position.x !== cell.x || hit.position.y !== cell.y || hit.position.z !== cell.z) continue;
-        if (onlyName) return { position: { x: cell.x, y: cell.y, z: cell.z }, raycasts, candidates: exposed.length };
-        confirmed.add(cell.id);
-        const block = ctx.registry.blocksByStateId[cell.id];
-        if (!block || typeof block.name !== 'string') throw new Error(`nearby blocks: state id ${cell.id} is not in the registry`);
-        found.push({ name: block.name, metadata: block.metadata, x: cell.x, y: cell.y, z: cell.z });
+    const wants = (id) => {
+        const block = ctx.registry.blocksByStateId[id];
+        if (!block || typeof block.name !== 'string') throw new Error(`nearby blocks: state id ${id} is not in the registry`);
+        if (onlyName) return block.name === onlyName;
+        return !confirmed.has(id);
+    };
+    const reached = reachedSections(ctx, idx);
+    const halfX = CHUNK_WIDTH / 2;
+    const halfY = SECTION_HEIGHT / 2;
+    reached.sort((a, b) => dist2(eye.x, eye.y, eye.z, a.originX + halfX, a.originY + halfY, a.originZ + halfX)
+        - dist2(eye.x, eye.y, eye.z, b.originX + halfX, b.originY + halfY, b.originZ + halfX));
+    let foundAt = null;
+    for (const node of reached) {
+        if (foundAt) break;
+        const sec = node.sec;
+        let pending = false;
+        for (const id of sec.states) if (wants(id)) pending = true;
+        if (!pending) continue;
+        // One section's facing faces, not the view's. Later sections of a confirmed state are not copied.
+        const facing = [];
+        for (const cell of sec.cells.values()) {
+            if (!wants(cell.id)) continue;
+            for (let face = 0; face < FACE_COUNT; face++) {
+                if ((cell.mask & (1 << face)) === 0) continue;
+                if (!faceLooksAtEye(eye, cell, face)) continue;
+                const [fx, fy, fz] = FACES[face];
+                const point = { x: cell.x + 0.5 + fx * 0.5, y: cell.y + 0.5 + fy * 0.5, z: cell.z + 0.5 + fz * 0.5 };
+                facing.push({ cell, point, d: dist2(eye.x, eye.y, eye.z, point.x, point.y, point.z) });
+            }
+        }
+        facing.sort((a, b) => a.d - b.d);
+        candidates += facing.length;
+        for (const item of facing) {
+            if (!wants(item.cell.id)) continue;
+            const dir = new Vec3(item.point.x - eye.x, item.point.y - eye.y, item.point.z - eye.z);
+            const range = Math.sqrt(item.d);
+            if (!(range > 0)) continue;
+            raycasts += 1;
+            const hit = bot.world.raycast(eyeVec, dir.normalize(), range);
+            const cell = item.cell;
+            if (!hit || !hit.position || hit.position.x !== cell.x || hit.position.y !== cell.y || hit.position.z !== cell.z) continue;
+            if (onlyName) { foundAt = { x: cell.x, y: cell.y, z: cell.z }; break; }
+            confirmed.add(cell.id);
+            const block = ctx.registry.blocksByStateId[cell.id];
+            found.push({ name: block.name, metadata: block.metadata, x: cell.x, y: cell.y, z: cell.z });
+        }
     }
-    if (onlyName) return { position: null, raycasts, candidates: exposed.length };
-    return { found, raycasts, candidates: exposed.length };
+    if (onlyName) return { position: foundAt, raycasts, candidates, sectionsReached: reached.length };
+    return { found, raycasts, candidates, sectionsReached: reached.length };
 }
 
 function perceivedBlocks(bot) {
@@ -1178,7 +1399,7 @@ function perceivedBlocks(bot) {
     enqueueView(idx, ctx);
     scheduleIndex(bot, idx);
     const seen = confirmVisible(bot, ctx, idx, null);
-    perceivedStat.set(bot, { cellReads: 0, candidates: seen.candidates, raycasts: seen.raycasts, sectionsRead: 0, sectionsSkipped: 0 });
+    perceivedStat.set(bot, { cellReads: 0, candidates: seen.candidates, raycasts: seen.raycasts, sectionsRead: 0, sectionsSkipped: 0, sectionsReached: seen.sectionsReached });
     return seen.found;
 }
 

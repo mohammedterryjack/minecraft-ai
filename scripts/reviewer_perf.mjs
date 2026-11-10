@@ -10,10 +10,13 @@ const sync = await buildLayeredWorld(reg, V, ORES);
 console.log('built', Date.now() - t0, 'ms');
 const bot = { world: sync, registry: reg, entity: { position: new Vec3(3.5, 64, 3.5), eyeHeight: 1.62 }, game: { serverViewDistance: V, gameMode: 'survival' } };
 if (typeof bot.world.getColumns !== 'function') { console.log('sync world has no getColumns'); process.exit(1); }
+if (typeof global.gc === 'function') global.gc();
+const heapWorld = process.memoryUsage().heapUsed;
 const indexed = await world.indexPerceivedChunks(bot);
 const perChunk = indexed.chunks ? indexed.ms / indexed.chunks : 0;
 const maxChunk = indexed.perChunkMs.reduce((m, t) => t > m ? t : m, 0);
-console.log(`index ${indexed.chunks} chunks, ${indexed.ms.toFixed(1)} ms total, ${perChunk.toFixed(2)} ms/chunk, max ${maxChunk.toFixed(2)} ms, cell reads ${indexed.cellReads}, sections ${indexed.sectionsBuilt}`);
+console.log(`index ${indexed.chunks} chunks, ${indexed.ms.toFixed(1)} ms total, ${perChunk.toFixed(2)} ms/chunk, max ${maxChunk.toFixed(2)} ms, cell reads ${indexed.cellReads}, sections ${indexed.sectionsBuilt} skipped ${indexed.sectionsSkipped}`);
+if (typeof global.gc === 'function') global.gc();
 const heapAtRest = process.memoryUsage().heapUsed;
 for (let r = 0; r < 3; r++) {
     if (typeof global.gc === 'function') global.gc();
@@ -26,4 +29,4 @@ for (let r = 0; r < 3; r++) {
     const retained = process.memoryUsage().heapUsed - h0;
     console.log(`run ${r}: ${ms.toFixed(1)} ms, heap +${((h1 - h0) / 1e6).toFixed(1)} MB, retained after gc ${((retained) / 1e6).toFixed(1)} MB`, JSON.stringify(world.perceivedStats(bot)), names.join(','));
 }
-console.log(`heap at rest ${(heapAtRest / 1e6).toFixed(1)} MB`);
+console.log(`heap at rest ${(heapAtRest / 1e6).toFixed(1)} MB (world ${(heapWorld / 1e6).toFixed(1)} MB, index + graph ${((heapAtRest - heapWorld) / 1e6).toFixed(1)} MB)`);

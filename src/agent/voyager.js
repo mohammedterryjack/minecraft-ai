@@ -4021,8 +4021,9 @@ Use only c; no other globals.`;
     // fix81: the game-data planner (recipe_plan.js) over the live registry and bot.recipesAll (every recipe, not only the
     //        ones the inventory can make now). "known" is learned or observed: a source block of the item in
     //        observe().nearby_blocks, or a learned producer of it. Exact ties are a uniform choice.
-    // A partial pathfinder slice is not unreachable. mineflayer-pathfinder index.js:64-71 takes one tickTimeout
-    // yield; lib/astar.js:70 returns 'partial' and line 73 'timeout'. 'noPath' (line 121) is the open set exhausted.
+    // pathToBlock returns only success or noPath. A partial slice stays inside that search and is never stored
+    // here. mineflayer-pathfinder index.js:64-71 takes one tickTimeout yield; lib/astar.js:70 returns 'partial'
+    // and line 73 'timeout'. 'noPath' (line 121) is the open set exhausted, and that is the unreachable answer.
     _pathStatus(state, name, at) {
         if (state && state._reach && Object.hasOwn(state._reach, name)) {
             const status = state._reach[name];
