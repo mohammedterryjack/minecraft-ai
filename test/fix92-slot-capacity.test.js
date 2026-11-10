@@ -169,6 +169,20 @@ describe('fix92: whole-slot plan', () => {
         assert.strictEqual(mined.candidates.find(c => c.item === 'stone_pickaxe').keep, 1);
     });
 
+    it('capacityPlan with mineBlocks-shaped data does not throw incomplete useEvidence', () => {
+        const idx = JSON.parse(readFileSync(join(import.meta.dirname, '../bots/icefox2000/skills/index.json'), 'utf8'));
+        const mineBlocks = idx.find(s => s.name === 'mineBlocks');
+        assert.ok(mineBlocks);
+        assert.strictEqual(Object.hasOwn(mineBlocks, 'useEvidence'), false);
+        const stacks = [{ slot: 9, name: 'cobblestone', count: 64 }];
+        const live = capacityPlan(args(stacks, 1, 'cobblestone', 1, 'cobblestone', [mineBlocks]));
+        assert.ok(live.candidates);
+        const shaped = { name: 'mineBlocks', code: mineBlocks.code, task: 'mine blocks', description: mineBlocks.description };
+        assert.doesNotThrow(() => capacityPlan(args(stacks, 1, 'cobblestone', 1, 'cobblestone', [shaped])));
+        const missing = capacityPlan(args(stacks, 1, 'cobblestone', 1, 'cobblestone', [shaped]));
+        assert.strictEqual(missing.candidates.find(c => c.item === 'cobblestone').keep, 64);
+    });
+
     it('useEvidence is not a reserve; malformed consume evidence still throws', () => {
         const stacks = [{ slot: 9, name: 'diamond', count: 10 }];
         const stale = analysed('bare');

@@ -26,6 +26,21 @@ export function describeApiArg(a) {
     return `{${fields.join(',')}}`;
 }
 
+// fix97: findBlocks used `options.maxDistance || 16` and `options.count || 1`. An array is truthy, so it was kept,
+// and the scan's (maxDistance + 8) became a string. A length-2 array makes that NaN and the section iterator never ends.
+export function assertFindBlocksOptions(options, fnName) {
+    if (options === null || typeof options !== 'object' || Array.isArray(options)) {
+        throw new Error(`${fnName}: options object required, got ${options === null ? 'null' : Array.isArray(options) ? JSON.stringify(options) : typeof options}`);
+    }
+    for (const key of ['maxDistance', 'count']) {
+        if (!Object.hasOwn(options, key) || typeof options[key] !== 'number' || !Number.isFinite(options[key])) {
+            const v = options[key];
+            const shown = v === undefined ? 'undefined' : (typeof v === 'object' ? JSON.stringify(v) : String(v));
+            throw new Error(`${fnName}: ${key} must be a finite number, got ${shown}. matching is a block id, an array of block ids, or a function; maxDistance and count are numbers`);
+        }
+    }
+}
+
 export function wrapBotForApiTiming(bot) {
     if (!bot) throw new Error('[bot_api_timing] bot is required');
     if (bot.__isBotApiTimingProxy === true) return bot;
@@ -37,6 +52,7 @@ export function wrapBotForApiTiming(bot) {
             if (typeof prop === 'symbol' || prop === 'then' || prop === 'catch' || prop === 'finally') return raw;
             if (typeof raw !== 'function') return raw;
             return function timedBotApi(...args) {
+                if (prop === 'findBlocks' || prop === 'findBlock') assertFindBlocksOptions(args[0], String(prop));
                 const t0 = Date.now();
                 const done = () => {
                     const ms = Date.now() - t0;

@@ -19,7 +19,19 @@ export const NEVER_CUT_PROMPT = Object.freeze({ truncate: false, shift: false })
 //        one call, loud, and not a broken agent: restarting rebuilds the same prompt, so the step loop must not exit on it
 //        (voyager _onStepError). The caller of a repair/refactor/contract call already fails only that call.
 export const CONTEXT_FULL = 'CONTEXT_FULL';
-function contextFull(message) { const e = new Error(message); e.code = CONTEXT_FULL; return e; }
+function contextFull(message, counts) {
+    if (!counts || !Number.isInteger(counts.requestTokens) || !Number.isInteger(counts.contextTokens))
+        throw new Error(`[fix97] context overflow is missing token counts: ${message}`);
+    const e = new Error(message);
+    e.code = CONTEXT_FULL;
+    e.requestTokens = counts.requestTokens;
+    e.contextTokens = counts.contextTokens;
+    if (Object.hasOwn(counts, 'replyTokens')) {
+        if (!Number.isInteger(counts.replyTokens)) throw new Error(`[fix97] context overflow reply token count is not an integer: ${message}`);
+        e.replyTokens = counts.replyTokens;
+    }
+    return e;
+}
 
 export class Ollama {
     static prefix = 'ollama';
@@ -63,7 +75,7 @@ export class Ollama {
                 const message = err instanceof Error ? err.message : String(err);
                 const overflow = parseContextOverflow(message);
                 if (overflow) {
-                    throw contextFull(`!!! [fix96] ${model}: prompt does not fit: ${overflow.requestTokens} tokens, context ${overflow.contextTokens} tokens; nothing was cut and nothing was sent to the model (message chars: ${chatSectionSizes(messages)}). ${message}`);
+                    throw contextFull(`!!! [fix96] ${model}: prompt does not fit: ${overflow.requestTokens} tokens, context ${overflow.contextTokens} tokens; nothing was cut and nothing was sent to the model (message chars: ${chatSectionSizes(messages)}). ${message}`, { requestTokens: overflow.requestTokens, contextTokens: overflow.contextTokens });
                 }
                 throw err instanceof Error ? err : new Error(message);
             }
@@ -73,7 +85,7 @@ export class Ollama {
                 //        num_predict cap); which of the two it was is read from the counts Ollama returns
                 const ctx = this.params && this.params.options ? this.params.options.num_ctx : undefined;
                 if (Number.isInteger(ctx) && truncated.prompt_eval_count + truncated.eval_count >= ctx)
-                    throw contextFull(`!!! [fix96] ${model}: prompt (${truncated.prompt_eval_count} tokens) + reply (${truncated.eval_count} tokens) reached the context (${ctx} tokens); the reply is incomplete and nothing was cut (message chars: ${chatSectionSizes(messages)})`);
+                    throw contextFull(`!!! [fix96] ${model}: prompt (${truncated.prompt_eval_count} tokens) + reply (${truncated.eval_count} tokens) reached the context (${ctx} tokens); the reply is incomplete and nothing was cut (message chars: ${chatSectionSizes(messages)})`, { requestTokens: truncated.prompt_eval_count, contextTokens: ctx, replyTokens: truncated.eval_count });
                 throw new Error(`[ollama] ${model}: reply hit the num_predict cap (${truncated.eval_count} tokens) - incomplete: ${String(res).slice(0, 160)}`);   // fix31: fail loudly
             }
             const hasOpenTag = res.includes("<think>");
