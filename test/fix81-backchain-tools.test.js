@@ -77,7 +77,13 @@ function applyTask(task, inv, nearby) {
 function mkV({ inv, nearby, failTasks = [] }) {
     const v = Object.create(Voyager.prototype);
     v.agent = {
-        bot: { version: VER, registry, recipesAll: (id) => Recipe.find(id), inventory: { emptySlotCount: () => 1 } },
+        bot: {
+            version: VER, registry, recipesAll: (id) => Recipe.find(id), inventory: { emptySlotCount: () => 1 },
+            game: { gameMode: 'survival' },
+            entity: { eyeHeight: 1.62, position: { x: 0, y: 64, z: 0 } },
+            world: {},
+            pathfinder: { movements: {}, getPathTo: () => ({ status: 'success', cost: 1 }) },
+        },
         openChat() {},
     };
     v.skills = [];
@@ -89,7 +95,12 @@ function mkV({ inv, nearby, failTasks = [] }) {
     v._prefetchPlan = () => {};
     v._curSub = null;
     v.ran = [];
-    v.observe = () => ({ inventory: { ...inv }, nearby_blocks: [...nearby], empty_inventory_slots: 1 });
+    v.observe = () => ({
+        inventory: { ...inv },
+        nearby_blocks: [...nearby],
+        perceived_at: Object.fromEntries(nearby.map((name, i) => [name, { x: i + 1, y: 64, z: 1 }])),
+        empty_inventory_slots: 1,
+    });
     v._findReplay = task => ({ name: `route_${task.replace(/ /g, '_')}`, call: '' });
     v._structuredReplay = v._findReplay;
     v._embedReplay = async () => null;

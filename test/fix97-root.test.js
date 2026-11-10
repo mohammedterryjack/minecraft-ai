@@ -18,7 +18,7 @@ import { readFileSync } from 'node:fs';
 import { edibleNames, planFoodAcquisition } from '../src/agent/food_backchain.js';
 import { buildContractManifest } from '../scripts/fix97_contract_manifest.js';
 import { nestedBotMemberError, getBareAPI, Coder } from '../src/agent/coder.js';
-import { getNearestBlocks, getNearestBlocksWhere, getNearbyBlockTypes, getNearbyBlocks, nearbyBlockRadius } from '../src/agent/library/world.js';
+import { getNearestBlocks, getNearestBlocksWhere, getNearbyBlockTypes, getNearbyBlocks, nearbyBlockRadius, perceivedStats, pathToBlock } from '../src/agent/library/world.js';
 import pf from 'mineflayer-pathfinder';
 import { Vec3 } from 'vec3';
 import { wrapBotForApiTiming } from '../src/utils/bot_api_timing.js';
@@ -106,10 +106,14 @@ describe('fix97 goal identity: Collect 1 apple stays Collect 1 apple', () => {
         const v = mkV({});
         v._askLocal = async () => { throw new Error('the model must not rewrite an item goal'); };
         v._producers = () => [{ s: { name: 'collectSurface', task: 'Collect 64 dirt', effects: ['apple'], code: 'async function collectSurface(bot) { return true; }' }, V: 1 }];
+        v.agent.bot.game = { gameMode: 'survival' };
+        v.agent.bot.entity = { eyeHeight: 1.62, position: { x: 0, y: 64, z: 0 } };
+        v.agent.bot.world = {};
+        v.agent.bot.pathfinder = { movements: {}, getPathTo: () => ({ status: 'success', cost: 1 }) };
         v.observe = () => ({ inventory: {}, nearby_blocks: ['dirt'] });
         assert.strictEqual(await v._decompose('Collect 1 apple', 'no apples'), false);
         assert.strictEqual(v.progress.decomposed['Collect 1 apple'], undefined);
-        v.observe = () => ({ inventory: {}, nearby_blocks: ['oak_leaves', 'dirt'] });
+        v.observe = () => ({ inventory: {}, nearby_blocks: ['oak_leaves', 'dirt'], perceived_at: { oak_leaves: { x: 1, y: 70, z: 1 } } });
         assert.strictEqual(await v._decompose('Collect 1 apple', 'no apples'), true);
         const subs = v.progress.decomposed['Collect 1 apple'].subs;
         assert.deepStrictEqual(subs, ['reach oak_leaves']);
@@ -517,7 +521,11 @@ describe('fix97 code state and decompose limits', () => {
         v._askLocal = async () => { throw new Error('the model must not rewrite an item goal'); };
         v._producers = () => [];
         v._curSub = { task: 'Collect 1 apple', depth: 2 };
-        v.observe = () => ({ inventory: {}, nearby_blocks: ['oak_leaves'] });
+        v.agent.bot.game = { gameMode: 'survival' };
+        v.agent.bot.entity = { eyeHeight: 1.62, position: { x: 0, y: 64, z: 0 } };
+        v.agent.bot.world = {};
+        v.agent.bot.pathfinder = { movements: {}, getPathTo: () => ({ status: 'success', cost: 1 }) };
+        v.observe = () => ({ inventory: {}, nearby_blocks: ['oak_leaves'], perceived_at: { oak_leaves: { x: 1, y: 70, z: 1 } } });
         assert.strictEqual(await v._decompose('Collect 1 apple', 'overflow'), true);
         assert.strictEqual(await v._decompose('Collect 1 apple', 'again'), false);
         v.progress.subgoals = [];
@@ -705,71 +713,125 @@ describe('fix97 findBlocks refuses a non-numeric maxDistance or count', () => {
         assert.throws(() => nearbyBlockRadius({ game: { simulationDistance: 4 } }), /viewDistance is undefined/);
         assert.strictEqual(nearbyBlockRadius({ game: { serverViewDistance: 8 } }), 8 * CHUNK_WIDTH);
         assert.strictEqual(nearbyBlockRadius({ game: { serverViewDistance: 10, simulationDistance: 5 } }), 10 * CHUNK_WIDTH);
-        const { BLOCK_SECTION_VOLUME } = require('prismarine-chunk/src/pc/common/constants.js');
+        const { BLOCK_SECTION_VOLUME, SECTION_HEIGHT } = require('prismarine-chunk/src/pc/common/constants.js');
         const stoneId = registry.blocksByName.stone.defaultState;
         const oakLogId = registry.blocksByName.oak_log.defaultState;
         const diamondId = registry.blocksByName.diamond_ore.defaultState;
         const emeraldId = registry.blocksByName.emerald_ore.defaultState;
+        const dirtId = registry.blocksByName.dirt.defaultState;
+        assert.strictEqual(registry.blocksByStateId[stoneId].boundingBox, 'block');
+        assert.notStrictEqual(registry.blocksByStateId[stoneId].transparent, true);
         const eyeHeight = 1.62;
-        const reach = new pf.goals.GoalLookAtBlock(new Vec3(0, 0, 0), {}, { entityHeight: eyeHeight }).reach;
-        // diamond_ore 111 blocks below the feet, and emerald_ore 9 chunks away, are outside that reach.
         const feetY = 64;
+        const minY = -64;
+        const viewDistance = 10;
         const diamondY = feetY - 111;
-        assert.ok(Math.abs((feetY + eyeHeight) - diamondY) > reach, `diamond_ore is ${Math.abs((feetY + eyeHeight) - diamondY)} blocks from the eye, beyond GoalLookAtBlock reach ${reach}`);
-        assert.ok(9 * CHUNK_WIDTH > reach, `emerald_ore 9 chunks away is beyond GoalLookAtBlock reach ${reach}`);
         let cellReads = 0;
         let farReads = 0;
-        const sections = Array.from({ length: 24 }, () => null);
-        const minY = -64;
-        const stoodSection = (feetY - minY) >> 4;
-        const stoneSection = { palette: [stoneId], data: { get() { cellReads += 1; return stoneId; } } };
-        sections[stoodSection - 1] = stoneSection;
-        sections[stoodSection] = {
-            palette: [stoneId, oakLogId],
-            data: { get() { cellReads += 1; return stoneId; } },
+        const stoneOnly = { palette: [stoneId], data: { value: stoneId } };
+        const eyeOriginY = minY + ((feetY - minY) >> 4) * SECTION_HEIGHT;
+        const stateOf = (x, y, z) => {
+            if (y >= diamondY - (diamondY - minY) % SECTION_HEIGHT && y < diamondY - (diamondY - minY) % SECTION_HEIGHT + SECTION_HEIGHT && x >= 0 && x < 16 && z >= 0 && z < 16) return diamondId;
+            if (x === 8 && z === 10 && y >= feetY && y <= feetY + 2) return stoneId;
+            if (x === 8 && y === feetY + 1 && z === 12) return dirtId;
+            if (x === 8 && y === feetY + 1 && z === 11) return 0;
+            if (x === 8 && (y === feetY + 1 || y === feetY + 2) && z === 8) return 0;
+            return stoneId;
         };
-        const diamondSection = (diamondY - minY) >> 4;
-        sections[diamondSection] = {
+        const eyeSection = {
+            palette: [stoneId, oakLogId, dirtId],
+            data: { get(index) {
+                cellReads += 1;
+                const lx = index & 15, lz = (index >> 4) & 15, ly = (index >> 8) & 15;
+                return stateOf(lx, eyeOriginY + ly, lz);
+            } },
+        };
+        const diamondOrigin = minY + ((diamondY - minY) >> 4) * SECTION_HEIGHT;
+        const diamondSection = {
             palette: [diamondId],
-            data: { get() { farReads += 1; throw new Error('diamond_ore section was read'); } },
+            data: { get() { cellReads += 1; return diamondId; } },
+        };
+        const stoodSections = Array.from({ length: 24 }, (_, si) => {
+            const originY = minY + si * SECTION_HEIGHT;
+            if (originY === eyeOriginY) return eyeSection;
+            if (originY === diamondOrigin) return diamondSection;
+            return stoneOnly;
+        });
+        const columns = [];
+        for (let cz = -viewDistance; cz <= viewDistance; cz++) {
+            for (let cx = -viewDistance; cx <= viewDistance; cx++) {
+                columns.push({ chunkX: cx, chunkZ: cz, column: { minY, sections: cx === 0 && cz === 0 ? stoodSections : Array.from({ length: 24 }, () => stoneOnly) } });
+            }
+        }
+        const outside = {
+            palette: [emeraldId],
+            data: { get() { farReads += 1; throw new Error('emerald_ore outside view distance was read'); } },
+        };
+        columns.push({ chunkX: viewDistance + 1, chunkZ: 0, column: { minY, sections: [outside] } });
+        const raycast = (from, dir, range) => {
+            // The aim point is the face. Step just past it so the sample lands in the block, which is what
+            // prismarine-world's shape intersection reports (the measurement fixture uses that raycast).
+            let hit = null;
+            for (let t = 0; t <= range + 0.05; t += 0.05) {
+                const x = Math.floor(from.x + dir.x * t);
+                const y = Math.floor(from.y + dir.y * t);
+                const z = Math.floor(from.z + dir.z * t);
+                const id = stateOf(x, y, z);
+                const block = registry.blocksByStateId[id];
+                if (id !== 0 && block && block.boundingBox === 'block' && block.transparent !== true) {
+                    hit = { position: { x, y, z } };
+                    break;
+                }
+            }
+            return hit;
         };
         const viewBot = {
-            game: { serverViewDistance: 10 },
+            game: { serverViewDistance: viewDistance, gameMode: 'survival' },
             registry,
             entity: { position: new Vec3(8, feetY, 8), eyeHeight },
             blockAt() { return null; },
             findBlocks() { throw new Error('nearby blocks must not call findBlocks'); },
-            world: { getColumns() { return [
-                { chunkX: 0, chunkZ: 0, column: { minY, sections } },
-                { chunkX: 9, chunkZ: 0, column: { minY, sections: [{ palette: [emeraldId], data: { get() { farReads += 1; throw new Error('emerald_ore section was read'); } } }] } },
-            ]; } },
+            world: { getColumns() { return columns; }, raycast },
         };
         const nearbyNames = getNearbyBlockTypes(viewBot);
-        const cube = (10 * CHUNK_WIDTH * 2 + 1) ** 3;
-        assert.ok(nearbyNames.includes('stone'));
-        assert.ok(!nearbyNames.includes('oak_log'), 'a palette entry no cell still holds is not nearby');
-        assert.ok(!nearbyNames.includes('diamond_ore'), `diamond_ore is excluded because it is beyond GoalLookAtBlock reach ${reach}`);
-        assert.ok(!nearbyNames.includes('emerald_ore'), `emerald_ore is excluded because 9 chunks is beyond GoalLookAtBlock reach ${reach}`);
+        const stats = perceivedStats(viewBot);
+        const cube = (viewDistance * CHUNK_WIDTH * 2 + 1) ** 3;
+        assert.ok(nearbyNames.includes('stone'), 'an exposed stone face the ray hits is perceived');
+        assert.ok(!nearbyNames.includes('dirt'), 'dirt behind the wall is occluded');
+        assert.ok(!nearbyNames.includes('oak_log'), 'a palette entry no cell still holds is not perceived');
+        assert.ok(!nearbyNames.includes('diamond_ore'), 'buried diamond_ore has no face open to a non-occluding block');
+        assert.ok(!nearbyNames.includes('emerald_ore'), 'emerald_ore outside the view distance is not read');
         assert.strictEqual(farReads, 0);
         assert.ok(cellReads > 0);
-        assert.ok(cellReads < BLOCK_SECTION_VOLUME, `cell reads ${cellReads} walked a whole section`);
+        assert.ok(cellReads < BLOCK_SECTION_VOLUME * 16, `cell reads ${cellReads} walked more than a handful of sections`);
         assert.ok(cellReads < cube, `cell reads ${cellReads} against the view-distance cube ${cube}`);
+        assert.ok(stats.candidates > 0 && stats.candidates < BLOCK_SECTION_VOLUME, `candidates ${stats.candidates} allocated a section or more`);
+        assert.ok(stats.candidates < cube);
+        assert.ok(stats.raycasts > 0 && stats.raycasts <= stats.candidates);
         const listed = getNearbyBlocks(viewBot);
-        assert.ok(listed.some(b => b.name === 'stone'));
-        assert.ok(!listed.some(b => b.name === 'diamond_ore' || b.name === 'oak_log' || b.name === 'emerald_ore'));
-        assert.ok(cellReads < cube);
+        const stone = listed.find(b => b.name === 'stone');
+        assert.ok(stone, 'an exposed stone is in the block list');
+        assert.ok(Number.isInteger(stone.x) && Number.isInteger(stone.y) && Number.isInteger(stone.z));
+        assert.ok(!listed.some(b => b.name === 'diamond_ore' || b.name === 'oak_log' || b.name === 'emerald_ore' || b.name === 'dirt'));
         const queriesSrc = readFileSync(new URL('../src/agent/commands/queries.js', import.meta.url), 'utf8');
         assert.match(queriesSrc, /world\.getNearbyBlocks\(bot\)/);
         assert.doesNotMatch(queriesSrc, /getNearbyBlocks\(bot,/);
         assert.doesNotMatch(queriesSrc, /nearbyBlockRadius/);
-        assert.ok(cellReads < cube, `!nearbyBlocks uses getNearbyBlocks, whose cell reads ${cellReads} are inside the reach and not the view-distance cube ${cube}`);
-        const missing = Array.from({ length: 24 }, () => null);
+        const hole = Array.from({ length: 24 }, () => stoneOnly);
+        hole[(feetY - minY) >> 4] = null;
+        const holeColumns = [];
+        for (let cz = -viewDistance; cz <= viewDistance; cz++) {
+            for (let cx = -viewDistance; cx <= viewDistance; cx++) {
+                holeColumns.push({ chunkX: cx, chunkZ: cz, column: { minY, sections: cx === 0 && cz === 0 ? hole : Array.from({ length: 24 }, () => stoneOnly) } });
+            }
+        }
         assert.throws(() => getNearbyBlockTypes({
+            game: { serverViewDistance: viewDistance },
             registry,
             entity: { position: new Vec3(8, feetY, 8), eyeHeight },
-            world: { getColumns() { return [{ chunkX: 0, chunkZ: 0, column: { minY, sections: missing } }]; } },
+            world: { getColumns() { return holeColumns; }, raycast },
         }), /not loaded/);
-        assert.throws(() => getNearbyBlockTypes({ registry, entity: { position: new Vec3(8, feetY, 8), eyeHeight } }), /getColumns/);
+        assert.throws(() => getNearbyBlockTypes({ game: { serverViewDistance: viewDistance }, registry, entity: { position: new Vec3(8, feetY, 8), eyeHeight } }), /getColumns/);
         const { EventEmitter } = require('events');
         const client = new EventEmitter();
         const gameBot = {
@@ -878,5 +940,118 @@ describe('fix97 the incomplete useEvidence throw is unreachable', () => {
         const mb = idx.find(s => s.name === 'mineBlocks');
         assert.ok(mb);
         assert.strictEqual(Object.hasOwn(mb, 'useEvidence'), false);
+    });
+});
+
+describe('fix97 reachability is a pathfinder search per target', () => {
+    it('the food planner calls getPathTo once for each source it still has to judge', () => {
+        const v = mkV({});
+        const calls = [];
+        v.agent.bot.game = { gameMode: 'survival' };
+        v.agent.bot.entity = { eyeHeight: 1.62, position: { x: 0, y: 64, z: 0 } };
+        v.agent.bot.world = {};
+        v.agent.bot.pathfinder = {
+            movements: { id: 'bot-movements' },
+            getPathTo(movements, goal) {
+                assert.strictEqual(movements, v.agent.bot.pathfinder.movements);
+                calls.push(goal.pos.x);
+                return { status: goal.pos.x === 4 ? 'noPath' : 'success', cost: goal.pos.x };
+            },
+        };
+        const src = v._obtainPlanner({ inventory: {}, nearby_blocks: [], perceived_at: {} }).sources('raw_iron');
+        assert.ok(src.length >= 2, `raw_iron sources: ${src.join(', ')}`);
+        const state = {
+            inventory: { stone_pickaxe: 1 },
+            nearby_blocks: [...src, 'dirt'],
+            perceived_at: { [src[0]]: { x: 4, y: 12, z: 4 }, [src[1]]: { x: 8, y: 12, z: 4 } },
+        };
+        const pre = v._obtainPlanner(state).prerequisites('raw_iron', 1, state.inventory);
+        assert.strictEqual(pre.how, 'collect');
+        assert.deepStrictEqual(calls, [4, 8], `pathfinder targets were ${calls.join(', ')} for sources ${src.join(', ')}`);
+        calls.length = 0;
+        const namedOnly = { inventory: { stone_pickaxe: 1 }, nearby_blocks: [src[0], 'dirt'], perceived_at: {} };
+        v._obtainPlanner(namedOnly).prerequisites('raw_iron', 1, namedOnly.inventory);
+        assert.deepStrictEqual(calls, [], 'a nearby name with no perceived position is not a pathfinder target');
+        const direct = pathToBlock(v.agent.bot, { x: 8, y: 12, z: 4 });
+        assert.strictEqual(direct.status, 'success');
+    });
+});
+
+describe('fix97 observe on a view-distance world', () => {
+    it('a terrain with caves and buried ore stays cheap', () => {
+        const { performance } = require('perf_hooks');
+        const Chunk = require('prismarine-chunk')(VER);
+        const World = require('prismarine-world')(registry);
+        const world = new World(null).sync;
+        const stoneId = registry.blocksByName.stone.defaultState;
+        const diamondId = registry.blocksByName.diamond_ore.defaultState;
+        const viewDistance = 10;
+        const minY = -64;
+        const probe = new Chunk({ minY, worldHeight: 384 });
+        const Section = probe.sections[0].constructor;
+        const stoneSection = new Section({ singleValue: stoneId, maxBitsPerBlock: probe.maxBitsPerBlock });
+        const airSection = probe.sections[probe.sections.length - 1];
+        const feetY = 64;
+        const eyeSection = (feetY - minY) >> 4;
+        const side = viewDistance * 2 + 1;
+        const exposedSurface = side * side * 16 * 16;
+        assert.ok(exposedSurface >= 3000, `surface exposes ${exposedSurface} blocks`);
+        for (let cz = -viewDistance; cz <= viewDistance; cz++) {
+            for (let cx = -viewDistance; cx <= viewDistance; cx++) {
+                const column = new Chunk({ minY, worldHeight: 384 });
+                for (let si = 0; si < column.sections.length; si++) {
+                    column.sections[si] = si < eyeSection ? stoneSection : airSection;
+                }
+                if (cx === 0 && cz === 0) {
+                    column.sections[1] = new Section({ singleValue: stoneId, maxBitsPerBlock: probe.maxBitsPerBlock });
+                    column.setBlockStateId({ x: 8, y: feetY - 111, z: 8 }, diamondId);
+                    column.sections[6] = new Section({ singleValue: stoneId, maxBitsPerBlock: probe.maxBitsPerBlock });
+                    for (let z = 0; z < 16; z++) for (let x = 0; x < 16; x++) for (let y = 40; y < 48; y++) {
+                        if ((x + y + z) % 2 === 0) column.setBlockStateId({ x, y, z }, 0);
+                    }
+                }
+                world.setColumn(cx, cz, column);
+            }
+        }
+        const bot = {
+            game: { serverViewDistance: viewDistance, gameMode: 'survival', dimension: 'overworld', minY, height: 384 },
+            registry,
+            version: VER,
+            health: 20,
+            food: 20,
+            oxygenLevel: 300,
+            heldItem: null,
+            time: { timeOfDay: 6000 },
+            entities: {},
+            entity: { position: new Vec3(8.5, feetY, 8.5), eyeHeight: 1.62 },
+            inventory: { items: () => [], emptySlotCount: () => 36, slots: new Array(46).fill(null) },
+            world,
+        };
+        const v = Object.create(Voyager.prototype);
+        v.agent = { bot, recentDeaths: [] };
+        v._recovery = () => ({ blocked: false });
+        v._hunger = () => ({ urgent: false, belowRegen: false });
+        v._getChestFacts = () => [];
+        v._threats = () => 'none';
+        v._deathHotspots = () => 'none';
+        if (typeof global.gc === 'function') global.gc();
+        const before = process.memoryUsage().heapUsed;
+        const t0 = performance.now();
+        const state = v.observe();
+        const ms = performance.now() - t0;
+        const heapDelta = process.memoryUsage().heapUsed - before;
+        let retained = null;
+        if (typeof global.gc === 'function') {
+            global.gc();
+            retained = process.memoryUsage().heapUsed - before;
+        }
+        const stats = perceivedStats(bot);
+        const cube = (viewDistance * 16 * 2 + 1) ** 3;
+        assert.ok(state.nearby_blocks.includes('stone'));
+        assert.ok(!state.nearby_blocks.includes('diamond_ore'));
+        assert.ok(stats.cellReads < cube / 100, `cell reads ${stats.cellReads}`);
+        assert.ok(stats.candidates < 20000, `candidates ${stats.candidates}`);
+        assert.ok(ms < 2000, `observe took ${ms} ms`);
+        console.log(`[fix97] observe view-distance 10: ${ms.toFixed(1)} ms, heap delta ${heapDelta} bytes${retained === null ? '' : `, retained after gc ${retained} bytes`}, cell reads ${stats.cellReads}, candidates ${stats.candidates}, raycasts ${stats.raycasts}, sections read ${stats.sectionsRead}, skipped ${stats.sectionsSkipped}, exposed surface blocks ${exposedSurface}`);
     });
 });

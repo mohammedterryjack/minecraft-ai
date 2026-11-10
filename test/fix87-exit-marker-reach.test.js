@@ -91,7 +91,13 @@ describe('fix87: no block of a registry type within search range is a reach need
     });
 
     function plannerBot() {
-        return { version: VER, registry, recipesAll: (id) => Recipe.find(id), inventory: { emptySlotCount: () => 4 } };
+        return {
+            version: VER, registry, recipesAll: (id) => Recipe.find(id), inventory: { emptySlotCount: () => 4 },
+            game: { gameMode: 'survival' },
+            entity: { eyeHeight: 1.62, position: { x: 0, y: 64, z: 0 } },
+            world: {},
+            pathfinder: { movements: {}, getPathTo: () => ({ status: 'success', cost: 1 }) },
+        };
     }
     function vWith(bot) {
         const v = Object.create(Voyager.prototype);
@@ -141,7 +147,7 @@ describe('fix87: no block of a registry type within search range is a reach need
         v._chainNeeds('Collect 1 oak_log', needs, absent);
         assert.strictEqual(v.progress.subgoals[0].task, 'reach oak_log');
 
-        const present = v._failureNeeds('Collect 1 oak_log', null, null, { inventory: {}, nearby_blocks: ['oak_log'] });
+        const present = v._failureNeeds('Collect 1 oak_log', null, null, { inventory: {}, nearby_blocks: ['oak_log'], perceived_at: { oak_log: { x: 1, y: 64, z: 1 } } });
         assert.strictEqual(present, null);
 
         // sticks also drop from leaves. With nothing nearby that collect is cheaper than crafting, so the need is

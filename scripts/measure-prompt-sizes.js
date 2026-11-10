@@ -104,7 +104,7 @@ death_hotspots: none`;
 - getInventoryCounts(bot) [built-in]
 - getAllFreeSpaces(bot, range) [built-in]
 - getBiomeName(bot) [built-in]
-- getNearbyBlockTypes(bot) [built-in]
+- getNearbyBlockTypes(bot) [built-in, blocks the bot can see]
 - getNearbyEntityTypes(bot) [built-in]
 - getNearbyPlayerNames(bot) [built-in]
 - getItemCount(bot, itemName) [built-in]

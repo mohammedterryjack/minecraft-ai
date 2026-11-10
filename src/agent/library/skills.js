@@ -599,10 +599,9 @@ function _survivalMovements(bot, {dig = true} = {}) {
     return m;
 }
 
-// fix60: a block is usable when a ray from the bot's eye reaches one of its faces within the game's reach. The reach is
-// mineflayer-pathfinder's own GoalLookAtBlock survival reach; the eye height is the bot's own. The walk goal uses the same
-// test from each candidate node, so the path ends exactly where the final check passes (GoalLookAtBlock's own isEnd measures
-// reach from the node's feet to the block raised by the eye height, which rejects reachable spots below a block).
+// fix60: a block is usable when a ray from the bot's eye reaches one of its faces within game.reach
+// (https://minecraft.wiki/w/Player#Reach). The eye height is the bot's own. The walk goal is GoalLookAtBlock
+// with that reach, so the path ends where the same check passes.
 function _faceInReach(world, eye, pos, reach) {
     for (const [dx, dy, dz] of [[0.5, 0, 0], [-0.5, 0, 0], [0, 0.5, 0], [0, -0.5, 0], [0, 0, 0.5], [0, 0, -0.5]]) {
         const face = pos.offset(0.5 + dx, 0.5 + dy, 0.5 + dz);
@@ -616,7 +615,10 @@ class GoalSeeAndReachBlock extends pf.goals.GoalLookAtBlock {
     isEnd(node) { return _faceInReach(this.world, new Vec3(node.x + 0.5, node.y + this.entityHeight, node.z + 0.5), this.pos, this.reach); }
 }
 function _lookAtGoal(bot, block) {
-    return new GoalSeeAndReachBlock(block.position, bot.world, { entityHeight: bot.entity.eyeHeight });
+    return new GoalSeeAndReachBlock(block.position, bot.world, { entityHeight: bot.entity.eyeHeight, reach: world.gameReach(bot) });
+}
+function outOfReach(bot, pos) {
+    return !world.withinInteractionRange(bot, pos);
 }
 export function canReachBlock(bot, block) {
     /**
@@ -862,7 +864,7 @@ export async function breakBlockAt(bot, x, y, z) {
             return true;
         }
 
-        if (bot.entity.position.distanceTo(block.position) > 4.5) {
+        if (outOfReach(bot, block.position)) {
             let pos = block.position;
             let movements = new pf.Movements(bot);
             movements.canPlaceOn = false;
@@ -1045,14 +1047,14 @@ export async function placeBlock(bot, blockType, x, y, z, placeOn='bottom', dont
         bot.pathfinder.setMovements(new pf.Movements(bot));
         await bot.pathfinder.goto(inverted_goal);
     }
-    if (bot.entity.position.distanceTo(targetBlock.position) > 4.5) {
+    if (outOfReach(bot, targetBlock.position)) {
         // too far
         let pos = targetBlock.position;
         let movements = new pf.Movements(bot);
         bot.pathfinder.setMovements(movements);
         await goToGoal(bot, new pf.goals.GoalNear(pos.x, pos.y, pos.z, 3));
     }
-    if (!bot.canSeeBlock(targetBlock) || bot.entity.position.distanceTo(targetBlock.position) > 4) await _reachBlock(bot, targetBlock);
+    if (!bot.canSeeBlock(targetBlock) || outOfReach(bot, targetBlock.position)) await _reachBlock(bot, targetBlock);
 
     // fix42: place block with direct state verification (fail loud with clear reason)
     try {
@@ -1240,7 +1242,7 @@ export async function putInChest(bot, itemName, num=-1) {
     }
     let to_put = num === -1 ? item.count : Math.min(num, item.count);
     await _reachBlock(bot, chest);
-    if (bot.entity.position.distanceTo(chest.position.offset(0.5,0.5,0.5)) > 4.5) {
+    if (outOfReach(bot, chest.position)) {
         log(bot, `Could not reach the chest at ${chest.position} (path blocked or too far). Move closer first.`);
         return false;
     }
@@ -1269,7 +1271,7 @@ export async function takeFromChest(bot, itemName, num=-1) {
         return false;
     }
     await _reachBlock(bot, chest);
-    if (bot.entity.position.distanceTo(chest.position.offset(0.5,0.5,0.5)) > 4.5) {
+    if (outOfReach(bot, chest.position)) {
         log(bot, `Could not reach the chest at ${chest.position} (path blocked or too far). Move closer first.`);
         return false;
     }
@@ -1319,7 +1321,7 @@ export async function viewChest(bot) {
         return false;
     }
     await _reachBlock(bot, chest);
-    if (bot.entity.position.distanceTo(chest.position.offset(0.5,0.5,0.5)) > 4.5) {
+    if (outOfReach(bot, chest.position)) {
         log(bot, `Could not reach the chest at ${chest.position} (path blocked or too far). Move closer first.`);
         return false;
     }
@@ -2198,12 +2200,12 @@ export async function tillAndSow(bot, x, y, z, seedType=null) {
         }
     }
     // if distance is too far, move to the block
-    if (bot.entity.position.distanceTo(block.position) > 4.5) {
+    if (outOfReach(bot, block.position)) {
         let pos = block.position;
         bot.pathfinder.setMovements(new pf.Movements(bot));
         await goToGoal(bot, new pf.goals.GoalNear(pos.x, pos.y, pos.z, 3));
     }
-    if (!bot.canSeeBlock(block) || bot.entity.position.distanceTo(block.position) > 4) await _reachBlock(bot, block);
+    if (!bot.canSeeBlock(block) || outOfReach(bot, block.position)) await _reachBlock(bot, block);
     if (block.name !== 'farmland') {
         let hoe = bot.inventory.items().find(item => item.name.includes('hoe'));
         let to_equip = hoe?.name || 'diamond_hoe';
@@ -2244,12 +2246,12 @@ export async function activateNearestBlock(bot, type) {
         log(bot, `Could not find any ${type} to activate.`);
         return false;
     }
-    if (bot.entity.position.distanceTo(block.position) > 4.5) {
+    if (outOfReach(bot, block.position)) {
         let pos = block.position;
         bot.pathfinder.setMovements(new pf.Movements(bot));
         await goToGoal(bot, new pf.goals.GoalNear(pos.x, pos.y, pos.z, 3));
     }
-    if (!bot.canSeeBlock(block) || bot.entity.position.distanceTo(block.position) > 4) await _reachBlock(bot, block);
+    if (!bot.canSeeBlock(block) || outOfReach(bot, block.position)) await _reachBlock(bot, block);
     await bot.activateBlock(block);
     log(bot, `Activated ${type} at x:${block.position.x.toFixed(1)}, y:${block.position.y.toFixed(1)}, z:${block.position.z.toFixed(1)}.`);
     return true;
@@ -2643,13 +2645,13 @@ export async function useToolOn(bot, toolName, targetName) {
 
     // if block in view is closer than the target block, it is in our way. try to move closer
     const viewBlocked = () => {
-        const blockInView = bot.blockAtCursor(5);
+        const blockInView = bot.blockAtCursor(world.gameReach(bot));
         const headPos = bot.entity.position.offset(0, bot.entity.height, 0);
         return blockInView && 
             !blockInView.position.equals(block.position) && 
             blockInView.position.distanceTo(headPos) < block.position.distanceTo(headPos);
     }
-    const blockInView = bot.blockAtCursor(5);
+    const blockInView = bot.blockAtCursor(world.gameReach(bot));
     if (viewBlocked()) {
         log(bot, `Block ${blockInView.name} is in the way, moving closer...`);
         // choose random block next to target block, go to it
@@ -2657,7 +2659,7 @@ export async function useToolOn(bot, toolName, targetName) {
         await goToPosition(bot, nearbyPos.x, nearbyPos.y, nearbyPos.z, 1);
         await bot.lookAt(block.position.offset(0.5, 0.5, 0.5));
         if (viewBlocked()) {
-            const blockInView = bot.blockAtCursor(5);
+            const blockInView = bot.blockAtCursor(world.gameReach(bot));
             log(bot, `Block ${blockInView.name} is in the way, not using ${toolName}.`);
             return false;
         }
