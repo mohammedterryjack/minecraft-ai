@@ -423,7 +423,7 @@ describe('fix98: prompt facts', () => {
             heldItem: null,
             inventory: { items: () => [], emptySlotCount: () => 36, slots: Array(46).fill(null) },
             entities: {},
-            world: { getBiome: () => 1 },
+            world: { getBiome: () => 1, getColumns: () => [] },
             findBlocks: () => [],
             blockAt: () => ({ skyLight: 0 }),
         };
