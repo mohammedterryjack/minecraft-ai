@@ -1524,12 +1524,16 @@ Use only c; no other globals.`;
     // A comparison whose literal equals the observed count of an item, and whose other side is that item's inventory count.
     // Comments and strings are not literals. `const need = 55; counts.oak_log >= need` and `const n = counts.oak_log; n >= 55`
     // are the same comparison: the binding is resolved in its scope before the two sides are compared.
-    static copiedCountComparisons(code, entries, registry) {
+    static copiedCountComparisons(code, entries, registry, facts) {
         if (!registry || !registry.itemsByName) throw new Error('[fix97] copied-count check needs the game data registry');
         if (entries !== null && !Array.isArray(entries)) throw new Error('[fix97] copied-count check needs the observed counts');
         const ast = Voyager.parseSkill(code);
         const COMPARE = new Set(['<', '<=', '>', '>=', '==', '===', '!=', '!==']);
         const hits = [];
+        const keeps = new Set();
+        const slotNs = new Set();
+        const invPairs = new Set();
+        const realItem = (item) => Object.hasOwn(registry.itemsByName, item);
         const scopes = [];
         const functionScopes = [];
         const push = () => { scopes.push(new Map()); };
@@ -1571,13 +1575,27 @@ Use only c; no other globals.`;
             if (node.type === 'CallExpression') return { n: null, items: new Set(Voyager.namesInAst(node)), invMap: false, invItem: null };
             return { n: null, items: new Set(Voyager.namesInAst(node)), invMap: false, invItem: null };
         };
+        // `(count || 0) - N` is the amount discarded. N is how many to keep. The `|| 0` is not part of a comparison.
+        const keptCount = (node) => {
+            if (!node || node.type !== 'LogicalExpression' || (node.operator !== '||' && node.operator !== '??')) return null;
+            if (!node.right || node.right.type !== 'Literal' || node.right.value !== 0) return null;
+            return resolve(node.left);
+        };
         const consider = (expr) => {
-            if (!expr || expr.type !== 'BinaryExpression' || !COMPARE.has(expr.operator)) return;
+            if (!expr || expr.type !== 'BinaryExpression') return;
             const L = resolve(expr.left), R = resolve(expr.right);
+            const kept = expr.operator === '-' ? (L.invItem ? L : keptCount(expr.left)) : null;
+            if (kept && kept.invItem && typeof R.n === 'number' && realItem(kept.invItem)) keeps.add(`${kept.invItem}\0${R.n}`);
+            if (!COMPARE.has(expr.operator)) return;
+            if (L.invItem && typeof R.n === 'number' && realItem(L.invItem)) invPairs.add(`${L.invItem}\0${R.n}`);
+            else if (typeof R.n === 'number' && !L.invItem) slotNs.add(R.n);
+            if (R.invItem && typeof L.n === 'number' && realItem(R.invItem)) invPairs.add(`${R.invItem}\0${L.n}`);
+            else if (typeof L.n === 'number' && !R.invItem) slotNs.add(L.n);
             const pairs = [];
             if (L.invItem && typeof R.n === 'number') pairs.push([L.invItem, R.n]);
             if (R.invItem && typeof L.n === 'number') pairs.push([R.invItem, L.n]);
             for (const [item, n] of pairs) {
+                if (!realItem(item)) continue;
                 if (Voyager.countIsGameFact(registry, item, n)) continue;
                 if (entries === null) {
                     hits.push({ n, item, source: 'inventory', quote: null, op: expr.operator });
@@ -1632,6 +1650,11 @@ Use only c; no other globals.`;
                 }
                 return;
             }
+            if (n.type === 'CallExpression') {
+                for (const arg of n.arguments || []) {
+                    if (arg && arg.type === 'Literal' && typeof arg.value === 'number') slotNs.add(arg.value);
+                }
+            }
             consider(n);
             for (const v of Object.values(n)) {
                 if (Array.isArray(v)) { for (const x of v) walk(x); }
@@ -1641,6 +1664,11 @@ Use only c; no other globals.`;
         push();
         functionScopes.push(scopes[0]);
         walk(ast);
+        if (facts && typeof facts === 'object') {
+            facts.keeps = keeps;
+            facts.slotNs = slotNs;
+            facts.invPairs = invPairs;
+        }
         return hits;
     }
     // An inventory comparison of item X to a literal is a copied count when that literal is not X's goal
@@ -1649,16 +1677,26 @@ Use only c; no other globals.`;
     // Structured name:count state is what snapshotThresholdFeedback pairs, from promptCounts, not from a sentence.
     static copiedInventoryHits(skill, registry) {
         if (!skill || typeof skill.name !== 'string') throw new Error('[fix97] copied-count check needs the skill name');
+        if (!registry || !registry.itemsByName) throw new Error('[fix97] copied-count check needs the game data registry');
         const goals = Voyager.goalQuantities(skill.task);
         const isGoal = (item, n) => goals.some(g => g.item === item && g.n === n);
+        const facts = {};
+        const pairKey = (item, n) => `${item}\0${n}`;
+        const isItem = (item) => Object.hasOwn(registry.itemsByName, item);
         const hits = [];
+        // A keep is `count - N` passed to a discard: N is how many of that item to leave, not a count that was observed.
+        // A contract ceiling (`<` / `<=`) is the same kind of cap when the code uses N as an argument or against something
+        // that is not that item's inventory count, and never compares the item itself to N.
         const take = (h, where) => {
+            if (!isItem(h.item)) return;
             if (isGoal(h.item, h.n)) return;
             if (Voyager.countIsGameFact(registry, h.item, h.n)) return;
+            if (facts.keeps && facts.keeps.has(pairKey(h.item, h.n))) return;
+            if (where !== 'code' && (h.op === '<' || h.op === '<=') && facts.slotNs && facts.slotNs.has(h.n) && !(facts.invPairs && facts.invPairs.has(pairKey(h.item, h.n)))) return;
             hits.push({ n: h.n, item: h.item, op: h.op, where, source: 'inventory' });
         };
         if (typeof skill.code === 'string') {
-            for (const h of Voyager.copiedCountComparisons(skill.code, null, registry)) take(h, 'code');
+            for (const h of Voyager.copiedCountComparisons(skill.code, null, registry, facts)) take(h, 'code');
         }
         if (skill.contract && typeof skill.contract === 'object') {
             for (const field of ['pre', 'post']) {
@@ -2346,7 +2384,9 @@ Use only c; no other globals.`;
             // fix89: a missing input is a structured need. Chain it (the same path a failed goal uses) instead of
             //        replaying the raiser. The next step leaves the step to that chain (_needServePending).
             if (Array.isArray(rp.needs) && rp.needs.length > 0) {
-                if (this._chainNeeds(label, rp.needs, this.observe())) {
+                const seen = this.observe();
+                await this._noteReach(seen);
+                if (this._chainNeeds(label, rp.needs, seen)) {
                     console.log(`[urgent-need] ${st.best.entry.name} lacked an input; backchained`);
                     return true;
                 }
@@ -2417,6 +2457,7 @@ Use only c; no other globals.`;
     async _serveLearnedFood(st, before) {
         const registry = this.agent.bot.registry;
         if (!registry) throw new Error('[fix93] bot.registry required to plan food from game data');
+        await this._noteReach(before);
         const edibles = edibleNames(registry);
         const inv = before.inventory;
         const planner = this._obtainPlanner(before);
@@ -2735,7 +2776,13 @@ Use only c; no other globals.`;
     }
     async _runForeground(label, fn, timeout) {
         // fix42: populate bot.__safeToToss before any skill run (for tossClutter/freeInventory)
-        this._prepareTossSignals();
+        const capacity = this._prepareTossSignals();
+        if (capacity) {
+            const seen = this.observe();
+            await this._noteReach(seen);
+            const plan = this._buildCapacityPlan(capacity.req, seen, capacity.slotsNeeded);
+            this.agent.bot.__capacityPlan = plan.removals;
+        }
         // fix51: track inventory+equipment before run for death item-drop reporting (same view as satisfaction check)
         this._beforeRunInv = this._getInventoryWithEquipment();
         // fix28: progress = position, inventory, health, food, open-window contents (crafting/furnace UI) or a lit furnace/smoker nearby (smelting wait)
@@ -3726,7 +3773,11 @@ Use only c; no other globals.`;
         // ADAM-style: record inventory delta for needs/produces learning
         if (ok) this.npGraph.recordDelta(r.name, runBefore.inventory, after.inventory, goalItems);   // fix70: this run only
         // fix81: what the failed run lacked (not for a misroute: the wrong skill's needs are not the goal's)
-        const needs = !ok && !libFault && !cut && !misrouted ? this._failureNeeds(task, reported, failTrace, after) : null;
+        let needs = null;
+        if (!ok && !libFault && !cut && !misrouted) {
+            await this._noteReach(after);
+            needs = this._failureNeeds(task, reported, failTrace, after);
+        }
         const reason = !ok ? this._failureReason(failTrace) : null;   // fix89: FAILED lines already on the trace
 
         // fix37 (D): detect and log inventory-full as a fact for learning
@@ -3970,6 +4021,34 @@ Use only c; no other globals.`;
     // fix81: the game-data planner (recipe_plan.js) over the live registry and bot.recipesAll (every recipe, not only the
     //        ones the inventory can make now). "known" is learned or observed: a source block of the item in
     //        observe().nearby_blocks, or a learned producer of it. Exact ties are a uniform choice.
+    // A partial pathfinder slice is not unreachable. mineflayer-pathfinder index.js:64-71 takes one tickTimeout
+    // yield; lib/astar.js:70 returns 'partial' and line 73 'timeout'. 'noPath' (line 121) is the open set exhausted.
+    _pathStatus(state, name, at) {
+        if (state && state._reach && Object.hasOwn(state._reach, name)) {
+            const status = state._reach[name];
+            if (status !== 'success' && status !== 'noPath') {
+                throw new Error(`[fix97] ${name} path status ${status} is not unreachable (mineflayer-pathfinder index.js tickTimeout; lib/astar.js compute).`);
+            }
+            return status;
+        }
+        const pf = this.agent.bot && this.agent.bot.pathfinder;
+        if (pf && typeof pf.getPathFromTo === 'function') {
+            throw new Error(`[fix97] ${name} has not been searched to completion. bot.pathfinder.getPathFromTo steps the search (mineflayer-pathfinder index.js:75). A partial result is not unreachable (index.js:41,64-71; lib/astar.js:70).`);
+        }
+        return world.pathStatusSync(this.agent.bot, at).status;
+    }
+    async _noteReach(state) {
+        if (!state || !state.perceived_at || typeof state.perceived_at !== 'object') return state;
+        const pf = this.agent.bot && this.agent.bot.pathfinder;
+        if (!pf || typeof pf.getPathFromTo !== 'function') return state;
+        if (!state._reach) state._reach = {};
+        for (const [name, pos] of Object.entries(state.perceived_at)) {
+            if (Object.hasOwn(state._reach, name)) continue;
+            const result = await world.pathToBlock(this.agent.bot, pos);
+            state._reach[name] = result.status;
+        }
+        return state;
+    }
     _obtainPlanner(state) {
         const bot = this.agent.bot;
         if (!Array.isArray(state.nearby_blocks)) throw new Error('[fix81] _obtainPlanner: state.nearby_blocks (array) required');
@@ -3987,7 +4066,7 @@ Use only c; no other globals.`;
         const reachableBlock = (block) => {
             if (reached.has(block)) return reached.get(block);
             const at = state.perceived_at && state.perceived_at[block];
-            const ok = at ? world.pathToBlock(bot, at).status === 'success' : false;
+            const ok = at ? this._pathStatus(state, block, at) === 'success' : false;
             reached.set(block, ok);
             return ok;
         };
@@ -4325,7 +4404,7 @@ Use only c; no other globals.`;
                     if (!near.has(b)) continue;
                     const at = state.perceived_at && state.perceived_at[b];
                     if (!at) throw new Error(`[fix97] ${b} is perceived but has no position. Reachability is pathToBlock of that block, not membership of nearby_blocks.`);
-                    if (world.pathToBlock(this.agent.bot, at).status === 'success') usable.push(b);
+                    if (this._pathStatus(state, b, at) === 'success') usable.push(b);
                 }
                 if (src.length > 0 && usable.length === 0) {
                     const blocksByName = this.agent.bot.registry.blocksByName;
@@ -4666,13 +4745,15 @@ Use only c; no other globals.`;
         if (detail.length === 0) detail = 'none';
         throw new Error(`[fix92] LOUD: no whole-slot plan frees ${slotsNeeded} slot(s) for ${n.count} ${n.item} (${why}; rejected: ${detail})`);
     }
-    _tossClutterCall(entry) {
+    async _tossClutterCall(entry) {
         const req = entry.slotRequest;
         if (!req || typeof req.item !== 'string' || !Number.isInteger(req.count) || req.count < 1) throw new Error(`[fix92] tossClutter subgoal has no slot request: ${JSON.stringify(entry)}`);
         const bot = this.agent.bot;
         const live = emptySlotsToFit(bot.registry, stackableCounts(bot), req.item, req.count);
         if (live < 1) throw new Error(`[fix92] LOUD: ${req.item} already fits; tossClutter plan is stale`);
-        const plan = this._buildCapacityPlan(req, this.observe(), live);
+        const seen = this.observe();
+        await this._noteReach(seen);
+        const plan = this._buildCapacityPlan(req, seen, live);
         if (plan.freed < live) throw new Error(`[fix92] LOUD: tossClutter plan is stale; it frees ${plan.freed} of ${live} slot(s) for ${req.item}`);
         bot.__capacityPlan = plan.removals;
         return `await tossClutter(bot, ${live}, ${JSON.stringify(plan.removals)});`;
@@ -5614,11 +5695,10 @@ Use only c; no other globals.`;
         if (cur && cur.slotRequest) {
             const req = cur.slotRequest;
             const slotsNeeded = emptySlotsToFit(this.agent.bot.registry, stackableCounts(this.agent.bot), req.item, req.count);
-            if (slotsNeeded > 0) {
-                const plan = this._buildCapacityPlan(req, this.observe(), slotsNeeded);
-                this.agent.bot.__capacityPlan = plan.removals;
-            } else this.agent.bot.__capacityPlan = [];
+            if (slotsNeeded > 0) return { req, slotsNeeded };
+            this.agent.bot.__capacityPlan = [];
         } else this.agent.bot.__capacityPlan = [];
+        return null;
     }
     // fix37/fix49/fix74: run one practice skill. Returns null when the code-model call completed (abort: no verdict),
     // { skipped } when the bot cannot practice now, { notRun } when the skill could not be staged, else the run's verdict
@@ -5752,6 +5832,7 @@ Use only c; no other globals.`;
         const goal = smeltGoal(task) || countGoal(task) || parseVerboseGoal(task);
         if (goal && typeof goal.item === 'string' && Number.isInteger(goal.count)) {
             const state = this.observe();
+            await this._noteReach(state);
             const inv = state.inventory || {};
             const planner = this._obtainPlanner(state);
             const pre = planner.prerequisites(goal.item, goal.count, inv);
@@ -5773,9 +5854,9 @@ Use only c; no other globals.`;
                 const chosen = ranked[0];
                 const at = state.perceived_at && state.perceived_at[chosen];
                 if (!at) throw new Error(`[fix97] reach ${chosen} has no perceived position. The pathfinder decides reachability of that block; nearby_blocks does not.`);
-                const path = world.pathToBlock(this.agent.bot, at);
-                if (path.status !== 'success') {
-                    console.log(`[psn] decompose skipped for "${task}": pathfinder status ${path.status} for ${chosen}`);
+                const status = this._pathStatus(state, chosen, at);
+                if (status !== 'success') {
+                    console.log(`[psn] decompose skipped for "${task}": pathfinder status ${status} for ${chosen}`);
                     return false;
                 }
                 const reach = `reach ${chosen}`;
@@ -7343,7 +7424,7 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
         let route;
         if (goalKind.kind === 'skill') {
             let call = `await ${goalKind.skill.name}(bot);`;
-            if (goalKind.skill.name === 'tossClutter' && this._curSub && this._curSub.task === task && this._curSub.slotRequest) call = this._tossClutterCall(this._curSub);
+            if (goalKind.skill.name === 'tossClutter' && this._curSub && this._curSub.task === task && this._curSub.slotRequest) call = await this._tossClutterCall(this._curSub);
             route = { name: goalKind.skill.name, call };
         }
         else if (goalKind.kind === 'reach') {
@@ -7379,7 +7460,11 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
         // fix90: while a need serve is current, the chain belongs to that need (need:hunger), not the skill name.
         //        fix89 chained only in the raiser branch; a curriculum replay of the skill left the serve free to cold-start again.
         if (rp && !rp.ok && !rp.interrupted) this._noteEdgeOutcome(task, false);
-        if (rp && !rp.ok && Array.isArray(rp.needs)) { if (this._chainNeeds(this._chainOwner(task), rp.needs, this.observe())) return true; }
+        if (rp && !rp.ok && Array.isArray(rp.needs)) {
+            const seen = this.observe();
+            await this._noteReach(seen);
+            if (this._chainNeeds(this._chainOwner(task), rp.needs, seen)) return true;
+        }
         // fix55: a skill goal is that skill; its failure is already blamed/queued for repair by _attribute, so no new code is written for it
         if (goalKind.kind === 'skill') { console.log(`[voyager] skill goal ${task} failed its learned post-contract; repair of the skill handles it (no code generation)`); return true; }
         if (this._cursorLimited()) {
@@ -7671,9 +7756,11 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
         if (!anyCut) {
             const bot = this.agent.bot, reported = peekPreconditionUnmet(bot);
             clearPreconditionUnmet(bot);
-            const needs = this._failureNeeds(task, reported, lastTrace, this.observe());
+            const seen = this.observe();
+            await this._noteReach(seen);
+            const needs = this._failureNeeds(task, reported, lastTrace, seen);
             this._noteEdgeOutcome(task, false);
-            if (needs !== null && this._chainNeeds(this._chainOwner(task), needs, this.observe())) return true;
+            if (needs !== null && this._chainNeeds(this._chainOwner(task), needs, seen)) return true;
         }
         // fix19 (1): failed twice (recently) or cut off -> decompose
         const fails = this.progress.failed.slice(-20).filter(t => t === task).length;

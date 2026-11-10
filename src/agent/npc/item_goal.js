@@ -314,10 +314,11 @@ export class ItemGoal {
         let next = next_info.node;
         let quantity = next_info.quantity;
 
-        // A block target is reachable only when a pathfinder search of that block succeeds. The perceived
-        // set says the bot can see a block of this name; it is not the reachability answer.
-        const seenAt = next.type === 'block' ? world.perceivedPosition(this.agent.bot, next.source) : null;
-        const blockUnreachable = next.type === 'block' && !(seenAt && world.pathToBlock(this.agent.bot, seenAt).status === 'success');
+        // A block target is reachable only when a pathfinder search of that block succeeds. The position is
+        // read from the live exposed index (perceivedPosition awaits it). A missing cache entry is not "unreachable".
+        const seenAt = next.type === 'block' ? await world.perceivedPosition(this.agent.bot, next.source) : null;
+        const path = seenAt ? await world.pathToBlock(this.agent.bot, seenAt) : null;
+        const blockUnreachable = next.type === 'block' && !(seenAt && path.status === 'success');
         const huntUnseen = next.type === 'hunt' && !world.getNearbyEntityTypes(this.agent.bot).includes(next.source);
         if (blockUnreachable || huntUnseen) {
             next.fails += 1;

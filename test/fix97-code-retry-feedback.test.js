@@ -196,6 +196,8 @@ describe('fix97 code-retry feedback is compact by construction', () => {
         const grouped = groupVaryingLines(text);
         assert.match(grouped, /at:/);
         assert.deepStrictEqual(recoverTemplatedLines(grouped), ['alpha 1', 'beta 2', 'alpha 3', 'beta 4']);
+        const suffixed = 'stood at the chest (x2)';
+        assert.strictEqual(recoverTemplatedLines(groupVaryingLines(suffixed)).join('\n'), suffixed);
         assert.throws(() => groupVaryingLines(undefined), /text must be a string/);
         assert.throws(() => recoverTemplatedLines(null), /text must be a string/);
     });
