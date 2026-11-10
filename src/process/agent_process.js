@@ -13,11 +13,14 @@ const LOGS_DIR = fileURLToPath(new URL('../../logs/', import.meta.url));
 export const HEAP_SNAPSHOT_DIR = path.join(LOGS_DIR, 'heap');
 
 // Node options must precede the script. mkdir throws; the child is not spawned without the directory.
-export function agentChildArgv(name, port, load_memory, init_message, count_id) {
-    mkdirSync(HEAP_SNAPSHOT_DIR, { recursive: true });
+export function agentChildArgv(name, port, load_memory, init_message, count_id, diagnosticDir) {
+    if (typeof diagnosticDir !== 'string' || diagnosticDir.length === 0) {
+        throw new Error('agentChildArgv: diagnosticDir required');
+    }
+    mkdirSync(diagnosticDir, { recursive: true });
     const args = [
         '--heapsnapshot-signal=SIGUSR2',
-        `--diagnostic-dir=${HEAP_SNAPSHOT_DIR}`,
+        `--diagnostic-dir=${diagnosticDir}`,
         init_agent_path,
         name,
     ];
@@ -41,7 +44,7 @@ export class AgentProcess {
         this.count_id = count_id;
         this.running = true;
 
-        const args = agentChildArgv(this.name, this.port, load_memory, init_message, count_id);
+        const args = agentChildArgv(this.name, this.port, load_memory, init_message, count_id, HEAP_SNAPSHOT_DIR);
 
         const agentProcess = spawn(process.execPath, args, {
             stdio: 'inherit',
