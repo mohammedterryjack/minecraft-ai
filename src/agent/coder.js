@@ -11,7 +11,7 @@ const { tokenizer: acornTokenizer, tokTypes } = acorn;
 import pf from 'mineflayer-pathfinder';
 import { logPromptBreakdown } from './prompt_utils.js';
 import { withStallPhase, pushStallPhase, popStallPhase, getStallPhaseStack } from '../utils/event_loop_guard.js';
-import { mainThreadWatchdogStarted, publishMainThreadCode } from '../utils/main_thread_watchdog.js';
+import { mainThreadWatchdogStarted, publishMainThreadCode, finishMainThreadCode } from '../utils/main_thread_watchdog.js';
 import { wrapBotForApiTiming } from '../utils/bot_api_timing.js';
 import { markPreconditionUnmet } from './precondition.js';
 
@@ -1016,7 +1016,7 @@ export class Coder {
         code = code.replaceAll('console.log(', 'log(bot,');
         code = code.replaceAll('log("', 'log(bot,"');
 
-        console.log(`[staging] coder:_stageCode staged_source=${code.length} chars lines=${code.split('\n').length}`);
+        console.log(`[staging] coder:_stageCode pre-guard staged_source=${code.length} chars lines=${code.split('\n').length}`);
 
         // fix44: interrupt guard uses __mcLog__ (collision-safe binding injected into endowments)
         // String/template aware: naive `;\n` replacement breaks instrumentSrc template bodies that contain `;`+newline
@@ -1024,6 +1024,7 @@ export class Coder {
         // followed by the interrupt check
         if (!lintOnly) code = this._injectLoopTurns(code);
         code = this._injectSemicolonInterruptGuards(code);
+        console.log(`[staging] coder:_stageCode post-guard staged_source=${code.length} chars lines=${code.split('\n').length}`);
         for (let line of code.split('\n')) {
             // every loop iteration checks for an interrupt
             line = line.replace(/^(\s*(?:\}\s*)?(?:for|while)\s*\(.*\)\s*\{)\s*$/, '$1 if (bot.interrupt_code) {__mcLog__(bot, "Code interrupted.");return;}');
@@ -1069,7 +1070,7 @@ export class Coder {
         // fix96: the watchdog writes this into watchdog_kill.json if the main thread blocks while it runs. Kills at 15:43 and
         //        17:32 GMT on 9 Nov named only the skill (smeltWithFuel, expandExplorationRangeForCactus); the generated code
         //        that blocked was never saved, so the cause could not be read.
-        if (mainThreadWatchdogStarted()) publishMainThreadCode({ label: getStallPhaseStack().join(' <- '), source: src });
+        const codeGen = mainThreadWatchdogStarted() ? publishMainThreadCode({ label: getStallPhaseStack().join(' <- '), source: src }) : null;
 
         let filename = this.file_counter + '.js';
         // if (this.file_counter > 0) {
@@ -1118,16 +1119,31 @@ export class Coder {
         let mainFn;
         try {
             mainFn = compartment.evaluate(src);
+        } catch (e) {
+            if (codeGen !== null) finishMainThreadCode(codeGen);
+            throw e;
         } finally {
             popStallPhase();
         }
         
         if (write_result) {
             console.error('Error writing code execution file: ' + write_result);
+            if (codeGen !== null) finishMainThreadCode(codeGen);
             return null;
         }
+        // fix100: finish this generation when main settles, for every caller (replay, regression, practice, writeCode).
+        // A later publish has a newer generation, so this finish cannot clear it.
+        if (typeof mainFn !== 'function') {
+            if (codeGen !== null) finishMainThreadCode(codeGen);
+            return { func:{main: mainFn}, src_lint_copy: src_lint_copy, preludeLines };
+        }
+        const gen = codeGen;
+        const main = async (bot) => {
+            try { return await mainFn(bot); }
+            finally { if (gen !== null) finishMainThreadCode(gen); }
+        };
         // fix45: return preludeLines for shadow warning exclusion
-        return { func:{main: mainFn}, src_lint_copy: src_lint_copy, preludeLines };
+        return { func:{main}, src_lint_copy: src_lint_copy, preludeLines };
     }
 
     _sanitizeCode(code) {

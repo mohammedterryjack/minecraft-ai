@@ -459,6 +459,40 @@ describe('fix93 hunger serve', () => {
         assert.strictEqual(v._route, 'eatCookedMutton');
         assert.strictEqual(v._chained, undefined);
     });
+    it('need:hunger decomposed to Craft 1 bread keeps that need and serves it', async () => {
+        const v = mk({ consume: { n: 14, food: 46.2, hp: 0 } });
+        const hunger = { task: 'need:hunger', retry: true };
+        const mine = { task: 'Mine 1 iron_ore' };
+        v.progress.subgoals = [hunger, mine];
+        v.progress.blockers = [];
+        v.progress.recipeEdges = {};
+        v.progress.decomposed = {};
+        v._producers = () => [];
+        v._chainNeeds = Voyager.prototype._chainNeeds;
+        v._resolveChainedNeed = Voyager.prototype._resolveChainedNeed;
+        v._subgoalForNeed = Voyager.prototype._subgoalForNeed;
+        v._subgoalToObtainItem = Voyager.prototype._subgoalToObtainItem;
+        v._prereqChain = Voyager.prototype._prereqChain;
+        v._resolveGoal = Voyager.prototype._resolveGoal;
+        v._needKey = Voyager.prototype._needKey;
+        v._obtainPlanner = () => ({
+            cheapest: () => ({ item: 'bread', ties: [] }),
+            prerequisites: () => ({ task: 'Craft 1 bread', how: 'craft', plan: ['Craft 1 bread'], cycles: [], steps: [], ties: [] }),
+        });
+        assert.strictEqual(await v._serveUrgent(), true);
+        assert.ok(v.progress.subgoals.includes(hunger));
+        assert.ok(v.progress.subgoals.includes(mine));
+        assert.ok(v.progress.subgoals.some(s => s.task === 'Craft 1 bread' && s.parent === 'need:hunger'));
+        assert.ok(!v.progress.subgoals.some(s => s !== hunger && s.task === 'need:hunger' && s.retry === true));
+    });
+    it('a backchain that drops a queued object is still reported loudly', async () => {
+        const v = mk({ consume: { n: 14, food: 46.2, hp: 0 } });
+        v._chainNeeds = () => { v.progress.subgoals = [{ task: 'Craft 1 bread' }]; return true; };
+        await assert.rejects(v._serveUrgent(), /LOUD: food backchain dropped unrelated queued work "Mine 1 iron_ore"/);
+        const v2 = mk({ consume: { n: 14, food: 46.2, hp: 0 } });
+        v2._chainNeeds = () => { v2.progress.subgoals.splice(0, 1); return true; };
+        await assert.rejects(v2._serveUrgent(), /LOUD: food backchain dropped unrelated queued work "Mine 1 iron_ore"/);
+    });
     it('an unreachable plan fails loudly and does not drop the queue', async () => {
         const v = mk({ consume: { n: 2, food: 4, hp: 0 } });
         v._obtainPlanner = () => ({ cheapest: () => { throw new Error('[fix81] LOUD: none of bread can be obtained from the game data'); } });

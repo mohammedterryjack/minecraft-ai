@@ -23,10 +23,12 @@ describe('fix79: watchdog worker writes its evidence once, complete, then parks'
         const dir = mkdtempSync(join(tmpdir(), 'fix79-wd-'));
         const ev = join(dir, 'watchdog_kill.json');
         const victim = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1 << 30)'], { stdio: 'ignore' });
-        const ctl = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 2));
+        const ctl = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT * 3));
+        const kaSab = new SharedArrayBuffer(BigInt64Array.BYTES_PER_ELEMENT);
+        const ackSab = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
         const { port1, port2 } = new MessageChannel();
         const callLenSab = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT), callSab = new SharedArrayBuffer(CALL_SLOT_BYTES);   // fix96
-        const worker = new Worker(WORKER, { workerData: { sab: ctl.buffer, callLenSab, callSab, port: port2, pid: victim.pid, evidencePath: ev }, transferList: [port2], stderr: true });
+        const worker = new Worker(WORKER, { workerData: { sab: ctl.buffer, kaSab, ackSab, callLenSab, callSab, port: port2, pid: victim.pid, evidencePath: ev }, transferList: [port2], stderr: true });
         const errors = []; worker.on('error', e => errors.push(e));
         port1.postMessage({ phases: ['test'], skill: 'spin', stack: 'a <- b' });
         Atomics.store(ctl, 1, LIMIT_MS); Atomics.notify(ctl, 1);   // armed; no beats ever follow

@@ -1792,8 +1792,9 @@ Use only c; no other globals.`;
         throw new Error(`[fix91] _pursueProposedTask returned ${JSON.stringify(acted)} for "${task}"; expected true or false`);
     }
     // fix93: built-in raiser. An edible already held is eaten and the deficit closes on measured food.
-    // Otherwise the cheapest game-data plan is queued ahead of the raiser. The open-goal retry of
-    // need:hunger is not left on the queue. Unrelated queued work stays.
+    // Otherwise the cheapest game-data plan is queued ahead of the raiser. The retry anchor this call
+    // inserted is not left on the queue. Entries already queued stay, by object identity. Unrelated
+    // queued work that disappears is reported.
     async _consumeItem(item) {
         return skills.consume(this.agent.bot, item);
     }
@@ -1824,15 +1825,26 @@ Use only c; no other globals.`;
         }
         const droppers = plan.entityDroppers.length ? plan.entityDroppers.join(', ') : 'none in game data';
         console.log(`[urgent-need] no edible held; plan ${plan.task} for ${plan.item} (${plan.how}); entity droppers: ${droppers}`);
-        const queued = Array.isArray(this.progress.subgoals) ? this.progress.subgoals.map(s => s.task) : [];
+        // fix100: the retry anchor _chainNeeds just inserted is the open-goal retry of this call. Remove that object.
+        // A queued entry that was already there — including the hunger need being served — is a different object and stays.
+        // Matching on the task string treated that need as unrelated work and threw, so the serve never stuck and the next
+        // step planned the whole food tree again (the 09:07–09:31Z timeouts).
+        const prior = Array.isArray(this.progress.subgoals) ? [...this.progress.subgoals] : [];
+        const priorSet = new Set(prior);
         const chained = this._chainNeeds('need:hunger', plan.needs, before);
         if (chained !== true) throw new Error('[fix93] LOUD: food backchain did not queue a plan');
         if (!Array.isArray(this.progress.subgoals)) throw new Error('[fix93] food backchain left no subgoal queue');
-        this.progress.subgoals = this.progress.subgoals.filter(s => !(s.task === 'need:hunger' && s.retry === true));
-        for (const t of queued) {
-            if (!this.progress.subgoals.some(s => s.task === t)) throw new Error(`[fix93] LOUD: food backchain dropped unrelated queued work ${JSON.stringify(t)}`);
+        for (const entry of prior) {
+            if (!this.progress.subgoals.includes(entry)) throw new Error(`[fix93] LOUD: food backchain dropped unrelated queued work ${JSON.stringify(entry.task)}`);
         }
-        console.log(`[urgent-need] queued ${plan.task} ahead of the food raiser; unrelated queue kept (${queued.length})`);
+        const anchors = [];
+        for (const s of this.progress.subgoals) {
+            if (!priorSet.has(s) && s.retry === true && s.prereq === true) anchors.push(s);
+        }
+        if (anchors.length !== 1) throw new Error(`[fix93] LOUD: food backchain inserted ${anchors.length} prerequisite retries; expected the one open-goal retry of this serve`);
+        const anchor = anchors[0];
+        this.progress.subgoals = this.progress.subgoals.filter(s => s !== anchor);
+        console.log(`[urgent-need] queued ${plan.task} ahead of the food raiser; unrelated queue kept (${prior.length})`);
         return true;
     }
 
@@ -2225,11 +2237,17 @@ Use only c; no other globals.`;
         const ev = JSON.parse(readFileSync(evidencePath, 'utf8'));
         if (ev.reported === true) return;
         const code = Object.hasOwn(ev, 'code') && ev.code !== null ? ev.code : null;
-        console.error(`!!! [watchdog] previous process ${ev.pid} was SIGKILLed at ${ev.at} after ${ev.silentMs}ms without a main-loop turn; `
-            + `phase ${ev.phases.join(' <- ')}; skill ${ev.skill}; stack ${ev.stack}; bot API call ${Object.hasOwn(ev, 'call') ? ev.call : '(not recorded by this watchdog version)'}`);
-        console.error(code === null
-            ? '!!! [watchdog] no staged code was recorded for that kill'
-            : `!!! [watchdog] staged code running at the kill (${code.label}, staged ${code.at}):\n${code.source}`);
+        let inspector = '';
+        if (!Object.hasOwn(ev, 'callFrames')) inspector = '; inspector stack not recorded by this watchdog version';
+        else if (ev.callFrames === 'stack not captured') inspector = '; stack not captured';
+        else if (!Array.isArray(ev.callFrames)) throw new Error(`[watchdog] callFrames is not an array or "stack not captured": ${JSON.stringify(ev.callFrames)}`);
+        else inspector = `; inspector stack ${ev.callFrames.map(f => `${f.functionName}@${f.lineNumber}`).join(' <- ')}`;
+        const clock = Object.hasOwn(ev, 'killClock') ? ` on the ${ev.killClock} clock` : '';
+        console.error(`!!! [watchdog] previous process ${ev.pid} was SIGKILLed at ${ev.at} after ${ev.silentMs}ms without a main-loop turn${clock}; `
+            + `phase ${ev.phases.join(' <- ')}; skill ${ev.skill}; stack ${ev.stack}; bot API call ${Object.hasOwn(ev, 'call') ? ev.call : '(not recorded by this watchdog version)'}${inspector}`);
+        if (code === null) console.error('!!! [watchdog] no staged code was recorded for that kill');
+        else if (Object.hasOwn(code, 'endedAt')) console.error(`!!! [watchdog] last staged code finished at ${code.endedAt} (${code.label}); it was not running at the kill`);
+        else console.error(`!!! [watchdog] staged code running at the kill (${code.label}, staged ${code.at}):\n${code.source}`);
         writeAtomic(evidencePath, JSON.stringify({ ...ev, reported: true }));
     }
     _settleDeadTrials(evidencePath) {
@@ -2820,9 +2838,16 @@ Use only c; no other globals.`;
         const ct = this._contract(r);
         if (ct) console.log(`[contract] ${r.name}: pre=${ct.pre} post=${ct.item ? '+' + (ct.count || 1) + ' ' + ct.item : ct.mob ? 'killed ' + ct.mob : 'smelted ' + ct.input}`);
         if (!pc.ok) {
-            if (pc.reroute && r.name !== pc.reroute && this.skills.some(s => s.name === pc.reroute && !s.demoted)) {
+            // fix100: a failed craft used to reroute to obtainItem with no learned evidence it produces the goal
+            // (bread's edge had failed 15/15). That shipped the bundle on every later step. Reroute only when the
+            // target is learned to produce the goal item; otherwise report the unmet need, same as a reach precheck.
+            const rerouteTo = pc.reroute && r.name !== pc.reroute ? this.skills.find(s => s.name === pc.reroute && !s.demoted) : null;
+            if (rerouteTo && this._routeFit(rerouteTo, [pc.item]).fits) {
                 console.log(`[skillv] precheck ${r.name}: not applicable (${pc.why}); rerouting to ${pc.reroute} to fetch prerequisites`);
                 r = { name: pc.reroute, call: `await ${pc.reroute}(bot, ${JSON.stringify(pc.item)}, ${pc.count});` };
+            } else if (rerouteTo) {
+                console.error(`!!! [fix87] LOUD: ${r.name}: ${pc.why}; ${pc.reroute} has no learned evidence it produces ${pc.item}; reporting the unmet need instead of rerouting`);
+                return { ok: false, name: r.name, output: '', reason: pc.why, needs: [this._checkNeed({ item: pc.item, count: pc.count, reason: 'ingredients' }, pc.why)] };
             } else if (pc.need) {
                 // fix87: "no <block> within search range" is a reach need. Returning null here used to skip the chain
                 // and write new code, so a log that is not nearby never became "reach <log block>".
@@ -3220,6 +3245,13 @@ Use only c; no other globals.`;
         if (!Array.isArray(state.nearby_blocks)) throw new Error('[fix81] _obtainPlanner: state.nearby_blocks (array) required');
         if (typeof bot.recipesAll !== 'function') throw new Error('[fix81] _obtainPlanner: bot.recipesAll required');
         const near = new Set(state.nearby_blocks), memo = new Map();
+        // fix100: learned smelt edges are read once. plan() calls smeltInputs on every node; scanning goalStats
+        // there made a hunger serve walk the whole history 20k times (12.5s at 1080 keys, 76s at 5000, Node 20).
+        // The edges do not change during one synchronous plan, same as sourceMemo's game data.
+        const smelt = this._learnedSmeltIndex();
+        // fix100: _edgeSuccess -> _resolveGoal -> countGoal re-reads minecraft-data and re-runs the goal regex on every
+        // node. Recipe edges and the registry do not change during one synchronous plan.
+        const edgeMemo = new Map();
         return obtainPlanner({
             registry: bot.registry,
             recipesOf: id => bot.recipesAll(id, null, true),
@@ -3228,8 +3260,17 @@ Use only c; no other globals.`;
                 return memo.get(item);
             },
             proven: item => Object.hasOwn(this.progress.recipeEdges, item) && this.progress.recipeEdges[item].status === 'proven',
-            edgeSuccess: (item, verb) => this._edgeSuccess(item, verb),
-            smeltInputs: item => this._learnedSmeltInputs(item),
+            edgeSuccess: (item, verb) => {
+                let byVerb = edgeMemo.get(item);
+                if (byVerb === undefined) { byVerb = new Map(); edgeMemo.set(item, byVerb); }
+                if (!byVerb.has(verb)) byVerb.set(verb, this._edgeSuccess(item, verb));
+                return byVerb.get(verb);
+            },
+            smeltInputs: item => {
+                const inputs = smelt.get(item);
+                if (inputs === undefined) return [];
+                return [...inputs];
+            },
         });
     }
     // fix96: observed success of an item's producer edge (progress.recipeEdges runs/fails), the fix90 posterior. 1 when there is
@@ -3246,15 +3287,24 @@ Use only c; no other globals.`;
         return this._posteriorMean(e.runs - e.fails, e.fails);
     }
     // fix96: furnace recipes are not in the game data. A "Smelt N <in> into N <out>" goal that succeeded is a learned edge in -> out.
-    _learnedSmeltInputs(item) {
+    // fix100: one pass, grouped by output. Set insertion order matches the old per-item scan (Object.entries order, first input kept).
+    _learnedSmeltIndex() {
         if (!this.progress.goalStats || typeof this.progress.goalStats !== 'object') throw new Error('[fix96] progress.goalStats required to read learned smelt edges');
-        const out = new Set();
+        const byItem = new Map();
         for (const [key, st] of Object.entries(this.progress.goalStats)) {
             if (!(st.success > 0)) continue;
             const sm = smeltGoal(key.split('::')[0]);
-            if (sm !== null && sm.item === item && sm.input !== item) out.add(sm.input);
+            if (sm === null || sm.input === sm.item) continue;
+            let inputs = byItem.get(sm.item);
+            if (inputs === undefined) { inputs = new Set(); byItem.set(sm.item, inputs); }
+            inputs.add(sm.input);
         }
-        return [...out];
+        return byItem;
+    }
+    _learnedSmeltInputs(item) {
+        const inputs = this._learnedSmeltIndex().get(item);
+        if (inputs === undefined) return [];
+        return [...inputs];
     }
     // fix81: the goal key a subgoal chain is seeking: an item goal seeks the item, an ensure goal the block PLACED nearby
     _goalKey(goal) {
@@ -6414,6 +6464,9 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
     }
 
     async step() {
+        // fix100: one event-loop turn before the step body. A post-run tail and the next serve otherwise
+        // stay in one microtask chain, so a heartbeat interval never runs between them.
+        await new Promise((resolve) => { setImmediate(resolve); });
         const now = Date.now(); console.log(`[timing] ${new Date().toISOString().slice(11,19)}Z step start (gap since last step end ${this._stepEnd ? now - this._stepEnd : 0}ms)`);   // fix27
         try { return await this._step(); } finally { this._flushSkills(); this._stepEnd = Date.now(); console.log(`[timing] ${new Date().toISOString().slice(11,19)}Z step end (took ${this._stepEnd - now}ms)`); }
     }
