@@ -143,8 +143,26 @@ export function obtainPlanner({ registry, recipesOf, known, proven, edgeSuccess,
         if (Array.isArray(p.from)) out.from = [...p.from];
         return out;
     };
-    const furnaceSlot = { current: null };
-    const fuelSlot = { current: null };
+    const fuelMemo = new Map();
+    // A craft is an AND of its ingredients; a smelt is an AND of (input, furnace, fuel); the recipes, furnace
+    // inputs, and collect/obtain options for one item are an OR. cheapest() asks for that graph once per food,
+    // and each food walks it again. Memoising the solved node is how AND/OR graph search avoids expanding the
+    // same node again (Nilsson, Principles of Artificial Intelligence, 1980; Martelli and Montanari, "Additive
+    // AND/OR Graphs", IJCAI 1973). GOAP keys the search the same way, on the world state (Orkin, "Applying
+    // Goal-Oriented Action Planning to Games", AI Game Programming Wisdom 2, 2003).
+    // The key is that world state: the item, the count still needed, the inventory, whether held stock of the
+    // item counts, and whether infeasible options are dropped. The branch is not in the key. path.includes
+    // cuts a cycle before the lookup, so iron_ingot is not solved as a member of its own branch
+    // (iron_ingot -> iron_block -> iron_ingot). Solving the same state again on the next branch was the
+    // fan-out: a smelt plans every furnace input, charcoal's inputs are every log, and each log was expanded
+    // again per branch (2.8M expansions, 6–8 s). A state already on the stack — fuel asked for while that
+    // fuel's own plan is running — is a cycle as well; the lookup returns null and the outer solve is stored.
+    const planMemo = new Map();
+    const PLANNING = Object.freeze({ planning: true });
+    let planCalls = 0;
+    function planStateKey(item, need, inv, feasible, gain) {
+        return item + '\0' + need + '\0' + (gain ? '1' : '0') + '\0' + (feasible ? '1' : '0') + '\0' + invKey(inv);
+    }
     // the harvest tools a source of `item` needs, or null when some source drops it by hand or with a tool already held
     const toolsNeeded = (item, inv) => {
         const tools = new Set();
@@ -176,46 +194,61 @@ export function obtainPlanner({ registry, recipesOf, known, proven, edgeSuccess,
         return ranked[0].o;
     };
 
-    function sharedSubplan(slot, key, compute) {
-        if (slot.current && slot.current.key === key && slot.current.plan !== undefined) return clonePlan(slot.current.plan);
-        if (slot.current && slot.current.key === key) return null;
-        slot.current = { key };
-        const planResult = compute();
-        slot.current = { key, plan: clonePlan(planResult) };
-        return planResult;
-    }
     function planFurnace(inv, ctx) {
         if (!Object.hasOwn(registry.itemsByName, 'furnace')) throw new Error('[fix97] registry has no furnace item');
-        const key = (ctx.feasible === true ? '1' : '0') + '\0' + invKey(inv);
-        return sharedSubplan(furnaceSlot, key, () => plan('furnace', 1, { ...inv }, [], ctx, false));
+        return plan('furnace', 1, { ...inv }, [], ctx, false);
     }
     function planFuel(inv, ctx, path) {
         const key = (ctx.feasible === true ? '1' : '0') + '\0' + invKey(inv);
-        const fuel = sharedSubplan(fuelSlot, key, () => {
-            if (!fuelNames.length) throw new Error('[fix97] LOUD: no fuel item exists in this registry, so a smelt has no fuel');
-            // A held fuel is an inventory plan (cost 0), which is cheaper than any obtain. Same order as cheapest.
-            const held = fuelNames.filter(name => has(inv, name) > 0);
-            const candidates = held.length ? held : fuelNames;
-            const opts = [];
-            for (const name of candidates) {
-                const sub = plan(name, 1, { ...inv }, [], ctx, false);
-                if (!sub) continue;
-                if (ctx.feasible === true && sub.feasible !== true) continue;
-                sub.fuelItem = name;
-                opts.push({ cost: sub.cost, item: name, steps: sub.steps, plan: sub });
-            }
-            const best = pick(opts, ctx, 'fuel');
-            return best ? best.plan : null;
-        });
-        if (!fuel) return null;
-        if (typeof fuel.fuelItem !== 'string' || fuel.fuelItem.length === 0) throw new Error('[fix97] LOUD: fuel plan has no fuel item');
-        if (path.includes(fuel.fuelItem)) return null;
-        return fuel;
+        const hit = fuelMemo.get(key);
+        if (hit === PLANNING) return null;
+        if (hit !== undefined) {
+            if (!hit) return null;
+            if (path.includes(hit.fuelItem)) return null;
+            return clonePlan(hit);
+        }
+        if (!fuelNames.length) throw new Error('[fix97] LOUD: no fuel item exists in this registry, so a smelt has no fuel');
+        fuelMemo.set(key, PLANNING);
+        // A held fuel is an inventory plan (cost 0), which is cheaper than any obtain. Same order as cheapest.
+        const held = fuelNames.filter(name => has(inv, name) > 0);
+        const candidates = held.length ? held : fuelNames;
+        const opts = [];
+        for (const name of candidates) {
+            const sub = plan(name, 1, { ...inv }, [], ctx, false);
+            if (!sub) continue;
+            if (ctx.feasible === true && sub.feasible !== true) continue;
+            sub.fuelItem = name;
+            opts.push({ cost: sub.cost, item: name, steps: sub.steps, plan: sub });
+        }
+        const best = pick(opts, ctx, 'fuel');
+        const chosen = best ? best.plan : null;
+        fuelMemo.set(key, clonePlan(chosen));
+        if (!chosen) return null;
+        if (typeof chosen.fuelItem !== 'string' || chosen.fuelItem.length === 0) throw new Error('[fix97] LOUD: fuel plan has no fuel item');
+        if (path.includes(chosen.fuelItem)) return null;
+        return chosen;
     }
     function plan(item, need, inv, path, ctx, gain) {
         // an ingredient that is already being planned on this branch is a cycle, even when the inventory holds it
         // (9 iron_ingot -> iron_block -> 9 iron_ingot makes nothing)
         if (path.includes(item)) { ctx.cycles.add([...path, item].join(' -> ')); return null; }
+        const key = planStateKey(item, need, inv, ctx.feasible === true, gain);
+        const hit = planMemo.get(key);
+        if (hit === PLANNING) return null;
+        if (hit !== undefined) return clonePlan(hit);
+        planCalls += 1;
+        planMemo.set(key, PLANNING);
+        let planned;
+        try {
+            planned = expandPlan(item, need, inv, path, ctx, gain);
+        } catch (err) {
+            planMemo.delete(key);
+            throw err;
+        }
+        planMemo.set(key, clonePlan(planned));
+        return planned;
+    }
+    function expandPlan(item, need, inv, path, ctx, gain) {
         const have = gain ? 0 : Math.min(has(inv, item), need);
         if (have) inv[item] -= have;
         const rem = need - have;
@@ -338,6 +371,8 @@ export function obtainPlanner({ registry, recipesOf, known, proven, edgeSuccess,
     return {
         sources,
         toolsNeeded,
+        // expansions of plan(), not cache hits. cheapest() of every food is one AND/OR search.
+        planCalls() { return planCalls; },
         // gain `count` more `item` starting from `inv`: how (craft / collect / obtain), the task for it, and its DIRECT
         // prerequisites (each one a subgoal that is planned again, the same way, when it runs). Throws when the game data
         // gives no acyclic way at all.
