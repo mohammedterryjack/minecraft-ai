@@ -144,8 +144,15 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         const disk = buildContractManifest(live);
         assert.strictEqual(disk.checkOakLogPresent, false);
         assert.strictEqual(disk.apply, false);
-        assert.ok(disk.records.some(r => r.id === 'checkOakLog.code.55' && /promptCounts/.test(r.evidence) && /55/.test(r.evidence)));
-        assert.ok(disk.records.some(r => r.id === 'checkOakLog.pre.55'));
+        assert.deepStrictEqual(disk.records.map(r => r.id), ['checkOakLog.code.55', 'checkOakLog.pre.55']);
+        const diskCode = disk.records.find(r => r.id === 'checkOakLog.code.55');
+        const diskPre = disk.records.find(r => r.id === 'checkOakLog.pre.55');
+        assert.match(diskCode.evidence, /copied/);
+        assert.match(diskCode.evidence, /promptCounts/);
+        assert.match(diskCode.evidence, /counts\.oak_log >= 55/);
+        assert.match(diskPre.evidence, /copied/);
+        assert.match(diskPre.evidence, /promptCounts/);
+        assert.match(diskPre.evidence, /c\.pre\.inv\.oak_log >= 55/);
         for (const id of ['smeltIronIntoIngot.code.1', 'mineBlocks.pre.2', 'craftItem.pre.2', 'craftArmorSet.post.4']) {
             assert.ok(!disk.records.some(r => r.id === id), id);
         }
@@ -468,9 +475,9 @@ describe('fix97 findBlocks refuses a non-numeric maxDistance or count', () => {
         const { CHUNK_WIDTH } = require('prismarine-chunk/src/pc/common/constants.js');
         assert.throws(() => nearbyBlockRadius({}), /viewDistance/);
         assert.throws(() => nearbyBlockRadius({ game: {}, settings: { viewDistance: 'far' } }), /client request/);
-        assert.throws(() => nearbyBlockRadius({ game: { serverViewDistance: 0, simulationDistance: 0 } }), /positive integers/);
+        assert.throws(() => nearbyBlockRadius({ game: { serverViewDistance: 0 } }), /viewDistance is 0/);
+        assert.throws(() => nearbyBlockRadius({ game: { simulationDistance: 4 } }), /viewDistance is undefined/);
         assert.strictEqual(nearbyBlockRadius({ game: { serverViewDistance: 8 } }), 8 * CHUNK_WIDTH);
-        assert.strictEqual(nearbyBlockRadius({ game: { simulationDistance: 4 } }), 4 * CHUNK_WIDTH);
         assert.strictEqual(nearbyBlockRadius({ game: { serverViewDistance: 10, simulationDistance: 5 } }), 10 * CHUNK_WIDTH);
         let seen = null;
         const viewBot = {
@@ -495,11 +502,13 @@ describe('fix97 findBlocks refuses a non-numeric maxDistance or count', () => {
         require('mineflayer/lib/plugins/game.js')(gameBot, { brand: 'test' });
         client.emit('login', { dimension: 'overworld', gameMode: 0, maxPlayers: 20, viewDistance: 6, simulationDistance: 4 });
         assert.strictEqual(gameBot.game.serverViewDistance, 6);
-        assert.strictEqual(gameBot.game.simulationDistance, 4);
-        client.emit('update_view_distance', { viewDistance: 9 });
+        assert.strictEqual(gameBot.game.simulationDistance, undefined);
+        assert.strictEqual(nearbyBlockRadius(gameBot), 6 * CHUNK_WIDTH);
         client.emit('simulation_distance', { distance: 7 });
+        assert.strictEqual(gameBot.game.simulationDistance, undefined);
+        assert.strictEqual(nearbyBlockRadius(gameBot), 6 * CHUNK_WIDTH);
+        client.emit('update_view_distance', { viewDistance: 9 });
         assert.strictEqual(gameBot.game.serverViewDistance, 9);
-        assert.strictEqual(gameBot.game.simulationDistance, 7);
         assert.strictEqual(nearbyBlockRadius(gameBot), 9 * CHUNK_WIDTH);
         assert.match(Voyager.prototype._pursueProposedTask.toString(), /maxDistance and count are finite numbers/);
         assert.match(Voyager.prototype._pursueProposedTask.toString(), /findBlock\(options\) returns one block and does not take count/);

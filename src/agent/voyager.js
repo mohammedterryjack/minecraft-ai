@@ -101,7 +101,8 @@ export function extractFeedback(output) {
     return collapseRepeats(String(output === undefined || output === null ? '' : output).split('\n')).join('\n');
 }
 // fix97: the code-retry prompt is this text. compose-retry #78 (fix96 1c2f9c0, Collect 1 stripped_birch_wood) sent
-// 181705 chars, of which the retry section was 170464 (94%), and Ollama counted 58984 tokens against num_ctx 8192.
+// the prompt in CODE_RETRY_78 (src/models/code_retry_observation.js): 181705 chars, retry section 170464 (94%),
+// Ollama prompt_eval_count 58984 against num_ctx 8192.
 // The section was attempt 1's execution output, the 789-call trace, the inventory-full fact and the behaviour log,
 // each repeating the same lines. collapseRepeats only merges consecutive identical lines, so 60 identical
 // collectLogs FAILs interleaved with other calls, and pathfinder lines that differ by coordinates, all stayed.
