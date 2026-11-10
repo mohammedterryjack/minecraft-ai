@@ -12,7 +12,7 @@ import pf from 'mineflayer-pathfinder';
 import { logPromptBreakdown } from './prompt_utils.js';
 import { withStallPhase, pushStallPhase, popStallPhase, getStallPhaseStack } from '../utils/event_loop_guard.js';
 import { mainThreadWatchdogStarted, publishMainThreadCode, finishMainThreadCode } from '../utils/main_thread_watchdog.js';
-import { wrapBotForApiTiming } from '../utils/bot_api_timing.js';
+import { wrapBotForApiTiming, FIND_BLOCKS_NUMERIC_OPTIONS } from '../utils/bot_api_timing.js';
 import { markPreconditionUnmet } from './precondition.js';
 
 // fix38: expose pathfinder goals to generated code (fail loud if missing)
@@ -87,25 +87,31 @@ export function missingCountArithmetic(code) {
 }
 // fix74: internal sandbox binding of markPreconditionUnmet (see _stageCode endowments); seeded primitives call it by this name
 export const PRECONDITION_UNMET_BINDING = '__mcPreconditionUnmet__';
+// The parameter list and the JSDoc @param types on the function itself. Defaults are not shown: the model copied them.
+export function parameterList(fn) {
+    const str = fn.toString();
+    const match = str.match(/function\s+\w+\s*\(([^)]*)\)/);
+    if (!match) return null;
+    const types = new Map();
+    for (const m of str.matchAll(/@param\s+\{([^}]+)\}\s+(\w+)/g)) types.set(m[2], m[1]);
+    return match[1].split(',').map(p => p.trim()).filter(Boolean).map(p => {
+        const name = p.split('=')[0].trim();
+        return { name, type: types.has(name) ? types.get(name) : null };
+    });
+}
+function numberType(type) {
+    return typeof type === 'string' && type.split('|').map(s => s.trim()).includes('number');
+}
+
 export function getBareAPI() {
     if (_bareAPICache) return _bareAPICache;
     const extractSig = (fn, modName) => {
-        const str = fn.toString();
-        const match = str.match(/function\s+\w+\s*\(([^)]*)\)/);
-        if (!match) return null;
-        // fix97: the raw signature taught `count=10000` and `block_types=null` with no types, and mineIronOres put a
-        // name list in the distance slot. The JSDoc @param types are the API. A typed parameter is shown as `name: type`,
-        // without the default that the model copied.
-        const types = new Map();
-        for (const m of str.matchAll(/@param\s+\{([^}]+)\}\s+(\w+)/g)) types.set(m[2], m[1]);
-        // Only the arguments the mineIronOres call put in the wrong slot. Typing every parameter
-        // would rewrite the whole catalogue, including getBlockAtOffset(bot, offset).
-        const typed = new Set(['block_types', 'predicate', 'distance', 'count']);
-        const params = match[1].split(',').map(p => p.trim()).filter(Boolean).map(p => {
-            const name = p.split('=')[0].trim();
-            return typed.has(name) && types.has(name) ? `${name}: ${types.get(name)}` : p;
-        }).join(', ');
-        return { name: fn.name, sig: `${fn.name}(${params})`, source: modName };
+        const params = parameterList(fn);
+        if (!params) return null;
+        const shown = params.map(p => p.type ? `${p.name}: ${p.type}` : p.name).join(', ');
+        const numericArgs = {};
+        params.forEach((p, i) => { if (numberType(p.type)) numericArgs[i] = p.name; });
+        return { name: fn.name, sig: `${fn.name}(${shown})`, source: modName, numericArgs };
     };
     // fix41: collect ALL function keys first, then try extractSig; fallback to name() if regex misses
     const skillKeys = Object.keys(skills).filter(k => typeof skills[k] === 'function' && k !== 'log');
@@ -420,13 +426,10 @@ export class Coder {
         catch (e) { return `Syntax error (cannot parse): ${e.message}`; }
         const bad = n => n && (n.type === 'ArrayExpression' || n.type === 'ObjectExpression');
         const kind = n => n.type === 'ArrayExpression' ? 'array' : 'object';
-        const positional = {
-            getNearestBlocks: { 2: 'distance', 3: 'count' },
-            getNearestBlocksWhere: { 2: 'distance', 3: 'count' },
-            getNearestBlock: { 2: 'distance' },
-            getNearbyBlockTypes: { 1: 'distance' },
-            getNearbyBlocks: { 1: 'distance' },
-        };
+        const positional = {};
+        for (const fn of getBareAPI().byName ? Object.values(getBareAPI().byName) : []) {
+            if (fn.numericArgs && Object.keys(fn.numericArgs).length) positional[fn.name] = fn.numericArgs;
+        }
         const errs = [];
         const walk = (node) => {
             if (!node || typeof node.type !== 'string') return;
@@ -439,7 +442,7 @@ export class Coder {
                     if (first && first.type === 'ObjectExpression') {
                         for (const p of first.properties) {
                             if (p.type !== 'Property' || p.computed || p.key.type !== 'Identifier') continue;
-                            if (p.key.name !== 'maxDistance' && p.key.name !== 'count') continue;
+                            if (!FIND_BLOCKS_NUMERIC_OPTIONS.includes(p.key.name)) continue;
                             if (!bad(p.value)) continue;
                             errs.push(`${name} option ${p.key.name} is an ${kind(p.value)} literal, not a finite number. matching may be an array of block ids; maxDistance and count are numbers`);
                         }

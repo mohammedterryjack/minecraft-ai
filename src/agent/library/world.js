@@ -492,7 +492,11 @@ function positionsWithin(distance) {
     return span * span * span;
 }
 
-export function getNearbyBlocks(bot, distance = 16) {
+// A chunk is 16 blocks on a side (https://minecraft.wiki/w/Chunk). The nearby-block listing is that radius.
+// Callers pass it. getNearbyBlocks and getNearbyBlockTypes have no default.
+export const NEARBY_BLOCK_RADIUS = 16;
+
+export function getNearbyBlocks(bot, distance) {
     /**
      * Blocks around the bot, every position inside the given radius.
      * @param {Bot} bot - The bot to get nearby blocks for.
@@ -505,7 +509,7 @@ export function getNearbyBlocks(bot, distance = 16) {
     return getNearestBlocks(bot, null, distance, positionsWithin(distance));
 }
 
-export function getNearbyBlockTypes(bot, distance = 16) {
+export function getNearbyBlockTypes(bot, distance) {
     /**
      * Get a list of all nearby block names.
      * @param {Bot} bot - The bot to get nearby blocks for.

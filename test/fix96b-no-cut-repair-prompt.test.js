@@ -172,6 +172,7 @@ describe('fix96b: a prompt that does not fit fails that call loudly; the bot kee
         const fatal = [];
         v.agent = { fatal: (where) => fatal.push(where) };
         v.progress = { failed: [], decomposed: {}, subgoals: [] };
+        v.skills = [];
         v._saveProgress = () => {};
         const full = () => { const e = new Error('!!! [fix96] qwen3: prompt does not fit: 8243 tokens, context 8192 tokens'); e.code = CONTEXT_FULL; return e; };
         await assert.rejects(() => v._onStepError(full()), /prompt does not fit/);

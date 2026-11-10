@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /**
  * fix97: dry-run manifest of learned contracts whose pre/post use a numeric literal that is not a code literal
- * (comments and strings do not count), not recorded evidence, and not a minecraft-data fact of a name the skill
- * or the contract actually writes (stack size, recipe count, armour slot group, mature block state, material
- * multiplier). Nothing is reset.
+ * (comments and strings do not count), not recorded evidence, and not a minecraft-data fact of the field being
+ * compared. A code comparison that equals an observed count (promptCounts, or consumeEvidence max) is a record too.
+ * Nothing is reset. Each record's verdict is one reason line.
  *
  *   node scripts/fix97_contract_manifest.js --bots-dir=bots/icefox2000
  */
@@ -19,49 +19,57 @@ const registry = require('minecraft-data')(settings.minecraft_version);
 
 const CAUSE = {
     fix: 'fix97',
-    name: 'a contract numeric literal that is not a code literal, recorded evidence, or a minecraft-data fact of a named item, block, recipe, or window slot',
+    name: 'a contract numeric literal that is not a code literal, recorded evidence, or a minecraft-data fact of the field being compared',
 };
-
-function verdictFor(token, skill, field, src) {
-    const codeLiterals = Voyager.contractNumericLiterals(skill.code);
-    const evidence = Voyager.recordedNumbers({
-        consumes: skill.consumes, effects: skill.effects, consumeEvidence: skill.consumeEvidence,
-        effectEvidence: skill.effectEvidence, observedRuns: skill.observedRuns, stats: skill.stats,
-    });
-    const names = [...new Set([...Voyager.referencedNames(skill.code), ...Voyager.referencedNames(src)])].sort();
-    const game = [...Voyager.gameDataNumbers(registry, [skill.code, src])].sort((a, b) => a - b);
-    return `${skill.name}.${field} literal ${token} is not a code literal [${codeLiterals.join(', ')}], not recorded evidence [${evidence.join(', ')}], and not a minecraft-data fact [${game.join(', ')}] of the names this skill and contract write [${names.join(', ')}]. Comments and strings are not code literals.`;
-}
+const COUNT_CAUSE = {
+    fix: 'fix97',
+    name: 'a code comparison whose literal equals an observed count of that item',
+};
 
 export function buildContractManifest(skills) {
     if (!Array.isArray(skills)) throw new Error('[fix97] skill index must be an array');
     const records = [];
     for (const skill of skills) {
         if (!skill || typeof skill.name !== 'string') throw new Error('[fix97] skill entry has no name');
+        if (typeof skill.code === 'string') {
+            for (const hit of Voyager.copiedCountComparisons(skill.code, Voyager.observedCountEntries(skill))) {
+                records.push({
+                    id: `${skill.name}.code.${hit.n}`,
+                    file: 'skills',
+                    path: [skill.name, 'code'],
+                    cause: COUNT_CAUSE,
+                    evidence: `${skill.name} compares ${hit.item} ${hit.op} ${hit.n}, and ${hit.source} of ${hit.item} is ${hit.n}`,
+                    verdict: `${skill.name}.code.${hit.n}: the code compares ${hit.item} ${hit.op} ${hit.n}, and ${hit.n} is the ${hit.source} count of ${hit.item}. The count was observed when the skill was generated. It is not a threshold.`,
+                    apply: false,
+                });
+            }
+        }
         if (!skill.contract) continue;
         if (typeof skill.code !== 'string') throw new Error(`[fix97] ${skill.name} has a contract and no code`);
         for (const field of ['pre', 'post']) {
             const src = skill.contract[field];
             if (typeof src !== 'string') continue;
-            for (const token of Voyager.unsupportedContractNumbers(src, skill, registry)) {
+            for (const hit of Voyager.unsupportedContractDetails(src, skill, registry)) {
                 records.push({
-                    id: `${skill.name}.${field}.${token}`,
+                    id: `${skill.name}.${field}.${hit.n}`,
                     file: 'skills',
                     path: [skill.name, 'contract', field],
                     cause: CAUSE,
-                    evidence: `${field} literal ${token} is not a code literal, recorded evidence, or a minecraft-data fact`,
-                    verdict: verdictFor(token, skill, field, src),
+                    evidence: `${field} literal ${hit.n} on ${Voyager.pathText(hit.path)}`,
+                    verdict: `${skill.name}.${field}.${hit.n}: ${hit.verdict}`,
                     apply: false,
                 });
             }
         }
     }
+    const reasonLines = records.map(r => r.verdict);
     return {
         fix: 'fix97',
         dryRun: true,
         apply: false,
         checkOakLogPresent: skills.some(s => s.name === 'checkOakLog'),
         scanned: skills.length,
+        reasonLines,
         records,
     };
 }
