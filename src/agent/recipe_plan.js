@@ -103,11 +103,19 @@ export function obtainPlanner({ registry, recipesOf, known, proven, edgeSuccess,
     };
     // expected units: count / (yield per source x observed success of the edge)
     const expected = (rem, perSource, item, verb) => rem / (perSource * success(item, verb));
-    // a block that is not an item (water, carrots ...) has no recipe in the game data; it can only be collected
-    const recipes = item => (Object.hasOwn(registry.itemsByName, item) ? recipesOf(itemId(item)) : []).map(r => ({
-        yield: r.result.count,
-        ingredients: r.delta.filter(d => d.count < 0).map(d => ({ item: itemName(d.id), count: -d.count })),
-    }));
+    // a block that is not an item (water, carrots ...) has no recipe in the game data; it can only be collected.
+    // fix100: recipes do not change while a planner lives (same rule as sourceMemo). plan() asked for them on every node.
+    const recipeMemo = new Map();
+    const recipes = item => {
+        if (!recipeMemo.has(item)) {
+            const found = Object.hasOwn(registry.itemsByName, item) ? recipesOf(itemId(item)) : [];
+            recipeMemo.set(item, found.map(r => ({
+                yield: r.result.count,
+                ingredients: r.delta.filter(d => d.count < 0).map(d => ({ item: itemName(d.id), count: -d.count })),
+            })));
+        }
+        return recipeMemo.get(item);
+    };
     const has = (inv, item) => (Object.hasOwn(inv, item) ? inv[item] : 0);
     // the harvest tools a source of `item` needs, or null when some source drops it by hand or with a tool already held
     const toolsNeeded = (item, inv) => {

@@ -14,12 +14,17 @@
  * is not added on top of it: adding it would leave the process alive after the server had
  * already kicked the client.
  *
+ * fix100: each keep_alive the client processes is stamped for the watchdog. The kill deadline
+ * is that stamp plus the kick bound (the server's own rule). The beat stays evidence of the
+ * loop turning; it does not move the keep-alive deadline. The gap between packets is still
+ * not a sample: Date.now() in that handler included stalls and the maximum only climbed.
+ *
  * Root cause of long stalls in production was unknown; this guard plus `withStallPhase` phase
  * stacks attribute stalls to labeled phases so the next step is diagnosis from real logs.
  */
 
 import { monitorEventLoopDelay } from 'node:perf_hooks';
-import { mainThreadWatchdogStarted, armMainThreadWatchdog, beatMainThreadWatchdog, publishMainThreadEvidence } from './main_thread_watchdog.js';
+import { mainThreadWatchdogStarted, armMainThreadWatchdog, beatMainThreadWatchdog, publishMainThreadEvidence, noteMainThreadKeepAlive, finishOpenMainThreadCode } from './main_thread_watchdog.js';
 
 // Vanilla ServerCommonPacketListenerImpl.keepConnectionAlive compares against 15000L.
 // That check both sends the next ClientboundKeepAlivePacket and, when one is already
@@ -32,10 +37,15 @@ let _phaseStack = [];
 /** fix64: what the PSN harness is running right now (mirrored from bot.__psnRunningSkill / __psnStackStr) */
 let _psnSkill = '(none)';
 let _psnStack = '(none)';
+/** fix100: the phase that last popped, so a later kill does not look like that phase is still running */
+let _lastPopped = null;
 
 /** fix64: hand the current attribution to the off-thread watchdog, which cannot read main-thread state once it is blocked */
 function _publishEvidence() {
-    if (mainThreadWatchdogStarted()) publishMainThreadEvidence({ phases: [..._phaseStack], skill: _psnSkill, stack: _psnStack });
+    if (!mainThreadWatchdogStarted()) return;
+    const ev = { phases: [..._phaseStack], skill: _psnSkill, stack: _psnStack };
+    if (_lastPopped) { ev.lastPopped = _lastPopped.phase; ev.at = _lastPopped.at; }
+    publishMainThreadEvidence(ev);
 }
 
 /**
@@ -110,7 +120,13 @@ export function pushStallPhase(phase) {
 }
 
 export function popStallPhase() {
-    _phaseStack.pop();
+    const popped = _phaseStack.pop();
+    if (popped !== undefined) {
+        _lastPopped = { phase: String(popped), at: new Date().toISOString() };
+        // The action phase wraps the staged run. When it pops, that code has finished. Clear the published
+        // bundle here so a later block is not recorded as a stale stage-exec that was still running.
+        if (String(popped).startsWith('action:') && mainThreadWatchdogStarted()) finishOpenMainThreadCode();
+    }
     _publishEvidence();
 }
 
@@ -163,13 +179,14 @@ function _scheduleStallPoll(bot) {
         const silenceMs = watchdogSilenceLimitMs();
         armMainThreadWatchdog(silenceMs);
         beatMainThreadWatchdog();
-        console.log(`[watchdog] ARMED: SIGKILL after ${silenceMs}ms without a main-loop heartbeat (vanilla keepConnectionAlive ${KEEP_ALIVE_INTERVAL_MS}ms × 2, beat period ${pollMs}ms)`);
+        console.log(`[watchdog] ARMED: SIGKILL after ${silenceMs}ms without a main-loop heartbeat (vanilla keepConnectionAlive ${KEEP_ALIVE_INTERVAL_MS}ms × 2, beat period ${pollMs}ms); a processed keep-alive kills at that packet + ${silenceMs}ms`);
     }
 }
 
 /**
- * Arm once per bot at the keep-alive kick bound. Inbound keep_alive times are not read:
- * Date.now() there included the bot's own stalls and the maximum only climbed.
+ * Arm once per bot at the keep-alive kick bound. The keep_alive handler stamps the moment the
+ * packet was processed (process.hrtime). It does not learn the interval from the gap: Date.now()
+ * there included the bot's own stalls and the maximum only climbed.
  * @param {import('mineflayer').Bot} bot
  */
 export function startEventLoopStallGuard(bot) {
@@ -190,6 +207,12 @@ export function startEventLoopStallGuard(bot) {
         set: (v) => { _psnStack = v ? String(v) : '(none)'; _publishEvidence(); },
     });
     bot.__eventLoopStallThresholdMs = KEEP_ALIVE_KICK_MS;
+    // The packet was processed on this turn. Stamp hrtime; the interval stays KEEP_ALIVE_INTERVAL_MS.
+    const onKeepAlive = () => {
+        if (mainThreadWatchdogStarted()) noteMainThreadKeepAlive();
+    };
+    bot.__watchdogKeepAlive = onKeepAlive;
+    bot._client.on('keep_alive', onKeepAlive);
     _scheduleStallPoll(bot);
 }
 
@@ -201,6 +224,13 @@ export function stopEventLoopStallGuard(bot) {
     if (bot && bot.__stallEventLoopHist) {
         bot.__stallEventLoopHist.disable();
         bot.__stallEventLoopHist = null;
+    }
+    if (bot && bot.__watchdogKeepAlive) {
+        if (!bot._client || typeof bot._client.removeListener !== 'function') {
+            throw new Error('[event_loop_guard] cannot remove the keep_alive stamp: bot._client.removeListener is not a function');
+        }
+        bot._client.removeListener('keep_alive', bot.__watchdogKeepAlive);
+        bot.__watchdogKeepAlive = null;
     }
     if (bot) {
         bot.__eventLoopStallGuardHooked = false;
