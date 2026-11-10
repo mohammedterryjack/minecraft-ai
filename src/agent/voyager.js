@@ -3863,8 +3863,11 @@ Use only c; no other globals.`;
         if (typeof s.is_day !== 'boolean') throw new Error('[fix98] compact state is_day required');
         if (typeof s.sleeping !== 'boolean') throw new Error('[fix98] compact state sleeping required');
         if (typeof s.sky_light !== 'number') throw new Error('[fix98] compact state sky_light required');
-        if (typeof s.time_since_rest !== 'number') throw new Error('[fix98] compact state minecraft:time_since_rest required');
-        return `pos:(${s.position}) biome:${s.biome} time:${s.time} is_day:${s.is_day} sleeping:${s.sleeping} sky_light:${s.sky_light} time_since_rest:${s.time_since_rest} hp:${s.health_value}/${s.health_max} food:${s.food_value}/${s.food_max} inv:${s.inventory_slots},${s.empty_inventory_slots}empty${held ? ` held:${held}` : ''} threats:${s.threats || 'none'} items:[${invSummary}]`;
+        let restText;
+        if (typeof s.rest_unavailable === 'string' && s.rest_unavailable.length > 0) restText = `unavailable (${s.rest_unavailable})`;
+        else if (typeof s.time_since_rest === 'number') restText = String(s.time_since_rest);
+        else restText = 'not delivered';
+        return `pos:(${s.position}) biome:${s.biome} time:${s.time} is_day:${s.is_day} sleeping:${s.sleeping} sky_light:${s.sky_light} time_since_rest:${restText} hp:${s.health_value}/${s.health_max} food:${s.food_value}/${s.food_max} inv:${s.inventory_slots},${s.empty_inventory_slots}empty${held ? ` held:${held}` : ''} threats:${s.threats || 'none'} items:[${invSummary}]`;
     }
     _stateText(s) {
         // fix34: present inventory facts prominently as exact counts (not just JSON blob)

@@ -1,6 +1,7 @@
 /**
  * fix98: rest need and threat interrupt. Hunger and threat share the Thompson slot.
- * A statistics packet without minecraft:time_since_rest throws. No local counter.
+ * minecraft:time_since_rest's id comes from the vanilla custom_stat report. A version
+ * mismatch, a missing entry, or a statistics packet without that id fails only rest.
  * A bed the game data accepts is obtained by the recipe chain, not a free-text sleep task.
  */
 import { describe, it, before } from 'node:test';
@@ -11,8 +12,9 @@ import { Vec3 } from 'vec3';
 import { VitalsModel } from '../src/agent/vitals_model.js';
 import { CONTEXT_FULL } from '../src/models/ollama.js';
 import {
-    RestThreat, emptyRestStore, readRestStatistic, restIdsFromData, learnRestId, clientCommandSpec,
-    installProtocolFacts, restFacts, bedItemNames, damageTypesFromData, REST_STATISTIC,
+    RestThreat, emptyRestStore, readRestStatistic, resolveRestStatIds, loadCustomStatReport,
+    clientCommandSpec, installProtocolFacts, restFacts, bedItemNames, damageTypesFromData,
+    markRestUnavailable, REST_STATISTIC,
 } from '../src/agent/rest_threat.js';
 import minecraftData from 'minecraft-data';
 import { _setVersionForTest as loadMcData } from '../src/utils/mcdata.js';
@@ -68,6 +70,42 @@ function mkV() {
         equipment: { hand: 'empty' },
     });
     return v;
+}
+
+function wireServe(v) {
+    v.served = [];
+    v.proposeTask = async () => ({ task: 'Eat cooked beef', reasoning: 'food is low' });
+    v._acceptPlannerTask = async (proposal) => ({ task: proposal.task, proposal });
+    v._pursueProposedTask = async () => { v.served.push(v.currentTask); return true; };
+    v._afterSuccess = () => {};
+    v._replay = async () => ({ ok: true });
+    v._goalBackoffMultiplier = () => 1;
+}
+
+async function assertHungerAndThreatStillServe(v) {
+    v.restThreat.installed = true;
+    v.agent.bot.food = 10;
+    v.agent.bot.health = 20;
+    v.restThreat.noteSourcedHurt('from-the-event', 1, v.agent.bot.restSince);
+    const both = v._urgentCandidates(v._hungerServeState());
+    assert.ok(both.find(c => c.id === 'hunger'), 'hunger still a candidate');
+    assert.ok(both.find(c => c.id === 'threat'), 'threat still a candidate');
+    assert.strictEqual(both.find(c => c.id === 'rest'), undefined);
+    wireServe(v);
+    assert.strictEqual(await v._serveUrgent(), true);
+    assert.strictEqual(v.served[0], 'need:hunger');
+    v.currentTask = null;
+    v.agent.bot.food = 20;
+    v.agent.bot.health = 20;
+    v.restThreat.s.pending = null;
+    v.restThreat.s.hurts = {};
+    v.restThreat.noteSourcedHurt('from-the-event', 1000, v.agent.bot.restSince);
+    const threatSide = v._urgentCandidates(v._hungerServeState());
+    assert.strictEqual(threatSide.find(c => c.id === 'hunger'), undefined);
+    assert.ok(threatSide.find(c => c.id === 'threat'));
+    assert.strictEqual(threatSide.find(c => c.id === 'rest'), undefined);
+    assert.strictEqual(await v._serveUrgent(), true);
+    assert.strictEqual(v.served[1], 'need:threat');
 }
 
 describe('fix98: hunger and threat share one slot', () => {
@@ -155,30 +193,23 @@ describe('fix98: a threat interrupt is not blamed', () => {
 });
 
 describe('fix98: statistics packet', () => {
-    it('a reply with no minecraft:time_since_rest throws and no counter is invented', () => {
-        const mc = minecraftData(VER);
-        assert.strictEqual(restIdsFromData(mc, null), null);
-        const ids = learnRestId({ entries: [
-            { categoryId: 2, statisticId: 9, value: 11 },
-            { categoryId: 1, statisticId: 3, value: 7 },
-        ] }, 11);
-        assert.deepStrictEqual(ids, { categoryId: 2, statisticId: 9 });
-        assert.throws(
-            () => readRestStatistic({ entries: [{ categoryId: 1, statisticId: 3, value: 7 }] }, ids),
-            new RegExp(REST_STATISTIC),
-        );
-        assert.throws(
-            () => learnRestId({ entries: [
-                { categoryId: 2, statisticId: 9, value: 11 },
-                { categoryId: 1, statisticId: 3, value: 11 },
-            ] }, 11),
-            /matched/,
-        );
+    it('resolves minecraft:time_since_rest from the vanilla custom_stat report', () => {
+        const report = loadCustomStatReport();
+        assert.strictEqual(report.minecraftVersion, VER);
+        assert.strictEqual(report.jarSha1, '8dd1a28015f51b1803213892b50b7b4fc76e594d');
+        assert.match(report.generatedBy, /net\.minecraft\.data\.Main/);
+        const ids = resolveRestStatIds(report, VER);
+        const stat = report.registries['minecraft:custom_stat'].entries[REST_STATISTIC].protocol_id;
+        const category = report.registries['minecraft:stat_type'].entries['minecraft:custom'].protocol_id;
+        assert.deepStrictEqual(ids, { categoryId: category, statisticId: stat });
         const model = new RestThreat(emptyRestStore());
         assert.strictEqual(Object.hasOwn(model, 'ticks'), false);
         assert.strictEqual(model.s.harmFloor, null);
-        const value = readRestStatistic({ entries: [{ categoryId: ids.categoryId, statisticId: ids.statisticId, value: 11 }] }, ids);
-        assert.strictEqual(value, 11);
+        assert.strictEqual(readRestStatistic({ entries: [{ categoryId: ids.categoryId, statisticId: ids.statisticId, value: 11 }] }, ids), 11);
+        assert.throws(
+            () => readRestStatistic({ entries: [{ categoryId: ids.categoryId, statisticId: ids.statisticId + 1, value: 11 }] }, ids),
+            new RegExp(REST_STATISTIC),
+        );
     });
 
     it('the request_stats action and the statistics packet name come from the protocol schema', () => {
@@ -190,24 +221,91 @@ describe('fix98: statistics packet', () => {
         assert.strictEqual(mappings[String(spec.action)], 'request_stats');
     });
 
-    it('a statistics listener stores the value, and a packet without the stat throws', () => {
+    it('a statistics listener stores the value from the report id', () => {
+        const ids = resolveRestStatIds(loadCustomStatReport(), VER);
         const packets = [];
+        const handlers = {};
         const bot = {
+            version: VER,
             entity: {},
             on() {},
             _client: {
                 write(name, body) { packets.push({ name, body }); },
-                on(name, fn) { bot._client.fn = fn; bot._client.event = name; },
+                on(name, fn) { handlers[name] = fn; },
             },
         };
-        bot.__fix98StatObserved = { name: REST_STATISTIC, value: 42 };
-        installProtocolFacts(bot, minecraftData(VER));
+        const model = new RestThreat(emptyRestStore());
+        installProtocolFacts(bot, minecraftData(VER), model);
         assert.strictEqual(packets.length, 1);
         assert.strictEqual(packets[0].name, 'client_command');
-        assert.throws(() => bot._client.fn({ entries: [] }), new RegExp(REST_STATISTIC));
-        bot._client.fn({ entries: [{ categoryId: 2, statisticId: 9, value: 42 }] });
+        handlers.statistics({ entries: [{ categoryId: ids.categoryId, statisticId: ids.statisticId, value: 42 }] });
         assert.strictEqual(bot.restSince, 42);
-        assert.deepStrictEqual(bot.__fix98StatIds, { categoryId: 2, statisticId: 9 });
+        assert.strictEqual(model.restUnavailable, null);
+    });
+
+    it('a statistics packet without the id fails only rest, and hunger and threat still serve', async () => {
+        const v = mkV();
+        v.agent.bot.version = VER;
+        const handlers = {};
+        v.agent.bot.on = () => {};
+        v.agent.bot._client = { write() {}, on(name, fn) { handlers[name] = fn; } };
+        installProtocolFacts(v.agent.bot, minecraftData(VER), v.restThreat);
+        const ids = resolveRestStatIds(loadCustomStatReport(), VER);
+        const logs = [];
+        const orig = console.error;
+        console.error = (...args) => { logs.push(args.join(' ')); };
+        try {
+            assert.doesNotThrow(() => handlers.statistics({
+                entries: [{ categoryId: ids.categoryId, statisticId: ids.statisticId + 1, value: 9 }],
+            }));
+        } finally {
+            console.error = orig;
+        }
+        assert.match(logs.join('\n'), /rest unavailable/);
+        assert.match(v.restThreat.restUnavailable, new RegExp(REST_STATISTIC));
+        assert.strictEqual(typeof v.agent.bot.restSince, 'undefined');
+        await assertHungerAndThreatStillServe(v);
+        assert.match(v.restThreat.restUnavailable, new RegExp(REST_STATISTIC));
+    });
+
+    it('a version mismatch fails only rest', async () => {
+        const report = loadCustomStatReport();
+        const wrong = { ...report, minecraftVersion: '26.3' };
+        assert.throws(() => resolveRestStatIds(wrong, VER), /does not match bot\.version/);
+        const v = mkV();
+        v.agent.bot.version = VER;
+        v.agent.bot.restSince = 40;
+        v.restThreat.installed = true;
+        let reason;
+        try {
+            resolveRestStatIds(wrong, v.agent.bot.version);
+        } catch (err) {
+            reason = err.message;
+            markRestUnavailable(v.restThreat, v.agent.bot, reason);
+        }
+        assert.match(reason, /26\.3/);
+        assert.strictEqual(v.restThreat.restCandidate(v.agent.bot, 1, 1), null);
+        await assertHungerAndThreatStillServe(v);
+    });
+
+    it('a missing custom_stat entry fails only rest', async () => {
+        const report = loadCustomStatReport();
+        const missing = structuredClone(report);
+        delete missing.registries['minecraft:custom_stat'].entries[REST_STATISTIC];
+        assert.throws(() => resolveRestStatIds(missing, VER), new RegExp(REST_STATISTIC));
+        const v = mkV();
+        v.agent.bot.version = VER;
+        v.agent.bot.restSince = 40;
+        v.restThreat.installed = true;
+        try {
+            resolveRestStatIds(missing, v.agent.bot.version);
+            assert.fail('missing entry should throw');
+        } catch (err) {
+            markRestUnavailable(v.restThreat, v.agent.bot, err.message);
+        }
+        assert.match(v.restThreat.restUnavailable, new RegExp(REST_STATISTIC));
+        assert.strictEqual(v.restThreat.restCandidate(v.agent.bot, 1, 1), null);
+        await assertHungerAndThreatStillServe(v);
     });
 
     it('starvation at food 0 with no entityHurt is non-entity damage and is recorded', () => {
