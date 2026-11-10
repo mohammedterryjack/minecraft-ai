@@ -459,6 +459,9 @@ export class Voyager {
         if (!Object.hasOwn(this.progress, 'blockers')) this.progress.blockers = [];
         for (const b of this.progress.blockers) assertProgressBlocker(b);
         if (!Object.hasOwn(this.progress, 'recipeEdges')) this.progress.recipeEdges = {};
+        // fix97: a task whose code or curriculum prompt does not fit the context. Persisted, so a restart does not rebuild it.
+        if (!Object.hasOwn(this.progress, 'contextBlocked')) this.progress.contextBlocked = {};
+        if (this.progress.contextBlocked === null || typeof this.progress.contextBlocked !== 'object' || Array.isArray(this.progress.contextBlocked)) throw new Error(`[fix97] progress.contextBlocked must be an object, got ${JSON.stringify(this.progress.contextBlocked)}`);
         // fix95: when each task last completed (ms). A decomposition is stale only when its parent completed AFTER it was
         //        decomposed. Older progress files have no map; it starts empty (no completion is known to postdate a decomposition).
         if (!Object.hasOwn(this.progress, 'completedAt')) this.progress.completedAt = {};
@@ -1155,6 +1158,7 @@ export class Voyager {
   c.game.item(name) / c.game.block(name) = true when name is an item / a block in the game data; c.game.drops(block) = names of the items that block drops; c.game.harvestTools(block) = the tools that block drops with, or null when the game data lists none
 NEVER enumerate item, block or kind names in a list (e.g. ['birch_log', 'spruce_log'].includes(c.args[1])): a hand-written list leaves out real values (oak_log) and every call with one of them is refused. Derive membership from c.game (game data) or from the observed state (c.pre / c.post).
 A postcondition must not require a held or returned item that a named block's harvestTools omit. harvestTools(block) is null when the block drops by hand: requiring a tool for it is wrong.
+A numeric literal is a count the code itself writes, or a game-data fact (an item's stack size, a recipe count, the armour slot group). It is never a count copied from a comment, a string, or the inventory at the time the skill was written. Comments and strings in the code are not numbers. Inventory counts change; read them from c.pre.inv.
 pre: what must hold before the call for it to be able to succeed (use "c => true" if nothing). A precondition reads c.pre and c.args only. It must not read c.post: that is the state after the call.
 post: what the call promises afterwards when it reports success (state the observable effect: arrived near target, item gained, still alive, not stranded underground, etc.). If the call returns false/null it already reported failure, so post may return true in that case. post must return a boolean; undefined is not a boolean.
 IMPORTANT for equip skills: postconditions should check c.post.eq (equipment state) rather than c.delta for idempotency - already-equipped items should satisfy the postcondition without requiring an inventory change.
@@ -1296,17 +1300,9 @@ Use only c; no other globals.`;
         //        heldItem is that string, not an item with .type. Posts that also read delta/inv are about the inventory, not this probe.
         const fields = this._extractPostFields(ct.post);
         if (skill && typeof skill.code === 'string') {
-            const codeNumbers = new Set(Voyager.contractNumericLiterals(skill.code));
-            const evidenceNumbers = new Set(Voyager.recordedNumbers({
-                consumes: skill.consumes, effects: skill.effects, consumeEvidence: skill.consumeEvidence,
-                effectEvidence: skill.effectEvidence, observedRuns: skill.observedRuns, stats: skill.stats,
-            }));
             for (const k of ['pre', 'post']) {
-                for (const n of Voyager.contractNumericLiterals(ct[k])) {
-                    if (n === 0 || n === 1) continue;
-                    if (codeNumbers.has(n) || evidenceNumbers.has(n)) continue;
-                    return `${k} uses ${n}, which is not in the skill's code or recorded evidence`;
-                }
+                const hit = Voyager.unsupportedContractNumbers(ct[k], skill, reg);
+                if (hit.length) return `${k} uses ${hit.join(', ')}, which is not a code literal, recorded evidence, or a minecraft-data fact of a named item, block, recipe, or window slot`;
             }
         }
         const probes = fields.eq.includes('heldItem') && !fields.delta.length && !fields.inv.length ? this._returnProbes(skill) : [];
@@ -1340,18 +1336,186 @@ Use only c; no other globals.`;
         walk(ast);
         return out;
     }
-    // fix97: a numeric literal in a contract (oak log count < 55) that is not a whole literal in the skill source
-    // or a number in the recorded evidence is a hallucinated constant. 55 must not match inside 155 or 5512.
-    // 0 and 1 are the contract encoding (absent, one argument), not a game threshold.
-    static contractNumericLiterals(src) {
-        const ast = acorn.parse(`(${String(src)})`, { ecmaVersion: 'latest' }), out = [];
+    // fix97: a program, not one parenthesized expression. A helper function or a trailing call is a script or a
+    // module (top-level await). A contract arrow is an expression statement. A real parse error is thrown.
+    // Comments are not nodes. A string's value is not a number, so "currently 55" is not a numeric literal.
+    static parseSource(src) {
+        const text = String(src);
+        const errors = [];
+        for (const sourceType of ['script', 'module']) {
+            try { return acorn.parse(text, { ecmaVersion: 'latest', sourceType }); }
+            catch (e) { errors.push(`${sourceType}: ${e instanceof Error ? e.message : String(e)}`); }
+        }
+        throw new Error(`[fix97] does not parse as a script or a module: ${errors.join(' | ')}`);
+    }
+    static walkAst(ast, visit) {
         const walk = n => {
             if (!n || typeof n.type !== 'string') return;
-            if (n.type === 'Literal' && typeof n.value === 'number') out.push(n.value);
-            for (const v of Object.values(n)) { if (Array.isArray(v)) v.forEach(walk); else if (v && typeof v === 'object' && typeof v.type === 'string') walk(v); }
+            visit(n);
+            for (const v of Object.values(n)) {
+                if (Array.isArray(v)) { for (const x of v) walk(x); }
+                else if (v && typeof v === 'object' && typeof v.type === 'string') walk(v);
+            }
         };
         walk(ast);
+    }
+    // Numeric literals only. 55 must not match inside 155 or 5512, and a comment or string that says "currently 55" is not one.
+    static contractNumericLiterals(src) {
+        const out = [];
+        Voyager.walkAst(Voyager.parseSource(src), n => {
+            if (n.type === 'Literal' && typeof n.value === 'number') out.push(n.value);
+        });
         return out;
+    }
+    // Names a contract or skill actually writes: string literals, and member names (c.pre.inv.oak_log, 'chest').
+    static referencedNames(src) {
+        const names = [];
+        Voyager.walkAst(Voyager.parseSource(src), n => {
+            if (n.type === 'Literal' && typeof n.value === 'string') names.push(n.value);
+            if (n.type === 'MemberExpression' && !n.computed && n.property && n.property.type === 'Identifier') names.push(n.property.name);
+        });
+        return names;
+    }
+    // minecraft-data facts of those names: stack size, durability, food points, recipe result and ingredient
+    // counts, the mature block-state value, a material multiplier, and a window slot group's size (armour is 4).
+    // Not a list of allowed numbers. A name that is not an item, block, or slot contributes nothing.
+    static gameDataNumbers(registry, sources) {
+        if (!registry || !registry.itemsByName || !registry.blocksByName) throw new Error('[fix97] gameDataNumbers: registry required');
+        if (!Array.isArray(sources)) throw new Error('[fix97] gameDataNumbers: sources required');
+        const names = new Set();
+        for (const src of sources) for (const name of Voyager.referencedNames(src)) names.add(name);
+        const nums = new Set();
+        const add = n => { if (typeof n === 'number') nums.add(n); };
+        for (const name of names) {
+            const item = Object.hasOwn(registry.itemsByName, name) ? registry.itemsByName[name] : null;
+            if (item) {
+                add(item.stackSize);
+                add(item.maxDurability);
+                const food = registry.foodsByName && Object.hasOwn(registry.foodsByName, name) ? registry.foodsByName[name] : null;
+                if (food) { add(food.foodPoints); add(food.saturation); }
+                const recs = registry.recipes && Object.hasOwn(registry.recipes, item.id) ? registry.recipes[item.id] : null;
+                if (Array.isArray(recs)) {
+                    for (const r of recs) {
+                        if (r.result) add(r.result.count);
+                        const cells = [];
+                        if (Array.isArray(r.ingredients)) cells.push(...r.ingredients);
+                        if (Array.isArray(r.inShape)) for (const row of r.inShape) if (Array.isArray(row)) cells.push(...row);
+                        const tally = new Map();
+                        for (const cell of cells) {
+                            if (typeof cell !== 'number') continue;
+                            const prev = tally.has(cell) ? tally.get(cell) : 0;
+                            tally.set(cell, prev + 1);
+                        }
+                        for (const count of tally.values()) add(count);
+                    }
+                }
+                if (registry.materials) {
+                    const id = String(item.id);
+                    for (const table of Object.values(registry.materials)) {
+                        if (table && typeof table === 'object' && Object.hasOwn(table, id)) add(table[id]);
+                    }
+                }
+            }
+            const block = Object.hasOwn(registry.blocksByName, name) ? registry.blocksByName[name] : null;
+            if (block && Array.isArray(block.states)) {
+                for (const st of block.states) {
+                    // age is the crop's mature value (wheat 7, beetroot 3). Other int states (water level) are not a threshold.
+                    if (!st || st.name !== 'age' || st.type !== 'int' || !Array.isArray(st.values) || st.values.length === 0) continue;
+                    const mature = Number(st.values[st.values.length - 1]);
+                    if (Number.isInteger(mature)) add(mature);
+                }
+            }
+        }
+        const windows = Array.isArray(registry.windowsArray) ? registry.windowsArray : [];
+        for (const w of windows) {
+            if (!w || !Array.isArray(w.slots)) continue;
+            const groups = w.slots.filter(s => s && typeof s.size === 'number' && typeof s.index === 'number');
+            for (const slot of w.slots) {
+                if (!slot || typeof slot.name !== 'string' || !names.has(slot.name)) continue;
+                if (typeof slot.size === 'number') add(slot.size);
+                if (typeof slot.index !== 'number') continue;
+                for (const g of groups) {
+                    if (slot.index >= g.index && slot.index < g.index + g.size) add(g.size);
+                }
+            }
+        }
+        return nums;
+    }
+    // 0 and 1 are the contract encoding (absent, one argument), not a game threshold.
+    static unsupportedContractNumbers(src, skill, registry) {
+        if (!skill || typeof skill.code !== 'string') throw new Error('[fix97] unsupportedContractNumbers: skill code required');
+        const codeNumbers = new Set(Voyager.contractNumericLiterals(skill.code));
+        const evidenceNumbers = new Set(Voyager.recordedNumbers({
+            consumes: skill.consumes, effects: skill.effects, consumeEvidence: skill.consumeEvidence,
+            effectEvidence: skill.effectEvidence, observedRuns: skill.observedRuns, stats: skill.stats,
+        }));
+        const gameNumbers = Voyager.gameDataNumbers(registry, [skill.code, src]);
+        const hits = [];
+        for (const n of Voyager.contractNumericLiterals(src)) {
+            if (n === 0 || n === 1) continue;
+            if (codeNumbers.has(n) || evidenceNumbers.has(n) || gameNumbers.has(n)) continue;
+            hits.push(n);
+        }
+        return hits;
+    }
+    // The contract model was copying "currently 55" out of a comment. Comments are not shown to it.
+    static stripComments(src) {
+        const text = String(src);
+        const comments = [];
+        const errors = [];
+        let parsed = false;
+        for (const sourceType of ['script', 'module']) {
+            comments.length = 0;
+            try {
+                acorn.parse(text, { ecmaVersion: 'latest', sourceType, onComment: comments });
+                parsed = true;
+                break;
+            } catch (e) { errors.push(`${sourceType}: ${e instanceof Error ? e.message : String(e)}`); }
+        }
+        if (!parsed) throw new Error(`[fix97] contract prompt: skill code does not parse: ${errors.join(' | ')}`);
+        if (comments.length === 0) return text;
+        let out = '', at = 0;
+        for (const c of comments) {
+            if (!Number.isInteger(c.start) || !Number.isInteger(c.end)) throw new Error('[fix97] parser comment has no range');
+            out += text.slice(at, c.start);
+            at = c.end;
+        }
+        return out + text.slice(at);
+    }
+    // Comments are removed above. A string or template text that still says "currently 55" is the same snapshot
+    // the contract model was copying. The digits in that text are blanked. A numeric literal in code (${55}) stays.
+    static sourceForContractPrompt(src) {
+        const text = Voyager.stripComments(src);
+        const ast = Voyager.parseSource(text);
+        const cuts = [];
+        Voyager.walkAst(ast, n => {
+            if (n.type === 'Literal' && typeof n.value === 'string' && /[0-9]/.test(n.value)) cuts.push([n.start, n.end, '""']);
+            if (n.type === 'TemplateElement' && n.value && typeof n.value.raw === 'string' && /[0-9]/.test(n.value.raw)) {
+                cuts.push([n.start, n.end, text.slice(n.start, n.end).replace(/[0-9]/g, '')]);
+            }
+        });
+        cuts.sort((a, b) => b[0] - a[0]);
+        let out = text;
+        for (const [start, end, rep] of cuts) {
+            if (!Number.isInteger(start) || !Number.isInteger(end)) throw new Error('[fix97] literal has no range');
+            out = out.slice(0, start) + rep + out.slice(end);
+        }
+        return out;
+    }
+    static contextTokenCounts(err) {
+        if (!(err instanceof Error)) throw new Error('[fix97] context overflow is not an Error');
+        if (Number.isInteger(err.requestTokens) && Number.isInteger(err.contextTokens)) {
+            const replyTokens = Object.hasOwn(err, 'replyTokens') ? err.replyTokens : null;
+            if (replyTokens !== null && !Number.isInteger(replyTokens)) throw new Error(`[fix97] context overflow reply token count is not an integer: ${err.message}`);
+            return { requestTokens: err.requestTokens, contextTokens: err.contextTokens, replyTokens };
+        }
+        const fit = err.message.match(/prompt does not fit: (\d+) tokens, context (\d+) tokens/);
+        if (fit) return { requestTokens: Number(fit[1]), contextTokens: Number(fit[2]), replyTokens: null };
+        const reached = err.message.match(/prompt \((\d+) tokens\) \+ reply \((\d+) tokens\) reached the context \((\d+) tokens\)/);
+        if (reached) return { requestTokens: Number(reached[1]), contextTokens: Number(reached[3]), replyTokens: Number(reached[2]) };
+        const request = err.message.match(/request \((\d+) tokens\) exceeds the available context size \((\d+) tokens\)/);
+        if (request) return { requestTokens: Number(request[1]), contextTokens: Number(request[2]), replyTokens: null };
+        throw new Error(`[fix97] CONTEXT_FULL has no token counts: ${err.message}`);
     }
     // Numbers actually stored on the skill (counts, maxima), not the digits of their JSON text.
     static recordedNumbers(value) {
@@ -2076,7 +2240,7 @@ Use only c; no other globals.`;
         }
         if (!learnable.length) return 0;
         const system = `You write PSN skill contracts for a Minecraft mineflayer skill library.\n${Voyager.CONTRACT_SPEC}\nReply ONLY with JSON: {"<skillName>": {"pre": "c => ...", "post": "c => ...", "text": "<one-line contract summary>"}, ...} for exactly the skills given.`;
-        const user = learnable.map(e => `--- ${e.name} ---\ndescription: ${e.description}\nobserved effects: ${JSON.stringify(e.effects)}\n${e.contractFail ? `previous contract was refused: ${e.contractFail}\n` : ''}${e.contract ? `current contract (${fixNote || 'to fix'}): ${JSON.stringify(e.contract)}\n` : ''}code:\n${String(e.code)}`).join('\n');
+        const user = learnable.map(e => `--- ${e.name} ---\ndescription: ${e.description}\nobserved effects: ${JSON.stringify(e.effects)}\n${e.contractFail ? `previous contract was refused: ${e.contractFail}\n` : ''}${e.contract ? `current contract (${fixNote || 'to fix'}): ${JSON.stringify(e.contract)}\n` : ''}code:\n${Voyager.sourceForContractPrompt(String(e.code))}`).join('\n');
         console.log(`[contract] learning contracts for ${learnable.length} skill(s) (${why}): ${learnable.map(e => e.name).join(', ')}`);
         let out; try { out = parseJSON(await this._ask(system, user, this._inferMeta('contract', { system, user }))); } catch (err) { console.log(`[contract] learning FAILED: ${err.message}`); return 0; }
         let n = 0;
@@ -2448,6 +2612,36 @@ Use only c; no other globals.`;
         return last;
     }
 
+    // A task whose prompt does not fit stays blocked across a restart. Absent means nothing is blocked.
+    _contextBlockReason(task) {
+        if (typeof task !== 'string' || task.length === 0) throw new Error(`[fix97] context block lookup needs a task, got ${JSON.stringify(task)}`);
+        if (!this.progress || typeof this.progress !== 'object') throw new Error('[fix97] progress required');
+        if (!Object.hasOwn(this.progress, 'contextBlocked')) return null;
+        const map = this.progress.contextBlocked;
+        if (map === null || typeof map !== 'object' || Array.isArray(map)) throw new Error(`[fix97] progress.contextBlocked must be an object, got ${JSON.stringify(map)}`);
+        if (!Object.hasOwn(map, task)) return null;
+        const row = map[task];
+        if (!row || !Number.isInteger(row.requestTokens) || !Number.isInteger(row.contextTokens)) throw new Error(`[fix97] contextBlocked[${JSON.stringify(task)}] has no token counts: ${JSON.stringify(row)}`);
+        const reply = Number.isInteger(row.replyTokens) ? `, reply ${row.replyTokens} tokens` : '';
+        return `blocked by context size (prompt ${row.requestTokens} tokens${reply}, context ${row.contextTokens} tokens)`;
+    }
+    _blockTaskForContext(task, err) {
+        const counts = Voyager.contextTokenCounts(err);
+        if (!this.progress || typeof this.progress !== 'object') throw new Error('[fix97] progress required');
+        if (!Object.hasOwn(this.progress, 'contextBlocked')) this.progress.contextBlocked = {};
+        if (this.progress.contextBlocked === null || typeof this.progress.contextBlocked !== 'object' || Array.isArray(this.progress.contextBlocked)) throw new Error(`[fix97] progress.contextBlocked must be an object, got ${JSON.stringify(this.progress.contextBlocked)}`);
+        const row = { requestTokens: counts.requestTokens, contextTokens: counts.contextTokens };
+        if (counts.replyTokens !== null) row.replyTokens = counts.replyTokens;
+        this.progress.contextBlocked[task] = row;
+        if (Array.isArray(this.progress.subgoals)) this.progress.subgoals = this.progress.subgoals.filter(s => !s || s.task !== task);
+        if (!Array.isArray(this.progress.failed)) throw new Error('[fix97] progress.failed must be an array');
+        const note = `${task} (blocked by context size: prompt ${counts.requestTokens} tokens, context ${counts.contextTokens} tokens)`;
+        if (!this.progress.failed.includes(note)) this.progress.failed.push(note);
+        this._saveProgress();
+        const reply = counts.replyTokens === null ? '' : `, reply ${counts.replyTokens} tokens`;
+        console.error(`!!! [voyager] LOUD: "${task}" blocked by context size: prompt ${counts.requestTokens} tokens${reply}, context ${counts.contextTokens} tokens. Only this task fails; it is not retried after a restart. num_ctx is not raised. ${err.message}`);
+    }
+
     // fix75: a step that throws is our bug. fix31 (f850a88) answered it with an exponential backoff scaled by the failing step's
     // duration, during which update() ran no step at all: the 14:25:37Z step (364 s, a 5-minute action timeout that
     // _interruptReason could not explain) bought 728 s of nothing, and icefox was slain by Red Figure at (-161,7,-15) at
@@ -2460,17 +2654,34 @@ Use only c; no other globals.`;
         //        Decomposition that cannot run (no task, or the plan and the model both refuse) throws: the step
         //        handler exits on that, it does not swallow the overflow and repeat it.
         if (e instanceof Error && e.code === CONTEXT_FULL) {
-            if (this._inOverflowDecompose) throw e;
             const task = typeof e.decomposeTask === 'string' && e.decomposeTask.length > 0 ? e.decomposeTask : this._overflowTask();
             if (typeof task !== 'string' || task.length === 0) throw e;
+            if (this._contextBlockReason(task) !== null) {
+                console.error(`!!! [voyager] LOUD: "${task}" is already blocked by context size; not retried. ${e.message}`);
+                return;
+            }
+            if (this._inOverflowDecompose) {
+                this._blockTaskForContext(task, e);
+                return;
+            }
             this._inOverflowDecompose = true;
             try {
                 const ok = await this._decompose(task, e.message);
-                if (ok !== true) throw e;
+                if (ok === true) {
+                    console.error(`!!! [voyager] prompt does not fit (${e.message}). Decomposed "${task}" instead of repeating the step. num_ctx is not raised.`);
+                    return;
+                }
+                if (ok !== false) throw new Error(`[fix97] _decompose returned ${JSON.stringify(ok)}; expected true or false`);
+                this._blockTaskForContext(task, e);
+            } catch (err) {
+                if (err instanceof Error && err.code === CONTEXT_FULL) {
+                    this._blockTaskForContext(task, err);
+                    return;
+                }
+                throw err;
             } finally {
                 this._inOverflowDecompose = false;
             }
-            console.error(`!!! [voyager] prompt does not fit (${e.message}). Decomposed "${task}" instead of repeating the step. num_ctx is not raised.`);
             return;
         }
         const sig = stepErrorSignature(e);
@@ -2607,6 +2818,25 @@ Use only c; no other globals.`;
     }
     // fix47: compact state format for efficient prompts (one line, critical info only)
     // Includes full inventory as k:v pairs (no slice - hiding items causes bugs like raw_iron:28 invisible)
+    // fix97: the code prompt used to include exact inventory counts (oak_log:55). The model copied that snapshot
+    // into the skill as a comment ("currently 55") and the contract learned it as a precondition. The skill reads
+    // counts at runtime. The curriculum still sees counts via _compactState; this view is names only.
+    _codeState(s) {
+        if (!s || typeof s.inventory !== 'object' || s.inventory === null) throw new Error('[fix97] code state.inventory required');
+        if (typeof s.position !== 'string') throw new Error('[fix97] code state.position required');
+        if (typeof s.biome !== 'string') throw new Error('[fix97] code state.biome required');
+        if (typeof s.time !== 'string') throw new Error('[fix97] code state.time required');
+        if (typeof s.health_value !== 'number' || typeof s.health_max !== 'number') throw new Error('[fix97] code state health required');
+        if (typeof s.food_value !== 'number' || typeof s.food_max !== 'number') throw new Error('[fix97] code state food required');
+        if (typeof s.inventory_slots !== 'string') throw new Error('[fix97] code state.inventory_slots required');
+        if (typeof s.empty_inventory_slots !== 'number') throw new Error('[fix97] code state.empty_inventory_slots required');
+        if (!s.equipment || typeof s.equipment.hand !== 'string') throw new Error('[fix97] code state.equipment.hand required');
+        if (typeof s.threats !== 'string') throw new Error('[fix97] code state.threats required');
+        const names = Object.keys(s.inventory).sort();
+        const items = names.length === 0 ? 'empty' : names.join(',');
+        const held = s.equipment.hand === 'empty' ? '' : ` held:${s.equipment.hand}`;
+        return `pos:(${s.position}) biome:${s.biome} time:${s.time.split(' ')[0]} hp:${s.health_value}/${s.health_max} food:${s.food_value}/${s.food_max} inv:${s.inventory_slots},${s.empty_inventory_slots}empty${held} threats:${s.threats} items:[${items}]`;
+    }
     _compactState(s) {
         const inv = s.inventory;
         const items = Object.entries(inv).sort((a, b) => b[1] - a[1]);
@@ -5001,14 +5231,15 @@ Use only c; no other globals.`;
 
     // ---------- automatic curriculum ----------
     // fix29: restored fix19 PSN decomposition (removed with the milestone planner in fix27c while its callers stayed):
-    // a goal that keeps failing is split by the local model into 2-4 subgoals (depth <= 2, 30-min cooldown per goal);
-    // each subgoal is learned as a skill, then the parent is retried composing those skills
+    // a goal that keeps failing is split into subgoals; each is learned as a skill, then the parent is retried.
+    // fix97: the depth cap of 2 and the 30-minute cooldown were a magic number and a timer. They made an overflowing
+    // prompt return false, the process exit, and the restart rebuild the same prompt. A task is not split again
+    // while the subgoals of its last split are still queued. That is the recorded split, not a clock.
     // fix47: inventory-first planning + harvestTools-based tool decompose
     async _decompose(task, reason) {
         const d = (this.progress.decomposed ||= {}), q = (this.progress.subgoals ||= []);
         const depth = (this._curSub?.task === task ? this._curSub.depth : 0);
-        if (depth >= 2) { console.log(`[psn] decompose skipped for "${task}": already a depth-${depth} subgoal`); return false; }
-        if (d[task] && Date.now() - d[task].at < 30 * 60e3) { console.log(`[psn] decompose skipped for "${task}": decomposed ${Math.round((Date.now() - d[task].at) / 60e3)} min ago`); return false; }
+        if (q.some(s => s && s.parent === task)) { console.log(`[psn] decompose skipped for "${task}": its subgoals are still queued`); return false; }
         
         // fix97: an item goal keeps its own task. Subgoals come from the game-data plan (block loot, entity loot,
         //        recipes, furnace recipes). A learned producer's task is a subgoal only when that task's item is the
@@ -5093,6 +5324,8 @@ Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
         if (it === null || typeof it !== 'object') throw new Error(`[fix91] subgoal entry must be an object, got ${JSON.stringify(it)}`);
         if (typeof it.task !== 'string' || it.task.length === 0) return 'empty task';
         const task = it.task;
+        const blocked = this._contextBlockReason(task);
+        if (blocked !== null) return blocked;
         const bad = validateTask(task);
         if (bad !== null) return bad;
         const prevSub = this._curSub;
@@ -5364,6 +5597,10 @@ Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
     // fix90: when the caller passes the state, backoff is the posterior in that state.
     _rejectTask(task, fromPlanner, state) {
         if (!task) return 'empty task';
+        if (typeof task === 'string' && task.length > 0) {
+            const blocked = this._contextBlockReason(task);
+            if (blocked !== null) return blocked;
+        }
         const bad = validateTask(task);
         if (bad) return bad;
         const g = this._resolveGoal(task);
@@ -5962,7 +6199,7 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         const callers = parentsOf(e.name, this._graph());
         const usedBuiltIn = builtInsCalled(getBareAPI().sigs, e.code);
         const apiList = this.unifiedAPIList(relevantSkills, usedBuiltIn);
-        const system = `You repair ONE skill in a Minecraft mineflayer skill library (PSN-style targeted fix). Return a single \`\`\`javascript code block containing ONLY the fixed function, with the SAME name and a compatible signature. First line inside the block: // DESCRIPTION: <one sentence>. Every loop must check bot.interrupt_code. If something still cannot be done, log(bot, 'FAILED: <reason>') and return a falsy value; no silent fallbacks. findBlock/findBlocks/nearestEntity/bot.entities/blockAt results can be null or empty: always null-check them before reading .position/.x or calling methods on them. Call AVAILABLE FUNCTIONS by name. Do not paste their source into this function. If this function is too large to fix as one piece, say so in the description and keep the body a composition of the listed skills.
+        const system = `You repair ONE skill in a Minecraft mineflayer skill library (PSN-style targeted fix). Return a single \`\`\`javascript code block containing ONLY the fixed function, with the SAME name and a compatible signature. First line inside the block: // DESCRIPTION: <one sentence>. Every loop must check bot.interrupt_code. If something still cannot be done, log(bot, 'FAILED: <reason>') and return a falsy value; no silent fallbacks. findBlock/findBlocks/nearestEntity/bot.entities/blockAt results can be null or empty: always null-check them before reading .position/.x or calling methods on them. bot.findBlocks(options) and bot.findBlock(options): matching is a block id, an array of block ids, or a function; maxDistance and count are finite numbers. getNearestBlocks(bot, block_types, distance, count): block_types is a block name or an array of names (null lists every block id); distance and count are finite numbers and are required. A list of names is not a distance. getNearbyBlockTypes(bot, distance) takes that distance, not block names. Call AVAILABLE FUNCTIONS by name. Do not paste their source into this function. If this function is too large to fix as one piece, say so in the description and keep the body a composition of the listed skills.
 
 AVAILABLE FUNCTIONS (call by bare name, e.g. goToPosition(bot, x, y, z) - do NOT use skills.* or world.* prefix):
 ${apiList}
@@ -6247,7 +6484,7 @@ Each function must:
 - Have a compatible signature
 - Be preceded by // DESCRIPTION: <one sentence>
 
-Every loop must check bot.interrupt_code. If something cannot be done, log(bot, 'FAILED: <reason>') and return a falsy value; no silent fallbacks. findBlock/findBlocks/nearestEntity/bot.entities/blockAt results can be null or empty: always null-check them.
+Every loop must check bot.interrupt_code. If something cannot be done, log(bot, 'FAILED: <reason>') and return a falsy value; no silent fallbacks. findBlock/findBlocks/nearestEntity/bot.entities/blockAt results can be null or empty: always null-check them. bot.findBlocks(options) and bot.findBlock(options): matching is a block id, an array of block ids, or a function; maxDistance and count are finite numbers. getNearestBlocks(bot, block_types, distance, count): block_types is a block name or an array of names (null lists every block id); distance and count are finite numbers and are required. A list of names is not a distance. getNearbyBlockTypes(bot, distance) takes that distance, not block names.
 Fix the child's own logic and how/when the caller uses it. No top-level call, no extra functions.
 
 AVAILABLE FUNCTIONS (call by bare name, e.g. goToPosition(bot, x, y, z) - do NOT use skills.* or world.* prefix):
@@ -6647,6 +6884,7 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
         const apiList = this.unifiedAPIList(shown, relevantBuiltIn);
         system += `\n\nVOYAGER MODE: write ONE reusable async function \`async function camelCaseName(bot) {...}\` that completes the task, then call it at the end with \`await camelCaseName(bot);\`.
 The first line of the code block must be a comment: // DESCRIPTION: <one sentence of what the function does>.
+Do not copy a number from the state into the function or into a comment. Item counts are read with getInventoryCounts(bot) when the function runs. A count observed now is not a threshold.
 
 AVAILABLE FUNCTIONS (call by bare name, e.g. goToPosition(bot, x, y, z) - do NOT use skills.* or world.* prefix):
 ${apiList}
@@ -6656,7 +6894,7 @@ IMPORTANT: All functions use bare names. Do NOT write skills.goToBlock or skills
 COMPOSE: build your function out of these skills (they can take arguments). Your new skill may take extra parameters with defaults, e.g. \`async function makeIronTools(bot, count = 1)\`. Do not create call cycles between skills, and do not call a skill from inside itself with the same parameters.${this.sharedHints?.length ? `
 SHARED CODE: these fragments are repeated in several skills; if you need this logic, put it in its own small reusable async function skill (named, with parameters) and call it, instead of inlining it again:
 ${this.sharedHints.map(h => '// used in ' + h.skills.join(', ') + '\n' + h.fragment).join('\n')}` : ''}
-Interrupts: the bot may be interrupted at any time (danger, getting stuck, a player talking). Every loop must start with \`if (bot.interrupt_code) return;\` and you must return immediately after any await when bot.interrupt_code is true. Every async function must contain an await. Never catch an error and keep looping; no unbounded loops (always cap attempts). There is no setTimeout/setInterval in scope; to wait use \`await sleep(ms)\`. findBlock/findBlocks/nearestEntity/bot.entities/blockAt results can be null or empty: always null-check them before reading .position/.x or calling methods on them.`;
+Interrupts: the bot may be interrupted at any time (danger, getting stuck, a player talking). Every loop must start with \`if (bot.interrupt_code) return;\` and you must return immediately after any await when bot.interrupt_code is true. Every async function must contain an await. Never catch an error and keep looping; no unbounded loops (always cap attempts). There is no setTimeout/setInterval in scope; to wait use \`await sleep(ms)\`. findBlock/findBlocks/nearestEntity/bot.entities/blockAt results can be null or empty: always null-check them before reading .position/.x or calling methods on them. bot.findBlocks(options) and bot.findBlock(options): matching is a block id, an array of block ids, or a function; maxDistance and count are finite numbers. getNearestBlocks(bot, block_types, distance, count): block_types is a block name or an array of names (null lists every block id); distance and count are finite numbers and are required. A list of names is not a distance. getNearbyBlockTypes(bot, distance) takes that distance, not block names.`;
         // only `related` are shown as context; the library is already in the execution scope, so its source is not copied into the prompt
         // fix97: the comment above said the library is already in scope and its source is not copied. The next line pasted
         // the top 3 bodies anyway, so each rewrite was trained on (and returned) a longer function. Signature, description
@@ -6673,10 +6911,10 @@ Interrupts: the bot may be interrupted at any time (danger, getting stuck, a pla
             if (this.abort) { console.log('[voyager] aborted for player'); return true; }
             // fix37: escalating duplicate feedback (changes each time to nudge the model)
             const dupeEscalation = consecutiveDupes > 0 ? `\n\n!!! CRITICAL: Your previous ${consecutiveDupes} reply(ies) were IDENTICAL to the one before. You MUST write DIFFERENT code this time. The previous code did not work. Change your approach, use different skills, or try a simpler strategy. Repeating the same code will cause this task to fail. !!!` : '';
-            // fix47: use compact state for efficient prompts (verbose state is available via _stateText if needed)
+            // fix97: item names only. _compactState's oak_log:55 was copied into checkOakLog as "currently 55".
             const currentState = this.observe();
-            const compactStateText = this._compactState(currentState);
-            const user = `Task: ${task}\nHint: ${proposal.context || ''}\n${recipeFacts(task)}\n--- state (compact) ---\n${compactStateText}
+            const codeStateText = this._codeState(currentState);
+            const user = `Task: ${task}\nHint: ${proposal.context || ''}\n${recipeFacts(task)}\n--- state (item names, counts are read at runtime) ---\n${codeStateText}
 --- learned skills you can call (already defined for your code: call them by name, never paste their source) ---\n${ctx || '(none)'}
 ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- feedback from last attempt ---\n${feedback}\n` : ''}${dupeEscalation}Attempt ${i}/${MAX_ATTEMPTS}. Write the code block:`;
             // fix47: per-prompt breakdown logging
@@ -6685,7 +6923,7 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
                     system: system.length - apiList.length,   // fix96: apiList is inside system; counted once, as prelude
                     skills: ctx.length,
                     prelude: apiList.length,
-                    state: compactStateText.length,
+                    state: codeStateText.length,
                     task: task.length + (proposal.context || '').length,
                     retry: 0
                 }, system.length + user.length);
@@ -6696,7 +6934,7 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
                     system: system.length - apiList.length,
                     skills: ctx.length,
                     prelude: apiList.length,
-                    state: compactStateText.length,
+                    state: codeStateText.length,
                     history: lastCode.length,
                     retry: feedback.length + dupeEscalation.length
                 }, system.length + user.length);

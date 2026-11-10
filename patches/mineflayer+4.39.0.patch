@@ -1,5 +1,5 @@
 diff --git a/node_modules/mineflayer/lib/plugins/blocks.js b/node_modules/mineflayer/lib/plugins/blocks.js
-index d75b9c5..ba8c3ae 100644
+index d75b9c5..781ea16 100644
 --- a/node_modules/mineflayer/lib/plugins/blocks.js
 +++ b/node_modules/mineflayer/lib/plugins/blocks.js
 @@ -127,12 +127,19 @@ function inject (bot, { version, storageBuilder, hideErrors }) {
@@ -23,11 +23,24 @@ index d75b9c5..ba8c3ae 100644
      return true // global palette, the block might be in there
    }
  
-@@ -154,7 +161,21 @@ function inject (bot, { version, storageBuilder, hideErrors }) {
+@@ -154,10 +161,37 @@ function inject (bot, { version, storageBuilder, hideErrors }) {
    }
  
    bot.findBlocks = (options) => {
 -    const matcher = getMatchingFunction(options.matching)
++    // minecraft-ai fix97: maxDistance || 16 and count || 1 kept an array (truthy), and (array + 8) is a string.
++    // A length-2 array becomes NaN, Math.ceil(NaN) is NaN, and OctahedronIterator never finishes (apothem > NaN),
++    // so the main thread scans until the watchdog SIGKILLs it. A missing value is not a finite number either.
++    if (options === null || typeof options !== 'object' || Array.isArray(options)) {
++      throw new Error(`findBlocks: options object required, got ${options === null ? 'null' : Array.isArray(options) ? JSON.stringify(options) : typeof options}`)
++    }
++    for (const key of ['maxDistance', 'count']) {
++      if (!Object.hasOwn(options, key) || typeof options[key] !== 'number' || !Number.isFinite(options[key])) {
++        const v = options[key]
++        const shown = v === undefined ? 'undefined' : (typeof v === 'object' ? JSON.stringify(v) : String(v))
++        throw new Error(`findBlocks: ${key} must be a finite number, got ${shown}. matching is a block id, an array of block ids, or a function; maxDistance and count are numbers`)
++      }
++    }
 +    const blockMatcher = getMatchingFunction(options.matching)
 +    // minecraft-ai fix96: the palette check built a Block (Block.fromStateId) for every palette entry of every loaded
 +    // section on every call, so a search for an absent block cost seconds (live: 15-17.6 s per call, then the watchdog
@@ -44,8 +57,13 @@ index d75b9c5..ba8c3ae 100644
 +      return m
 +    }
      const point = (options.point || bot.entity.position).floored()
-     const maxDistance = options.maxDistance || 16
-     const count = options.count || 1
+-    const maxDistance = options.maxDistance || 16
+-    const count = options.count || 1
++    const maxDistance = options.maxDistance
++    const count = options.count
+     const useExtraInfo = options.useExtraInfo || false
+     const fullMatcher = getFullMatchingFunction(matcher, useExtraInfo)
+     const start = new Vec3(Math.floor(point.x / 16), Math.floor(point.y / 16), Math.floor(point.z / 16))
 diff --git a/node_modules/mineflayer/lib/plugins/digging.js b/node_modules/mineflayer/lib/plugins/digging.js
 index 5ae5552..af28eef 100644
 --- a/node_modules/mineflayer/lib/plugins/digging.js

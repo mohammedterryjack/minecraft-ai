@@ -165,7 +165,7 @@ describe('fix96b: a prompt that does not fit fails that call loudly; the bot kee
         } finally { server.close(); }
     });
 
-    it('CONTEXT_FULL decomposes the current task and throws when that is impossible; another repeated error still exits', async () => {
+    it('CONTEXT_FULL decomposes the current task and blocks it when that is impossible; another repeated error still exits', async () => {
         const { Voyager } = await import('../src/agent/voyager.js');
         const { CONTEXT_FULL } = await import('../src/models/ollama.js');
         const v = Object.create(Voyager.prototype);
@@ -177,7 +177,9 @@ describe('fix96b: a prompt that does not fit fails that call loudly; the bot kee
         await assert.rejects(() => v._onStepError(full()), /prompt does not fit/);
         v.currentTask = 'Collect 1 oak_log';
         v._decompose = async () => false;
-        await assert.rejects(() => v._onStepError(full()), /prompt does not fit/);
+        await v._onStepError(full());
+        assert.match(v._contextBlockReason('Collect 1 oak_log'), /prompt 8243 tokens, context 8192 tokens/);
+        assert.deepStrictEqual(fatal, []);
         v._decompose = async () => true;
         await v._onStepError(full());
         assert.deepStrictEqual(fatal, []);

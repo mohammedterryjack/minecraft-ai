@@ -155,17 +155,37 @@ export function getFirstBlockAboveHead(bot, ignore_types=null, distance=32) {
 }
 
 
-export function getNearestBlocks(bot, block_types=null, distance=8, count=10000) {
+// fix97: the coder saw `getNearestBlocks(bot, block_types=null, distance=8, count=10000)` and mineIronOres called
+// getNearestBlocks(bot, null, ['iron_ore', 'deepslate_iron_ore']). null selects every block id (1057 in 1.20.4) and the
+// name list became maxDistance. describeApiArg prints array lengths, so the watchdog recorded
+// findBlocks({matching:[1057], maxDistance:[2], count:10000}). count 10000 was this default, not mineflayer's.
+function shownScanArg(v) {
+    if (v === undefined) return 'undefined';
+    if (typeof v === 'object') return JSON.stringify(v);
+    return String(v);
+}
+function requireScanNumber(fn, name, value) {
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+        const hint = fn === 'getNearbyBlocks' || fn === 'getNearbyBlockTypes'
+            ? `${fn}(bot, distance) takes a radius in blocks, not a list of block names. Named blocks: getNearestBlocks(bot, block_types, distance, count).`
+            : 'distance and count are numbers. Block names go in block_types (getNearestBlocks) or the predicate (getNearestBlocksWhere), not in the distance. bot.findBlocks({ matching, maxDistance, count }): matching is a block id, an array of block ids, or a function; maxDistance and count are finite numbers.';
+        throw new Error(`${fn}: ${name} must be a finite number, got ${shownScanArg(value)}. ${hint}`);
+    }
+}
+
+export function getNearestBlocks(bot, block_types, distance, count) {
     /**
      * Get a list of the nearest blocks of the given types.
      * @param {Bot} bot - The bot to get the nearest block for.
-     * @param {string[]} block_types - The names of the blocks to search for.
-     * @param {number} distance - The maximum distance to search, default 16.
-     * @param {number} count - The maximum number of blocks to find, default 10000.
+     * @param {string|string[]|null} block_types - Block names. null lists every block id. Not the distance.
+     * @param {number} distance - Maximum distance in blocks. A finite number, required.
+     * @param {number} count - Maximum number of blocks to return. A finite number, required.
      * @returns {Block[]} - The nearest blocks of the given type.
      * @example
      * let woodBlocks = world.getNearestBlocks(bot, ['oak_log', 'birch_log'], 16, 1);
      **/
+    requireScanNumber('getNearestBlocks', 'distance', distance);
+    requireScanNumber('getNearestBlocks', 'count', count);
     // if blocktypes is not a list, make it a list
     let block_ids = [];
     if (block_types === null) {
@@ -191,17 +211,19 @@ export function getNearestBlocks(bot, block_types=null, distance=8, count=10000)
     return getNearestBlocksWhere(bot, block_ids, distance, count);  
 }
 
-export function getNearestBlocksWhere(bot, predicate, distance=8, count=10000) {
+export function getNearestBlocksWhere(bot, predicate, distance, count) {
     /**
      * Get a list of the nearest blocks that satisfy the given predicate.
      * @param {Bot} bot - The bot to get the nearest blocks for.
-     * @param {function} predicate - The predicate to filter the blocks.
-     * @param {number} distance - The maximum distance to search, default 16.
-     * @param {number} count - The maximum number of blocks to find, default 10000.
+     * @param {function|number[]} predicate - A predicate, or block ids passed through as matching.
+     * @param {number} distance - Maximum distance in blocks. A finite number, required.
+     * @param {number} count - Maximum number of blocks to return. A finite number, required.
      * @returns {Block[]} - The nearest blocks that satisfy the given predicate.
      * @example
      * let waterBlocks = world.getNearestBlocksWhere(bot, block => block.name === 'water', 16, 10);
      **/
+    requireScanNumber('getNearestBlocksWhere', 'distance', distance);
+    requireScanNumber('getNearestBlocksWhere', 'count', count);
     let positions = bot.findBlocks({matching: predicate, maxDistance: distance, count: count});
     // fix51: filter out null blocks (chunk unloaded or invalid position)
     let blocks = positions.map(position => bot.blockAt(position)).filter(b => b !== null);
@@ -463,16 +485,37 @@ export function getNearbyPlayerNames(bot) {
 }
 
 
-export function getNearbyBlockTypes(bot, distance=16) {
+// Positions inside the cube of half-extent `distance` (the radius the caller passed). This replaces the old
+// count default of 10000, which was not the size of any search.
+function positionsWithin(distance) {
+    const span = Math.floor(distance) * 2 + 1;
+    return span * span * span;
+}
+
+export function getNearbyBlocks(bot, distance = 16) {
+    /**
+     * Blocks around the bot, every position inside the given radius.
+     * @param {Bot} bot - The bot to get nearby blocks for.
+     * @param {number} distance - Radius in blocks. A finite number. Not a list of block names.
+     * @returns {Block[]} - Blocks within that radius.
+     * @example
+     * let blocks = world.getNearbyBlocks(bot, 16);
+     **/
+    requireScanNumber('getNearbyBlocks', 'distance', distance);
+    return getNearestBlocks(bot, null, distance, positionsWithin(distance));
+}
+
+export function getNearbyBlockTypes(bot, distance = 16) {
     /**
      * Get a list of all nearby block names.
      * @param {Bot} bot - The bot to get nearby blocks for.
-     * @param {number} distance - The maximum distance to search, default 16.
+     * @param {number} distance - Radius in blocks. A finite number. Not a list of block names.
      * @returns {string[]} - A list of all nearby blocks.
      * @example
-     * let blocks = world.getNearbyBlockTypes(bot);
+     * let blocks = world.getNearbyBlockTypes(bot, 16);
      **/
-    let blocks = getNearestBlocks(bot, null, distance);
+    requireScanNumber('getNearbyBlockTypes', 'distance', distance);
+    let blocks = getNearbyBlocks(bot, distance);
     let found = [];
     for (let i = 0; i < blocks.length; i++) {
         if (!found.includes(blocks[i].name)) {

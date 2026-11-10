@@ -93,7 +93,18 @@ export function getBareAPI() {
         const str = fn.toString();
         const match = str.match(/function\s+\w+\s*\(([^)]*)\)/);
         if (!match) return null;
-        const params = match[1].trim();
+        // fix97: the raw signature taught `count=10000` and `block_types=null` with no types, and mineIronOres put a
+        // name list in the distance slot. The JSDoc @param types are the API. A typed parameter is shown as `name: type`,
+        // without the default that the model copied.
+        const types = new Map();
+        for (const m of str.matchAll(/@param\s+\{([^}]+)\}\s+(\w+)/g)) types.set(m[2], m[1]);
+        // Only the arguments the mineIronOres call put in the wrong slot. Typing every parameter
+        // would rewrite the whole catalogue, including getBlockAtOffset(bot, offset).
+        const typed = new Set(['block_types', 'predicate', 'distance', 'count']);
+        const params = match[1].split(',').map(p => p.trim()).filter(Boolean).map(p => {
+            const name = p.split('=')[0].trim();
+            return typed.has(name) && types.has(name) ? `${name}: ${types.get(name)}` : p;
+        }).join(', ');
         return { name: fn.name, sig: `${fn.name}(${params})`, source: modName };
     };
     // fix41: collect ALL function keys first, then try extractSig; fallback to name() if regex misses
@@ -392,7 +403,65 @@ export class Coder {
         }
         const missingCounts = missingCountArithmetic(code);   // fix83
         if (missingCounts.length) return missingCounts.join('\n');
-        return this._apiGate(code, knownNames);
+        // fix97: feedback only. The code string is not rewritten. An array or object literal for maxDistance/count
+        // (or the distance/count arguments that become those options) is how mineIronOres scanned every block.
+        const shape = this._nonNumericScanOptionLint(code);
+        const gate = this._apiGate(code, knownNames);
+        const parts = [];
+        if (shape) parts.push(shape);
+        if (gate) parts.push(gate);
+        return parts.length ? parts.join('\n') : null;
+    }
+
+    // fix97: array and object literals are not distances or counts. Identifiers are left to the runtime check.
+    _nonNumericScanOptionLint(code) {
+        let ast;
+        try { ast = acorn.parse(code, { ecmaVersion: 'latest', sourceType: 'module', allowAwaitOutsideFunction: true }); }
+        catch (e) { return `Syntax error (cannot parse): ${e.message}`; }
+        const bad = n => n && (n.type === 'ArrayExpression' || n.type === 'ObjectExpression');
+        const kind = n => n.type === 'ArrayExpression' ? 'array' : 'object';
+        const positional = {
+            getNearestBlocks: { 2: 'distance', 3: 'count' },
+            getNearestBlocksWhere: { 2: 'distance', 3: 'count' },
+            getNearestBlock: { 2: 'distance' },
+            getNearbyBlockTypes: { 1: 'distance' },
+            getNearbyBlocks: { 1: 'distance' },
+        };
+        const errs = [];
+        const walk = (node) => {
+            if (!node || typeof node.type !== 'string') return;
+            if (node.type === 'CallExpression') {
+                let name = null;
+                if (node.callee.type === 'Identifier') name = node.callee.name;
+                else if (node.callee.type === 'MemberExpression' && !node.callee.computed && node.callee.property.type === 'Identifier') name = node.callee.property.name;
+                if (name === 'findBlocks' || name === 'findBlock') {
+                    const first = node.arguments[0];
+                    if (first && first.type === 'ObjectExpression') {
+                        for (const p of first.properties) {
+                            if (p.type !== 'Property' || p.computed || p.key.type !== 'Identifier') continue;
+                            if (p.key.name !== 'maxDistance' && p.key.name !== 'count') continue;
+                            if (!bad(p.value)) continue;
+                            errs.push(`${name} option ${p.key.name} is an ${kind(p.value)} literal, not a finite number. matching may be an array of block ids; maxDistance and count are numbers`);
+                        }
+                    }
+                }
+                const slots = positional[name];
+                if (slots) {
+                    for (const [idx, label] of Object.entries(slots)) {
+                        const arg = node.arguments[Number(idx)];
+                        if (!bad(arg)) continue;
+                        errs.push(`${name} ${label} is an ${kind(arg)} literal, not a finite number. Block names are block_types or the predicate; distance and count are numbers`);
+                    }
+                }
+            }
+            for (const k in node) {
+                const v = node[k];
+                if (Array.isArray(v)) v.forEach(walk);
+                else if (v && typeof v.type === 'string') walk(v);
+            }
+        };
+        walk(ast);
+        return errs.length ? errs.join('\n') : null;
     }
 
     // fix32: static API gate on freshly generated code: every bot.<member> must exist on the live bot (or be assigned

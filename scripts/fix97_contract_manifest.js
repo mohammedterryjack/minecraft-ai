@@ -1,34 +1,36 @@
 #!/usr/bin/env node
 /**
- * fix97: dry-run manifest of learned contracts whose pre/post use a numeric literal that is not in the skill's
- * code or recorded evidence (the "Oak log count < 55" precondition). Nothing is reset.
+ * fix97: dry-run manifest of learned contracts whose pre/post use a numeric literal that is not a code literal
+ * (comments and strings do not count), not recorded evidence, and not a minecraft-data fact of a name the skill
+ * or the contract actually writes (stack size, recipe count, armour slot group, mature block state, material
+ * multiplier). Nothing is reset.
  *
  *   node scripts/fix97_contract_manifest.js --bots-dir=bots/icefox2000
  */
 import { readFileSync } from 'fs';
 import { join, resolve } from 'path';
 import { fileURLToPath } from 'url';
+import { createRequire } from 'module';
+import settings from '../settings.js';
 import { Voyager } from '../src/agent/voyager.js';
+
+const require = createRequire(import.meta.url);
+const registry = require('minecraft-data')(settings.minecraft_version);
 
 const CAUSE = {
     fix: 'fix97',
-    name: 'a contract numeric literal that is not in the skill source or recorded evidence was invented by the contract model',
+    name: 'a contract numeric literal that is not a code literal, recorded evidence, or a minecraft-data fact of a named item, block, recipe, or window slot',
 };
 
-function unsupportedNumbers(src, skill) {
-    const code = typeof skill.code === 'string' ? skill.code : '';
-    const codeNumbers = new Set(Voyager.contractNumericLiterals(code));
-    const evidenceNumbers = new Set(Voyager.recordedNumbers({
+function verdictFor(token, skill, field, src) {
+    const codeLiterals = Voyager.contractNumericLiterals(skill.code);
+    const evidence = Voyager.recordedNumbers({
         consumes: skill.consumes, effects: skill.effects, consumeEvidence: skill.consumeEvidence,
         effectEvidence: skill.effectEvidence, observedRuns: skill.observedRuns, stats: skill.stats,
-    }));
-    const hits = [];
-    for (const n of Voyager.contractNumericLiterals(src)) {
-        if (n === 0 || n === 1) continue;
-        if (codeNumbers.has(n) || evidenceNumbers.has(n)) continue;
-        hits.push(n);
-    }
-    return hits;
+    });
+    const names = [...new Set([...Voyager.referencedNames(skill.code), ...Voyager.referencedNames(src)])].sort();
+    const game = [...Voyager.gameDataNumbers(registry, [skill.code, src])].sort((a, b) => a - b);
+    return `${skill.name}.${field} literal ${token} is not a code literal [${codeLiterals.join(', ')}], not recorded evidence [${evidence.join(', ')}], and not a minecraft-data fact [${game.join(', ')}] of the names this skill and contract write [${names.join(', ')}]. Comments and strings are not code literals.`;
 }
 
 export function buildContractManifest(skills) {
@@ -37,16 +39,18 @@ export function buildContractManifest(skills) {
     for (const skill of skills) {
         if (!skill || typeof skill.name !== 'string') throw new Error('[fix97] skill entry has no name');
         if (!skill.contract) continue;
+        if (typeof skill.code !== 'string') throw new Error(`[fix97] ${skill.name} has a contract and no code`);
         for (const field of ['pre', 'post']) {
             const src = skill.contract[field];
             if (typeof src !== 'string') continue;
-            for (const token of unsupportedNumbers(src, skill)) {
+            for (const token of Voyager.unsupportedContractNumbers(src, skill, registry)) {
                 records.push({
                     id: `${skill.name}.${field}.${token}`,
                     file: 'skills',
                     path: [skill.name, 'contract', field],
                     cause: CAUSE,
-                    evidence: `${field} literal ${token} is not a whole number in the skill code or recorded evidence`,
+                    evidence: `${field} literal ${token} is not a code literal, recorded evidence, or a minecraft-data fact`,
+                    verdict: verdictFor(token, skill, field, src),
                     apply: false,
                 });
             }
