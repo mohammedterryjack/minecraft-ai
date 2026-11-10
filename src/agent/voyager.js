@@ -1364,6 +1364,13 @@ Use only c; no other globals.`;
     }
     _validContract(ct, skill) {
         if (!ct || typeof ct.post !== 'string' || typeof ct.pre !== 'string') return 'missing pre/post string';
+        // fix97: contractReadsReturn throws when a destructure or a computed key hides c.ret.
+        //        That message is the refusal. The caller queues the repair. The contract is not
+        //        installed, so the trace check never evaluates it and the throw is not a step error.
+        for (const k of ['pre', 'post']) {
+            const problem = Voyager.contractReturnProblem(ct[k]);
+            if (problem !== null) return problem;
+        }
         // fix43: include eq (equipment state) in test state for contract validation
         const eq = { heldItem: null, offHand: null, helmet: null, chestplate: null, leggings: null, boots: null };
         const s = { pos: { x: 0, y: 64, z: 0 }, hp: skills.VITALS_MAX.health, food: skills.VITALS_MAX.food, sky: 15, alive: true, dim: 'overworld', inv: {}, free: 0, eq };   // fix59: max from VITALS_MAX
@@ -1946,6 +1953,12 @@ Use only c; no other globals.`;
             if (Voyager.contractReadsReturn(contract[key])) return true;
         }
         return false;
+    }
+    // The message contractReadsReturn throws, or null when whether the source reads c.ret is decided.
+    static contractReturnProblem(src) {
+        try { Voyager.contractReadsReturn(src); }
+        catch (err) { return err instanceof Error ? err.message : String(err); }
+        return null;
     }
     static contractReadsReturn(src) {
         const ast = Voyager.parseContract(src);
@@ -2987,6 +3000,20 @@ Use only c; no other globals.`;
                 if (!Array.isArray(e.observedRuns)) e.observedRuns = [];
                 if (!e.observedRuns.some(p => p.rv === r.rv && p.heldItem === r.s1.eq.heldItem)) e.observedRuns.push({ rv: r.rv, heldItem: r.s1.eq.heldItem });
             }
+            // fix97: a contract accepted before this check still throws inside callSucceeded (below).
+            //        Refuse it here and queue the repair. callSucceeded is not called, so the throw
+            //        is not a step error and does not repeat on the next start.
+            if (e && e.contract && e.contract.seeded !== true) {
+                let problem = null;
+                if (typeof e.contract.pre === 'string') problem = Voyager.contractReturnProblem(e.contract.pre);
+                if (problem === null && typeof e.contract.post === 'string') problem = Voyager.contractReturnProblem(e.contract.post);
+                if (problem !== null) {
+                    e.contractFail = problem;
+                    console.log(`[contract] ${e.name} contract cannot be checked: ${problem}`);
+                    this._queueContractFix(e, problem);
+                    continue;
+                }
+            }
             let violated = false;
             let postHeld = false;
             if (e && e.contract) {
@@ -3166,7 +3193,19 @@ Use only c; no other globals.`;
         for (const e of learnable) {
             const ct = out?.[e.name], bad = this._validContract(ct, e);
             e.contractTried = Date.now();
-            if (bad) { e.contractFail = bad; console.log(`[contract] FAILED for ${e.name}: ${bad}`); continue; }
+            if (bad) {
+                e.contractFail = bad;
+                console.log(`[contract] FAILED for ${e.name}: ${bad}`);
+                // The refusal is the repair. A repair already in progress is that queue item;
+                // queueing the same refusal again would call the model on every step.
+                if (why !== 'contract repair' && ct) {
+                    let problem = null;
+                    if (typeof ct.pre === 'string') problem = Voyager.contractReturnProblem(ct.pre);
+                    if (problem === null && typeof ct.post === 'string') problem = Voyager.contractReturnProblem(ct.post);
+                    if (problem !== null) this._queueContractFix(e, bad);
+                }
+                continue;
+            }
             delete e.contractFail;
             // fix56/fix87: the same pre/post does not explain the violation. Installing it anyway left the contract
             //        unchanged, the queue entry was already consumed, and the next step queued the same repair (live:

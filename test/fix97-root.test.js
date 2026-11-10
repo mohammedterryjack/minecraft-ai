@@ -436,6 +436,66 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         assert.throws(() => Voyager.contractDeclaresReturn({ post: 'c => c[name]' }), /computed key/);
     });
 
+    it('a destructured parameter binding and a computed key on the parameter are refused when learned, queued, and do not fatal', async () => {
+        const forms = [
+            'c => { const { post, pre } = c; return post.free > pre.free }',
+            'c => c["po"+"st"].free > 0',
+        ];
+        const state = (free) => ({ pos: { x: 0, y: 64, z: 0 }, hp: 20, food: 20, sky: 15, alive: true, dim: 'overworld', inv: {}, free, eq: { heldItem: null } });
+        for (const post of forms) {
+            let expected;
+            try { Voyager.contractReadsReturn(post); }
+            catch (err) { expected = err.message; }
+            assert.strictEqual(typeof expected, 'string');
+            const v = mkV({});
+            const fatals = [];
+            v.agent.fatal = (why) => { fatals.push(why); };
+            v._saveSkills = () => {};
+            v._repairQueue = [];
+            const skill = {
+                name: 'clearSlots',
+                description: 'free a slot',
+                effects: [],
+                code: 'async function clearSlots(bot) { return true; }',
+                stats: { success: 0, fail: 0, streakFail: 0, tasks: [] },
+            };
+            v.skills = [skill];
+            v._ask = async () => JSON.stringify({ clearSlots: { pre: 'c => true', post, text: 'a free slot' } });
+            const n = await v._learnContracts([skill], 'saved');
+            assert.strictEqual(n, 0);
+            assert.strictEqual(Object.hasOwn(skill, 'contract'), false);
+            assert.strictEqual(skill.contractFail, expected);
+            assert.strictEqual(v._repairQueue.length, 1);
+            assert.strictEqual(v._repairQueue[0].kind, 'contract_fix');
+            assert.strictEqual(v._repairQueue[0].target, 'clearSlots');
+            assert.strictEqual(v._repairQueue[0].evidence, expected);
+            assert.deepStrictEqual(fatals, []);
+
+            const stored = {
+                name: 'clearSlots',
+                description: 'free a slot',
+                effects: [],
+                code: skill.code,
+                stats: { success: 0, fail: 0, streakFail: 0, tasks: [] },
+                contract: { pre: 'c => true', post, text: 'a free slot' },
+            };
+            v.skills = [stored];
+            v._repairQueue = [];
+            v._checkContracts([{ name: 'clearSlots', argv: [], rv: true, fail: false, s0: state(4), s1: state(5), delta: {}, parent: -1, depth: 0 }], true);
+            assert.deepStrictEqual(fatals, []);
+            assert.strictEqual(stored.contractFail, expected);
+            assert.strictEqual(v._repairQueue.length, 1);
+            assert.strictEqual(v._repairQueue[0].kind, 'contract_fix');
+            assert.strictEqual(v._repairQueue[0].evidence, expected);
+            assert.strictEqual(Object.hasOwn(stored.stats, 'calls'), false);
+        }
+        const v = mkV({});
+        const nested = { name: 'takeOne', code: 'async function takeOne(bot, item) { return true; }', effects: [] };
+        assert.strictEqual(v._validContract({ pre: 'c => true', post: 'c => c.post.inv[c.args[0]] > 0' }, nested), null);
+        assert.strictEqual(v._validContract({ pre: 'c => true', post: "c => c.delta['iron_helmet'] > 0" }, { name: 'smeltHelm', code: 'async function smeltHelm(bot) { return true; }', effects: [] }), null);
+        assert.strictEqual(v._validContract({ pre: 'c => true', post: 'c => c.ret === true' }, { name: 'did', code: 'async function did(bot) { return true; }', effects: [] }), null);
+    });
+
     it('a failed call is not a sample, so craftItem(null) and mineBlocks(oak_log, oak_log) do not refuse their pres', () => {
         const v = mkV({});
         const skills = JSON.parse(gunzipSync(readFileSync(new URL('./fixtures/icefox-live-index.json.gz', import.meta.url))));
