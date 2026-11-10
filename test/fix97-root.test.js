@@ -193,8 +193,10 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         const withArg = { name: 'checkOakLog', code: 'async function checkOakLog(bot, block) { return block === null; }', consumes: {}, effects: [] };
         const ok = v._validContract({ pre: 'c => c.args.length >= 1 && c.args[0] === null', post: 'c => true' }, withArg);
         assert.strictEqual(ok, null);
+        assert.strictEqual(withArg.contractEval, Voyager.CONTRACT_EVAL);
         const bareParam = { name: 'checkOakLog', code: 'async function checkOakLog(bot, block) { return true; }', consumes: {}, effects: [] };
-        assert.match(v._validContract({ pre: 'c => c.args[0] === null', post: 'c => true' }, bareParam), /parameter block has no sample for c\.args\[0\]/);
+        assert.strictEqual(v._validContract({ pre: 'c => c.args[0] === null', post: 'c => true' }, bareParam), null);
+        assert.strictEqual(bareParam.contractEval, Voyager.CONTRACT_EVAL);
         const buried = { name: 'checkOakLog', code: 'async function checkOakLog(bot) { return 155; }', consumes: {}, effects: [], stats: { success: 5512, fail: 0 } };
         const buriedReason = v._validContract({ pre: 'c => c.pre.inv.oak_log < 55', post: 'c => true' }, buried);
         assert.match(buriedReason, /pre uses 55/);
@@ -305,9 +307,59 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         assert.strictEqual(v._validContract({ pre: 'c => c.args.length === 4', post: 'c => true' }, midRest), null);
         const derived = { name: 'cookFood', code: 'async function cookFood(bot, count = Number("1")) { return count >= 1; }', consumes: {}, effects: [] };
         assert.strictEqual(v._validContract({ pre: 'c => c.args[0] >= 1', post: 'c => true' }, derived), null);
+        assert.strictEqual(derived.contractEval, Voyager.CONTRACT_EVAL);
         const invented = { name: 'cookFood', code: 'async function cookFood(bot, count = Number("1")) { return true; }', consumes: {}, effects: [] };
-        assert.match(v._validContract({ pre: 'c => c.args[0] >= 1', post: 'c => true' }, invented), /parameter count has no sample for c\.args\[0\]/);
+        assert.strictEqual(v._validContract({ pre: 'c => c.args[0] >= 1', post: 'c => true' }, invented), null);
+        assert.strictEqual(invented.contractEval, Voyager.CONTRACT_EVAL);
         assert.strictEqual(v._validContract({ pre: 'c => true', post: 'c => true' }, invented), null);
+        assert.strictEqual(Object.hasOwn(invented, 'contractEval'), false);
+    });
+
+    it('craftItem\'s typeof contract is accepted from a recorded call, a contradicting contract is rejected, and no call is pending', () => {
+        const v = mkV({});
+        const craft = {
+            name: 'craftItem',
+            code: 'async function craftItem(bot, itemName, target = 1) { if (!itemName) return false; return true; }',
+            stats: { success: 1, fail: 0, streakFail: 0, tasks: [] },
+        };
+        const typeofString = { pre: "c => c.pre.alive && typeof c.args[0] === 'string' && (c.args.length === 1 || (c.args.length === 2 && typeof c.args[1] === 'number' && c.args[1] >= 1))", post: 'c => true' };
+        assert.strictEqual(v._validContract(typeofString, craft), null);
+        assert.strictEqual(craft.contractEval, Voyager.CONTRACT_EVAL);
+        assert.strictEqual(Object.hasOwn(craft.stats, 'calls'), false);
+        assert.strictEqual(Voyager.recordCallShape(craft, ['oak_planks', 1]), true);
+        assert.strictEqual(Voyager.recordCallShape(craft, ['oak_planks', 1]), false);
+        assert.strictEqual(craft.stats.calls.length, 1);
+        assert.strictEqual(craft.stats.calls[0].shape, Voyager.CALL_SHAPE);
+        assert.deepStrictEqual(craft.stats.calls[0].types, ['string', 'number']);
+        assert.strictEqual(v._validContract(typeofString, craft), null);
+        assert.strictEqual(Object.hasOwn(craft, 'contractEval'), false);
+        assert.match(v._validContract({ pre: "c => typeof c.args[0] === 'number'", post: 'c => true' }, craft), /contradicts recorded call \("oak_planks", 1\)/);
+        assert.strictEqual(Voyager.recordCallShape(craft, ['stick', 4]), true);
+        assert.strictEqual(craft.stats.calls.length, 2);
+        const named = Voyager.skillArgCounts({ name: 'take', code: 'function take(bot, { item }, [n]) { return item === null && n === 1; }' });
+        assert.deepStrictEqual(named.names, ['{item}', '[n]']);
+        assert.throws(() => Voyager.parameterSample({
+            type: 'FunctionDeclaration',
+            body: { type: 'FunctionExpression' },
+            params: [{ type: 'Identifier', name: 'a' }],
+        }, { type: 'Identifier', name: 'a' }), /FunctionExpression has no parameter list/);
+        const pos = { x: 0, y: 64, z: 0 };
+        const s = { pos, hp: 20, food: 20, sky: 15, alive: true, dim: 'overworld', inv: {}, free: 0, eq: { heldItem: null } };
+        const live = {
+            name: 'craftItem',
+            code: craft.code,
+            stats: { success: 0, fail: 0, streakFail: 0, tasks: [] },
+            contract: typeofString,
+            contractEval: Voyager.CONTRACT_EVAL,
+        };
+        v.skills = [live];
+        v._repairQueue = [];
+        v._checkContracts([{ name: 'craftItem', argv: ['oak_planks', 1], rv: true, s0: s, s1: s, delta: {}, intr: false }], true);
+        assert.strictEqual(Object.hasOwn(live, 'contractEval'), false);
+        assert.strictEqual(live.stats.calls.length, 1);
+        assert.strictEqual(Object.hasOwn(live, 'contractFail'), false);
+        v._checkContracts([{ name: 'craftItem', argv: ['oak_planks', 1], rv: true, s0: s, s1: s, delta: {}, intr: false }], true);
+        assert.strictEqual(live.stats.calls.length, 1);
     });
 
     it('parses a skill as a module and a contract as a parenthesized expression, and a comment or string is not a numeric literal', () => {
