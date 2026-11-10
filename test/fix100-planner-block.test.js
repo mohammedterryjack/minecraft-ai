@@ -319,9 +319,10 @@ describe('fix100 watchdog', () => {
         const ended = await new Promise((resolve) => child.on('exit', (code, signal) => resolve({ code, signal })));
         assert.strictEqual(ended.signal, null, stderr);
         assert.strictEqual(ended.code, 1, stderr);
-        assert.match(stderr, /LOUD FAIL: watchdog worker crashed/);
         assert.match(stderr, /\[fatal\]/);
-        assert.match(stderr, /LOUD: process.exit with the watchdog worker crashed/);
+        // The worker writes this before it dies, on both the parent 'error' path and the 'exit'-only path.
+        assert.match(stderr, /LOUD FAIL: worker fatal:/);
+        assert.match(stderr, /TypeError: Cannot read properties of null \(reading 'gen'\)/);
         await rm(dir, { recursive: true, force: true });
     });
 

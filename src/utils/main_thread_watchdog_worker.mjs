@@ -19,6 +19,17 @@ import { workerData } from 'node:worker_threads';
 import { writeSync, writeFileSync, renameSync } from 'node:fs';
 import { Session } from 'node:inspector';
 
+// Node posts the parent's 'error' only after this returns false (no uncaughtException listener):
+// lib/internal/main/worker_thread.js workerOnGlobalUncaughtException, via
+// lib/internal/process/execution.js onGlobalUncaughtException.
+// uncaughtExceptionMonitor runs first and does not count as handling the exception
+// (https://nodejs.org/api/process.html#event-uncaughtexceptionmonitor), so the parent still
+// receives the error, and the stack is on stderr even when the parent only observes 'exit'.
+process.on('uncaughtExceptionMonitor', (err) => {
+    const text = err && err.stack ? err.stack : String(err);
+    writeSync(2, `[watchdog] LOUD FAIL: worker fatal: ${text}\n`);
+});
+
 const BEAT = 0, LIMIT = 1, READY = 2;
 const NS = 1_000_000n;
 const ctl = new Int32Array(workerData.sab);

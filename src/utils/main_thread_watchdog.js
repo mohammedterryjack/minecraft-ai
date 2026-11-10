@@ -62,24 +62,38 @@ export function startMainThreadWatchdog(evidencePath) {
     });
     let workerAlive = true;
     let workerDeadReason = null;
-    // 'error' is emitted before 'exit'. A throw here reaches uncaughtException, then fatalExit, then
-    // process.exit, while 'exit' has not run. The flag has to be clear before that throw or process.exit
-    // waits on a worker that can no longer ack, and launchd never restarts.
+    // 'error' is delivered before 'exit', but a throw from that listener is dropped when Node is
+    // inside the port drain (see the listener below). The crash is rethrown from 'exit', which is
+    // outside that drain, and workerAlive is already false so process.exit does not wait for an ack.
     const markWorkerDead = (reason) => {
         workerAlive = false;
         workerDeadReason = reason;
         Atomics.store(ack, 0, 1);
         Atomics.notify(ack, 0);
     };
+    let workerError = null;
     worker.on('error', (e) => {
+        // Do not throw here. lib/internal/worker.js kOnExit drains the message port and only then
+        // emits 'exit' (https://nodejs.org/api/worker_threads.html#event-exit: messages precede exit,
+        // and exit is the final event). The crash's ERROR_MESSAGE is posted and then the worker calls
+        // process.exit() (lib/internal/main/worker_thread.js workerOnGlobalUncaughtException), so the
+        // parent usually delivers 'error' from that drain. src/node_messaging.cc MessagePort::OnMessage
+        // returns when MakeCallback is empty, so a throw from this listener never becomes the uncaught
+        // exception, and the 'exit' listener's throw replaces it. The TypeError is lost.
+        workerError = e;
         markWorkerDead('crashed');
-        throw new Error(`[watchdog] LOUD FAIL: watchdog worker crashed: ${e && e.stack ? e.stack : e}`);
     });
     worker.on('exit', (code) => {
-        markWorkerDead('exited');
+        if (workerError) markWorkerDead('crashed');
+        else markWorkerDead('exited');
         // The exit event cannot run while the main thread is inside Atomics.wait, so a worker that
         // dies earlier is marked dead by 'error' or by terminate() before any wait.
+        // This throw is outside the port drain, so it does reach uncaughtException.
         if (_shuttingDown) return;
+        if (workerError) {
+            const text = workerError && workerError.stack ? workerError.stack : String(workerError);
+            throw new Error(`[watchdog] LOUD FAIL: watchdog worker crashed: ${text}`);
+        }
         throw new Error(`[watchdog] LOUD FAIL: watchdog worker exited (code ${code}); the main thread is unguarded`);
     });
     // terminate() only emits 'exit' later. A process.exit in the same tick would still see the worker
