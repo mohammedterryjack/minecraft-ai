@@ -419,7 +419,7 @@ describe('fix98: prompt facts', () => {
             health: 4,
             food: 0,
             oxygenLevel: 300,
-            game: { dimension: 'overworld' },
+            game: { dimension: 'overworld', serverViewDistance: 10 },
             heldItem: null,
             inventory: { items: () => [], emptySlotCount: () => 36, slots: Array(46).fill(null) },
             entities: {},
