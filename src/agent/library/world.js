@@ -906,19 +906,12 @@ function sectionInfo(column, si, where, registry, open) {
     return { kind: 'mixed', section };
 }
 
-function neighborSection(ctx, x, y, z, idx, selfKey) {
+function neighborSection(ctx, x, y, z, idx) {
     const cx = Math.floor(x / CHUNK_WIDTH), cz = Math.floor(z / CHUNK_WIDTH);
     if (!inView(ctx, cx, cz)) return { kind: 'hidden' };
     const key = `${cx},${cz}`;
     const col = ctx.columns.get(key);
-    if (!col) {
-        if (selfKey) {
-            let list = idx.waiters.get(key);
-            if (!list) { list = new Set(); idx.waiters.set(key, list); }
-            list.add(selfKey);
-        }
-        return { kind: 'hidden' };
-    }
+    if (!col) return { kind: 'hidden' };
     const column = col.column;
     if (!Number.isInteger(column.minY) || !Array.isArray(column.sections)) {
         throw new Error(`nearby blocks: chunk ${cx},${cz} has no minY or sections.`);
@@ -935,7 +928,7 @@ function readIndexedCell(ctx, x, y, z, idx) {
     return stateAt(ctx.columns, x, y, z, ctx.view);
 }
 
-function faceOpen(ctx, idx, selfKey, x, y, z, fx, fy, fz, ownCells) {
+function faceOpen(ctx, idx, x, y, z, fx, fy, fz, ownCells) {
     const nx = x + fx, ny = y + fy, nz = z + fz;
     if (ownCells) {
         const lx = nx - ownCells.minX, ly = ny - ownCells.originY, lz = nz - ownCells.minZ;
@@ -944,7 +937,7 @@ function faceOpen(ctx, idx, selfKey, x, y, z, fx, fy, fz, ownCells) {
             return nonOccluding(ctx.registry, id, idx.open);
         }
     }
-    const info = neighborSection(ctx, nx, ny, nz, idx, selfKey);
+    const info = neighborSection(ctx, nx, ny, nz, idx);
     if (info.kind === 'hidden') return false;
     if (info.kind === 'air' || info.kind === 'clear') return true;
     if (info.kind === 'solid') return false;
@@ -1055,12 +1048,7 @@ function visibilityGraph(ids, registry, openCache) {
     return { conn, reach };
 }
 
-function rememberWaiters(idx, selfKey) {
-    for (const list of idx.waiters.values()) list.delete(selfKey);
-}
-
 function indexSection(idx, ctx, cx, cz, si, column) {
-    const selfKey = `${cx},${cz}`;
     const { originY, where } = sectionWhere(cx, cz, column, si);
     const info = sectionInfo(column, si, where, ctx.registry, idx.open);
     idx.sectionsBuilt += 1;
@@ -1075,7 +1063,7 @@ function indexSection(idx, ctx, cx, cz, si, column) {
         let opened = false;
         for (let face = 0; face < FACE_COUNT; face++) {
             const [fx, fy, fz] = FACES[face];
-            const probe = neighborSection(ctx, minX + (fx > 0 ? CHUNK_WIDTH - 1 : 0) + fx, originY + (fy > 0 ? SECTION_HEIGHT - 1 : 0) + fy, minZ + (fz > 0 ? CHUNK_WIDTH - 1 : 0) + fz, idx, selfKey);
+            const probe = neighborSection(ctx, minX + (fx > 0 ? CHUNK_WIDTH - 1 : 0) + fx, originY + (fy > 0 ? SECTION_HEIGHT - 1 : 0) + fy, minZ + (fz > 0 ? CHUNK_WIDTH - 1 : 0) + fz, idx);
             if (probe.kind === 'solid' || probe.kind === 'hidden') continue;
             const positions = facePositions(minX, originY, minZ, face);
             if (info.kind === 'solid' && (probe.kind === 'air' || probe.kind === 'clear')) {
@@ -1084,10 +1072,10 @@ function indexSection(idx, ctx, cx, cz, si, column) {
                 continue;
             }
             for (const [x, y, z] of positions) {
-                if (info.kind === 'solid' && !faceOpen(ctx, idx, selfKey, x, y, z, fx, fy, fz, null)) continue;
+                if (info.kind === 'solid' && !faceOpen(ctx, idx, x, y, z, fx, fy, fz, null)) continue;
                 if (info.kind === 'clear') {
                     const id = readIndexedCell(ctx, x, y, z, idx);
-                    if (id === 0 || !faceOpen(ctx, idx, selfKey, x, y, z, fx, fy, fz, null)) continue;
+                    if (id === 0 || !faceOpen(ctx, idx, x, y, z, fx, fy, fz, null)) continue;
                     opened = true;
                     putCell(sec, x, y, z, id, 1 << face);
                     continue;
@@ -1116,7 +1104,7 @@ function indexSection(idx, ctx, cx, cz, si, column) {
         const x = minX + local.x, y = originY + local.y, z = minZ + local.z;
         for (let face = 0; face < FACE_COUNT; face++) {
             const [fx, fy, fz] = FACES[face];
-            if (!faceOpen(ctx, idx, selfKey, x, y, z, fx, fy, fz, own)) continue;
+            if (!faceOpen(ctx, idx, x, y, z, fx, fy, fz, own)) continue;
             opened = true;
             putCell(sec, x, y, z, id, 1 << face);
         }
@@ -1137,7 +1125,6 @@ function buildColumn(idx, ctx, cx, cz) {
         throw new Error(`nearby blocks: chunk ${cx},${cz} is queued in the view and is not loaded. A missing column is not an empty block list.`);
     }
     const column = col.column;
-    rememberWaiters(idx, selfKey);
     const started = performance.now();
     const sections = new Array(column.sections.length);
     for (let si = 0; si < column.sections.length; si++) sections[si] = indexSection(idx, ctx, cx, cz, si, column);
@@ -1183,6 +1170,13 @@ function indexReport(idx) {
 
 function scheduleIndex(bot, idx) {
     if (idx.pumping) return;
+    if (!idx.queue.length) {
+        if (idx.drain.length === 0) return;
+        const waiting = idx.drain.splice(0);
+        const report = indexReport(idx);
+        for (const w of waiting) w.resolve(report);
+        return;
+    }
     idx.pumping = true;
     const step = () => {
         if (!idx.queue.length) {
@@ -1193,13 +1187,18 @@ function scheduleIndex(bot, idx) {
             return;
         }
         const job = idx.queue.shift();
-        idx.pending.delete(`${job.cx},${job.cz}`);
+        const key = `${job.cx},${job.cz}`;
+        idx.pending.delete(key);
         try {
             buildColumn(idx, viewContext(bot), job.cx, job.cz);
         } catch (err) {
+            // Taken off pending before the build. Put it back and leave every other queued column pending.
+            // Clearing the queue left loaded in-view columns neither indexed nor pending (the reindexSectionAt invariant).
+            if (!idx.columns.has(key)) {
+                idx.pending.add(key);
+                idx.queue.unshift(job);
+            }
             idx.pumping = false;
-            idx.queue.length = 0;
-            idx.pending.clear();
             const waiting = idx.drain.splice(0);
             if (waiting.length === 0) throw err;
             for (const w of waiting) w.reject(err);
@@ -1219,7 +1218,6 @@ function chunkCorner(corner, event) {
 
 function dropColumn(idx, key) {
     const had = idx.columns.delete(key);
-    rememberWaiters(idx, key);
     idx.pending.delete(key);
     idx.queue = idx.queue.filter(job => `${job.cx},${job.cz}` !== key);
     if (had) bumpVis(idx);
@@ -1260,7 +1258,7 @@ function refreshBoundary(idx, ctx, cx, cz, face) {
         for (const [x, y, z] of facePositions(minX, originY, minZ, face)) {
             const id = info.kind === 'solid' ? info.id : readIndexedCell(ctx, x, y, z, idx);
             if (id === 0 || id === null) continue;
-            if (!faceOpen(ctx, idx, key, x, y, z, fx, fy, fz, null)) continue;
+            if (!faceOpen(ctx, idx, x, y, z, fx, fy, fz, null)) continue;
             const pack = `${x},${y},${z}`;
             const prev = sec.cells.get(pack);
             if (!prev || (prev.mask & bit) === 0) changed = true;
@@ -1296,19 +1294,29 @@ function dropOutsideView(idx, ctx) {
     idx.viewR = ctx.radius;
 }
 
+// A loaded column enters the square when the bot crosses a chunk border or the radius grows. There is no
+// load event: vanilla already sent the ring just past the view edge, and a scan's dropOutsideView drops a
+// column that stays loaded. Re-sync on every event that builds a view context. dropOutsideView returns
+// immediately when the stood chunk and the radius are unchanged.
+function syncView(bot, idx, ctx) {
+    dropOutsideView(idx, ctx);
+    enqueueView(idx, ctx);
+    scheduleIndex(bot, idx);
+}
+
 function onColumnLoad(bot, idx, corner) {
     const { cx, cz } = chunkCorner(corner, 'chunkColumnLoad');
     const ctx = viewContext(bot);
     dropColumn(idx, `${cx},${cz}`);
-    enqueueColumn(idx, ctx, cx, cz);
+    syncView(bot, idx, ctx);
     patchNeighborFaces(idx, ctx, cx, cz);
-    scheduleIndex(bot, idx);
 }
 
 function onColumnUnload(bot, idx, corner) {
     const { cx, cz } = chunkCorner(corner, 'chunkColumnUnload');
     const ctx = viewContext(bot);
     dropColumn(idx, `${cx},${cz}`);
+    syncView(bot, idx, ctx);
     patchNeighborFaces(idx, ctx, cx, cz);
 }
 
@@ -1341,6 +1349,7 @@ function onBlockUpdate(bot, idx, oldBlock, newBlock) {
         throw new Error('nearby blocks: blockUpdate has no position (prismarine-world worldsync.js _emitBlockUpdate).');
     }
     const ctx = viewContext(bot);
+    syncView(bot, idx, ctx);
     const done = new Set();
     reindexSectionAt(idx, ctx, pos.x, pos.y, pos.z, done);
     for (const [fx, fy, fz] of FACES) reindexSectionAt(idx, ctx, pos.x + fx, pos.y + fy, pos.z + fz, done);
@@ -1358,7 +1367,7 @@ function ensureIndex(bot) {
         throw new Error('nearby blocks: bot.world.on is missing. chunkColumnLoad, chunkColumnUnload, and blockUpdate are forwarded on the world (mineflayer lib/plugins/blocks.js forwardedEvents).');
     }
     idx = {
-        columns: new Map(), queue: [], pending: new Set(), waiters: new Map(), drain: [], pumping: false,
+        columns: new Map(), queue: [], pending: new Set(), drain: [], pumping: false,
         cellReads: 0, sectionsBuilt: 0, sectionsSkipped: 0, builds: 0, buildMs: 0, open: new Map(),
         visGen: 0, vis: null, reachedKeys: new Set(),
     };
@@ -1380,8 +1389,7 @@ export function indexPerceivedChunks(bot) {
     const idx = ensureIndex(bot);
     const ctx = viewContext(bot);
     if (!ctx.columns.has(standingKey(ctx))) return Promise.reject(missingStanding(ctx));
-    dropOutsideView(idx, ctx);
-    enqueueView(idx, ctx);
+    syncView(bot, idx, ctx);
     if (!idx.queue.length && !idx.pumping) return Promise.resolve(indexReport(idx));
     return new Promise((resolve, reject) => {
         idx.drain.push({ resolve, reject });
@@ -1400,6 +1408,21 @@ export function perceivedBuildStats(bot) {
     const idx = perceivedIndex.get(bot);
     if (!idx) throw new Error('perceivedBuildStats: the exposed index has not been built for this bot');
     return indexReport(idx);
+}
+
+export function perceivedViewColumns(bot) {
+    const idx = perceivedIndex.get(bot);
+    if (!idx) throw new Error('perceivedViewColumns: the exposed index has not been built for this bot');
+    const ctx = viewContext(bot);
+    const rows = [];
+    for (const key of ctx.columns.keys()) {
+        const parts = key.split(',');
+        const cx = Number(parts[0]);
+        const cz = Number(parts[1]);
+        if (!inView(ctx, cx, cz)) continue;
+        rows.push({ cx, cz, indexed: idx.columns.has(key), pending: idx.pending.has(key) });
+    }
+    return rows;
 }
 
 function componentFaces(sec, localIndex) {
@@ -1613,8 +1636,7 @@ function perceivedBlocks(bot) {
     const idx = ensureIndex(bot);
     dropOutsideView(idx, ctx);
     if (!idx.columns.has(standingKey(ctx))) buildColumn(idx, ctx, ctx.stoodX, ctx.stoodZ);
-    enqueueView(idx, ctx);
-    scheduleIndex(bot, idx);
+    syncView(bot, idx, ctx);
     const seen = confirmVisible(ctx, idx, null);
     perceivedStat.set(bot, {
         cellReads: 0, candidates: seen.candidates, raycasts: seen.raycasts, ddaRays: seen.ddaRays, ddaSteps: seen.ddaSteps,

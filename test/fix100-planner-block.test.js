@@ -27,6 +27,7 @@ const HEALTHY_CHILD = fileURLToPath(new URL('./fixtures/fix100-healthy-then-bloc
 const DEAD_WORKER_CHILD = fileURLToPath(new URL('./fixtures/fix100-dead-worker-exit-child.mjs', import.meta.url));
 const CRASH_EXIT_CHILD = fileURLToPath(new URL('./fixtures/fix100-worker-crash-exit-child.mjs', import.meta.url));
 const TERMINATE_EXIT_CHILD = fileURLToPath(new URL('./fixtures/fix100-terminate-exit-child.mjs', import.meta.url));
+const FRESH_HEARTBEAT_CHILD = fileURLToPath(new URL('./fixtures/fix103-fresh-heartbeat-child.mjs', import.meta.url));
 const START_AFTER_KEEPALIVE_MS = 13_000;
 const BLOCK_MS = 20_000;
 const INV = { oak_log: 23, diorite: 105, andesite: 60, raw_copper: 8, iron_helmet: 3, raw_iron: 85, torch: 80, oak_sapling: 18, granite: 64, coal: 15, stick: 1, cobbled_deepslate: 5, dark_oak_planks: 1, oak_button: 1, jukebox: 1, iron_sword: 1, music_disc_11: 1, honey_block: 1, cobblestone: 337, netherrack: 1, dirt: 261, birch_log: 6, oak_planks: 1 };
@@ -260,6 +261,7 @@ describe('fix100 watchdog', () => {
         const ended = await new Promise((resolve) => child.on('exit', (code, signal) => resolve({ code, signal })));
         assert.strictEqual(ended.signal, 'SIGKILL', stderr);
         assert.match(stderr, /MAIN THREAD BLOCKED/);
+        assert.doesNotMatch(stderr, /KEEP-ALIVE NOT PROCESSED/);
         assert.match(stderr, /limit 30000ms/);
         assert.match(stderr, /keep-alive/);
         assert.match(stderr, /blockedInHungerServe/);
@@ -267,6 +269,7 @@ describe('fix100 watchdog', () => {
         assert.doesNotMatch(stderr, /stack not captured/);
         const recorded = JSON.parse(readFileSync(ev, 'utf8'));
         assert.strictEqual(recorded.killClock, 'keep-alive');
+        assert.ok(recorded.silentMs >= KEEP_ALIVE_INTERVAL_MS, `heartbeat age ${recorded.silentMs}ms is still inside the beat interval`);
         assert.ok(recorded.silentMs < KEEP_ALIVE_KICK_MS, `heartbeat age ${recorded.silentMs}ms reached the beat kill`);
         assert.ok(recorded.kaAgeMs >= KEEP_ALIVE_KICK_MS, `ka age ${recorded.kaAgeMs}`);
         assert.ok(recorded.kaAgeMs < START_AFTER_KEEPALIVE_MS + BLOCK_MS, `killed after the block would have ended (${recorded.kaAgeMs}ms)`);
@@ -278,6 +281,23 @@ describe('fix100 watchdog', () => {
         assert.strictEqual(recorded.lastPopped, 'action:hunger-serve');
         assert.strictEqual(typeof recorded.lastPoppedAt, 'string');
         assert.strictEqual(existsSync(ev), true);
+        await rm(dir, { recursive: true, force: true });
+    });
+
+    it('a keep-alive kill with a heartbeat younger than the beat interval is KEEP-ALIVE NOT PROCESSED', { timeout: KEEP_ALIVE_KICK_MS + KEEP_ALIVE_INTERVAL_MS }, async () => {
+        const dir = await mkdtemp(join(tmpdir(), 'fix103-fresh-ka-'));
+        const ev = join(dir, 'watchdog_kill.json');
+        const child = spawn(process.execPath, [FRESH_HEARTBEAT_CHILD, ev], { stdio: ['ignore', 'pipe', 'pipe'] });
+        let stderr = '';
+        child.stderr.on('data', (d) => { stderr += d; });
+        const ended = await new Promise((resolve) => child.on('exit', (code, signal) => resolve({ code, signal })));
+        assert.strictEqual(ended.signal, 'SIGKILL', stderr);
+        assert.match(stderr, /KEEP-ALIVE NOT PROCESSED/);
+        assert.doesNotMatch(stderr, /MAIN THREAD BLOCKED/);
+        const recorded = JSON.parse(readFileSync(ev, 'utf8'));
+        assert.strictEqual(recorded.killClock, 'keep-alive');
+        assert.ok(recorded.silentMs < KEEP_ALIVE_INTERVAL_MS, `heartbeat age ${recorded.silentMs}ms is not under the beat interval`);
+        assert.ok(recorded.kaAgeMs >= KEEP_ALIVE_KICK_MS, `ka age ${recorded.kaAgeMs}`);
         await rm(dir, { recursive: true, force: true });
     });
 

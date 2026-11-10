@@ -138,24 +138,17 @@ describe('fix65: trial candidates are retired by the learner', () => {
         assert.strictEqual(v.skills.find(s => s.name === 'collectBlock').candidate.stats.fail, 1);
     });
 
-    it('a crash during the step is attributed to the call running when it was thrown', () => {
+    it('an uncaught exception during the step is fatal and is not attributed to the call that was running', () => {
         const v = liveVoyager();
+        const fatals = [];
         v.running = true; v.currentTask = 'Mine 1 iron_ore';
-        v.agent.bot.interrupt_code = false; v.agent.actions = { stop: () => {} }; v.agent.requestInterrupt = () => { v.agent.bot.interrupt_code = true; };   // fix75: the process error records itself as an interrupt source
+        v.agent.fatal = (why, err) => { fatals.push({ why, message: err.message }); };
         v._runStart = Date.now() - 4;
         v._onProcessError('UNCAUGHT EXCEPTION', new Error('boom'));
-        const c = v._crashedInRun();
-        assert.strictEqual(c.message, 'boom');
-        const t = c.t;
-        v.agent.bot.__psnOut = '';
-        v.agent.bot.__psnTrace = [
-            { name: 'mineOneIronOre', args: '[]', parent: -1, depth: 0, o0: 0, t0: t - 3, intr: true },
-            { name: 'collectBlock', args: '[]', parent: 0, depth: 1, o0: 0, t0: t - 1, intr: true },
-        ];
-        v._stall = null; v._lastRunMsg = ''; v.agent.lastDeath = null;
-        v._isLeaf = () => { throw STOP; };
-        assert.throws(() => v._attribute('mineOneIronOre', 'Mine 1 iron_ore', false, v._replayOverrides('mineOneIronOre', false), null), e => e === STOP);
-        assert.strictEqual(v.skills.find(s => s.name === 'collectBlock').candidate.stats.fail, 1);
+        assert.deepStrictEqual(fatals, [{ why: 'UNCAUGHT EXCEPTION', message: 'boom' }]);
+        assert.strictEqual(v._crashedInRun(), null);
+        assert.deepStrictEqual(v.progress.failed, []);
+        assert.strictEqual(v.skills.find(s => s.name === 'collectBlock').candidate.stats.fail, 0);
     });
 
     it('a run that killed the process is counted on the next start from the trial journal + watchdog evidence', () => {
