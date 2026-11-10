@@ -81,6 +81,7 @@ function createMockBot() {
     
     const mockWorld = {
         getBiome: () => ({ name: 'forest' }),
+        getColumns: () => [],
     };
     
     return {

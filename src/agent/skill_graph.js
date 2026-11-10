@@ -579,45 +579,41 @@ export function traceText(trace) {
 export function factKey(line) {
     return String(line).replace(/-?\d+(?:\.\d+)?/g, '#').replace(/\s+/g, ' ').trim();
 }
-// Every line is kept as a fact. Lines that differ only by numbers are one fact: the count, the first line, and the last line.
-// Interleaved repeats are the same fact. Nothing is cut.
+// Identical lines are one fact with a count. A line that differs, including by a number, is a different value and is listed.
+// Nothing is cut.
 export function groupVaryingLines(text) {
     const lines = String(text || '').split('\n').filter(l => l.trim().length > 0);
     const groups = new Map();
     const order = [];
     for (const line of lines) {
-        const key = factKey(line);
-        if (!key) continue;
-        let g = groups.get(key);
-        if (!g) { g = []; groups.set(key, g); order.push(key); }
-        g.push(line);
+        let g = groups.get(line);
+        if (!g) { g = 0; groups.set(line, 0); order.push(line); }
+        groups.set(line, (g || 0) + 1);
     }
-    return order.map(k => {
-        const g = groups.get(k);
-        if (g.length === 1) return g[0];
-        if (g[0] === g[g.length - 1]) return `${g[0]} (x${g.length})`;
-        return `${g[0]} (x${g.length}, last: ${g[g.length - 1]})`;
+    return order.map(line => {
+        const n = groups.get(line);
+        return n > 1 ? `${line} (x${n})` : line;
     }).join('\n');
 }
 function callErrorText(r) {
     const lines = [];
-    if (r.err) lines.push(String(r.err));
     if (Array.isArray(r.ownFail)) lines.push(...r.ownFail.filter(l => typeof l === 'string' && l.length > 0));
     return groupVaryingLines(lines.join('\n')).split('\n').join(' | ');
+}
+function outcomeText(r) {
+    return r.err ? `threw ${r.err}` : `${r.ret}${r.ok ? '' : ' FAIL'}`;
 }
 function callHead(trace, r) {
     const parent = Number.isInteger(r.parent) && r.parent >= 0 && r.parent < trace.length ? trace[r.parent].name : '';
     const args = r.args.replace(/^\[|\]$/g, '');
-    const outcome = r.err ? `threw ${r.err}` : `${r.ret}${r.ok ? '' : ' FAIL'}`;
-    return `${parent ? parent + ' > ' : ''}${r.name}(${args}) -> ${outcome}`;
+    return `${parent ? parent + ' > ' : ''}${r.name}(${args}) -> ${outcomeText(r)}`;
 }
 function callSignature(trace, r) {
     const parent = Number.isInteger(r.parent) && r.parent >= 0 && r.parent < trace.length ? trace[r.parent].name : '';
-    const outcome = r.err ? 'threw' : (r.ok ? 'ok' : 'fail');
-    return `${parent}|${r.name}|${factKey(r.args)}|${outcome}`;
+    return `${parent}|${r.name}|${factKey(r.args)}|${outcomeText(r)}|${callErrorText(r)}`;
 }
-// One entry per distinct call. The same call interleaved with others, or repeated with different coordinates, is one
-// entry: how many times it ran, and the first and last error. The count is the calls that are not printed one by one.
+// One entry per distinct call. The key includes the outcome and the error text, so a different return or a different
+// error is its own line with its own count. Identical calls, including ones interleaved with others, share a count.
 export function structuredTrace(trace) {
     if (!Array.isArray(trace)) throw new Error('structuredTrace: trace array required');
     const groups = new Map();
@@ -633,13 +629,10 @@ export function structuredTrace(trace) {
     }
     const lines = order.map(key => {
         const recs = groups.get(key);
-        const first = recs[0], last = recs[recs.length - 1];
-        const head = callHead(trace, first);
-        const e1 = callErrorText(first), e2 = callErrorText(last);
+        const head = callHead(trace, recs[0]);
+        const errors = callErrorText(recs[0]);
         const count = recs.length > 1 ? ` (x${recs.length})` : '';
-        const same = callHead(trace, first) === callHead(trace, last) && e1 === e2;
-        if (same) return `${head}${count}${e1 ? ' | ' + e1 : ''}`;
-        return `${head}${count} | first: ${e1 || head} | last: ${callHead(trace, last)}${e2 ? ' | ' + e2 : ''}`;
+        return `${head}${count}${errors ? ' | ' + errors : ''}`;
     });
     if (trace.untraced > 0) lines.push(`(${trace.untraced} further call(s) ran after the trace's ${trace.length} records and were not recorded)`);
     return lines.join('\n');

@@ -300,7 +300,8 @@ export class Prompter {
 
         let resp;
         try {
-            const convo = Array.isArray(messages) ? messages.map(m => typeof m === 'string' ? m : `${m.role}: ${m.content}`).join('\n') : '';
+            if (!Array.isArray(messages)) throw new Error('[code-prompt] coding messages must be an array');
+            const convo = messages.map(m => typeof m === 'string' ? m : `${m.role}: ${m.content}`).join('\n');
             writeCodePromptDump(prompt, convo);
             resp = await this.code_model.sendRequest(messages, prompt);
         } finally {

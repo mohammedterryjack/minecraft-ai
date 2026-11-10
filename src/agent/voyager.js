@@ -28,7 +28,7 @@ import minecraftData from 'minecraft-data';
 import { Ollama, CONTEXT_FULL } from '../models/ollama.js';
 import { setCallDurationStore } from '../models/call_durations.js';
 import { setMovementStore, learnedKinds, recordStep, recordCut, stepBound, noteUnbounded } from '../utils/movement_model.js';
-import { signatureOf, depsOf, missingCalls, installViolations, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf, thrownIn, declaredNames, skillSourceViolations, splitGeneratedCode, oneFunctionFeedback, entryCallFeedback, markerCallsMissing, markerGateNames, collapseRepeats, parsesAsScript, pastedLibrarySkills, factKey, groupVaryingLines, structuredTrace } from './skill_graph.js';
+import { signatureOf, depsOf, missingCalls, installViolations, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf, thrownIn, declaredNames, skillSourceViolations, splitGeneratedCode, oneFunctionFeedback, entryCallFeedback, markerCallsMissing, markerGateNames, collapseRepeats, parsesAsScript, pastedLibrarySkills, groupVaryingLines, structuredTrace } from './skill_graph.js';
 import { writeCodePromptDump } from '../models/code_prompt_dump.js';
 import { getBareAPI, collectBareApiUsedInSource, PRECONDITION_UNMET_BINDING } from './coder.js';   // fix40: unified bare-name API helper
 import { withStallPhase } from '../utils/event_loop_guard.js';
@@ -101,14 +101,14 @@ export function extractFeedback(output) {
     return collapseRepeats(String(output === undefined || output === null ? '' : output).split('\n')).join('\n');
 }
 // fix97: the code-retry prompt is this text. compose-retry #78 (fix96 1c2f9c0, Collect 1 stripped_birch_wood) sent
-// the prompt in CODE_RETRY_78 (src/models/code_retry_observation.js): 181705 chars, retry section 170464 (94%),
+// the prompt in CODE_RETRY_78 (test/fixtures/code_retry_observation.js): 181705 chars, retry section 170464 (94%),
 // Ollama prompt_eval_count 58984 against num_ctx 8192.
 // The section was attempt 1's execution output, the 789-call trace, the inventory-full fact and the behaviour log,
 // each repeating the same lines. collapseRepeats only merges consecutive identical lines, so 60 identical
 // collectLogs FAILs interleaved with other calls, and pathfinder lines that differ by coordinates, all stayed.
-// This builds the same facts once: one trace entry per distinct call (count, outcome, first and last error), then
-// output and behaviour lines whose words are already in that trace or in the inventory fact are not pasted again.
-// Nothing is sliced. A line that says something the trace does not say is kept, with its own repeats counted.
+// This builds the same facts once. A call's grouping key is its parent, name, argument words, the full outcome
+// (the return value or the throw), and the full error text. Every distinct key is one line with its count.
+// A line already printed verbatim is not pasted again. A longer line is not the same line. Nothing is sliced.
 export function codeRetryFeedback({ cut, output, trace, critique, invFull, behaviorLog }) {
     if (typeof critique !== 'string') throw new Error('[fix97] code retry feedback needs the critic text');
     if (typeof output !== 'string') throw new Error('[fix97] code retry feedback needs the execution output');
@@ -116,33 +116,20 @@ export function codeRetryFeedback({ cut, output, trace, critique, invFull, behav
     if (!(trace === null || Array.isArray(trace))) throw new Error('[fix97] code retry feedback needs the execution trace, or null when the attempt produced none');
     if (invFull !== null && invFull !== undefined && typeof invFull !== 'string') throw new Error('[fix97] code retry inventory fact must be text or null');
     const covered = new Set();
-    const cover = (text) => { for (const line of String(text).split('\n')) { const k = factKey(line); if (k) covered.add(k); } };
+    const cover = (text) => { for (const line of String(text).split('\n')) { const t = line.trim(); if (t) covered.add(t); } };
     const traceTextOut = Array.isArray(trace) ? structuredTrace(trace) : '';
     cover(traceTextOut);
-    if (Array.isArray(trace)) {
-        for (const r of trace) {
-            if (r && Array.isArray(r.ownFail)) for (const line of r.ownFail) if (typeof line === 'string') covered.add(factKey(line));
-            if (r && r.err) covered.add(factKey(String(r.err)));
-        }
-    }
     const inv = typeof invFull === 'string' ? invFull : '';
     if (inv.length) cover(inv);
     if (cut) { cover(String(cut)); cover(`Attempt ${cut}`); }
-    const already = (k) => {
-        if (covered.has(k)) return true;
-        for (const c of covered) if (c.startsWith(k) || k.startsWith(c)) return true;
-        return false;
-    };
     const fresh = (text) => {
         const kept = [];
         for (const line of String(text).split('\n')) {
-            if (!line.trim()) continue;
-            const k = factKey(line);
-            if (already(k)) continue;
-            if (inv.length && /inventory full/i.test(line) && /empty slots/i.test(line)) continue;
+            const t = line.trim();
+            if (!t || covered.has(t)) continue;
             kept.push(line);
         }
-        for (const line of kept) covered.add(factKey(line));
+        for (const line of kept) covered.add(line.trim());
         return groupVaryingLines(kept.join('\n'));
     };
     const outputFacts = fresh(output);
@@ -279,6 +266,8 @@ let VERSION = registryVersion(settings.minecraft_version);
 export function _setVersionForTest(v) { VERSION = v; }
 // How many of an item each recipe consumes. Built once per registry; itemFacts reads it for the item being grounded.
 const recipeUseCounts = new WeakMap();
+// Item and block ids, longest first, so oak_log is taken at a position before log.
+const registryItemNames = new WeakMap();
 
 // fix49: parse "ensure X" goals - places a block/item nearby (furnace, crafting_table, chest, etc.)
 // The goal item must be placed, not just in inventory - so satisfaction requires the item to exist as a block nearby
@@ -1359,9 +1348,10 @@ Use only c; no other globals.`;
         //        heldItem is that string, not an item with .type. Posts that also read delta/inv are about the inventory, not this probe.
         const fields = this._extractPostFields(ct.post);
         if (skill && typeof skill.code === 'string') {
+            const copied = Voyager.copiedInventoryHits({ ...skill, contract: ct }, reg);
             for (const k of ['pre', 'post']) {
-                const hit = Voyager.unsupportedContractNumbers(ct[k], skill, reg);
-                if (hit.length) return `${k} uses ${hit.join(', ')}, which is not a code literal, recorded evidence, or a minecraft-data fact of the field being compared`;
+                const hit = copied.filter(h => h.where === k);
+                if (hit.length) return `${k} uses ${hit.map(h => h.n).join(', ')}, which copies the observed count of ${hit.map(h => h.item).join(', ')}`;
             }
         }
         const probes = fields.eq.includes('heldItem') && !fields.delta.length && !fields.inv.length ? this._returnProbes(skill) : [];
@@ -1446,7 +1436,7 @@ Use only c; no other globals.`;
         });
         return ids;
     }
-    // Counts the prompt showed when the skill was generated, and the largest spend consumeEvidence measured.
+    // Counts the prompt showed when the skill was generated. A later consumeEvidence measurement is not that snapshot.
     static observedCountEntries(skill) {
         const out = [];
         if (Object.hasOwn(skill, 'promptCounts')) {
@@ -1457,19 +1447,150 @@ Use only c; no other globals.`;
                 out.push({ item, n, source: 'promptCounts' });
             }
         }
-        if (Object.hasOwn(skill, 'consumeEvidence') && skill.consumeEvidence) {
-            const ev = skill.consumeEvidence;
-            if (!ev.items || typeof ev.items !== 'object') throw new Error(`[fix97] ${skill.name}.consumeEvidence.items required`);
-            for (const [item, it] of Object.entries(ev.items)) {
-                if (!it || typeof it.max !== 'number') throw new Error(`[fix97] ${skill.name}.consumeEvidence.items.${item}.max is not a number`);
-                out.push({ item, n: it.max, source: 'consumeEvidence' });
+        return out;
+    }
+    // The task's own target. "Craft 4 birch_planks" and "Collect 7 dirt" name a quantity to produce, not a count the bot held.
+    static goalQuantities(task) {
+        if (typeof task !== 'string' || task.length === 0) return [];
+        const out = [];
+        const g = countGoal(task);
+        if (g) for (const item of g.items) out.push({ item, n: g.count });
+        const sm = task.match(/^(?:smelt|cook)\s+(\d+)\s+([a-z_]+)\s+into\s+(\d+)\s+([a-z_]+)/i);
+        if (sm) {
+            out.push({ item: sm[2].toLowerCase(), n: Number(sm[1]) });
+            out.push({ item: sm[4].toLowerCase(), n: Number(sm[3]) });
+        }
+        const placed = ensureGoal(task);
+        if (placed) out.push({ item: placed.item, n: placed.count });
+        const reached = reachGoal(task);
+        if (reached) out.push({ item: reached.item, n: reached.count });
+        return out;
+    }
+    static registryNamesLongestFirst(registry) {
+        if (!registry || !registry.itemsByName || !registry.blocksByName) throw new Error('[fix97] count scan needs the game data registry');
+        let names = registryItemNames.get(registry);
+        if (names) return names;
+        const set = new Set([...Object.keys(registry.itemsByName), ...Object.keys(registry.blocksByName)]);
+        names = [...set].sort((a, b) => b.length - a.length || (a < b ? -1 : a > b ? 1 : 0));
+        registryItemNames.set(registry, names);
+        return names;
+    }
+    // Pair each number in the text with the registry item id nearest to it. name:count in the curriculum state is the
+    // same pair: the id and the number sit next to each other. Two items at the same distance is not a guess.
+    static textCountPairs(text, registry) {
+        if (typeof text !== 'string' || text.length === 0) return [];
+        const names = Voyager.registryNamesLongestFirst(registry);
+        const items = [];
+        const lower = text.toLowerCase();
+        let i = 0;
+        const word = /[a-z0-9_]/i;
+        while (i < text.length) {
+            if (!word.test(text[i])) { i += 1; continue; }
+            const slice = lower.slice(i);
+            let matched = null;
+            for (const name of names) {
+                if (slice.startsWith(name) && !word.test(slice[name.length] || '')) { matched = name; break; }
             }
+            if (matched) {
+                items.push({ name: matched, start: i, end: i + matched.length });
+                i += matched.length;
+            } else {
+                while (i < text.length && word.test(text[i])) i += 1;
+            }
+        }
+        const numbers = [];
+        const re = /(?<![A-Za-z0-9_])-?\d+(?:\.\d+)?(?![A-Za-z0-9_])/g;
+        let m;
+        while ((m = re.exec(text))) numbers.push({ n: Number(m[0]), start: m.index, end: m.index + m[0].length });
+        const pairs = [];
+        for (const num of numbers) {
+            if (!Number.isFinite(num.n)) continue;
+            let best = [];
+            let bestDist = Infinity;
+            for (const item of items) {
+                const dist = num.end <= item.start ? item.start - num.end : item.end <= num.start ? num.start - item.end : 0;
+                if (dist < bestDist) { bestDist = dist; best = [item.name]; }
+                else if (dist === bestDist && !best.includes(item.name)) best.push(item.name);
+            }
+            if (best.length === 0) continue;
+            if (best.length !== 1) throw new Error(`[fix97] ${num.n} in ${JSON.stringify(text)} is equally near ${best.join(' and ')}`);
+            pairs.push({ item: best[0], n: num.n });
+        }
+        return pairs;
+    }
+    // The count the skill was generated from. promptCounts is that inventory when the skill stored it. Otherwise the
+    // task, the description, and repairHistory evidence carry the same inventory: the curriculum writes the task from
+    // the state, and the state lists items as name:count. A goal quantity of that item is the target, not the snapshot.
+    static generationCounts(skill, registry) {
+        if (!skill || typeof skill.name !== 'string') throw new Error('[fix97] generation counts need the skill name');
+        const goals = Voyager.goalQuantities(skill.task);
+        const isGoal = (item, n) => goals.some(g => g.item === item && g.n === n);
+        const out = [];
+        const add = (item, n, source, quote) => {
+            if (isGoal(item, n)) return;
+            if (out.some(e => e.item === item && e.n === n)) return;
+            out.push({ item, n, source, quote });
+        };
+        if (Object.hasOwn(skill, 'promptCounts')) {
+            for (const e of Voyager.observedCountEntries(skill)) add(e.item, e.n, e.source, null);
+            return out;
+        }
+        const texts = [];
+        if (typeof skill.task === 'string') texts.push({ source: 'task', text: skill.task });
+        if (typeof skill.description === 'string') texts.push({ source: 'description', text: skill.description });
+        if (Array.isArray(skill.repairHistory)) {
+            for (const h of skill.repairHistory) {
+                if (h && typeof h.evidence === 'string') texts.push({ source: 'repairHistory', text: h.evidence });
+            }
+        }
+        for (const t of texts) {
+            for (const pair of Voyager.textCountPairs(t.text, registry)) add(pair.item, pair.n, t.source, t.text);
         }
         return out;
     }
-    // A comparison whose literal equals the observed count of an item that comparison names. Comments and strings are not literals.
-    // 0 and 1 are not a copied snapshot. A number that is a stack size, a recipe result, or a recipe's use of that item is
-    // game data for the count, not a snapshot. `const need = 55; counts.oak_log >= need` and `const n = counts.oak_log; n >= 55`
+    // 0 and 1 are absent and one. A stack size, a recipe result, or a recipe's use of the item is game data for that count.
+    static countIsGameFact(registry, item, n) {
+        if (n === 0 || n === 1) return true;
+        return Voyager.itemFacts(registry, item).some(f => f.n === n && (f.kind === 'stack' || f.kind === 'recipeResult' || f.kind === 'ingredient'));
+    }
+    // A comparison of an inventory count of item X to a numeric literal. The count is c.pre.inv.X, c.post.inv.X, c.delta.X,
+    // or a getInventoryCounts binding. A computed member's index (c.args[2]) is not a side of the comparison.
+    static contractInventoryComparisons(src) {
+        const ast = Voyager.parseContract(src);
+        const root = ast.body[0].expression;
+        const param = root.params && root.params.length && root.params[0].type === 'Identifier' ? root.params[0].name : null;
+        const COMPARE = new Set(['<', '<=', '>', '>=', '==', '===', '!=', '!==']);
+        const hits = [];
+        const literalOf = (node) => {
+            if (!node) return null;
+            if (node.type === 'Literal' && typeof node.value === 'number') return node.value;
+            if (node.type === 'UnaryExpression' && node.operator === '-' && node.argument && node.argument.type === 'Literal' && typeof node.argument.value === 'number') return -node.argument.value;
+            return null;
+        };
+        const itemOf = (node) => {
+            const path = Voyager.memberPath(node, param);
+            if (!path) return null;
+            if (path.length === 3 && (path[0] === 'pre' || path[0] === 'post') && path[1] === 'inv' && path[2] !== '*') return path[2];
+            if (path.length === 2 && path[0] === 'delta' && path[1] !== '*') return path[1];
+            return null;
+        };
+        const walk = (n) => {
+            if (!n || typeof n.type !== 'string') return;
+            if (n.type === 'BinaryExpression' && COMPARE.has(n.operator)) {
+                const ln = literalOf(n.left), rn = literalOf(n.right);
+                if (ln !== null) { const item = itemOf(n.right); if (item) hits.push({ n: ln, item, op: n.operator }); }
+                if (rn !== null) { const item = itemOf(n.left); if (item) hits.push({ n: rn, item, op: n.operator }); }
+            }
+            for (const v of Object.values(n)) {
+                if (Array.isArray(v)) { for (const x of v) walk(x); }
+                else if (v && typeof v === 'object' && typeof v.type === 'string') walk(v);
+            }
+        };
+        walk(root);
+        return hits;
+    }
+    // A comparison whose literal equals the observed count of an item, and whose other side is that item's inventory count.
+    // Comments and strings are not literals. `const need = 55; counts.oak_log >= need` and `const n = counts.oak_log; n >= 55`
     // are the same comparison: the binding is resolved in its scope before the two sides are compared.
     static copiedCountComparisons(code, entries, registry) {
         if (!registry || !registry.itemsByName) throw new Error('[fix97] copied-count check needs the game data registry');
@@ -1485,34 +1606,50 @@ Use only c; no other globals.`;
             const target = kind === 'var' ? functionScopes[functionScopes.length - 1] : scopes[scopes.length - 1];
             target.set(name, value);
         };
-        const empty = () => ({ n: null, items: new Set() });
+        const empty = () => ({ n: null, items: new Set(), invMap: false, invItem: null });
+        const copy = (b) => ({ n: b.n, items: new Set(b.items), invMap: b.invMap === true, invItem: b.invItem || null });
+        const inventoryCall = (node) => {
+            if (!node || node.type !== 'CallExpression') return false;
+            const c = node.callee;
+            if (c.type === 'Identifier' && c.name === 'getInventoryCounts') return true;
+            if (c.type === 'MemberExpression' && !c.computed && c.property && c.property.type === 'Identifier' && c.property.name === 'getInventoryCounts') return true;
+            return false;
+        };
+        const propName = (node) => {
+            if (!node.computed && node.property.type === 'Identifier') return node.property.name;
+            if (node.property.type === 'Literal' && typeof node.property.value === 'string') return node.property.value;
+            return null;
+        };
         const resolve = (node) => {
             if (!node) return empty();
-            if (node.type === 'Literal' && typeof node.value === 'number') return { n: node.value, items: new Set() };
+            if (node.type === 'Literal' && typeof node.value === 'number') return { n: node.value, items: new Set(), invMap: false, invItem: null };
             if (node.type === 'Identifier') {
                 const b = lookup(node.name);
-                if (b) return { n: b.n, items: new Set(b.items) };
+                if (b) return copy(b);
                 return empty();
             }
             if (node.type === 'ChainExpression') return resolve(node.expression);
-            if (node.type === 'MemberExpression' || node.type === 'CallExpression') return { n: null, items: new Set(Voyager.namesInAst(node)) };
-            return { n: null, items: new Set(Voyager.namesInAst(node)) };
-        };
-        const grounded = (item, n) => {
-            if (n === 0 || n === 1) return true;
-            return Voyager.itemFacts(registry, item).some(f => f.n === n && (f.kind === 'stack' || f.kind === 'recipeResult' || f.kind === 'ingredient'));
+            if (node.type === 'CallExpression' && inventoryCall(node)) return { n: null, items: new Set(), invMap: true, invItem: null };
+            if (node.type === 'MemberExpression') {
+                const obj = resolve(node.object);
+                const prop = propName(node);
+                if (obj.invMap && prop) return { n: null, items: new Set([prop]), invMap: false, invItem: prop };
+                return { n: null, items: new Set(Voyager.namesInAst(node)), invMap: false, invItem: null };
+            }
+            if (node.type === 'CallExpression') return { n: null, items: new Set(Voyager.namesInAst(node)), invMap: false, invItem: null };
+            return { n: null, items: new Set(Voyager.namesInAst(node)), invMap: false, invItem: null };
         };
         const consider = (expr) => {
             if (!expr || expr.type !== 'BinaryExpression' || !COMPARE.has(expr.operator)) return;
             const L = resolve(expr.left), R = resolve(expr.right);
             const pairs = [];
-            if (typeof L.n === 'number') pairs.push([L.n, R.items]);
-            if (typeof R.n === 'number') pairs.push([R.n, L.items]);
-            for (const [n, items] of pairs) {
+            if (L.invItem && typeof R.n === 'number') pairs.push([L.invItem, R.n]);
+            if (R.invItem && typeof L.n === 'number') pairs.push([R.invItem, L.n]);
+            for (const [item, n] of pairs) {
                 for (const e of entries) {
-                    if (e.n !== n || !items.has(e.item)) continue;
-                    if (grounded(e.item, n)) continue;
-                    hits.push({ n, item: e.item, source: e.source, op: expr.operator });
+                    if (e.n !== n || e.item !== item) continue;
+                    if (Voyager.countIsGameFact(registry, item, n)) continue;
+                    hits.push({ n, item, source: e.source, quote: e.quote || null, op: expr.operator });
                 }
             }
         };
@@ -1553,6 +1690,8 @@ Use only c; no other globals.`;
                         const value = resolve(n.right);
                         existing.n = value.n;
                         existing.items = value.items;
+                        existing.invMap = value.invMap;
+                        existing.invItem = value.invItem;
                     }
                 }
                 return;
@@ -1566,6 +1705,28 @@ Use only c; no other globals.`;
         push();
         functionScopes.push(scopes[0]);
         walk(ast);
+        return hits;
+    }
+    // Code and contract comparisons of an inventory count of item X to a literal that is the count observed when the
+    // skill was generated. The skill is not selected by name. A goal quantity of X is not that observation.
+    static copiedInventoryHits(skill, registry) {
+        const observed = Voyager.generationCounts(skill, registry);
+        const hits = [];
+        if (typeof skill.code === 'string') {
+            for (const h of Voyager.copiedCountComparisons(skill.code, observed, registry)) hits.push({ ...h, where: 'code' });
+        }
+        if (skill.contract && typeof skill.contract === 'object') {
+            for (const field of ['pre', 'post']) {
+                const src = skill.contract[field];
+                if (typeof src !== 'string') continue;
+                for (const h of Voyager.contractInventoryComparisons(src)) {
+                    const obs = observed.find(e => e.item === h.item && e.n === h.n);
+                    if (!obs) continue;
+                    if (Voyager.countIsGameFact(registry, h.item, h.n)) continue;
+                    hits.push({ n: h.n, item: h.item, op: h.op, source: obs.source, quote: obs.quote || null, where: field });
+                }
+            }
+        }
         return hits;
     }
     static snapshotThresholdFeedback(code, counts) {

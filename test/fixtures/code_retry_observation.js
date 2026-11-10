@@ -1,4 +1,4 @@
-import { workOf } from './call_durations.js';
+import { workOf } from '../../src/models/call_durations.js';
 
 // fix97: the one Ollama token count this repo has for a code-retry prompt.
 // Composer call #78, kind compose-retry, fix96 1c2f9c0. Task: Collect 1 stripped_birch_wood,
