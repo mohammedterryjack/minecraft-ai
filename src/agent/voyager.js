@@ -47,6 +47,11 @@ const LOG_EVIDENCE_CHARS = 160;
 // fix79: _attribute's verdict when the run met every contract and the goal failed only because the route sent it to a skill with no
 //        learned evidence of producing the goal items: the route is blamed, not the skill
 export const MISROUTED = 'misrouted';
+// One stored call per distinct arity, argument types, and values. A repeated call is the same shape, so the
+// record is not a log of every call. The values are that call's c.args (objects are already null there).
+export const CALL_SHAPE = 'one record per distinct arity, argument types, and values';
+// A learned contract that reads c.args is not judged until a call has been recorded. No argument value is filled in.
+export const CONTRACT_EVAL = 'pending its first recorded call';
 // fix70: the API-lint failure in the repair evidence the code model sees. One definition for the startup re-lint and the
 // repair-time re-lint, so both evidences are the same text. fix96: the whole lint text (it was cut at 600 chars).
 const apiLintEvidence = (name, lint) => `${name} does not lint against the current built-in API, so it cannot run: ${String(lint).replace(/\s+/g, ' ')}`;
@@ -485,6 +490,8 @@ export function assertProgressBlocker(b) {
 }
 
 export class Voyager {
+    static CALL_SHAPE = CALL_SHAPE;
+    static CONTRACT_EVAL = CONTRACT_EVAL;
     constructor(agent) {
         this.agent = agent;
         this.dir = `./bots/${agent.name}/skills`;
@@ -1367,21 +1374,10 @@ Use only c; no other globals.`;
             if (counts) {
                 const args = Voyager.contractArgProblems(ct[k], skill);
                 if (args.length) return `${k}: ${args.map(p => p.text).join('; ')}`;
-                for (const i of Voyager.contractArgIndexes(ct[k])) {
-                    if (!Number.isInteger(i) || i < 0) continue;
-                    if (i >= counts.arity) continue;
-                    if (counts.known[i]) continue;
-                    return `${k}: parameter ${counts.names[i]} has no sample for c.args[${i}] (${counts.params[i]}). It has no literal default and the body does not compare it to a literal.`;
-                }
             }
             const shape = this._contractShapeProblem(ct[k], counts);
             if (shape) return `${k}: ${shape}`;
         }
-        const c = this._contractCtx({ args: counts ? counts.samples : [], ret: true, pre: s, post: s, delta: {} });
-        try { for (const k of ['pre', 'post']) { const r = this._compileContract(ct[k])(c); if (typeof r !== 'boolean') return `${k} returned ${r === undefined ? 'undefined' : JSON.stringify(r)} (${typeof r}), not a boolean`; } } catch (e) { return `throws: ${e.message}`; }
-        // fix86: an equip post is checked against the skill's traced successful returns (or a string it returns).
-        //        heldItem is that string, not an item with .type. Posts that also read delta/inv are about the inventory, not this probe.
-        const fields = this._extractPostFields(ct.post);
         if (skill && typeof skill.code === 'string') {
             const copied = Voyager.copiedInventoryHits({ ...skill, contract: ct }, reg);
             for (const k of ['pre', 'post']) {
@@ -1389,11 +1385,42 @@ Use only c; no other globals.`;
                 if (hit.length) return `${k} uses ${hit.map(h => h.n).join(', ')}, which compares the inventory count of ${hit.map(h => h.item).join(', ')} to a literal that is not its goal quantity and not game data`;
             }
         }
+        const readsArgs = Voyager.contractReadsArgs(ct.pre) || Voyager.contractReadsArgs(ct.post);
+        const recorded = Voyager.recordedCalls(skill);
+        // No recorded call: the shape and arity checks above are the whole judgment. Evaluating now would need an argument value.
+        if (readsArgs && recorded.length === 0) {
+            if (skill) skill.contractEval = CONTRACT_EVAL;
+            return null;
+        }
+        if (skill && skill.contractEval === CONTRACT_EVAL) delete skill.contractEval;
+        const argSets = readsArgs ? recorded.map(call => Voyager.callValues(call)) : [[]];
+        for (const args of argSets) {
+            const shown = readsArgs ? ` on recorded call ${Voyager.callText(args)}` : '';
+            const c = this._contractCtx({ args, ret: true, pre: s, post: s, delta: {} });
+            try {
+                for (const k of ['pre', 'post']) {
+                    const r = this._compileContract(ct[k])(c);
+                    if (typeof r !== 'boolean') return `${k} returned ${r === undefined ? 'undefined' : JSON.stringify(r)} (${typeof r}), not a boolean${shown}`;
+                    if (!readsArgs) continue;
+                    const parsed = Voyager.contractParam(ct[k]);
+                    const world = new Set(['pre', 'post', 'delta', 'ret', 'game', 'dist']);
+                    if (r === false && !Voyager.nodeReads(parsed.root, parsed.param, world)) return `${k}: contract contradicts recorded call ${Voyager.callText(args)} (${ct[k]})`;
+                    for (const piece of Voyager.argConstraints(ct[k])) {
+                        const held = this._compileContract(`c => (${piece})`)(c);
+                        if (held === false) return `${k}: contract contradicts recorded call ${Voyager.callText(args)} (${piece})`;
+                    }
+                }
+            } catch (e) { return `throws${shown}: ${e.message}`; }
+        }
+        // fix86: an equip post is checked against the skill's traced successful returns (or a string it returns).
+        //        heldItem is that string, not an item with .type. Posts that also read delta/inv are about the inventory, not this probe.
+        const fields = this._extractPostFields(ct.post);
         const probes = fields.eq.includes('heldItem') && !fields.delta.length && !fields.inv.length ? this._returnProbes(skill) : [];
+        const probeArgs = readsArgs ? Voyager.callValues(recorded[0]) : [];
         for (const p of probes) {
             if (!p || !Object.hasOwn(p, 'rv') || !Object.hasOwn(p, 'heldItem')) throw new Error(`[fix86] return probe for ${skill.name} is missing rv or heldItem`);
             const post = { ...s, eq: { ...eq, heldItem: p.heldItem } };
-            const ctx = this._contractCtx({ args: counts ? counts.samples : [], ret: p.rv, pre: s, post, delta: {} });
+            const ctx = this._contractCtx({ args: probeArgs, ret: p.rv, pre: s, post, delta: {} });
             let r;
             try { r = this._compileContract(ct.post)(ctx); }
             catch (e) { return `post throws on the skill's return ${JSON.stringify(p.rv)}: ${e.message}`; }
@@ -1736,8 +1763,8 @@ Use only c; no other globals.`;
         return Voyager.copiedCountComparisons(code, entries, registry).map(h => `\`${h.item} ${h.op} ${h.n}\` copies ${h.item}'s count from the state in this prompt. That count is what is held right now. Read it with getInventoryCounts(bot) when the function runs.`);
     }
     // c.args is the call's arguments after bot. required is how many of those have no default. arity is all of them
-    // when the function has no rest parameter. A sample is a literal default or a literal the body compares the
-    // parameter to. A missing sample is not filled in.
+    // when the function has no rest parameter. A literal default is recorded so the shape walk can see that parameter's
+    // type. It is not a call, and it is not used to decide whether a contract holds.
     static skillArgCounts(skill) {
         if (!skill || typeof skill.code !== 'string' || typeof skill.name !== 'string') throw new Error('[fix97] skillArgCounts needs the skill name and code');
         const ast = Voyager.parseSkill(skill.code);
@@ -1779,31 +1806,68 @@ Use only c; no other globals.`;
         }
         return null;
     }
+    static paramPattern(node) {
+        if (!node || typeof node.type !== 'string') throw new Error('[fix97] parameter has no AST node');
+        if (node.type === 'Identifier') return node.name;
+        if (node.type === 'RestElement') return `...${Voyager.paramPattern(node.argument)}`;
+        if (node.type === 'AssignmentPattern') return Voyager.paramPattern(node.left);
+        if (node.type === 'ObjectPattern') {
+            const props = node.properties.map(p => {
+                if (p.type === 'RestElement') return Voyager.paramPattern(p);
+                if (p.type !== 'Property') throw new Error(`[fix97] object pattern property is ${p && p.type}, not a property`);
+                if (!p.key || typeof p.key.type !== 'string') throw new Error('[fix97] object pattern property has no key');
+                const key = !p.computed && p.key.type === 'Identifier' ? p.key.name : !p.computed && p.key.type === 'Literal' ? String(p.key.value) : null;
+                if (key === null) throw new Error(`[fix97] object pattern key is ${p.key.type}${p.computed ? ' (computed)' : ''}; the pattern is not a name this check can read`);
+                const value = Voyager.paramPattern(p.value);
+                if (p.value.type === 'Identifier' && p.value.name === key) return key;
+                return `${key}: ${value}`;
+            });
+            return `{${props.join(', ')}}`;
+        }
+        if (node.type === 'ArrayPattern') return `[${node.elements.map(el => el === null ? '' : Voyager.paramPattern(el)).join(', ')}]`;
+        throw new Error(`[fix97] parameter pattern ${node.type} is not a name this check can read`);
+    }
+    static bindingNames(node, out = []) {
+        if (!node || typeof node.type !== 'string') throw new Error('[fix97] parameter binding has no AST node');
+        if (node.type === 'Identifier') { out.push(node.name); return out; }
+        if (node.type === 'RestElement') return Voyager.bindingNames(node.argument, out);
+        if (node.type === 'AssignmentPattern') return Voyager.bindingNames(node.left, out);
+        if (node.type === 'ObjectPattern') {
+            for (const p of node.properties) {
+                if (p.type === 'RestElement') Voyager.bindingNames(p, out);
+                else if (p.type === 'Property') Voyager.bindingNames(p.value, out);
+                else throw new Error(`[fix97] object pattern property is ${p && p.type}, not a property`);
+            }
+            return out;
+        }
+        if (node.type === 'ArrayPattern') {
+            for (const el of node.elements) if (el) Voyager.bindingNames(el, out);
+            return out;
+        }
+        throw new Error(`[fix97] parameter pattern ${node.type} is not a name this check can read`);
+    }
     static parameterSample(fn, param) {
-        const nameNode = param.type === 'AssignmentPattern' ? param.left : param;
-        if (!nameNode || nameNode.type !== 'Identifier') return { found: false, name: '?' };
-        const name = nameNode.name;
+        if (!fn || !fn.body) throw new Error('[fix97] parameter sample needs the function body');
+        const nameNode = param && param.type === 'AssignmentPattern' ? param.left : param;
+        const name = Voyager.paramPattern(nameNode);
+        const names = new Set(Voyager.bindingNames(nameNode));
         if (param.type === 'AssignmentPattern') {
             const lit = Voyager.literalOf(param.right);
             if (lit) return { found: true, name, value: lit.value };
         }
-        const binds = (p) => {
-            if (!p) return false;
-            if (p.type === 'RestElement') return binds(p.argument);
-            if (p.type === 'AssignmentPattern') return binds(p.left);
-            return p.type === 'Identifier' && p.name === name;
-        };
+        const binds = (p) => Voyager.bindingNames(p).some(n => names.has(n));
         const COMPARE = new Set(['===', '==', '!==', '!=', '<', '<=', '>', '>=']);
         let found = null;
         const walk = (node) => {
             if (!node || typeof node.type !== 'string' || found) return;
             if (node.type === 'FunctionDeclaration' || node.type === 'FunctionExpression' || node.type === 'ArrowFunctionExpression') {
-                if ((node.params || []).some(binds)) return;
+                if (!Array.isArray(node.params)) throw new Error(`[fix97] ${node.type} has no parameter list`);
+                if (node.params.some(binds)) return;
             }
             if (node.type === 'BinaryExpression' && COMPARE.has(node.operator)) {
                 let lit = null;
-                if (node.left.type === 'Identifier' && node.left.name === name) lit = Voyager.literalOf(node.right);
-                else if (node.right.type === 'Identifier' && node.right.name === name) lit = Voyager.literalOf(node.left);
+                if (node.left.type === 'Identifier' && names.has(node.left.name)) lit = Voyager.literalOf(node.right);
+                else if (node.right.type === 'Identifier' && names.has(node.right.name)) lit = Voyager.literalOf(node.left);
                 if (lit) { found = lit; return; }
             }
             for (const v of Object.values(node)) {
@@ -1833,6 +1897,95 @@ Use only c; no other globals.`;
         };
         walk(root);
         return indexes;
+    }
+    static contractParam(src) {
+        const ast = Voyager.parseContract(src);
+        const root = ast.body[0].expression;
+        const param = root.params && root.params.length && root.params[0].type === 'Identifier' ? root.params[0].name : null;
+        return { ast, root, param, text: `(${String(src)})` };
+    }
+    static nodeReads(node, param, keys) {
+        if (!param) return false;
+        let found = false;
+        const walk = (n) => {
+            if (!n || typeof n.type !== 'string' || found) return;
+            if (n.type === 'MemberExpression') {
+                const path = Voyager.memberPath(n, param);
+                if (path && keys.has(path[0])) found = true;
+            }
+            for (const v of Object.values(n)) {
+                if (Array.isArray(v)) { for (const x of v) walk(x); }
+                else if (v && typeof v === 'object' && typeof v.type === 'string') walk(v);
+            }
+        };
+        walk(node);
+        return found;
+    }
+    static contractReadsArgs(src) {
+        const { root, param } = Voyager.contractParam(src);
+        return Voyager.nodeReads(root, param, new Set(['args']));
+    }
+    // Top-level && pieces that mention only c.args. A false piece is the contract contradicting that call.
+    // A piece that also reads pre, post, delta, ret, game, or dist is about the world, not the arguments.
+    static argConstraints(src) {
+        const { root, param, text } = Voyager.contractParam(src);
+        if (!param || !root.body || root.body.type === 'BlockStatement') return [];
+        const parts = [];
+        const split = (node) => {
+            if (node && node.type === 'LogicalExpression' && node.operator === '&&') { split(node.left); split(node.right); return; }
+            if (node) parts.push(node);
+        };
+        split(root.body);
+        const state = new Set(['pre', 'post', 'delta', 'ret', 'game', 'dist']);
+        const out = [];
+        for (const node of parts) {
+            if (!Voyager.nodeReads(node, param, new Set(['args']))) continue;
+            if (Voyager.nodeReads(node, param, state)) continue;
+            out.push(text.slice(node.start, node.end));
+        }
+        return out;
+    }
+    static argType(value) {
+        if (value === null) return 'null';
+        if (typeof value === 'number' && Number.isNaN(value)) return 'nan';
+        if (typeof value === 'undefined') return 'undefined';
+        if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return typeof value;
+        throw new Error(`[fix97] recorded call argument is ${typeof value}, not a c.args value (an object is null in c.args)`);
+    }
+    static callShape(args) {
+        if (!Array.isArray(args)) throw new Error('[fix97] a recorded call has no argument list');
+        const types = args.map(v => Voyager.argType(v));
+        const values = args.map(v => (typeof v === 'number' && Number.isNaN(v)) || typeof v === 'undefined' ? null : v);
+        return { arity: args.length, types, values, shape: CALL_SHAPE };
+    }
+    static callValues(call) {
+        if (!call || !Array.isArray(call.types) || !Array.isArray(call.values) || call.types.length !== call.values.length) throw new Error('[fix97] a recorded call shape is missing types or values');
+        return call.types.map((t, i) => {
+            if (t === 'undefined') return undefined;
+            if (t === 'nan') return NaN;
+            if (t === 'null') return null;
+            return call.values[i];
+        });
+    }
+    static sameShape(a, b) {
+        return a.arity === b.arity && a.types.length === b.types.length && a.types.every((t, i) => t === b.types[i]) && a.values.every((v, i) => Object.is(v, b.values[i]));
+    }
+    static callText(args) {
+        return `(${args.map(x => typeof x === 'number' || x === undefined ? String(x) : JSON.stringify(x)).join(', ')})`;
+    }
+    static recordedCalls(skill) {
+        if (!skill || !skill.stats || !Object.hasOwn(skill.stats, 'calls')) return [];
+        if (!Array.isArray(skill.stats.calls)) throw new Error(`[fix97] ${skill.name} stats.calls is not a list of call shapes`);
+        return skill.stats.calls;
+    }
+    static recordCallShape(skill, args) {
+        if (!skill || typeof skill.name !== 'string') throw new Error('[fix97] recordCallShape needs the skill');
+        if (!skill.stats || typeof skill.stats !== 'object' || Array.isArray(skill.stats)) skill.stats = newStats();
+        if (!Array.isArray(skill.stats.calls)) skill.stats.calls = [];
+        const shape = Voyager.callShape(args);
+        if (skill.stats.calls.some(call => Voyager.sameShape(call, shape))) return false;
+        skill.stats.calls.push(shape);
+        return true;
     }
     // A c.args.length literal is legal from the required count through the arity, and at or above the required
     // count when the function has a rest parameter.
@@ -2693,6 +2846,19 @@ Use only c; no other globals.`;
         for (const r of trace) {
             if (r.intr || !r.s0 || !r.s1) continue;
             const e = this.skills.find(s => s.name === r.name);
+            if (e) {
+                if (!Array.isArray(r.argv)) throw new Error(`[fix97] ${e.name} trace has no c.args`);
+                const pending = e.contractEval === CONTRACT_EVAL;
+                Voyager.recordCallShape(e, r.argv);
+                if (pending && e.contract && e.contract.seeded !== true) {
+                    const bad = this._validContract(e.contract, e);
+                    if (bad) {
+                        e.contractFail = bad;
+                        console.log(`[contract] ${e.name} recorded call rejected the contract: ${bad}`);
+                        this._queueContractFix(e, bad);
+                    } else delete e.contractFail;
+                }
+            }
             // fix86: a string return is the equipped item name. The next contract for this skill is checked against it.
             if (e && typeof r.rv === 'string') {
                 if (!r.s1.eq || !Object.hasOwn(r.s1.eq, 'heldItem')) throw new Error(`[fix86] trace of ${e.name} has no eq.heldItem`);
