@@ -23,7 +23,7 @@ import { buildServerTerrain, makeServerChunk, serverHeight } from './server_terr
 import { gunzipSync } from 'node:zlib';
 import pf from 'mineflayer-pathfinder';
 import { Vec3 } from 'vec3';
-import { wrapBotForApiTiming } from '../src/utils/bot_api_timing.js';
+import { wrapBotForApiTiming, setBotApiDurationStore } from '../src/utils/bot_api_timing.js';
 import { readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { CONTEXT_FULL } from '../src/models/ollama.js';
@@ -1146,10 +1146,10 @@ describe('fix97 findBlocks refuses a non-numeric maxDistance or count', () => {
         require('mineflayer/lib/plugins/game.js')(gameBot, { brand: 'test' });
         client.emit('login', { dimension: 'overworld', gameMode: 0, maxPlayers: 20, viewDistance: 6, simulationDistance: 4 });
         assert.strictEqual(gameBot.game.serverViewDistance, 6);
-        assert.strictEqual(gameBot.game.simulationDistance, undefined);
+        assert.strictEqual(gameBot.game.simulationDistance, 4);
         assert.strictEqual(nearbyBlockRadius(gameBot), 6 * CHUNK_WIDTH);
         client.emit('simulation_distance', { distance: 7 });
-        assert.strictEqual(gameBot.game.simulationDistance, undefined);
+        assert.strictEqual(gameBot.game.simulationDistance, 7);
         assert.strictEqual(nearbyBlockRadius(gameBot), 6 * CHUNK_WIDTH);
         client.emit('update_view_distance', { viewDistance: 9 });
         assert.strictEqual(gameBot.game.serverViewDistance, 9);
@@ -1167,6 +1167,7 @@ describe('fix97 findBlocks refuses a non-numeric maxDistance or count', () => {
         assert.throws(() => raw.findBlocks({ matching: [registry.blocksByName.iron_ore.id], maxDistance: names, count: 10000 }), /findBlocks: maxDistance must be a finite number, got \["iron_ore","deepslate_iron_ore"\]/);
         assert.throws(() => raw.findBlocks({ matching: [registry.blocksByName.iron_ore.id], maxDistance: 16 }), /findBlocks: count must be a finite number, got undefined/);
         let wrapped = false;
+        setBotApiDurationStore({});
         const proxy = wrapBotForApiTiming({ findBlocks() { wrapped = true; return []; }, findBlock() { wrapped = true; return null; } });
         assert.throws(() => proxy.findBlocks({ matching: [1057], maxDistance: names, count: 10000 }), /findBlocks: maxDistance must be a finite number/);
         assert.throws(() => proxy.findBlock({ matching: [1057], maxDistance: 16, count: names }), /findBlock: count must be a finite number/);

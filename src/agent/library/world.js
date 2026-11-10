@@ -515,6 +515,26 @@ export function nearbyBlockRadius(bot) {
     return serverChunkRadius(bot) * CHUNK_WIDTH;
 }
 
+// simulation-distance in server.properties, in blocks. Login (play) sends it as simulationDistance
+// and packet simulation_distance replaces it. Entities are ticked inside this radius.
+// https://minecraft.wiki/w/Simulation_distance
+// https://wiki.vg/Protocol#Login_.28play.29
+function serverSimulationChunks(bot) {
+    const game = bot && bot.game;
+    if (!game || typeof game !== 'object') {
+        throw new Error('simulationBlockRadius: bot.game is missing. The server sends simulationDistance in the login play packet (https://wiki.vg/Protocol#Login_.28play.29).');
+    }
+    const sim = game.simulationDistance;
+    if (!Number.isInteger(sim) || sim <= 0) {
+        throw new Error(`simulationBlockRadius: server simulationDistance is ${JSON.stringify(sim)}. The client is told the simulation radius by login (play) and simulation_distance (https://wiki.vg/Protocol#Login_.28play.29, https://minecraft.wiki/w/Simulation_distance).`);
+    }
+    return sim;
+}
+
+export function simulationBlockRadius(bot) {
+    return serverSimulationChunks(bot) * CHUNK_WIDTH;
+}
+
 // Java Edition block interaction range, from the eyes to a block.
 // https://minecraft.wiki/w/Player#Reach — "Default interaction range": Java Edition block is 4.5 in
 // other game modes and 5 in Creative. The login packet does not carry this number (1.20.4); it is the

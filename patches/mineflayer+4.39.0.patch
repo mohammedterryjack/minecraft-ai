@@ -93,7 +93,7 @@ diff --git a/node_modules/mineflayer/lib/plugins/game.js b/node_modules/mineflay
 index d3291b0..0c951c2 100644
 --- a/node_modules/mineflayer/lib/plugins/game.js
 +++ b/node_modules/mineflayer/lib/plugins/game.js
-@@ -104,7 +104,9 @@ function inject (bot, options) {
+@@ -104,7 +104,14 @@ function inject (bot, options) {
      if (packet.enableRespawnScreen) {
        bot.game.enableRespawnScreen = packet.enableRespawnScreen
      }
@@ -103,8 +103,13 @@ index d3291b0..0c951c2 100644
 +    if (Number.isInteger(packet.viewDistance)) {
        bot.game.serverViewDistance = packet.viewDistance
      }
++    // simulationDistance is the chunk radius the server ticks (Login (play), varint).
++    // server.properties simulation-distance. The same varint arrives later as packet simulation_distance.
++    if (Number.isInteger(packet.simulationDistance)) {
++      bot.game.simulationDistance = packet.simulationDistance
++    }
  
-@@ -135,6 +137,15 @@ function inject (bot, options) {
+@@ -135,6 +142,24 @@ function inject (bot, options) {
      bot.game.difficulty = difficultyNames[packet.difficulty]
    })
  
@@ -115,6 +120,15 @@ index d3291b0..0c951c2 100644
 +      throw new Error(`update_view_distance viewDistance is ${JSON.stringify(packet && packet.viewDistance)}; the protocol field is a varint (minecraft-data pc/1.20.3 packet_update_view_distance, https://wiki.vg/Protocol#Update_View_Distance).`)
 +    }
 +    bot.game.serverViewDistance = packet.viewDistance
++  })
++
++  // Login (play) is the first simulation distance. The simulation_distance packet replaces it
++  // (protocol 1.20.3, packet_simulation_distance, field distance). A non-integer is not that packet.
++  bot._client.on('simulation_distance', (packet) => {
++    if (!packet || !Number.isInteger(packet.distance)) {
++      throw new Error(`simulation_distance distance is ${JSON.stringify(packet && packet.distance)}; the protocol field is a varint (minecraft-data pc/1.20.3 packet_simulation_distance, https://wiki.vg/Protocol#Login_.28play.29).`)
++    }
++    bot.game.simulationDistance = packet.distance
 +  })
 +
    bot._client.on(brandChannel, (serverBrand) => {

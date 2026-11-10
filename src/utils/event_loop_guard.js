@@ -12,7 +12,10 @@
  * The beat period is the Nyquist poll, half of the 15000 ms interval. The armed silence
  * limit is the kick bound (15000 × 2). A healthy loop beats inside that bound, so the beat
  * is not added on top of it: adding it would leave the process alive after the server had
- * already kicked the client.
+ * already kicked the client. That bound is the watchdog only.
+ *
+ * The STALL log is a delayed turn, not a missed keep-alive. A game tick is 20 per second
+ * (https://minecraft.wiki/w/Tick). A delay of one tick is a physics tick that did not run.
  *
  * Root cause of long stalls in production was unknown; this guard plus `withStallPhase` phase
  * stacks attribute stalls to labeled phases so the next step is diagnosis from real logs.
@@ -26,6 +29,11 @@ import { mainThreadWatchdogStarted, armMainThreadWatchdog, beatMainThreadWatchdo
 // pending, disconnects. The kick lands one or two of those intervals after a keepalive.
 export const KEEP_ALIVE_INTERVAL_MS = 15000;
 export const KEEP_ALIVE_KICK_MS = KEEP_ALIVE_INTERVAL_MS * 2;
+
+// The game loop runs at 20 ticks per second, so one tick is 1000/20 ms.
+// https://minecraft.wiki/w/Tick
+export const TICKS_PER_SECOND = 20;
+export const GAME_TICK_MS = 1000 / TICKS_PER_SECOND;
 
 /** @type {string[]} */
 let _phaseStack = [];
@@ -58,16 +66,12 @@ export function watchdogBeatPeriodMs() {
 }
 
 /**
- * The stall threshold is the server kick bound. It does not depend on observed gaps.
+ * The STALL log fires when one turn was delayed by a game tick. It is not the keep-alive kick.
  * @param {import('mineflayer').Bot} bot
  */
 export function stallThresholdMs(bot) {
     if (!bot) throw new Error('[event_loop_guard] bot required');
-    const t = bot.__eventLoopStallThresholdMs;
-    if (t !== KEEP_ALIVE_KICK_MS) {
-        throw new Error(`[event_loop_guard] stall threshold is ${t}, not the keep-alive kick bound ${KEEP_ALIVE_KICK_MS}ms`);
-    }
-    return t;
+    return GAME_TICK_MS;
 }
 
 /** Silence that arms SIGKILL: the keep-alive kick bound, 15000 ms × 2. */
@@ -124,8 +128,7 @@ export function runStallPollTickForTest(bot) {
 
 function _stallPollTick(bot) {
     if (mainThreadWatchdogStarted()) beatMainThreadWatchdog();   // fix64: this tick running at all is the heartbeat
-    const threshold = bot.__eventLoopStallThresholdMs;
-    if (typeof threshold !== 'number' || !Number.isFinite(threshold) || threshold <= 0) return;
+    const threshold = stallThresholdMs(bot);
     const h = bot.__stallEventLoopHist;
     if (!h) return;
     const maxNs = h.max;
@@ -133,12 +136,12 @@ function _stallPollTick(bot) {
     const maxMs = maxNs / 1e6;
     if (maxMs >= threshold) {
         const ctx = captureStallContext(bot);
-        console.error(`[event-loop] STALL: event loop delayed ${maxMs.toFixed(0)}ms (>= ${threshold}ms keep-alive kick bound) phase_stack="${ctx.phaseStr}" skill="${ctx.skill}" stack="${ctx.stack}"`);
+        console.error(`[event-loop] STALL: event loop delayed ${maxMs.toFixed(0)}ms (>= ${threshold}ms, one game tick at ${TICKS_PER_SECOND}/s) phase_stack="${ctx.phaseStr}" skill="${ctx.skill}" stack="${ctx.stack}"`);
     }
 }
 
 /**
- * Arm once. The threshold is the kick bound and the poll is the beat period.
+ * Arm once. The STALL log is one game tick. The poll is the watchdog beat.
  * A keep_alive gap does not reach here.
  * @param {import('mineflayer').Bot} bot
  */
@@ -149,7 +152,7 @@ function _scheduleStallPoll(bot) {
         clearInterval(bot.__stallPollInterval);
         bot.__stallPollInterval = null;
     }
-    console.log(`[event-loop] stall guard ARMED: threshold is the keep-alive kick bound (currently ${thresholdMs}ms = ${KEEP_ALIVE_INTERVAL_MS}×2); poll every ${pollMs}ms (Nyquist: interval/2)`);
+    console.log(`[event-loop] stall guard ARMED: STALL at one game tick (currently ${thresholdMs}ms = 1000/${TICKS_PER_SECOND}); poll every ${pollMs}ms (watchdog beat)`);
 
     if (!bot.__stallEventLoopHist) {
         bot.__stallEventLoopHist = monitorEventLoopDelay({ resolution: 20 });
@@ -168,8 +171,9 @@ function _scheduleStallPoll(bot) {
 }
 
 /**
- * Arm once per bot at the keep-alive kick bound. Inbound keep_alive times are not read:
- * Date.now() there included the bot's own stalls and the maximum only climbed.
+ * Arm once per bot. The STALL log is one game tick. The watchdog silence limit is the
+ * keep-alive kick bound, and only the watchdog reads it. Inbound keep_alive times are
+ * not read: Date.now() there included the bot's own stalls and the maximum only climbed.
  * @param {import('mineflayer').Bot} bot
  */
 export function startEventLoopStallGuard(bot) {
@@ -189,7 +193,6 @@ export function startEventLoopStallGuard(bot) {
         get: () => (_psnStack === '(none)' ? '' : _psnStack),
         set: (v) => { _psnStack = v ? String(v) : '(none)'; _publishEvidence(); },
     });
-    bot.__eventLoopStallThresholdMs = KEEP_ALIVE_KICK_MS;
     _scheduleStallPoll(bot);
 }
 
@@ -202,10 +205,7 @@ export function stopEventLoopStallGuard(bot) {
         bot.__stallEventLoopHist.disable();
         bot.__stallEventLoopHist = null;
     }
-    if (bot) {
-        bot.__eventLoopStallGuardHooked = false;
-        bot.__eventLoopStallThresholdMs = null;
-    }
+    if (bot) bot.__eventLoopStallGuardHooked = false;
 }
 
 /**

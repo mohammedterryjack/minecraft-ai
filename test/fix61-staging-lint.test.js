@@ -11,6 +11,7 @@
  */
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert';
+import { createRequire } from 'node:module';
 import http from 'node:http';
 import { rmSync } from 'fs';
 import { Voyager } from '../src/agent/voyager.js';
@@ -34,7 +35,17 @@ const CRAFT_ITEM = `async function craftItem(bot, itemName, target = 1) {
 }`;
 
 async function rig() {
-    const coder = new Coder({ name: NAME });
+    // This bundle's getNearestBlock distances are in blocks (craftItem, and craftRecipe in the
+    // closure). Login (play) viewDistance is chunks (https://wiki.vg/Protocol#Login_.28play.29);
+    // one chunk is CHUNK_WIDTH (prismarine-chunk). Grant the chunks that contain the furthest scan.
+    const { CHUNK_WIDTH } = createRequire(import.meta.url)('prismarine-chunk/src/pc/common/constants.js');
+    const recipe = Voyager.SEEDED_PRIMITIVES.find(p => p.name === 'craftRecipe');
+    if (!recipe) throw new Error('craftRecipe is not a seeded primitive');
+    const scans = [...`${CRAFT_ITEM}\n${recipe.code}`.matchAll(/getNearestBlock\([^)]*,\s*(\d+)\)/g)].map(m => Number(m[1]));
+    if (scans.length === 0) throw new Error('the linted bundle has no numeric getNearestBlock distance');
+    const chunks = Math.ceil(Math.max(...scans) / CHUNK_WIDTH);
+    if (!Number.isInteger(chunks) || chunks <= 0) throw new Error(`view distance in chunks is ${chunks} (CHUNK_WIDTH ${CHUNK_WIDTH})`);
+    const coder = new Coder({ name: NAME, bot: { game: { serverViewDistance: chunks, simulationDistance: chunks } } });
     while (!coder.code_lint_template || !coder.code_template) await new Promise(r => setImmediate(r));
     const v = Object.create(Voyager.prototype);
     v.skills = [...Voyager.SEEDED_PRIMITIVES.map(p => ({ name: p.name, code: p.code, deps: p.deps })), { name: 'craftItem', code: CRAFT_ITEM, deps: ['craftRecipe'] }];
