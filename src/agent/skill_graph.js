@@ -525,6 +525,21 @@ export function thrownIn(top) {
     return { staged: /^<anonymous>:\d+:\d+$/.test(tail), fn, loc: tail };
 }
 const FAIL_LINE = /FAILED|\bfailed\b|\bneed (?:a |an )?\w+_\w+|\bno \w+ within\b|cannot|can't|not enough/i;
+// fix102: V8's SlicedString is a pointer, offset and length into its parent string, and V8 does not
+// truncate that parent so it can be collected (https://github.com/v8/v8/blob/main/src/objects/string.h
+// class SlicedString: "truncating sliced string to enable otherwise unneeded parent to be GC'ed" is listed
+// as a missing feature). slice and split of a run's output are those slices, and a one-element
+// Array.prototype.join returns that same string, so evidence kept from it pins the whole bot.output.
+// `+ ''` and a template string keep the slice. A utf16le Buffer round-trip is a new sequential string
+// and is exact for every JS string, including a lone surrogate. utf8 is not: it replaces an unpaired
+// surrogate with U+FFFD, and a skill error sliced at 100 chars (skills.js placeBlock) can split an emoji.
+// The code units must match; a changed line would be a cut, so this throws.
+export function flatCopy(s) {
+    if (typeof s !== 'string') throw new Error(`flatCopy: string required, got ${typeof s}`);
+    const copy = Buffer.from(s, 'utf16le').toString('utf16le');
+    if (copy !== s) throw new Error('flatCopy: utf16le round-trip changed the string');
+    return copy;
+}
 // per-call contract result: failed return/exception, or a failure line emitted by the call itself (not by its children)
 export function annotateTrace(trace, output) {
     const out = String(output || '');
@@ -533,7 +548,7 @@ export function annotateTrace(trace, output) {
         let own = '', p = r.o0;
         for (const [a, b] of kids) { own += out.slice(p, a); p = Math.max(p, b); }
         own += out.slice(p, r.o1 ?? out.length);
-        r.ownFail = own.split('\n').filter(l => FAIL_LINE.test(l));
+        r.ownFail = own.split('\n').filter(l => FAIL_LINE.test(l)).map(flatCopy);
         r.ok = !r.intr && !r.fail && !r.ownFail.length;
     });
     return trace;
@@ -866,7 +881,8 @@ export function structuredTrace(trace) {
         lines.push(`${callHead(trace, r)}${errors ? ' | ' + errors : ''}`);
     }
     if (trace.untraced > 0) lines.push(`(${trace.untraced} further call(s) ran after the trace's ${trace.length} records and were not recorded)`);
-    return groupVaryingLines(lines.join('\n'));
+    // fix102: one kept failure line is the same SlicedString join/split returned. The retry prompt keeps this text.
+    return flatCopy(groupVaryingLines(lines.join('\n')));
 }
 // credit assignment: blame the deepest failing call; a failing leaf (hand-written primitive, no skill deps) is never edited,
 // so responsibility moves to its caller (PSN calling_pattern_issues -> caller_fix); otherwise the callee itself (callee_fix).
@@ -884,7 +900,7 @@ export function blame(trace, isLeaf) {
     let t = best[1], kind = 'callee_fix';
     while (t >= 0 && isLeaf(trace[t].name)) { t = trace[t].parent; kind = 'caller_fix'; }
     const swallowed = !propagated.length;
-    const evidence = (collapseRepeats(best[0].ownFail).join(' | ') || best[0].err || `returned ${best[0].ret}`);
+    const evidence = flatCopy(collapseRepeats(best[0].ownFail).join(' | ') || best[0].err || `returned ${best[0].ret}`);
     if (t < 0) return { target: null, leaf: best[0].name, path, kind: 'leaf_only', swallowed, evidence };
     return { target: trace[t].name, leaf: best[0].name, path, kind, swallowed, evidence };
 }
@@ -913,7 +929,7 @@ export function blameAll(trace, isLeaf, isLearned) {
     for (const [r, i] of [...pool].sort((x, y) => y[0].depth - x[0].depth)) {   // deepest failure first: it defines each skill's role
         const chain = []; for (let k = i; k >= 0; k = trace[k].parent) chain.unshift(k);
         const path = chain.map(k => trace[k].name);
-        const evidence = (collapseRepeats(r.ownFail).join(' | ') || r.err || `returned ${r.ret}`);
+        const evidence = flatCopy(collapseRepeats(r.ownFail).join(' | ') || r.err || `returned ${r.ret}`);
         for (const k of chain) {
             const n = trace[k].name; if (isLeaf(n) || !isLearned(n) || (k === i && trace[k].preFail)) continue;   // fix22: violated precondition -> caller's fault
             if (owned.has(k) && !trace[k].ownFail.length) continue;   // fix60: only propagated a callee-owned failure
