@@ -11,6 +11,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { selectAPI, createModel } from './_model_map.js';
 import { Ollama } from './ollama.js';
+import { writeCodePromptDump } from './code_prompt_dump.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -299,7 +300,8 @@ export class Prompter {
 
         let resp;
         try {
-            try { writeFileSync('/tmp/icefox_code_prompt.txt', prompt); } catch (e) {}
+            const convo = Array.isArray(messages) ? messages.map(m => typeof m === 'string' ? m : `${m.role}: ${m.content}`).join('\n') : '';
+            writeCodePromptDump(prompt, convo);
             resp = await this.code_model.sendRequest(messages, prompt);
         } finally {
             this.awaiting_coding = false; // never leave coding locked after an error

@@ -89,7 +89,8 @@ function createMockBot() {
         inventory: mockInventory,
         health: 18,
         food: 15,
-        game: { minY: -64, height: 384, maxHealth: 20, maxFood: 20 },
+        // Login (play) grants viewDistance in chunks. observe() reads it; the client settings value is not a grant.
+        game: { minY: -64, height: 384, maxHealth: 20, maxFood: 20, serverViewDistance: 10 },
         time: { timeOfDay: 6000 },
         registry: mockRegistry,
         version: '1.20.4',

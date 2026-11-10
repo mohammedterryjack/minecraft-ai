@@ -1,8 +1,13 @@
 import pf from 'mineflayer-pathfinder';
 import { Vec3 } from 'vec3';
+import { createRequire } from 'module';
 import * as mc from '../../utils/mcdata.js';
 import { carriedSlots } from '../../utils/carried.js';
 import { itemSourceBlocks } from '../../utils/item_sources.js';
+
+const require = createRequire(import.meta.url);
+// A chunk is 16 blocks on a side (prismarine-chunk; https://minecraft.wiki/w/Chunk).
+const { CHUNK_WIDTH } = require('prismarine-chunk/src/pc/common/constants.js');
 
 
 // fix42: getAllFreeSpaces returns all valid positions (for retry logic when placeBlock fails at one cell)
@@ -486,15 +491,38 @@ export function getNearbyPlayerNames(bot) {
 
 
 // Positions inside the cube of half-extent `distance` (the radius the caller passed). This replaces the old
-// count default of 10000, which was not the size of any search.
+// count default of 10000, which was not the size of any search. The cube's side is 2*floor(distance)+1: the center
+// block plus `distance` blocks each way. A radius of one chunk width (16) is a 33-block cube, which is why that
+// width is not itself the radius.
 function positionsWithin(distance) {
     const span = Math.floor(distance) * 2 + 1;
     return span * span * span;
 }
 
-// A chunk is 16 blocks on a side (https://minecraft.wiki/w/Chunk). The nearby-block listing is that radius.
-// Callers pass it. getNearbyBlocks and getNearbyBlockTypes have no default.
-export const NEARBY_BLOCK_RADIUS = 16;
+// Login (play) sends viewDistance and simulationDistance as chunk radii (varints).
+// https://wiki.vg/Protocol#Login_.28play.29 — Minecraft 1.20.4 uses the 1.20.3 protocol, where both fields follow maxPlayers.
+// https://minecraft.wiki/w/Render_distance — the view distance is how many chunks from the player are sent.
+// Later packets update them: update_view_distance (viewDistance) and simulation_distance (distance).
+// Mineflayer stores the login view distance on bot.game.serverViewDistance and, with the game.js patch, the
+// simulation distance and both update packets. The client settings view distance is the request, not the grant.
+function serverChunkRadius(bot) {
+    const game = bot && bot.game;
+    if (!game || typeof game !== 'object') {
+        throw new Error('nearbyBlockRadius: bot.game is missing. The server sends viewDistance and simulationDistance in the login play packet (https://wiki.vg/Protocol#Login_.28play.29).');
+    }
+    const view = game.serverViewDistance;
+    const sim = game.simulationDistance;
+    const granted = Number.isInteger(view) && view > 0 ? view : Number.isInteger(sim) && sim > 0 ? sim : null;
+    if (granted === null) {
+        throw new Error(`nearbyBlockRadius: server viewDistance (${JSON.stringify(view)}) and simulationDistance (${JSON.stringify(sim)}) are not positive integers. Both are varints on the login play packet (wiki.vg Protocol, Login (play); https://minecraft.wiki/w/Render_distance). bot.settings.viewDistance is the client request, not the distance the server granted.`);
+    }
+    return granted;
+}
+
+// Block radius of the chunks the server has granted. Callers pass it. There is no default.
+export function nearbyBlockRadius(bot) {
+    return serverChunkRadius(bot) * CHUNK_WIDTH;
+}
 
 export function getNearbyBlocks(bot, distance) {
     /**

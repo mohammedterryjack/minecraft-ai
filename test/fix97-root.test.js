@@ -18,7 +18,7 @@ import { readFileSync } from 'node:fs';
 import { edibleNames, planFoodAcquisition } from '../src/agent/food_backchain.js';
 import { buildContractManifest } from '../scripts/fix97_contract_manifest.js';
 import { nestedBotMemberError, getBareAPI, Coder } from '../src/agent/coder.js';
-import { getNearestBlocks, getNearestBlocksWhere, getNearbyBlockTypes } from '../src/agent/library/world.js';
+import { getNearestBlocks, getNearestBlocksWhere, getNearbyBlockTypes, nearbyBlockRadius } from '../src/agent/library/world.js';
 import { wrapBotForApiTiming } from '../src/utils/bot_api_timing.js';
 import { readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
@@ -35,6 +35,7 @@ before(async () => {
     const mod = await import('../src/agent/voyager.js');
     Voyager = mod.Voyager;
     mod._setVersionForTest(VER);
+    (await import('../src/utils/mcdata.js'))._setVersionForTest(VER);
 });
 
 function mkV(progress) {
@@ -135,12 +136,19 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         const manifest = buildContractManifest(fixture);
         assert.strictEqual(manifest.apply, false);
         assert.strictEqual(manifest.dryRun, true);
-        assert.deepStrictEqual(manifest.records.map(r => r.id), ['checkOakLog.pre.55']);
+        assert.deepStrictEqual(manifest.records.map(r => r.id), ['checkOakLog.pre.55', 'checkOakLog.code.55']);
+        const code55 = manifest.records.find(r => r.id === 'checkOakLog.code.55');
+        assert.match(code55.evidence, /promptCounts/);
+        assert.match(code55.evidence, /55/);
         const live = JSON.parse(readFileSync(new URL('../bots/icefox2000/skills/index.json', import.meta.url), 'utf8'));
         const disk = buildContractManifest(live);
         assert.strictEqual(disk.checkOakLogPresent, false);
         assert.strictEqual(disk.apply, false);
-        assert.ok(disk.records.length === 0, JSON.stringify(disk.records));
+        assert.ok(disk.records.some(r => r.id === 'checkOakLog.code.55' && /promptCounts/.test(r.evidence) && /55/.test(r.evidence)));
+        assert.ok(disk.records.some(r => r.id === 'checkOakLog.pre.55'));
+        for (const id of ['smeltIronIntoIngot.code.1', 'mineBlocks.pre.2', 'craftItem.pre.2', 'craftArmorSet.post.4']) {
+            assert.ok(!disk.records.some(r => r.id === id), id);
+        }
     });
 
     it('parses a skill as a module and a contract as a parenthesized expression, and a comment or string is not a numeric literal', () => {
@@ -196,9 +204,6 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         const manifest = buildContractManifest(skills);
         assert.deepStrictEqual(manifest.records.map(r => r.id), [
             'craftToolSet.post.3',
-            'isSafeTarget.pre.2',
-            'isSafeTarget.pre.3',
-            'isSafeTarget.pre.2',
             'harvestCrop.post.2',
             'breakBlockAt.pre.2',
             'equipBestPickaxeForIronOre.post.4',
@@ -225,6 +230,19 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         assert.match(byId['checkOakLog.code.55'], /promptCounts count of oak_log/);
         assert.match(byId['checkOakLog.pre.55'], /promptCounts count of oak_log/);
         assert.strictEqual(manifest.checkOakLogPresent, true);
+        const absent = [
+            { name: 'smeltIronIntoIngot', code: 'async function smeltIronIntoIngot(bot) { const c = getInventoryCounts(bot); return c.raw_iron < 1; }', promptCounts: { raw_iron: 1 }, contract: { pre: 'c => true', post: 'c => true' } },
+            { name: 'mineBlocks', code: 'async function mineBlocks(bot, blockName, count = 1) { return true; }', contract: { pre: 'c => c.args.length >= 2', post: 'c => true' } },
+            { name: 'craftItem', code: 'async function craftItem(bot, itemName, target = 1) { return true; }', contract: { pre: 'c => c.args.length >= 2', post: 'c => true' } },
+            { name: 'hasItemCount', code: 'async function hasItemCount(bot, name, count) { return true; }', contract: { pre: 'c => c.args.length >= 2', post: 'c => true' } },
+            { name: 'ensureIngredientsAndCraft', code: 'async function ensureIngredientsAndCraft(bot, itemName, count = 1) { return true; }', contract: { pre: 'c => c.args.length >= 2', post: 'c => true' } },
+            { name: 'craftArmorSet', code: 'async function craftArmorSet(bot, material = "iron") {\n  const counts = getInventoryCounts(bot);\n  if (counts.iron_ingot < 4) return false;\n  return true;\n}', promptCounts: { iron_ingot: 4 }, contract: { pre: 'c => true', post: 'c => c.ret === 4' } },
+            { name: 'isSafeTarget', code: 'function isSafeTarget(bot, x, z, maxRange = 48) { return true; }', contract: { pre: 'c => c.args.length >= 2 && c.args.length <= 3', post: 'c => true' } },
+        ];
+        const cleared = buildContractManifest(absent);
+        for (const id of ['smeltIronIntoIngot.code.1', 'mineBlocks.pre.2', 'craftItem.pre.2', 'hasItemCount.pre.2', 'ensureIngredientsAndCraft.pre.2', 'craftArmorSet.post.4', 'isSafeTarget.pre.2', 'isSafeTarget.pre.3']) {
+            assert.ok(!cleared.records.some(r => r.id === id), `${id} in ${cleared.records.map(r => r.id).join(',')}`);
+        }
     });
 });
 
@@ -246,6 +264,20 @@ describe('fix97 code state and decompose limits', () => {
         assert.match(feedback.join('\n'), /oak_log >= 55/);
         const distance = 'async function checkOakLog(bot) {\n  return getNearestBlock(bot, "oak_log", 32);\n}';
         assert.deepStrictEqual(Voyager.snapshotThresholdFeedback(distance, { oak_log: 55 }), []);
+        const entries = [{ item: 'oak_log', n: 55, source: 'promptCounts' }];
+        const bound = 'async function checkOakLog(bot) {\n  const counts = getInventoryCounts(bot);\n  const need = 55;\n  return counts.oak_log >= need;\n}';
+        const aliased = 'async function checkOakLog(bot) {\n  const counts = getInventoryCounts(bot);\n  const n = counts.oak_log;\n  return n >= 55;\n}';
+        const both = 'async function checkOakLog(bot) {\n  const counts = getInventoryCounts(bot);\n  const need = 55;\n  const n = counts.oak_log;\n  return n >= need;\n}';
+        for (const src of [bound, aliased, both]) {
+            const hits = Voyager.copiedCountComparisons(src, entries, registry);
+            assert.ok(hits.some(h => h.item === 'oak_log' && h.n === 55), src);
+        }
+        const one = 'async function placeTable(bot) {\n  const counts = getInventoryCounts(bot);\n  return counts.crafting_table >= 1;\n}';
+        const sticks = 'async function craftSticks(bot) {\n  const counts = getInventoryCounts(bot);\n  return counts.stick < 2;\n}';
+        const raw = 'async function smeltIronIntoIngot(bot) {\n  const counts = getInventoryCounts(bot);\n  return counts.raw_iron < 1;\n}';
+        assert.deepStrictEqual(Voyager.copiedCountComparisons(one, [{ item: 'crafting_table', n: 1, source: 'promptCounts' }], registry), []);
+        assert.deepStrictEqual(Voyager.copiedCountComparisons(sticks, [{ item: 'stick', n: 2, source: 'promptCounts' }], registry), []);
+        assert.deepStrictEqual(Voyager.copiedCountComparisons(raw, [{ item: 'raw_iron', n: 1, source: 'promptCounts' }], registry), []);
     });
 
     it('a depth-2 goal still decomposes, and a queued split is not repeated on a clock', async () => {
@@ -433,9 +465,44 @@ describe('fix97 findBlocks refuses a non-numeric maxDistance or count', () => {
         assert.doesNotMatch(sig, /10000/);
         assert.match(getBareAPI().byName.getNearbyBlockTypes.sig, /distance: number/);
         assert.doesNotMatch(getBareAPI().byName.getNearbyBlocks.sig, /=/);
+        const { CHUNK_WIDTH } = require('prismarine-chunk/src/pc/common/constants.js');
+        assert.throws(() => nearbyBlockRadius({}), /viewDistance/);
+        assert.throws(() => nearbyBlockRadius({ game: {}, settings: { viewDistance: 'far' } }), /client request/);
+        assert.throws(() => nearbyBlockRadius({ game: { serverViewDistance: 0, simulationDistance: 0 } }), /positive integers/);
+        assert.strictEqual(nearbyBlockRadius({ game: { serverViewDistance: 8 } }), 8 * CHUNK_WIDTH);
+        assert.strictEqual(nearbyBlockRadius({ game: { simulationDistance: 4 } }), 4 * CHUNK_WIDTH);
+        assert.strictEqual(nearbyBlockRadius({ game: { serverViewDistance: 10, simulationDistance: 5 } }), 10 * CHUNK_WIDTH);
+        let seen = null;
+        const viewBot = {
+            game: { serverViewDistance: 2 },
+            registry,
+            findBlocks(opts) { seen = opts; return []; },
+            blockAt() { return null; },
+        };
+        getNearbyBlockTypes(viewBot, nearbyBlockRadius(viewBot));
+        assert.strictEqual(seen.maxDistance, 2 * CHUNK_WIDTH);
+        assert.strictEqual(seen.count, (2 * CHUNK_WIDTH * 2 + 1) ** 3);
+        const { EventEmitter } = require('events');
+        const client = new EventEmitter();
+        const gameBot = {
+            _client: client,
+            supportFeature(name) { return name === 'dimensionIsAString' || name === 'customChannelIdentifier'; },
+            emit() {},
+            registry: { dimensionsByName: {} },
+        };
+        client.registerChannel = () => {};
+        client.writeChannel = () => {};
+        require('mineflayer/lib/plugins/game.js')(gameBot, { brand: 'test' });
+        client.emit('login', { dimension: 'overworld', gameMode: 0, maxPlayers: 20, viewDistance: 6, simulationDistance: 4 });
+        assert.strictEqual(gameBot.game.serverViewDistance, 6);
+        assert.strictEqual(gameBot.game.simulationDistance, 4);
+        client.emit('update_view_distance', { viewDistance: 9 });
+        client.emit('simulation_distance', { distance: 7 });
+        assert.strictEqual(gameBot.game.serverViewDistance, 9);
+        assert.strictEqual(gameBot.game.simulationDistance, 7);
+        assert.strictEqual(nearbyBlockRadius(gameBot), 9 * CHUNK_WIDTH);
         assert.match(Voyager.prototype._pursueProposedTask.toString(), /maxDistance and count are finite numbers/);
         assert.match(Voyager.prototype._pursueProposedTask.toString(), /findBlock\(options\) returns one block and does not take count/);
-        const { EventEmitter } = require('events');
         const raw = new EventEmitter();
         raw._client = new EventEmitter();
         raw.registry = registry;

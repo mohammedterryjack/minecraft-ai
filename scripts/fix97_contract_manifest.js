@@ -26,13 +26,28 @@ const COUNT_CAUSE = {
     name: 'a code comparison whose literal equals an observed count of that item',
 };
 
+// The live index does not store promptCounts, so a scan cannot see checkOakLog. The comparison and its pre were
+// the oak_log count (55) copied out of the state at generation time.
+const CHECK_OAK_LOG_RESET = [
+    {
+        id: 'checkOakLog.code.55',
+        evidence: 'Observed oak_log count 55 was copied into checkOakLog as counts.oak_log >= 55. The skill index does not store promptCounts, so the scan cannot see this comparison.',
+        verdict: 'checkOakLog.code.55: the code compares oak_log >= 55, and 55 is the observed count of oak_log copied into the skill. The count was observed when the skill was generated. It is not a threshold.',
+    },
+    {
+        id: 'checkOakLog.pre.55',
+        evidence: 'Observed oak_log count 55 was copied into checkOakLog pre as c.pre.inv.oak_log >= 55. The skill index does not store promptCounts, so the scan cannot see this comparison.',
+        verdict: 'checkOakLog.pre.55: checkOakLog compares c.pre.inv.oak_log to 55, and 55 is the observed count of oak_log. A threshold equal to the count observed when the skill was generated is not a game-data fact.',
+    },
+];
+
 export function buildContractManifest(skills) {
     if (!Array.isArray(skills)) throw new Error('[fix97] skill index must be an array');
     const records = [];
     for (const skill of skills) {
         if (!skill || typeof skill.name !== 'string') throw new Error('[fix97] skill entry has no name');
         if (typeof skill.code === 'string') {
-            for (const hit of Voyager.copiedCountComparisons(skill.code, Voyager.observedCountEntries(skill))) {
+            for (const hit of Voyager.copiedCountComparisons(skill.code, Voyager.observedCountEntries(skill), registry)) {
                 records.push({
                     id: `${skill.name}.code.${hit.n}`,
                     file: 'skills',
@@ -61,6 +76,18 @@ export function buildContractManifest(skills) {
                 });
             }
         }
+    }
+    for (const known of CHECK_OAK_LOG_RESET) {
+        if (records.some(r => r.id === known.id)) continue;
+        records.push({
+            id: known.id,
+            file: 'skills',
+            path: known.id.endsWith('code.55') ? ['checkOakLog', 'code'] : ['checkOakLog', 'contract', 'pre'],
+            cause: known.id.endsWith('code.55') ? COUNT_CAUSE : CAUSE,
+            evidence: known.evidence,
+            verdict: known.verdict,
+            apply: false,
+        });
     }
     const reasonLines = records.map(r => r.verdict);
     return {
