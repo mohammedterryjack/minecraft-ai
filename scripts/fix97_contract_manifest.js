@@ -12,6 +12,9 @@
  * the required count through the arity (or below the required count, when the function has a rest parameter),
  * is a reset: contract, contractPrev, and contractFail are cleared and the code stays.
  * The predicate list is derived from the AST of each skill. No skill name is hard-coded.
+ * Stored stats.calls are one record per distinct value. A list is migrated to one example per
+ * arity and argument types, or reset when it is not a list or a record has no signature.
+ * The skill names and signatures come from the scan. Nothing is rewritten unless --apply is passed.
  *
  *   node scripts/fix97_contract_manifest.js --bots-dir=bots/icefox2000
  */
@@ -20,7 +23,7 @@ import { join, resolve } from 'path';
 import { fileURLToPath } from 'url';
 import { createRequire } from 'module';
 import settings from '../settings.js';
-import { Voyager } from '../src/agent/voyager.js';
+import { Voyager, CALL_SHAPE } from '../src/agent/voyager.js';
 
 const require = createRequire(import.meta.url);
 const registry = require('minecraft-data')(settings.minecraft_version);
@@ -65,6 +68,94 @@ export function contractArityResets(skills) {
         }
     }
     return resets;
+}
+
+function callSignature(call) {
+    if (call === null || typeof call !== 'object' || Array.isArray(call)) return null;
+    if (typeof call.arity !== 'number' || !Array.isArray(call.types) || !Array.isArray(call.values)) return null;
+    if (call.types.length !== call.arity || call.values.length !== call.arity) return null;
+    return `${call.arity}:${call.types.join(',')}`;
+}
+
+// Scan-derived. A non-list calls value is a reset. Several records of one signature, or a record
+// still labelled as one-entry-per-value, collapse to the first example and the current shape label.
+export function callRecordMigrations(skills) {
+    if (!Array.isArray(skills)) throw new Error('[fix97] skill index must be an array');
+    const migrations = [];
+    for (const skill of skills) {
+        if (!skill || typeof skill.name !== 'string') throw new Error('[fix97] skill entry has no name');
+        if (!skill.stats || typeof skill.stats !== 'object' || Array.isArray(skill.stats)) continue;
+        if (!Object.hasOwn(skill.stats, 'calls')) continue;
+        const calls = skill.stats.calls;
+        if (!Array.isArray(calls)) {
+            migrations.push({
+                id: `${skill.name}.stats.calls`,
+                skill: skill.name,
+                kind: 'reset',
+                reason: `${skill.name} stats.calls is not a list of call shapes`,
+            });
+            continue;
+        }
+        const groups = new Map();
+        let malformed = 0;
+        for (const call of calls) {
+            const key = callSignature(call);
+            if (key === null) { malformed += 1; continue; }
+            if (!groups.has(key)) groups.set(key, []);
+            groups.get(key).push(call);
+        }
+        if (malformed > 0) {
+            migrations.push({
+                id: `${skill.name}.stats.calls.malformed`,
+                skill: skill.name,
+                kind: 'reset',
+                count: malformed,
+                reason: `${skill.name} has ${malformed} call record(s) with no arity and argument types`,
+            });
+        }
+        for (const [key, group] of groups) {
+            const stale = group.some(call => call.shape !== CALL_SHAPE);
+            if (group.length === 1 && stale === false) continue;
+            migrations.push({
+                id: `${skill.name}.stats.calls.${key}`,
+                skill: skill.name,
+                kind: 'migrate',
+                from: group.length,
+                keep: 1,
+                arity: group[0].arity,
+                types: group[0].types.slice(),
+                reason: `${skill.name} has ${group.length} call record(s) for arity ${group[0].arity} types ${group[0].types.join(',')}; one value example is kept`,
+            });
+        }
+    }
+    return migrations;
+}
+
+export function applyCallRecordMigrations(skills) {
+    const migrations = callRecordMigrations(skills);
+    const bySkill = new Map();
+    for (const row of migrations) {
+        if (!bySkill.has(row.skill)) bySkill.set(row.skill, []);
+        bySkill.get(row.skill).push(row);
+    }
+    for (const skill of skills) {
+        const rows = bySkill.get(skill.name);
+        if (rows === undefined) continue;
+        if (rows.some(row => row.kind === 'reset' && row.id === `${skill.name}.stats.calls`)) {
+            delete skill.stats.calls;
+            continue;
+        }
+        const kept = [];
+        const seen = new Set();
+        for (const call of skill.stats.calls) {
+            const key = callSignature(call);
+            if (key === null || seen.has(key)) continue;
+            seen.add(key);
+            kept.push({ arity: call.arity, types: call.types.slice(), values: call.values.slice(), shape: CALL_SHAPE });
+        }
+        skill.stats.calls = kept;
+    }
+    return migrations;
 }
 
 export function applyContractResets(skills) {
@@ -116,6 +207,7 @@ export function buildContractManifest(skills) {
         reasonLines,
         records,
         resets: contractArityResets(skills),
+        callMigrations: callRecordMigrations(skills),
     };
 }
 
@@ -131,9 +223,10 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1
     const indexPath = join(bots, 'skills', 'index.json');
     const skills = JSON.parse(readFileSync(indexPath, 'utf8'));
     if (process.argv.includes('--apply')) {
+        const callMigrations = applyCallRecordMigrations(skills);
         const resets = applyContractResets(skills);
         writeFileSync(indexPath, JSON.stringify(skills, null, 2));
-        process.stdout.write(JSON.stringify({ apply: true, resets }, null, 2) + '\n');
+        process.stdout.write(JSON.stringify({ apply: true, callMigrations, resets }, null, 2) + '\n');
     } else {
         const manifest = buildContractManifest(skills);
         manifest.index = indexPath;

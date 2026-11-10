@@ -47,10 +47,14 @@ const LOG_EVIDENCE_CHARS = 160;
 // fix79: _attribute's verdict when the run met every contract and the goal failed only because the route sent it to a skill with no
 //        learned evidence of producing the goal items: the route is blamed, not the skill
 export const MISROUTED = 'misrouted';
-// One stored call per distinct arity, argument types, and values. A repeated call is the same shape, so the
-// record is not a log of every call. The values are that call's c.args (objects are already null there).
-export const CALL_SHAPE = 'one record per distinct arity, argument types, and values';
-// A learned contract that reads c.args is not judged until a call has been recorded. No argument value is filled in.
+// One stored call per distinct arity and argument types. The values are one example of that signature
+// (objects are already null in c.args). A different value of the same type is the same record, so a
+// count or a coordinate cannot grow the list. The previous record, one entry per distinct value, is
+// CALL_SHAPE_VALUES; the manifest migrates or resets those stored lists explicitly.
+export const CALL_SHAPE_VALUES = 'one record per distinct arity, argument types, and values';
+export const CALL_SHAPE = 'one record per distinct arity and argument types, with one value example';
+// A learned contract that reads c.args is judged only against calls that succeeded with no contract
+// violation. Until one of those is recorded, no argument value is filled in.
 export const CONTRACT_EVAL = 'pending its first recorded call';
 // fix70: the API-lint failure in the repair evidence the code model sees. One definition for the startup re-lint and the
 // repair-time re-lint, so both evidences are the same text. fix96: the whole lint text (it was cut at 600 chars).
@@ -491,6 +495,7 @@ export function assertProgressBlocker(b) {
 
 export class Voyager {
     static CALL_SHAPE = CALL_SHAPE;
+    static CALL_SHAPE_VALUES = CALL_SHAPE_VALUES;
     static CONTRACT_EVAL = CONTRACT_EVAL;
     constructor(agent) {
         this.agent = agent;
@@ -1968,20 +1973,47 @@ Use only c; no other globals.`;
         });
     }
     static sameShape(a, b) {
-        return a.arity === b.arity && a.types.length === b.types.length && a.types.every((t, i) => t === b.types[i]) && a.values.every((v, i) => Object.is(v, b.values[i]));
+        if (!a || !b || !Array.isArray(a.types) || !Array.isArray(b.types)) throw new Error('[fix97] a recorded call shape is missing types');
+        return a.arity === b.arity && a.types.length === b.types.length && a.types.every((t, i) => t === b.types[i]);
+    }
+    // The tracer's success: not a failure flag, and a return other than the failure returns
+    // (false, null, 0) and the default undefined. A violated contract is a separate fact.
+    static callSucceeded(record) {
+        if (!record || typeof record !== 'object') throw new Error('[fix97] call record required');
+        if (record.fail === true) return false;
+        if (record.rv === undefined || record.rv === false || record.rv === null || record.rv === 0) return false;
+        return true;
     }
     static callText(args) {
         return `(${args.map(x => typeof x === 'number' || x === undefined ? String(x) : JSON.stringify(x)).join(', ')})`;
     }
     static recordedCalls(skill) {
-        if (!skill || !skill.stats || !Object.hasOwn(skill.stats, 'calls')) return [];
+        if (!skill || !skill.stats) return [];
+        if (typeof skill.stats !== 'object' || Array.isArray(skill.stats)) throw new Error(`[fix97] ${skill.name} stats is not an object`);
+        if (!Object.hasOwn(skill.stats, 'calls')) return [];
         if (!Array.isArray(skill.stats.calls)) throw new Error(`[fix97] ${skill.name} stats.calls is not a list of call shapes`);
         return skill.stats.calls;
     }
-    static recordCallShape(skill, args) {
+    // outcome.succeeded and outcome.violated are required. A call that failed, or whose pre or post
+    // did not hold, is evidence for nothing and is not stored. stats is not created here, and a
+    // calls value that is not a list is not replaced: both throw, the same as recordedCalls.
+    static recordCallShape(skill, args, outcome) {
         if (!skill || typeof skill.name !== 'string') throw new Error('[fix97] recordCallShape needs the skill');
-        if (!skill.stats || typeof skill.stats !== 'object' || Array.isArray(skill.stats)) skill.stats = newStats();
-        if (!Array.isArray(skill.stats.calls)) skill.stats.calls = [];
+        if (outcome === undefined || outcome === null || typeof outcome !== 'object' || Array.isArray(outcome)) {
+            throw new Error('[fix97] recordCallShape needs { succeeded, violated }');
+        }
+        if (typeof outcome.succeeded !== 'boolean' || typeof outcome.violated !== 'boolean') {
+            throw new Error(`[fix97] recordCallShape outcome succeeded and violated must be booleans, got ${typeof outcome.succeeded} and ${typeof outcome.violated}`);
+        }
+        if (outcome.succeeded !== true || outcome.violated !== false) return false;
+        if (!skill.stats) throw new Error(`[fix97] ${skill.name} has no stats`);
+        if (typeof skill.stats !== 'object' || Array.isArray(skill.stats)) {
+            throw new Error(`[fix97] ${skill.name} stats is not an object`);
+        }
+        if (Object.hasOwn(skill.stats, 'calls') && !Array.isArray(skill.stats.calls)) {
+            throw new Error(`[fix97] ${skill.name} stats.calls is not a list of call shapes`);
+        }
+        if (!Object.hasOwn(skill.stats, 'calls')) skill.stats.calls = [];
         const shape = Voyager.callShape(args);
         if (skill.stats.calls.some(call => Voyager.sameShape(call, shape))) return false;
         skill.stats.calls.push(shape);
@@ -2858,26 +2890,15 @@ Use only c; no other globals.`;
         for (const r of trace) {
             if (r.intr || !r.s0 || !r.s1) continue;
             const e = this.skills.find(s => s.name === r.name);
-            if (e) {
-                if (!Array.isArray(r.argv)) throw new Error(`[fix97] ${e.name} trace has no c.args`);
-                const pending = e.contractEval === CONTRACT_EVAL;
-                Voyager.recordCallShape(e, r.argv);
-                if (pending && e.contract && e.contract.seeded !== true) {
-                    const bad = this._validContract(e.contract, e);
-                    if (bad) {
-                        e.contractFail = bad;
-                        console.log(`[contract] ${e.name} recorded call rejected the contract: ${bad}`);
-                        this._queueContractFix(e, bad);
-                    } else delete e.contractFail;
-                }
-            }
+            if (e && !Array.isArray(r.argv)) throw new Error(`[fix97] ${e.name} trace has no c.args`);
             // fix86: a string return is the equipped item name. The next contract for this skill is checked against it.
             if (e && typeof r.rv === 'string') {
                 if (!r.s1.eq || !Object.hasOwn(r.s1.eq, 'heldItem')) throw new Error(`[fix86] trace of ${e.name} has no eq.heldItem`);
                 if (!Array.isArray(e.observedRuns)) e.observedRuns = [];
                 if (!e.observedRuns.some(p => p.rv === r.rv && p.heldItem === r.s1.eq.heldItem)) e.observedRuns.push({ rv: r.rv, heldItem: r.s1.eq.heldItem });
             }
-            if (!e?.contract) continue;
+            let violated = false;
+            if (e && e.contract) {
             const c = this._contractCtx({ args: r.argv, ret: r.rv, pre: r.s0, post: r.s1, delta: r.delta });
             for (const k of ['pre', 'post']) {
                 // fix51: when skill explicitly returns false, skip postcondition checking
@@ -2887,6 +2908,7 @@ Use only c; no other globals.`;
                 let ok;
                 try { ok = this._compileContract(e.contract[k])(c); }
                 catch (err) {
+                    violated = true;
                     // fix86: c.post.pos.dist / similar throw TypeError. The contract is not the state shape; drop it.
                     if (err instanceof TypeError && err.message.includes('is not a function')) {
                         console.error(`[fix86] LOUD: ${e.name}.${k} calls a method the contract state does not have (${err.message}); deleting the contract`);
@@ -2900,6 +2922,7 @@ Use only c; no other globals.`;
                     continue;
                 }
                 if (ok !== false) { if (k === 'pre') r.preHeld = true; continue; }   // fix60: the callee's own precondition held in this state
+                violated = true;   // a false pre or post is not a sample, including when the call's return was a success
                 // fix89: undefined is the default return, not a success. A violated pre is "the contract is wrong" only
                 //        when the call returned an explicit success (true, a string, a number other than 0). Otherwise
                 //        the pre names a real lack and _contractNeed turns the inventory reads into a structured need.
@@ -2940,6 +2963,19 @@ Use only c; no other globals.`;
                 appendFileSync(`./bots/${this.agent.name}/violated_contracts.jsonl`, JSON.stringify({ at: new Date().toISOString(), skill: e.name, field: k, contract: e.contract[k], args: r.argv, task: this.currentTask, analysis, state: { pre: r.s0, post: r.s1, delta: r.delta } }) + '\n');
                 // the task outcome disagrees with the contract: the contract itself may be wrong -> it is repairable
                 if (taskOk && k === 'post' && r.parent < 0) this._queueContractFix(e, `postcondition failed but the task check passed`);
+            }
+            }
+            if (e) {
+                const pending = e.contractEval === CONTRACT_EVAL;
+                const added = Voyager.recordCallShape(e, r.argv, { succeeded: Voyager.callSucceeded(r), violated });
+                if (added && pending && e.contract && e.contract.seeded !== true) {
+                    const bad = this._validContract(e.contract, e);
+                    if (bad) {
+                        e.contractFail = bad;
+                        console.log(`[contract] ${e.name} recorded call rejected the contract: ${bad}`);
+                        this._queueContractFix(e, bad);
+                    } else delete e.contractFail;
+                }
             }
         }
     }
