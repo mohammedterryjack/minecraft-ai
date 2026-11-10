@@ -17,6 +17,7 @@
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { gameReach, withinInteractionRange } from './library/world.js';
 
 export const REST_STATISTIC = 'minecraft:time_since_rest';
 const CUSTOM_STAT_REGISTRY = 'minecraft:custom_stat';
@@ -411,7 +412,20 @@ export function bedItemNames(bot) {
 export function findBedBlock(bot) {
     if (!bot || typeof bot.findBlock !== 'function') throw new Error('[fix98] bot.findBlock was not delivered');
     if (typeof bot.isABed !== 'function') throw new Error('[fix98] bot.isABed was not delivered');
-    return bot.findBlock({ matching: block => bot.isABed(block) === true });
+    const eyeHeight = bot.entity && bot.entity.eyeHeight;
+    if (typeof eyeHeight !== 'number' || !Number.isFinite(eyeHeight)) {
+        throw new Error('[fix98] bot.entity.eyeHeight was not delivered');
+    }
+    // Sleep is a use. The bed has to be inside the interaction range. A block the bot can
+    // see, and a block the pathfinder can walk to, are not beds it can sleep in.
+    const reach = gameReach(bot);
+    const bed = bot.findBlock({
+        matching: block => bot.isABed(block) === true,
+        maxDistance: reach + eyeHeight,
+    });
+    if (bed === null) return null;
+    if (!bed.position || withinInteractionRange(bot, bed.position) !== true) return null;
+    return bed;
 }
 
 export function emptyRestStore() {

@@ -13,7 +13,7 @@ import { VitalsModel } from '../src/agent/vitals_model.js';
 import { CONTEXT_FULL } from '../src/models/ollama.js';
 import {
     RestThreat, emptyRestStore, readRestStatistic, resolveRestStatIds, loadCustomStatReport,
-    clientCommandSpec, installProtocolFacts, restFacts, bedItemNames, damageTypesFromData,
+    clientCommandSpec, installProtocolFacts, restFacts, bedItemNames, findBedBlock, damageTypesFromData,
     markRestUnavailable, REST_STATISTIC,
 } from '../src/agent/rest_threat.js';
 import minecraftData from 'minecraft-data';
@@ -54,7 +54,7 @@ function mkV() {
     v.restThreat = new RestThreat(emptyRestStore());
     v.agent = {
         name: 'icefox2000',
-        bot: { health: 20, food: 10, game: { maxHealth: 20, maxFood: 20 }, interrupt_code: false, entity: { position: new Vec3(0, 64, 0) } },
+        bot: { health: 20, food: 10, game: { maxHealth: 20, maxFood: 20, gameMode: 'survival' }, interrupt_code: false, entity: { position: new Vec3(0, 64, 0), eyeHeight: 1.62 } },
         requestInterrupt(source) { v.agent.bot.interrupt_code = true; v.interrupted = source; },
         recentDeaths: [],
     };
@@ -395,6 +395,19 @@ describe('fix98: rest serve chains a bed from game data', () => {
         assert.ok(!tasks.some(t => /sleep/i.test(t)), tasks.join(' | '));
     });
 
+    it('a bed outside the interaction range is not a bed to sleep in', () => {
+        const bot = {
+            entity: { position: new Vec3(0, 64, 0), eyeHeight: 1.62 },
+            game: { gameMode: 'survival' },
+            isABed: () => true,
+            findBlock: () => ({ name: 'bed', position: new Vec3(0, 64, 30) }),
+        };
+        assert.strictEqual(findBedBlock(bot), null);
+        const near = { name: 'bed', position: new Vec3(1, 64, 0) };
+        bot.findBlock = () => near;
+        assert.strictEqual(findBedBlock(bot), near);
+    });
+
     it('bot.sleep rejection is rethrown', async () => {
         const v = mkV();
         const bed = { name: 'placed', position: new Vec3(1, 64, 0) };
@@ -412,7 +425,22 @@ describe('fix98: prompt facts', () => {
     it('observe carries is_day, sleeping, sky light, and the rest statistic', () => {
         const pos = new Vec3(0, 64, 0);
         const stoneStateId = 1;
-        const sections = Array.from({ length: 24 }, () => ({ data: { value: stoneStateId } }));
+        const minY = -64;
+        const sectionCount = 24;
+        const view = 1;
+        const eyeSection = (pos.y - minY) >> 4;
+        const stoneSection = { palette: [stoneStateId], data: { value: stoneStateId } };
+        const airSection = { palette: [0], data: { value: 0 } };
+        const columns = [];
+        for (let dz = -view; dz <= view; dz++) {
+            for (let dx = -view; dx <= view; dx++) {
+                columns.push({
+                    chunkX: dx,
+                    chunkZ: dz,
+                    column: { minY, sections: Array.from({ length: sectionCount }, (_, si) => (si < eyeSection ? stoneSection : airSection)) },
+                });
+            }
+        }
         const bot = {
             entity: { position: pos, eyeHeight: 1.62 },
             time: { timeOfDay: 18000, isDay: false },
@@ -421,14 +449,15 @@ describe('fix98: prompt facts', () => {
             health: 4,
             food: 0,
             oxygenLevel: 300,
-            game: { dimension: 'overworld', serverViewDistance: 10 },
+            game: { dimension: 'overworld', serverViewDistance: view, gameMode: 'survival' },
             heldItem: null,
             inventory: { items: () => [], emptySlotCount: () => 36, slots: Array(46).fill(null) },
             entities: {},
-            registry: { blocksByStateId: { [stoneStateId]: { name: 'stone', metadata: 0 } } },
+            registry: { blocksByStateId: { [stoneStateId]: { name: 'stone', metadata: 0, boundingBox: 'block', transparent: false } } },
             world: {
                 getBiome: () => 1,
-                getColumns: () => [{ chunkX: 0, chunkZ: 0, column: { minY: -64, sections } }],
+                getColumns: () => columns,
+                raycast: () => null,
             },
             findBlocks: () => [],
             blockAt: () => ({ skyLight: 0 }),

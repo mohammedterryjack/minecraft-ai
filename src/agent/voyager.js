@@ -2911,6 +2911,8 @@ Use only c; no other globals.`;
             console.log('[urgent-need] threat backchain still queued; leaving the step to that work');
             return false;
         }
+        // The proposal sees perceived blocks (what a raycast confirms). Walking to one is
+        // pathToBlock, which this interrupt does not call. The interrupt is the learned hurt.
         const before = this.observe();
         const label = 'need:threat';
         this.currentTask = label;
