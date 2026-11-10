@@ -50,8 +50,8 @@ describe('fix67: relative and absolute lookups are separate', () => {
 describe('fix67: prompt API docs', () => {
     it('signatures and docstrings name the two lookups and their frames; the old name is nowhere', () => {
         const sigs = getBareAPI().sigs;
-        assert.ok(sigs.includes('getBlockAtOffset(bot, offset)'), sigs.filter(s => /Block/.test(s)).join(' '));
-        assert.ok(sigs.includes('getBlockAtAbsolute(bot, position)'));
+        assert.ok(sigs.includes('getBlockAtOffset(bot: Bot, offset: Vec3)'), sigs.filter(s => /Block/.test(s)).join(' '));
+        assert.ok(sigs.includes('getBlockAtAbsolute(bot: Bot, position: Vec3)'));
         const docs = getSkillDocs().join('\n');
         assert.match(docs, /getBlockAtOffset\n[^]*RELATIVE to the bot's feet[^]*getBlockAtOffset\(bot, new Vec3\(0, -1, 0\)\)/);
         assert.match(docs, /getBlockAtAbsolute\n[^]*ABSOLUTE world position[^]*getBlockAtAbsolute\(bot, new Vec3\(-124, 33, 57\)\)/);

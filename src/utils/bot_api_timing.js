@@ -26,13 +26,20 @@ export function describeApiArg(a) {
     return `{${fields.join(',')}}`;
 }
 
+// findBlocks options that must be finite numbers. The lint reads this list; it is not a second table of call shapes.
+export const FIND_BLOCKS_NUMERIC_OPTIONS = ['maxDistance', 'count'];
+
 // fix97: findBlocks used `options.maxDistance || 16` and `options.count || 1`. An array is truthy, so it was kept,
 // and the scan's (maxDistance + 8) became a string. A length-2 array makes that NaN and the section iterator never ends.
+// findBlock returns one block and does not take count; the patched function passes count 1 itself.
 export function assertFindBlocksOptions(options, fnName) {
     if (options === null || typeof options !== 'object' || Array.isArray(options)) {
         throw new Error(`${fnName}: options object required, got ${options === null ? 'null' : Array.isArray(options) ? JSON.stringify(options) : typeof options}`);
     }
-    for (const key of ['maxDistance', 'count']) {
+    const required = fnName === 'findBlock' ? ['maxDistance'] : FIND_BLOCKS_NUMERIC_OPTIONS;
+    const present = fnName === 'findBlock' ? FIND_BLOCKS_NUMERIC_OPTIONS.filter(key => Object.hasOwn(options, key)) : required;
+    const keys = required.concat(present.filter(key => !required.includes(key)));
+    for (const key of keys) {
         if (!Object.hasOwn(options, key) || typeof options[key] !== 'number' || !Number.isFinite(options[key])) {
             const v = options[key];
             const shown = v === undefined ? 'undefined' : (typeof v === 'object' ? JSON.stringify(v) : String(v));
