@@ -50,7 +50,8 @@ export const MISROUTED = 'misrouted';
 // One stored call per distinct arity and argument types. The values are one example of that signature
 // (objects are already null in c.args). A different value of the same type is the same record, so a
 // count or a coordinate cannot grow the list. The previous record, one entry per distinct value, is
-// CALL_SHAPE_VALUES; the manifest migrates or resets those stored lists explicitly.
+// CALL_SHAPE_VALUES. A stored record is a recorded call only when it has this shape and boolean
+// succeeded and violated flags. A value-list example, including one relabelled as CALL_SHAPE, is reset.
 export const CALL_SHAPE_VALUES = 'one record per distinct arity, argument types, and values';
 export const CALL_SHAPE = 'one record per distinct arity and argument types, with one value example';
 // A learned contract that reads c.args is judged only against calls that succeeded with no contract
@@ -549,7 +550,8 @@ export class Voyager {
         // fix60: learned local-model call durations (bound a hung Ollama call), persisted with progress
         if (!this.progress.callDurations) this.progress.callDurations = {};
         setCallDurationStore(this.progress.callDurations);
-        if (!this.progress.botApiDurations) this.progress.botApiDurations = {};
+        if (!Object.hasOwn(this.progress, 'botApiDurations')) this.progress.botApiDurations = {};
+        if (this.progress.botApiDurations === null || typeof this.progress.botApiDurations !== 'object' || Array.isArray(this.progress.botApiDurations)) throw new Error(`[fix97] progress.botApiDurations must be an object, got ${JSON.stringify(this.progress.botApiDurations)}`);
         setBotApiDurationStore(this.progress.botApiDurations);
         // fix66: learned time per block / per progress gap (movement no-progress checks), persisted with progress
         if (!this.progress.movement) this.progress.movement = {};
@@ -1932,6 +1934,16 @@ Use only c; no other globals.`;
         const { root, param } = Voyager.contractParam(src);
         return Voyager.nodeReads(root, param, new Set(['args']));
     }
+    // A return value is evidence only when the contract reads c.ret. A missing contract does not.
+    static contractDeclaresReturn(contract) {
+        if (contract === null || typeof contract !== 'object' || Array.isArray(contract)) return false;
+        for (const key of ['pre', 'post']) {
+            if (typeof contract[key] !== 'string') continue;
+            const { root, param } = Voyager.contractParam(contract[key]);
+            if (Voyager.nodeReads(root, param, new Set(['ret']))) return true;
+        }
+        return false;
+    }
     // Top-level && pieces that mention only c.args. A false piece is the contract contradicting that call.
     // A piece that also reads pre, post, delta, ret, game, or dist is about the world, not the arguments.
     static argConstraints(src) {
@@ -1978,12 +1990,19 @@ Use only c; no other globals.`;
         if (!a || !b || !Array.isArray(a.types) || !Array.isArray(b.types)) throw new Error('[fix97] a recorded call shape is missing types');
         return a.arity === b.arity && a.types.length === b.types.length && a.types.every((t, i) => t === b.types[i]);
     }
-    // The tracer's success: not a failure flag, and a return other than the failure returns
-    // (false, null, 0) and the default undefined. A violated contract is a separate fact.
-    static callSucceeded(record) {
-        if (!record || typeof record !== 'object') throw new Error('[fix97] call record required');
-        if (record.fail === true) return false;
-        if (record.rv === undefined || record.rv === false || record.rv === null || record.rv === 0) return false;
+    // Success is what was observed. skill_graph threw() sets err (and rv false). settle() leaves
+    // rv undefined and fail false when the function returns nothing. The call succeeded when it
+    // did not throw and, if the contract has a post, that post held. A return value is evidence
+    // only when the contract reads c.ret. A violated pre or post is a separate fact (outcome.violated).
+    static callSucceeded(record, skill) {
+        if (record === null || typeof record !== 'object' || Array.isArray(record)) throw new Error('[fix97] call record required');
+        if (skill === null || typeof skill !== 'object' || Array.isArray(skill)) throw new Error('[fix97] callSucceeded needs the skill');
+        if (Object.hasOwn(record, 'err')) return false;
+        const post = skill.contract !== null && typeof skill.contract === 'object' && typeof skill.contract.post === 'string' ? skill.contract.post : null;
+        if (post !== null && record.postHeld !== true) return false;
+        if (Voyager.contractDeclaresReturn(skill.contract)) {
+            if (record.rv === undefined || record.rv === false || record.rv === null || record.rv === 0) return false;
+        }
         return true;
     }
     static callText(args) {
@@ -2018,7 +2037,7 @@ Use only c; no other globals.`;
         if (!Object.hasOwn(skill.stats, 'calls')) skill.stats.calls = [];
         const shape = Voyager.callShape(args);
         if (skill.stats.calls.some(call => Voyager.sameShape(call, shape))) return false;
-        skill.stats.calls.push(shape);
+        skill.stats.calls.push({ ...shape, succeeded: outcome.succeeded, violated: outcome.violated });
         return true;
     }
     // A c.args.length literal is legal from the required count through the arity, and at or above the required
@@ -2900,13 +2919,15 @@ Use only c; no other globals.`;
                 if (!e.observedRuns.some(p => p.rv === r.rv && p.heldItem === r.s1.eq.heldItem)) e.observedRuns.push({ rv: r.rv, heldItem: r.s1.eq.heldItem });
             }
             let violated = false;
+            let postHeld = false;
             if (e && e.contract) {
+            const declaresReturn = Voyager.contractDeclaresReturn(e.contract);
             const c = this._contractCtx({ args: r.argv, ret: r.rv, pre: r.s0, post: r.s1, delta: r.delta });
             for (const k of ['pre', 'post']) {
-                // fix51: when skill explicitly returns false, skip postcondition checking
-                // The skill already signaled failure; evaluating post would just mark VIOLATED for expected failure
-                // This fixes craftSticks/tossClutter VIOLATED when they legitimately can't succeed
-                if (k === 'post' && r.rv === false) continue;
+                // A false return is the skill signaling failure only when the contract reads c.ret.
+                // Otherwise the post is still observed: a function that returns nothing, or false,
+                // can satisfy a post that does not read c.ret.
+                if (k === 'post' && r.rv === false && declaresReturn) continue;
                 let ok;
                 try { ok = this._compileContract(e.contract[k])(c); }
                 catch (err) {
@@ -2923,7 +2944,7 @@ Use only c; no other globals.`;
                     this._queueContractFix(e, `${k} threw: ${err.message}`);
                     continue;
                 }
-                if (ok !== false) { if (k === 'pre') r.preHeld = true; continue; }   // fix60: the callee's own precondition held in this state
+                if (ok !== false) { if (k === 'pre') r.preHeld = true; if (k === 'post') postHeld = true; continue; }   // fix60: the callee's own precondition held in this state
                 violated = true;   // a false pre or post is not a sample, including when the call's return was a success
                 // fix89: undefined is the default return, not a success. A violated pre is "the contract is wrong" only
                 //        when the call returned an explicit success (true, a string, a number other than 0). Otherwise
@@ -2969,7 +2990,8 @@ Use only c; no other globals.`;
             }
             if (e) {
                 const pending = e.contractEval === CONTRACT_EVAL;
-                const added = Voyager.recordCallShape(e, r.argv, { succeeded: Voyager.callSucceeded(r), violated });
+                const observed = e.contract && typeof e.contract.post === 'string' ? { ...r, postHeld } : r;
+                const added = Voyager.recordCallShape(e, r.argv, { succeeded: Voyager.callSucceeded(observed, e), violated });
                 if (added && pending && e.contract && e.contract.seeded !== true) {
                     const bad = this._validContract(e.contract, e);
                     if (bad) {

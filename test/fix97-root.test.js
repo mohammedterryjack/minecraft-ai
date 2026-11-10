@@ -331,6 +331,8 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         assert.strictEqual(Voyager.recordCallShape(craft, ['oak_planks', 1], recorded), false);
         assert.strictEqual(craft.stats.calls.length, 1);
         assert.strictEqual(craft.stats.calls[0].shape, Voyager.CALL_SHAPE);
+        assert.strictEqual(craft.stats.calls[0].succeeded, true);
+        assert.strictEqual(craft.stats.calls[0].violated, false);
         assert.deepStrictEqual(craft.stats.calls[0].types, ['string', 'number']);
         assert.strictEqual(v._validContract(typeofString, craft), null);
         assert.strictEqual(Object.hasOwn(craft, 'contractEval'), false);
@@ -366,6 +368,34 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         assert.strictEqual(live.stats.calls.length, 1);
     });
 
+    it('a void skill is recorded when the call did not throw and the post held, so its c.args contract is not left pending', () => {
+        const v = mkV({});
+        const code = 'async function placeMarker(bot, name) { await bot.chat(name); }';
+        const skill = {
+            name: 'placeMarker',
+            code,
+            stats: { success: 0, fail: 0, streakFail: 0, tasks: [] },
+            contract: { pre: "c => typeof c.args[0] === 'string'", post: 'c => c.post.alive' },
+            contractEval: Voyager.CONTRACT_EVAL,
+        };
+        v.skills = [skill];
+        v._repairQueue = [];
+        const s = { pos: { x: 0, y: 64, z: 0 }, hp: 20, food: 20, sky: 15, alive: true, dim: 'overworld', inv: {}, free: 0, eq: { heldItem: null } };
+        const call = { name: 'placeMarker', argv: ['oak_log'], rv: undefined, s0: s, s1: s, delta: {}, intr: false };
+        v._checkContracts([call], true);
+        assert.strictEqual(skill.stats.calls.length, 1);
+        assert.strictEqual(skill.stats.calls[0].succeeded, true);
+        assert.strictEqual(skill.stats.calls[0].violated, false);
+        assert.deepStrictEqual(skill.stats.calls[0].values, ['oak_log']);
+        assert.strictEqual(Object.hasOwn(skill, 'contractEval'), false);
+        v._checkContracts([call], true);
+        assert.strictEqual(skill.stats.calls.length, 1);
+        const readsReturn = { contract: { pre: "c => typeof c.args[0] === 'string'", post: 'c => c.ret === true' } };
+        assert.strictEqual(Voyager.callSucceeded({ rv: undefined, postHeld: true }, readsReturn), false);
+        assert.strictEqual(Voyager.callSucceeded({ rv: undefined, err: 'boom', postHeld: true }, skill), false);
+        assert.strictEqual(Voyager.callSucceeded({ rv: undefined, postHeld: true }, skill), true);
+    });
+
     it('a failed call is not a sample, so craftItem(null) and mineBlocks(oak_log, oak_log) do not refuse their pres', () => {
         const v = mkV({});
         const skills = JSON.parse(gunzipSync(readFileSync(new URL('./fixtures/icefox-live-index.json.gz', import.meta.url))));
@@ -392,7 +422,7 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         assert.match(v._validContract(mine.contract, mine), /contradicts recorded call \("oak_log", "oak_log"\)/);
     });
 
-    it('a thousand counts of one signature are one record, and a stored value-list is migrated explicitly', () => {
+    it('a thousand counts of one signature are one record, and a stored value-list without outcome flags is reset', () => {
         const skills = JSON.parse(gunzipSync(readFileSync(new URL('./fixtures/icefox-live-index.json.gz', import.meta.url))));
         const craft = structuredClone(skills.find(s => s.name === 'craftItem'));
         delete craft.stats.calls;
@@ -411,28 +441,60 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         const broken = { name: 'broken', stats: { calls: { n: 1 } } };
         const manifest = buildContractManifest([stored, broken]);
         assert.deepStrictEqual(manifest.callMigrations.map(m => m.id), [
-            'counted.stats.calls.2:string,number',
+            'counted.stats.calls.unflagged',
             'broken.stats.calls',
         ]);
-        assert.strictEqual(manifest.callMigrations[0].from, 1000);
-        assert.strictEqual(manifest.callMigrations[0].keep, 1);
+        assert.strictEqual(manifest.callMigrations[0].kind, 'reset');
+        assert.strictEqual(manifest.callMigrations[0].count, 1001);
         const applied = applyCallRecordMigrations(structuredClone([stored, broken]));
         assert.strictEqual(applied.length, 2);
         assert.strictEqual(stored.stats.calls.length, 1001);
         assert.strictEqual(stored.stats.calls[0].shape, Voyager.CALL_SHAPE_VALUES);
         const copy = structuredClone([stored, broken]);
         applyCallRecordMigrations(copy);
-        assert.strictEqual(copy[0].stats.calls.length, 2);
-        assert.strictEqual(copy[0].stats.calls[0].shape, Voyager.CALL_SHAPE);
-        assert.deepStrictEqual(copy[0].stats.calls[0].values, ['stick', 0]);
-        assert.deepStrictEqual(copy[0].stats.calls[1].types, ['string']);
+        assert.strictEqual(Object.hasOwn(copy[0].stats, 'calls'), false);
         assert.strictEqual(Object.hasOwn(copy[1].stats, 'calls'), false);
+        const flagged = {
+            name: 'kept',
+            stats: {
+                calls: [
+                    { arity: 2, types: ['string', 'number'], values: ['stick', 4], shape: Voyager.CALL_SHAPE, succeeded: true, violated: false },
+                    { arity: 2, types: ['string', 'number'], values: ['stick', 9], shape: Voyager.CALL_SHAPE, succeeded: true, violated: false },
+                ],
+            },
+        };
+        const keptRows = applyCallRecordMigrations([flagged]);
+        assert.strictEqual(keptRows.length, 1);
+        assert.strictEqual(keptRows[0].kind, 'migrate');
+        assert.strictEqual(flagged.stats.calls.length, 1);
+        assert.deepStrictEqual(flagged.stats.calls[0].values, ['stick', 4]);
+        assert.strictEqual(flagged.stats.calls[0].succeeded, true);
+        assert.strictEqual(flagged.stats.calls[0].violated, false);
         assert.throws(() => Voyager.recordCallShape({ name: 'craftItem' }, ['stick', 4], recorded), /has no stats/);
         assert.throws(() => Voyager.recordCallShape({ name: 'craftItem', stats: { calls: { n: 1 } } }, ['stick', 4], recorded), /not a list/);
         assert.throws(() => Voyager.recordedCalls({ name: 'craftItem', stats: { calls: { n: 1 } } }), /not a list/);
         assert.throws(() => Voyager.recordedCalls({ name: 'craftItem', stats: [] }), /stats is not an object/);
         const live = buildContractManifest(skills);
         assert.deepStrictEqual(live.callMigrations, []);
+    });
+
+    it('a legacy craftItem [null] record, relabelled as CALL_SHAPE with no outcome flags, is reset to pending', () => {
+        const v = mkV({});
+        const skills = JSON.parse(gunzipSync(readFileSync(new URL('./fixtures/icefox-live-index.json.gz', import.meta.url))));
+        const craft = structuredClone(skills.find(s => s.name === 'craftItem'));
+        craft.stats.calls = [{ arity: 1, types: ['null'], values: [null], shape: Voyager.CALL_SHAPE }];
+        const rows = applyCallRecordMigrations([craft]);
+        assert.strictEqual(rows.length, 1);
+        assert.strictEqual(rows[0].kind, 'reset');
+        assert.strictEqual(rows[0].id, 'craftItem.stats.calls.unflagged');
+        assert.strictEqual(Object.hasOwn(craft.stats, 'calls'), false);
+        assert.strictEqual(v._validContract(craft.contract, craft), null);
+        assert.strictEqual(craft.contractEval, Voyager.CONTRACT_EVAL);
+        const kept = structuredClone(skills.find(s => s.name === 'craftItem'));
+        kept.stats.calls = [{ arity: 2, types: ['string', 'number'], values: ['stick', 4], shape: Voyager.CALL_SHAPE, succeeded: true, violated: false }];
+        assert.deepStrictEqual(applyCallRecordMigrations([kept]), []);
+        assert.strictEqual(v._validContract(kept.contract, kept), null);
+        assert.strictEqual(Object.hasOwn(kept, 'contractEval'), false);
     });
 
     it('parses a skill as a module and a contract as a parenthesized expression, and a comment or string is not a numeric literal', () => {

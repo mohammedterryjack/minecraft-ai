@@ -68,9 +68,21 @@ export function noteBotApiDuration(name, ms) {
     if (typeof name !== 'string' || name.length === 0) throw new Error('[bot-api] method name required');
     if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) throw new Error(`[bot-api] duration of ${name} is ${ms}`);
     const prev = _durations[name];
-    const bound = prev && prev.n > 0 ? prev.max : null;
-    const earlier = prev && prev.n > 0 ? prev.n : 0;
-    const rec = prev ? prev : { n: 0, max: 0 };
+    let bound = null;
+    let earlier = 0;
+    let rec;
+    if (prev === undefined) {
+        rec = { n: 0, max: 0 };
+    } else {
+        if (prev === null || typeof prev !== 'object' || Array.isArray(prev) || !Number.isInteger(prev.n) || typeof prev.max !== 'number' || !Number.isFinite(prev.max)) {
+            throw new Error(`[bot-api] recorded ${name} duration is ${JSON.stringify(prev)}; n must be an integer and max a finite number`);
+        }
+        rec = prev;
+        if (prev.n > 0) {
+            bound = prev.max;
+            earlier = prev.n;
+        }
+    }
     rec.n += 1;
     if (ms > rec.max) rec.max = ms;
     _durations[name] = rec;

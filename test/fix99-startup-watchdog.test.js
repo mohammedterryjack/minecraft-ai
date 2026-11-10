@@ -14,7 +14,7 @@ import { armBackendReady, offsetOfCurrentRun } from '../src/process/backend_read
 import { resumeWhenBackendReady, EXIT_BACKEND_READY } from '../src/process/backend_unavailable.js';
 import {
     startEventLoopStallGuard, stopEventLoopStallGuard, stallThresholdMs, watchdogSilenceLimitMs,
-    watchdogBeatPeriodMs, KEEP_ALIVE_INTERVAL_MS, KEEP_ALIVE_KICK_MS, GAME_TICK_MS,
+    watchdogBeatPeriodMs, KEEP_ALIVE_INTERVAL_MS, KEEP_ALIVE_KICK_MS,
 } from '../src/utils/event_loop_guard.js';
 
 const START = '[12:04:00] [Server thread/INFO]: Starting minecraft server version 1.21.4\n';
@@ -142,8 +142,8 @@ describe('fix99: the watchdog limit is the keep-alive kick bound', () => {
                 now += gap;
                 bot._client.emit('keep_alive');
             }
-            // The gap does not move the watchdog. The STALL log is one game tick, not this kick bound.
-            assert.strictEqual(stallThresholdMs(bot), GAME_TICK_MS);
+            // The gap does not move the watchdog. The STALL log is a pending keep-alive, not this kick bound.
+            assert.strictEqual(stallThresholdMs(bot), KEEP_ALIVE_INTERVAL_MS);
             assert.notStrictEqual(stallThresholdMs(bot), KEEP_ALIVE_KICK_MS);
             assert.strictEqual(watchdogSilenceLimitMs(), KEEP_ALIVE_KICK_MS);
             assert.strictEqual(KEEP_ALIVE_KICK_MS, KEEP_ALIVE_INTERVAL_MS * 2);
