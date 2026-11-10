@@ -12,7 +12,7 @@ import { readFileSync } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import settings from '../settings.js';
-import { wrapBotForApiTiming } from '../src/utils/bot_api_timing.js';
+import { wrapBotForApiTiming, setBotApiDurationStore, _clearBotApiDurationStoreForTest } from '../src/utils/bot_api_timing.js';
 
 const REMOVED_KEYS = [
     'check_timeout_interval_ms',
@@ -65,87 +65,61 @@ describe('fix57: settings_spec.json (mindserver load path)', () => {
     });
 });
 
-describe('fix57: bot_api_timing logs only over learned stall threshold', () => {
-    it('does not log when threshold is not learned', () => {
-        const bot = {
-            blockAt() {
-                return null;
-            },
-        };
+describe('fix57: bot_api_timing logs only past the recorded durations of that method', () => {
+    it('throws when no duration store is attached, and a non-object store is rejected', () => {
+        assert.throws(() => setBotApiDurationStore(null), /duration store must be an object/);
+        assert.throws(() => setBotApiDurationStore([]), /duration store must be an object/);
+        _clearBotApiDurationStoreForTest();
+        const bot = { blockAt() { return null; } };
+        const timed = wrapBotForApiTiming(bot);
+        assert.throws(() => timed.blockAt(), /duration store is not attached/);
+    });
+
+    it('the first call is recorded and does not log, and a later call within that maximum does not log', () => {
+        const store = {};
+        setBotApiDurationStore(store);
+        const realNow = Date.now;
+        let now = 1_000;
+        Date.now = () => now;
         const logs = [];
         const orig = console.log;
-        console.log = (...a) => {
-            logs.push(a.map(String).join(' '));
-        };
+        console.log = (...a) => logs.push(a.map(String).join(' '));
+        const bot = { blockAt() { now += 4; return null; } };
         try {
             const timed = wrapBotForApiTiming(bot);
             timed.blockAt();
+            timed.blockAt();
         } finally {
+            Date.now = realNow;
             console.log = orig;
         }
-        assert.deepStrictEqual(
-            logs.filter((l) => l.includes('[bot-api]')),
-            []
-        );
+        assert.deepStrictEqual(logs.filter((l) => l.includes('[bot-api]')), []);
+        assert.strictEqual(store.blockAt.n, 2);
+        assert.strictEqual(store.blockAt.max, 4);
     });
 
-    it('does not log when duration is at or under the learned threshold', () => {
-        const bot = {
-            __eventLoopStallThresholdMs: 50,
-            blockAt() {
-                return null;
-            },
-        };
+    it('a call longer than every recorded call of that method logs the recorded maximum', () => {
+        const store = {};
+        setBotApiDurationStore(store);
+        const realNow = Date.now;
+        let now = 1_000;
+        Date.now = () => now;
         const logs = [];
         const orig = console.log;
-        console.log = (...a) => {
-            logs.push(a.map(String).join(' '));
-        };
+        console.log = (...a) => logs.push(a.map(String).join(' '));
+        const bot = { blockAt() { now += 4; return null; } };
         try {
             const timed = wrapBotForApiTiming(bot);
             timed.blockAt();
+            bot.blockAt = () => { now += 9; return null; };
+            timed.blockAt();
         } finally {
-            console.log = orig;
-        }
-        assert.deepStrictEqual(
-            logs.filter((l) => l.includes('[bot-api]')),
-            []
-        );
-    });
-
-    it('logs when duration exceeds the learned threshold', async () => {
-        const bot = {
-            __eventLoopStallThresholdMs: 5,
-            async slow() {
-                await new Promise((r) => setTimeout(r, 20));
-                return 1;
-            },
-        };
-        const logs = [];
-        const orig = console.log;
-        console.log = (...a) => {
-            logs.push(a.map(String).join(' '));
-        };
-        try {
-            const timed = wrapBotForApiTiming(bot);
-            await timed.slow();
-        } finally {
+            Date.now = realNow;
             console.log = orig;
         }
         const apiLogs = logs.filter((l) => l.includes('[bot-api]'));
         assert.equal(apiLogs.length, 1);
-        assert.ok(apiLogs[0].includes('slow'), apiLogs[0]);
-        assert.ok(/slow \d+ms/.test(apiLogs[0]), apiLogs[0]);
-    });
-
-    it('throws if __eventLoopStallThresholdMs is set but invalid', () => {
-        const bot = {
-            __eventLoopStallThresholdMs: -1,
-            blockAt() {
-                return null;
-            },
-        };
-        const timed = wrapBotForApiTiming(bot);
-        assert.throws(() => timed.blockAt(), /positive finite number/);
+        assert.match(apiLogs[0], /blockAt 9ms exceeds the longest recorded blockAt call \(4ms across 1 call/);
+        assert.doesNotMatch(apiLogs[0], /keep-alive|30000/);
     });
 });

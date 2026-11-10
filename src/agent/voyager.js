@@ -34,7 +34,7 @@ import { writeCodePromptDump } from '../models/code_prompt_dump.js';
 import { getBareAPI, collectBareApiUsedInSource, PRECONDITION_UNMET_BINDING } from './coder.js';   // fix40: unified bare-name API helper
 import { withStallPhase } from '../utils/event_loop_guard.js';
 import { watchdogEvidencePath } from '../utils/main_thread_watchdog.js';
-import { wrapBotForApiTiming } from '../utils/bot_api_timing.js';
+import { wrapBotForApiTiming, setBotApiDurationStore } from '../utils/bot_api_timing.js';
 import { logPromptBreakdown, extractBareCalls } from './prompt_utils.js';   // fix47: shared prompt utilities
 import { recordConsumeEvidence, verifiedConsumes, recordEffectEvidence, verifiedEffects, count as invCount } from './consume_evidence.js';   // fix70, fix74
 import { practiceWorld, causalChanges, effectVerdict, noteCausalSuccess } from './practice_rank.js';   // fix93
@@ -549,6 +549,8 @@ export class Voyager {
         // fix60: learned local-model call durations (bound a hung Ollama call), persisted with progress
         if (!this.progress.callDurations) this.progress.callDurations = {};
         setCallDurationStore(this.progress.callDurations);
+        if (!this.progress.botApiDurations) this.progress.botApiDurations = {};
+        setBotApiDurationStore(this.progress.botApiDurations);
         // fix66: learned time per block / per progress gap (movement no-progress checks), persisted with progress
         if (!this.progress.movement) this.progress.movement = {};
         setMovementStore(this.progress.movement);

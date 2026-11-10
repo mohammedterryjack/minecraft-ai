@@ -8,7 +8,8 @@
  *    b) candidate outcomes were read before death/stall/timeout attribution, so a cut candidate was skipped as `intr`;
  *    c) a hang killed the process before any outcome was written. A trial journal + the watchdog's evidence file now count
  *       it on the next start.
- * 3) ARMED is the keep-alive kick bound. A keep_alive gap does not log again and does not replace it.
+ * 3) The stall guard arms at one game tick. A keep_alive gap does not log again and does not replace it.
+ *    The keep-alive kick bound stays on the watchdog.
  */
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert';
@@ -22,7 +23,7 @@ import * as world from '../src/agent/library/world.js';
 import { Coder } from '../src/agent/coder.js';
 import { Voyager } from '../src/agent/voyager.js';
 import { instrumentSrc } from '../src/agent/skill_graph.js';
-import { startEventLoopStallGuard, stopEventLoopStallGuard, watchdogSilenceLimitMs } from '../src/utils/event_loop_guard.js';
+import { startEventLoopStallGuard, stopEventLoopStallGuard, watchdogSilenceLimitMs, GAME_TICK_MS } from '../src/utils/event_loop_guard.js';
 import { watchdogEvidencePath } from '../src/utils/main_thread_watchdog.js';
 
 const NAME = '__fix65_test__';
@@ -225,8 +226,8 @@ describe('fix65: trial candidates are retired by the learner', () => {
     });
 });
 
-describe('fix65: ARMED is the keep-alive kick bound', () => {
-    it('the guard arms once at 30000ms, and keep_alive gaps do not log again or replace it', () => {
+describe('fix65: the stall guard arms at one game tick', () => {
+    it('the guard arms once at one game tick, and keep_alive gaps do not log again or replace it', () => {
         const realNow = Date.now, realLog = console.log;
         const lines = [];
         let now = 1_000_000;
@@ -242,7 +243,7 @@ describe('fix65: ARMED is the keep-alive kick bound', () => {
             Date.now = realNow; console.log = realLog;
         }
         const armed = lines.filter(l => l.includes('stall guard ARMED'));
-        assert.deepStrictEqual(armed.map(l => Number(l.match(/currently (\d+)ms/)[1])), [30000]);
-        assert.strictEqual(bot.__eventLoopStallThresholdMs, null);
+        assert.deepStrictEqual(armed.map(l => Number(l.match(/currently (\d+)ms/)[1])), [GAME_TICK_MS]);
+        assert.strictEqual(bot.__eventLoopStallThresholdMs, undefined);
     });
 });

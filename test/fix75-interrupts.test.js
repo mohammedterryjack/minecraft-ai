@@ -12,12 +12,17 @@ import { describe, it, before } from 'node:test';
 import assert from 'node:assert';
 import { readFileSync, readdirSync } from 'node:fs';
 import { ActionManager, checkInterruptSource } from '../src/agent/action_manager.js';
+import { setBotApiDurationStore } from '../src/utils/bot_api_timing.js';
 
 let Voyager, stepErrorSignature;
 before(async () => { const mod = await import('../src/agent/voyager.js'); Voyager = mod.Voyager; stepErrorSignature = mod.stepErrorSignature; mod._setVersionForTest('1.21.4'); });
 
 /** An agent as far as ActionManager uses it; requestInterrupt is agent.js's (checked against the source below). */
 function mkAgent() {
+    // A finished action calls bot.emit through the timing proxy. That call is compared with
+    // recorded durations of emit. Voyager attaches progress.botApiDurations; this agent has no
+    // progress, so the test attaches the same empty store.
+    setBotApiDurationStore({});
     const agent = {
         bot: { interrupt_code: false, output: '', emit() {}, stopDigging() {}, collectBlock: { cancelTask() {} }, pathfinder: { stop() {}, setGoal() {} }, pvp: { stop() {} } },
         history: { add() {} }, cleanKill(m) { throw new Error('cleanKill: ' + m); },

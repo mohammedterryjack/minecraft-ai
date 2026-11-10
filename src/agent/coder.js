@@ -703,59 +703,67 @@ export class Coder {
     }
 
     /**
-     * Warn on large-radius block/entity scans (numeric maxDistance or similar).
-     */
-    /**
+     * Warn when a scan asks for blocks past the server view distance, or entities past the
+     * simulation distance. Both are chunk radii from Login (play), converted to blocks.
+     * maxBlocks is a count, not a distance, so it is not compared.
      * @param {string} code
      * @param {number} preludeLines
-     * @param {number} warnDistMs numeric literal threshold (the keep-alive kick bound the stall guard sets)
      */
-    _largeWorldScanLint(code, preludeLines, warnDistMs) {
-        if (typeof warnDistMs !== 'number' || !Number.isFinite(warnDistMs) || warnDistMs <= 0) {
-            throw new Error('[coder] _largeWorldScanLint: warnDistMs must be a positive finite number');
-        }
+    _largeWorldScanLint(code, preludeLines) {
         let ast;
         try {
             ast = acorn.parse(code, { ecmaVersion: 'latest', sourceType: 'module', allowAwaitOutsideFunction: true, locations: true });
         } catch (e) {
             throw new Error(`[coder] _largeWorldScanLint: parse failed: ${e && e.message ? e.message : String(e)}`);
         }
-        const warnDist = warnDistMs;
+        const bot = this.agent && this.agent.bot;
+        const blockScans = new Set(['findBlock', 'findBlocks']);
         const out = [];
-        const scanCalleeNames = new Set(['findBlock', 'findBlocks', 'nearestEntity']);
+        let blockRadius = null;
+        let entityRadius = null;
+        const blocks = () => {
+            if (blockRadius === null) blockRadius = world.nearbyBlockRadius(bot);
+            return blockRadius;
+        };
+        const entities = () => {
+            if (entityRadius === null) entityRadius = world.simulationBlockRadius(bot);
+            return entityRadius;
+        };
+        const past = (n, radius, what, chunks) => `${n} blocks is past the server ${what} (${chunks} chunks, ${radius} blocks)`;
         const walk = (node) => {
             if (!node || typeof node.type !== 'string') return;
             if (node.type === 'CallExpression') {
                 let reportLine = null;
                 let detail = '';
                 const callee = node.callee;
-                if (callee?.type === 'MemberExpression' && !callee.computed && callee.object?.type === 'Identifier' && callee.object.name === 'bot' && callee.property?.type === 'Identifier' && scanCalleeNames.has(callee.property.name)) {
+                if (callee?.type === 'MemberExpression' && !callee.computed && callee.object?.type === 'Identifier' && callee.object.name === 'bot' && callee.property?.type === 'Identifier' && (blockScans.has(callee.property.name) || callee.property.name === 'nearestEntity')) {
+                    const entity = callee.property.name === 'nearestEntity';
+                    const what = entity ? 'simulation distance' : 'view distance';
+                    const consider = (n, line, where) => {
+                        if (n === null) return;
+                        const radius = entity ? entities() : blocks();
+                        const chunks = entity ? bot.game.simulationDistance : bot.game.serverViewDistance;
+                        if (n > radius) {
+                            reportLine = line;
+                            detail = `${where}=${past(n, radius, what, chunks)}`;
+                        }
+                    };
                     const first = node.arguments[0];
                     if (first?.type === 'ObjectExpression') {
                         for (const p of first.properties) {
-                            if (p.type !== 'Property' || p.key?.type !== 'Identifier') continue;
-                            const kn = p.key.name;
-                            if (kn !== 'maxDistance' && kn !== 'maxBlocks') continue;
-                            const n = this._getNumericLiteral(p.value);
-                            if (n !== null && n >= warnDist) {
-                                reportLine = p.value.loc.start.line;
-                                detail = `bot.${callee.property.name} option ${kn}=${n} (>= keep-alive kick bound ${warnDist}ms as stall-risk distance)`;
-                            }
+                            if (p.type !== 'Property' || p.key?.type !== 'Identifier' || p.key.name !== 'maxDistance') continue;
+                            consider(this._getNumericLiteral(p.value), p.value.loc.start.line, `bot.${callee.property.name} option maxDistance`);
                         }
                     }
-                    if (callee.property.name === 'nearestEntity' && node.arguments.length >= 2) {
-                        const n = this._getNumericLiteral(node.arguments[1]);
-                        if (n !== null && n >= warnDist) {
-                            reportLine = node.arguments[1].loc.start.line;
-                            detail = `bot.nearestEntity second arg maxDistance=${n} (>= keep-alive kick bound ${warnDist}ms as stall-risk distance)`;
-                        }
+                    if (entity && node.arguments.length >= 2) {
+                        consider(this._getNumericLiteral(node.arguments[1]), node.arguments[1].loc.start.line, 'bot.nearestEntity second arg maxDistance');
                     }
                 }
                 if (callee?.type === 'Identifier' && callee.name === 'getNearestBlock' && node.arguments.length >= 3) {
                     const n = this._getNumericLiteral(node.arguments[2]);
-                    if (n !== null && n >= warnDist) {
+                    if (n !== null && n > blocks()) {
                         reportLine = node.arguments[2].loc.start.line;
-                        detail = `getNearestBlock distance=${n} (>= keep-alive kick bound ${warnDist}ms as stall-risk distance)`;
+                        detail = `getNearestBlock distance=${past(n, blockRadius, 'view distance', bot.game.serverViewDistance)}`;
                     }
                 }
                 if (reportLine !== null && reportLine > preludeLines) {
@@ -1025,24 +1033,10 @@ export class Coder {
             return header + errors.join('');
         }
 
-        const bot = this.agent.bot;
-        const stallMs =
-            bot &&
-            typeof bot.__eventLoopStallThresholdMs === 'number' &&
-            Number.isFinite(bot.__eventLoopStallThresholdMs) &&
-            bot.__eventLoopStallThresholdMs > 0
-                ? bot.__eventLoopStallThresholdMs
-                : null;
-        if (stallMs === null) {
-            warnings.push(
-                'WARNING: large-radius scan stall-risk check is OFF until the event-loop guard sets the keep-alive kick bound.\n'
-            );
-        }
-        const largeScanWarnings = stallMs === null ? [] : this._largeWorldScanLint(code, preludeLines, stallMs);
+        const largeScanWarnings = this._largeWorldScanLint(code, preludeLines);
         if (largeScanWarnings.length > 0) {
-            const wd = stallMs;
-            let w = `WARNING: Large-radius block/world scan (numeric distance >= ${wd} — the keep-alive kick bound used for stall detection) may block the event loop.\n`;
-            w += 'Prefer smaller maxDistance, chunk-aware iteration, or yield with await between batches.\n';
+            let w = 'WARNING: Scan distance is past the chunks the server sends (view distance) or ticks (simulation distance).\n';
+            w += 'A maxDistance in blocks that is larger than that radius reads chunks the client does not have.\n';
             for (const x of largeScanWarnings) {
                 w += `  Line ${x.line}: ${x.detail}\n`;
             }
