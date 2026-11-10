@@ -107,7 +107,8 @@ export function extractFeedback(output) {
 // each repeating the same lines. collapseRepeats only merges consecutive identical lines, so 60 identical
 // collectLogs FAILs interleaved with other calls, and pathfinder lines that differ by coordinates, all stayed.
 // This builds the same facts once. Lines that differ only by numbers are one template: each numeric slot is an
-// exact run, an arithmetic range, or the value list, so every value can be read back. A line already printed
+// exact run, an arithmetic range, or the value list, so every value can be read back. When that grouping would
+// change the order, each row keeps the index it had. A line already printed
 // verbatim is not pasted again. A longer line is not the same line. Nothing is sliced.
 export function codeRetryFeedback({ cut, output, trace, critique, invFull, behaviorLog }) {
     if (typeof critique !== 'string') throw new Error('[fix97] code retry feedback needs the critic text');
@@ -226,7 +227,17 @@ export function parseNumberWord(word) {
     return null;
 }
 
+// A stored task is the goal sentence, or "kind: sentence" (craftItem: Craft 1 iron_pickaxe,
+// collectSurface: Collect 32 dirt). The kind is one identifier, the label the curriculum wrote;
+// the sentence is the goal. countGoal, smeltGoal, ensureGoal, and reachGoal all read the sentence,
+// and parseVerboseGoal and _resolveGoal call those parsers.
+function goalSentence(task) {
+    if (typeof task !== 'string') return task;
+    const m = task.match(/^([A-Za-z_][A-Za-z0-9_]*):\s+([\s\S]+)$/);
+    return m ? m[2] : task;
+}
 function countGoal(task) {
+    task = goalSentence(task);
     // fix47: support both numeric ("5") and word ("five") counts
     const m = task.match(/^(mine|collect|gather|craft|smelt|obtain|get|chop|cook)\s+(\d+|[a-z]+)\s+([a-z_ ]+)/i);
     if (!m) return null;
@@ -266,13 +277,12 @@ let VERSION = registryVersion(settings.minecraft_version);
 export function _setVersionForTest(v) { VERSION = v; }
 // How many of an item each recipe consumes. Built once per registry; itemFacts reads it for the item being grounded.
 const recipeUseCounts = new WeakMap();
-// Item and block ids, longest first, so oak_log is taken at a position before log.
-const registryItemNames = new WeakMap();
 
 // fix49: parse "ensure X" goals - places a block/item nearby (furnace, crafting_table, chest, etc.)
 // The goal item must be placed, not just in inventory - so satisfaction requires the item to exist as a block nearby
 // Uses observed state (findBlock) to check satisfaction, not skill name patterns
 function ensureGoal(task) {
+    task = goalSentence(task);
     const m = task.match(/^ensure\s+([a-z_]+)\b/i);
     if (!m) return null;
     const item = m[1].toLowerCase().replace(/ /g, '_');
@@ -290,6 +300,7 @@ function ensureGoal(task) {
 //        being observed nearby (observe().nearby_blocks), like an ensure goal, but it is FOUND, not placed: its failure needs
 //        are not "place it" (that would chain reach -> place -> collect -> reach)
 function reachGoal(task) {
+    task = goalSentence(task);
     const m = task.match(/^reach\s+([a-z_]+)$/i);
     if (!m) return null;
     if (!VERSION) throw new Error('[fix83] LOUD FAIL: reachGoal called but VERSION is null - bot version must be set before parsing goals');
@@ -300,8 +311,9 @@ function reachGoal(task) {
 
 // "Smelt 6 raw_iron into 6 iron_ingot" -> verify by output gained
 function smeltGoal(task) {
+    task = goalSentence(task);
     const m = task.match(/^(?:smelt|cook)\s+(\d+)\s+([a-z_]+)\s+into\s+(\d+)\s+([a-z_]+)/i);
-    return m ? { count: parseInt(m[1]), input: m[2].toLowerCase(), verb: 'smelt', item: m[4].toLowerCase(), items: [m[4].toLowerCase()] } : null;
+    return m ? { count: parseInt(m[1]), outputCount: parseInt(m[3]), input: m[2].toLowerCase(), verb: 'smelt', item: m[4].toLowerCase(), items: [m[4].toLowerCase()] } : null;
 }
 
 // fix55: required params of a skill besides bot (from its signature; params with defaults are optional)
@@ -1351,7 +1363,7 @@ Use only c; no other globals.`;
             const copied = Voyager.copiedInventoryHits({ ...skill, contract: ct }, reg);
             for (const k of ['pre', 'post']) {
                 const hit = copied.filter(h => h.where === k);
-                if (hit.length) return `${k} uses ${hit.map(h => h.n).join(', ')}, which copies the observed count of ${hit.map(h => h.item).join(', ')}`;
+                if (hit.length) return `${k} uses ${hit.map(h => h.n).join(', ')}, which compares the inventory count of ${hit.map(h => h.item).join(', ')} to a literal that is not its goal quantity and not game data`;
             }
         }
         const probes = fields.eq.includes('heldItem') && !fields.delta.length && !fields.inv.length ? this._returnProbes(skill) : [];
@@ -1449,110 +1461,23 @@ Use only c; no other globals.`;
         }
         return out;
     }
-    // The task's own target. "Craft 4 birch_planks" and "Collect 7 dirt" name a quantity to produce, not a count the bot held.
+    // The task's own target, from the same parsers the curriculum and the goal resolver use.
+    // "Craft 4 birch_planks" and "collectSurface: Collect 32 dirt" name a quantity to produce.
+    // The kind label is that parser's grammar (goalSentence), not a scan of the surrounding prose.
     static goalQuantities(task) {
         if (typeof task !== 'string' || task.length === 0) return [];
         const out = [];
         const g = countGoal(task);
         if (g) for (const item of g.items) out.push({ item, n: g.count });
-        const sm = task.match(/^(?:smelt|cook)\s+(\d+)\s+([a-z_]+)\s+into\s+(\d+)\s+([a-z_]+)/i);
+        const sm = smeltGoal(task);
         if (sm) {
-            out.push({ item: sm[2].toLowerCase(), n: Number(sm[1]) });
-            out.push({ item: sm[4].toLowerCase(), n: Number(sm[3]) });
+            out.push({ item: sm.input, n: sm.count });
+            out.push({ item: sm.item, n: sm.outputCount });
         }
         const placed = ensureGoal(task);
         if (placed) out.push({ item: placed.item, n: placed.count });
         const reached = reachGoal(task);
         if (reached) out.push({ item: reached.item, n: reached.count });
-        return out;
-    }
-    static registryNamesLongestFirst(registry) {
-        if (!registry || !registry.itemsByName || !registry.blocksByName) throw new Error('[fix97] count scan needs the game data registry');
-        let names = registryItemNames.get(registry);
-        if (names) return names;
-        const set = new Set([...Object.keys(registry.itemsByName), ...Object.keys(registry.blocksByName)]);
-        names = [...set].sort((a, b) => b.length - a.length || (a < b ? -1 : a > b ? 1 : 0));
-        registryItemNames.set(registry, names);
-        return names;
-    }
-    // Pair each number with the registry item id nearest to it. The curriculum state writes name:count, so the id
-    // stands immediately before the number. In a list the next id starts one separator after this number, the same
-    // distance as the colon, so the item before the number is the pair. Two items that both end before the number
-    // at that distance cannot occur: they would end at the same index.
-    static textCountPairs(text, registry) {
-        if (typeof text !== 'string' || text.length === 0) return [];
-        const names = Voyager.registryNamesLongestFirst(registry);
-        const items = [];
-        const lower = text.toLowerCase();
-        let i = 0;
-        const word = /[a-z0-9_]/i;
-        while (i < text.length) {
-            if (!word.test(text[i])) { i += 1; continue; }
-            const slice = lower.slice(i);
-            let matched = null;
-            for (const name of names) {
-                if (slice.startsWith(name) && !word.test(slice[name.length] || '')) { matched = name; break; }
-            }
-            if (matched) {
-                items.push({ name: matched, start: i, end: i + matched.length });
-                i += matched.length;
-            } else {
-                while (i < text.length && word.test(text[i])) i += 1;
-            }
-        }
-        const numbers = [];
-        const re = /(?<![A-Za-z0-9_])-?\d+(?:\.\d+)?(?![A-Za-z0-9_])/g;
-        let m;
-        while ((m = re.exec(text))) numbers.push({ n: Number(m[0]), start: m.index, end: m.index + m[0].length });
-        const pairs = [];
-        for (const num of numbers) {
-            if (!Number.isFinite(num.n)) continue;
-            let best = [];
-            let bestDist = Infinity;
-            for (const item of items) {
-                const dist = num.end <= item.start ? item.start - num.end : item.end <= num.start ? num.start - item.end : 0;
-                if (dist < bestDist) { bestDist = dist; best = [item.name]; }
-                else if (dist === bestDist && !best.includes(item.name)) best.push(item.name);
-            }
-            if (best.length === 0) continue;
-            let item = best[0];
-            if (best.length !== 1) {
-                const preceding = items.filter(it => it.end <= num.start && best.includes(it.name) && (num.start - it.end) === bestDist);
-                if (preceding.length !== 1) throw new Error(`[fix97] ${num.n} in ${JSON.stringify(text)} is equally near ${best.join(' and ')}`);
-                item = preceding[0].name;
-            }
-            pairs.push({ item, n: num.n });
-        }
-        return pairs;
-    }
-    // The count the skill was generated from. promptCounts is that inventory when the skill stored it. Otherwise the
-    // task, the description, and repairHistory evidence carry the same inventory: the curriculum writes the task from
-    // the state, and the state lists items as name:count. A goal quantity of that item is the target, not the snapshot.
-    static generationCounts(skill, registry) {
-        if (!skill || typeof skill.name !== 'string') throw new Error('[fix97] generation counts need the skill name');
-        const goals = Voyager.goalQuantities(skill.task);
-        const isGoal = (item, n) => goals.some(g => g.item === item && g.n === n);
-        const out = [];
-        const add = (item, n, source, quote) => {
-            if (isGoal(item, n)) return;
-            if (out.some(e => e.item === item && e.n === n)) return;
-            out.push({ item, n, source, quote });
-        };
-        if (Object.hasOwn(skill, 'promptCounts')) {
-            for (const e of Voyager.observedCountEntries(skill)) add(e.item, e.n, e.source, null);
-            return out;
-        }
-        const texts = [];
-        if (typeof skill.task === 'string') texts.push({ source: 'task', text: skill.task });
-        if (typeof skill.description === 'string') texts.push({ source: 'description', text: skill.description });
-        if (Array.isArray(skill.repairHistory)) {
-            for (const h of skill.repairHistory) {
-                if (h && typeof h.evidence === 'string') texts.push({ source: 'repairHistory', text: h.evidence });
-            }
-        }
-        for (const t of texts) {
-            for (const pair of Voyager.textCountPairs(t.text, registry)) add(pair.item, pair.n, t.source, t.text);
-        }
         return out;
     }
     // 0 and 1 are absent and one. A stack size, a recipe result, or a recipe's use of the item is game data for that count.
@@ -1601,7 +1526,7 @@ Use only c; no other globals.`;
     // are the same comparison: the binding is resolved in its scope before the two sides are compared.
     static copiedCountComparisons(code, entries, registry) {
         if (!registry || !registry.itemsByName) throw new Error('[fix97] copied-count check needs the game data registry');
-        if (!Array.isArray(entries)) throw new Error('[fix97] copied-count check needs the observed counts');
+        if (entries !== null && !Array.isArray(entries)) throw new Error('[fix97] copied-count check needs the observed counts');
         const ast = Voyager.parseSkill(code);
         const COMPARE = new Set(['<', '<=', '>', '>=', '==', '===', '!=', '!==']);
         const hits = [];
@@ -1653,9 +1578,13 @@ Use only c; no other globals.`;
             if (L.invItem && typeof R.n === 'number') pairs.push([L.invItem, R.n]);
             if (R.invItem && typeof L.n === 'number') pairs.push([R.invItem, L.n]);
             for (const [item, n] of pairs) {
+                if (Voyager.countIsGameFact(registry, item, n)) continue;
+                if (entries === null) {
+                    hits.push({ n, item, source: 'inventory', quote: null, op: expr.operator });
+                    continue;
+                }
                 for (const e of entries) {
                     if (e.n !== n || e.item !== item) continue;
-                    if (Voyager.countIsGameFact(registry, item, n)) continue;
                     hits.push({ n, item, source: e.source, quote: e.quote || null, op: expr.operator });
                 }
             }
@@ -1714,24 +1643,28 @@ Use only c; no other globals.`;
         walk(ast);
         return hits;
     }
-    // Code and contract comparisons of an inventory count of item X to a literal that is the count observed when the
-    // skill was generated. The skill is not selected by name. A goal quantity of X is not that observation.
+    // An inventory comparison of item X to a literal is a copied count when that literal is not X's goal
+    // quantity (countGoal / smeltGoal / ensureGoal / reachGoal, including a leading kind: label), not a
+    // minecraft-data stack or recipe count for X, and not 0 or 1. The task prose is not a source of counts.
+    // Structured name:count state is what snapshotThresholdFeedback pairs, from promptCounts, not from a sentence.
     static copiedInventoryHits(skill, registry) {
-        const observed = Voyager.generationCounts(skill, registry);
+        if (!skill || typeof skill.name !== 'string') throw new Error('[fix97] copied-count check needs the skill name');
+        const goals = Voyager.goalQuantities(skill.task);
+        const isGoal = (item, n) => goals.some(g => g.item === item && g.n === n);
         const hits = [];
+        const take = (h, where) => {
+            if (isGoal(h.item, h.n)) return;
+            if (Voyager.countIsGameFact(registry, h.item, h.n)) return;
+            hits.push({ n: h.n, item: h.item, op: h.op, where, source: 'inventory' });
+        };
         if (typeof skill.code === 'string') {
-            for (const h of Voyager.copiedCountComparisons(skill.code, observed, registry)) hits.push({ ...h, where: 'code' });
+            for (const h of Voyager.copiedCountComparisons(skill.code, null, registry)) take(h, 'code');
         }
         if (skill.contract && typeof skill.contract === 'object') {
             for (const field of ['pre', 'post']) {
                 const src = skill.contract[field];
                 if (typeof src !== 'string') continue;
-                for (const h of Voyager.contractInventoryComparisons(src)) {
-                    const obs = observed.find(e => e.item === h.item && e.n === h.n);
-                    if (!obs) continue;
-                    if (Voyager.countIsGameFact(registry, h.item, h.n)) continue;
-                    hits.push({ n: h.n, item: h.item, op: h.op, source: obs.source, quote: obs.quote || null, where: field });
-                }
+                for (const h of Voyager.contractInventoryComparisons(src)) take(h, field);
             }
         }
         return hits;
@@ -3232,7 +3165,7 @@ Use only c; no other globals.`;
                 legs: bot.inventory.slots[7] ? bot.inventory.slots[7].name : 'empty',
                 feet: bot.inventory.slots[8] ? bot.inventory.slots[8].name : 'empty',
             },
-            nearby_blocks: world.getNearbyBlockTypes(bot, world.nearbyBlockRadius(bot)),
+            nearby_blocks: world.getNearbyBlockTypes(bot),
             nearby_entities: world.getNearbyEntityTypes(bot),
             known_chests: this._getChestFacts(),
             threats: this._threats(),
@@ -3909,7 +3842,7 @@ Use only c; no other globals.`;
         this._saveSkills();
     }
     // fix55: ONE goal resolver. Each kind comes from one rule over disjoint grammars (no fallback chain):
-    //   item   - "Smelt N a into N b" / "<verb> N <item>" (smeltGoal / countGoal): verified by inventory gain
+    //   item   - "Smelt N a into N b" / "<verb> N <item>", after an optional "kind:" label (smeltGoal / countGoal): verified by inventory gain
     //   ensure - "ensure <block>" (ensureGoal): verified by the block being placed nearby
     //   skill  - the text IS the name of a library skill (learned names): verified by that skill's learned post-contract
     //   invalid- a bare identifier that is not a usable skill: rejected loudly back to the planner
@@ -6711,7 +6644,7 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         const callers = parentsOf(e.name, this._graph());
         const usedBuiltIn = builtInsCalled(getBareAPI().sigs, e.code);
         const apiList = this.unifiedAPIList(relevantSkills, usedBuiltIn);
-        const system = `You repair ONE skill in a Minecraft mineflayer skill library (PSN-style targeted fix). Return a single \`\`\`javascript code block containing ONLY the fixed function, with the SAME name and a compatible signature. First line inside the block: // DESCRIPTION: <one sentence>. Every loop must check bot.interrupt_code. If something still cannot be done, log(bot, 'FAILED: <reason>') and return a falsy value; no silent fallbacks. findBlock/findBlocks/nearestEntity/bot.entities/blockAt results can be null or empty: always null-check them before reading .position/.x or calling methods on them. bot.findBlocks(options): matching is a block id, an array of block ids, or a function; maxDistance and count are finite numbers. bot.findBlock(options) returns one block and does not take count; pass matching and maxDistance. getNearestBlocks(bot, block_types, distance, count): block_types is a block name or an array of names (null lists every block id); distance and count are finite numbers and are required. A list of names is not a distance. getNearbyBlockTypes(bot, distance) takes that distance, not block names. Call AVAILABLE FUNCTIONS by name. Do not paste their source into this function. If this function is too large to fix as one piece, say so in the description and keep the body a composition of the listed skills.
+        const system = `You repair ONE skill in a Minecraft mineflayer skill library (PSN-style targeted fix). Return a single \`\`\`javascript code block containing ONLY the fixed function, with the SAME name and a compatible signature. First line inside the block: // DESCRIPTION: <one sentence>. Every loop must check bot.interrupt_code. If something still cannot be done, log(bot, 'FAILED: <reason>') and return a falsy value; no silent fallbacks. findBlock/findBlocks/nearestEntity/bot.entities/blockAt results can be null or empty: always null-check them before reading .position/.x or calling methods on them. bot.findBlocks(options): matching is a block id, an array of block ids, or a function; maxDistance and count are finite numbers. bot.findBlock(options) returns one block and does not take count; pass matching and maxDistance. getNearestBlocks(bot, block_types, distance, count): block_types is a block name or an array of names (null lists every block id); distance and count are finite numbers and are required. A list of names is not a distance. getNearbyBlockTypes(bot) lists blocks within the pathfinder's block reach; it does not take a radius. Call AVAILABLE FUNCTIONS by name. Do not paste their source into this function. If this function is too large to fix as one piece, say so in the description and keep the body a composition of the listed skills.
 
 AVAILABLE FUNCTIONS (call by bare name, e.g. goToPosition(bot, x, y, z) - do NOT use skills.* or world.* prefix):
 ${apiList}
@@ -6996,7 +6929,7 @@ Each function must:
 - Have a compatible signature
 - Be preceded by // DESCRIPTION: <one sentence>
 
-Every loop must check bot.interrupt_code. If something cannot be done, log(bot, 'FAILED: <reason>') and return a falsy value; no silent fallbacks. findBlock/findBlocks/nearestEntity/bot.entities/blockAt results can be null or empty: always null-check them. bot.findBlocks(options): matching is a block id, an array of block ids, or a function; maxDistance and count are finite numbers. bot.findBlock(options) returns one block and does not take count; pass matching and maxDistance. getNearestBlocks(bot, block_types, distance, count): block_types is a block name or an array of names (null lists every block id); distance and count are finite numbers and are required. A list of names is not a distance. getNearbyBlockTypes(bot, distance) takes that distance, not block names.
+Every loop must check bot.interrupt_code. If something cannot be done, log(bot, 'FAILED: <reason>') and return a falsy value; no silent fallbacks. findBlock/findBlocks/nearestEntity/bot.entities/blockAt results can be null or empty: always null-check them. bot.findBlocks(options): matching is a block id, an array of block ids, or a function; maxDistance and count are finite numbers. bot.findBlock(options) returns one block and does not take count; pass matching and maxDistance. getNearestBlocks(bot, block_types, distance, count): block_types is a block name or an array of names (null lists every block id); distance and count are finite numbers and are required. A list of names is not a distance. getNearbyBlockTypes(bot) lists blocks within the pathfinder's block reach; it does not take a radius.
 Fix the child's own logic and how/when the caller uses it. No top-level call, no extra functions.
 
 AVAILABLE FUNCTIONS (call by bare name, e.g. goToPosition(bot, x, y, z) - do NOT use skills.* or world.* prefix):
@@ -7406,7 +7339,7 @@ IMPORTANT: All functions use bare names. Do NOT write skills.goToBlock or skills
 COMPOSE: build your function out of these skills (they can take arguments). Your new skill may take extra parameters with defaults, e.g. \`async function makeIronTools(bot, count = 1)\`. Do not create call cycles between skills, and do not call a skill from inside itself with the same parameters.${this.sharedHints?.length ? `
 SHARED CODE: these fragments are repeated in several skills; if you need this logic, put it in its own small reusable async function skill (named, with parameters) and call it, instead of inlining it again:
 ${this.sharedHints.map(h => '// used in ' + h.skills.join(', ') + '\n' + h.fragment).join('\n')}` : ''}
-Interrupts: the bot may be interrupted at any time (danger, getting stuck, a player talking). Every loop must start with \`if (bot.interrupt_code) return;\` and you must return immediately after any await when bot.interrupt_code is true. Every async function must contain an await. Never catch an error and keep looping; no unbounded loops (always cap attempts). There is no setTimeout/setInterval in scope; to wait use \`await sleep(ms)\`. findBlock/findBlocks/nearestEntity/bot.entities/blockAt results can be null or empty: always null-check them before reading .position/.x or calling methods on them. bot.findBlocks(options): matching is a block id, an array of block ids, or a function; maxDistance and count are finite numbers. bot.findBlock(options) returns one block and does not take count; pass matching and maxDistance. getNearestBlocks(bot, block_types, distance, count): block_types is a block name or an array of names (null lists every block id); distance and count are finite numbers and are required. A list of names is not a distance. getNearbyBlockTypes(bot, distance) takes that distance, not block names.`;
+Interrupts: the bot may be interrupted at any time (danger, getting stuck, a player talking). Every loop must start with \`if (bot.interrupt_code) return;\` and you must return immediately after any await when bot.interrupt_code is true. Every async function must contain an await. Never catch an error and keep looping; no unbounded loops (always cap attempts). There is no setTimeout/setInterval in scope; to wait use \`await sleep(ms)\`. findBlock/findBlocks/nearestEntity/bot.entities/blockAt results can be null or empty: always null-check them before reading .position/.x or calling methods on them. bot.findBlocks(options): matching is a block id, an array of block ids, or a function; maxDistance and count are finite numbers. bot.findBlock(options) returns one block and does not take count; pass matching and maxDistance. getNearestBlocks(bot, block_types, distance, count): block_types is a block name or an array of names (null lists every block id); distance and count are finite numbers and are required. A list of names is not a distance. getNearbyBlockTypes(bot) lists blocks within the pathfinder's block reach; it does not take a radius.`;
         // only `related` are shown as context; the library is already in the execution scope, so its source is not copied into the prompt
         // fix97: the comment above said the library is already in scope and its source is not copied. The next line pasted
         // the top 3 bodies anyway, so each rewrite was trained on (and returned) a longer function. Signature, description

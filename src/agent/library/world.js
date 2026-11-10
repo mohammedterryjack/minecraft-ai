@@ -7,7 +7,7 @@ import { itemSourceBlocks } from '../../utils/item_sources.js';
 
 const require = createRequire(import.meta.url);
 // A chunk is 16 blocks on a side (prismarine-chunk; https://minecraft.wiki/w/Chunk).
-const { CHUNK_WIDTH, BLOCK_SECTION_VOLUME } = require('prismarine-chunk/src/pc/common/constants.js');
+const { CHUNK_WIDTH, BLOCK_SECTION_VOLUME, SECTION_WIDTH, SECTION_HEIGHT } = require('prismarine-chunk/src/pc/common/constants.js');
 
 
 // fix42: getAllFreeSpaces returns all valid positions (for retry logic when placeBlock fails at one cell)
@@ -171,9 +171,7 @@ function shownScanArg(v) {
 }
 function requireScanNumber(fn, name, value) {
     if (typeof value !== 'number' || !Number.isFinite(value)) {
-        const hint = fn === 'getNearbyBlocks' || fn === 'getNearbyBlockTypes'
-            ? `${fn}(bot, distance) takes a radius in blocks, not a list of block names. Named blocks: getNearestBlocks(bot, block_types, distance, count).`
-            : 'distance and count are numbers. Block names go in block_types (getNearestBlocks) or the predicate (getNearestBlocksWhere), not in the distance. bot.findBlocks({ matching, maxDistance, count }): matching is a block id, an array of block ids, or a function; maxDistance and count are finite numbers.';
+        const hint = 'distance and count are numbers. Block names go in block_types (getNearestBlocks) or the predicate (getNearestBlocksWhere), not in the distance. bot.findBlocks({ matching, maxDistance, count }): matching is a block id, an array of block ids, or a function; maxDistance and count are finite numbers.';
         throw new Error(`${fn}: ${name} must be a finite number, got ${shownScanArg(value)}. ${hint}`);
     }
 }
@@ -490,15 +488,6 @@ export function getNearbyPlayerNames(bot) {
 }
 
 
-// Positions inside the cube of half-extent `distance` (the radius the caller passed). This replaces the old
-// count default of 10000, which was not the size of any search. The cube's side is 2*floor(distance)+1: the center
-// block plus `distance` blocks each way. A radius of one chunk width (16) is a 33-block cube, which is why that
-// width is not itself the radius.
-function positionsWithin(distance) {
-    const span = Math.floor(distance) * 2 + 1;
-    return span * span * span;
-}
-
 // The client only holds the chunks inside the server's view distance. Login (play) sends that radius as
 // viewDistance, a varint after maxPlayers (minecraft-data pc/1.20.3 protocol.json packet_login; Minecraft 1.20.4
 // uses protocol 1.20.3). Set Center Chunk (packet_update_view_position: chunkX, chunkZ) moves the center, and
@@ -507,8 +496,8 @@ function positionsWithin(distance) {
 // https://wiki.vg/Protocol#Set_Center_Chunk
 // https://wiki.vg/Protocol#Update_View_Distance
 // https://minecraft.wiki/w/Render_distance
-// findBlocks reads loaded chunks, so the scan radius is that view distance in chunks times the chunk width.
 // bot.settings.viewDistance is the client's request, not the radius the server granted.
+// This radius is which chunks the server sends. It is not how far a block counts as nearby.
 function serverChunkRadius(bot) {
     const game = bot && bot.game;
     if (!game || typeof game !== 'object') {
@@ -521,94 +510,152 @@ function serverChunkRadius(bot) {
     return view;
 }
 
-// Block radius of the chunks the server has granted. Callers pass it. There is no default.
+// Block radius of the chunks the server has granted. Not the nearby-block query.
 export function nearbyBlockRadius(bot) {
     return serverChunkRadius(bot) * CHUNK_WIDTH;
 }
 
-export function getNearbyBlocks(bot, distance) {
-    /**
-     * Blocks around the bot, every position inside the given radius.
-     * @param {Bot} bot - The bot to get nearby blocks for.
-     * @param {number} distance - Radius in blocks. A finite number. Not a list of block names.
-     * @returns {Block[]} - Blocks within that radius.
-     * @example
-     * let blocks = world.getNearbyBlocks(bot, 16);
-     **/
-    requireScanNumber('getNearbyBlocks', 'distance', distance);
-    return getNearestBlocks(bot, null, distance, positionsWithin(distance));
+// A block is nearby when the bot can look at it from where it stands. That distance is
+// mineflayer-pathfinder's GoalLookAtBlock.reach (lib/goals.js: `this.reach = options.reach || 4.5`,
+// commented "default survival: 4.5 creative: 5"). The same figure is Java Edition's survival block
+// interaction range (https://minecraft.wiki/w/Player#Reach). The pathfinder's searchRadius defaults to
+// -1, which means the search is not limited (index.js), so it is not a nearby bound. The reach is read
+// off a GoalLookAtBlock; this file does not write the number.
+// GoalLookAtBlock.isEnd measures from the eye (feet plus entityHeight) to the block position.
+function blockReach(bot) {
+    const pos = bot && bot.entity && bot.entity.position;
+    if (!pos || !Number.isFinite(pos.x) || !Number.isFinite(pos.y) || !Number.isFinite(pos.z)) {
+        throw new Error('nearby blocks: bot.entity.position is missing. GoalLookAtBlock measures reach from the eye (mineflayer-pathfinder lib/goals.js).');
+    }
+    const eyeHeight = bot.entity.eyeHeight;
+    if (typeof eyeHeight !== 'number' || !Number.isFinite(eyeHeight)) {
+        throw new Error('nearby blocks: bot.entity.eyeHeight is missing. GoalLookAtBlock measures reach from the eye (mineflayer-pathfinder lib/goals.js, entityHeight).');
+    }
+    if (!bot.world || typeof bot.world.getColumns !== 'function') {
+        throw new Error('nearby blocks: bot.world.getColumns is missing. Block states are read from loaded chunk sections (prismarine-chunk), not from findBlocks.');
+    }
+    const goal = new pf.goals.GoalLookAtBlock(new Vec3(pos.x, pos.y, pos.z), bot.world, { entityHeight: eyeHeight });
+    if (typeof goal.reach !== 'number' || !(goal.reach > 0)) {
+        throw new Error(`nearby blocks: GoalLookAtBlock.reach is ${JSON.stringify(goal.reach)} (mineflayer-pathfinder lib/goals.js).`);
+    }
+    return { eye: { x: pos.x, y: pos.y + eyeHeight, z: pos.z }, reach: goal.reach };
 }
 
-// View distance is a square of chunks around the player (Chebyshev), not a sphere of blocks.
-// https://minecraft.wiki/w/Render_distance
-function columnsInView(bot, chunkRadius) {
-    const world = bot && bot.world;
-    if (!world || typeof world.getColumns !== 'function') {
-        throw new Error('getNearbyBlockTypes: bot.world.getColumns is missing. Block types are the palettes of the loaded chunk columns (prismarine-world), not a walk of the view-distance cube.');
-    }
-    const pos = bot.entity && bot.entity.position;
-    if (!pos || !Number.isFinite(pos.x) || !Number.isFinite(pos.z)) {
-        throw new Error('getNearbyBlockTypes: bot.entity.position is missing. The view distance is a square of chunks around the player (https://minecraft.wiki/w/Render_distance).');
-    }
-    const centerX = Math.floor(pos.x / CHUNK_WIDTH);
-    const centerZ = Math.floor(pos.z / CHUNK_WIDTH);
-    const columns = [];
-    for (const col of world.getColumns()) {
-        if (!col || !Number.isInteger(Number(col.chunkX)) || !Number.isInteger(Number(col.chunkZ)) || !col.column) {
-            throw new Error(`getNearbyBlockTypes: a loaded column has no chunk coordinates (${JSON.stringify(col && { chunkX: col.chunkX, chunkZ: col.chunkZ })}).`);
-        }
-        const cx = Number(col.chunkX), cz = Number(col.chunkZ);
-        if (Math.max(Math.abs(cx - centerX), Math.abs(cz - centerZ)) <= chunkRadius) columns.push(col.column);
-    }
-    return columns;
+function dist2(ax, ay, az, bx, by, bz) {
+    const dx = ax - bx, dy = ay - by, dz = az - bz;
+    return dx * dx + dy * dy + dz * dz;
 }
 
-// Indirect and single-value sections store the block state ids in the palette. A direct section has no local palette;
-// its state ids are the cell values, so the bound is that section's volume, not the view-distance cube.
-function stateIdsInSection(section) {
-    if (!section) return [];
+// Closest point of the half-open box [min, max) to the eye. A section one plane past the reach is not a candidate.
+function boxWithinReach(eye, reach2, minX, minY, minZ, maxX, maxY, maxZ) {
+    const px = eye.x < minX ? minX : eye.x >= maxX ? maxX : eye.x;
+    const py = eye.y < minY ? minY : eye.y >= maxY ? maxY : eye.y;
+    const pz = eye.z < minZ ? minZ : eye.z >= maxZ ? maxZ : eye.z;
+    return dist2(eye.x, eye.y, eye.z, px, py, pz) <= reach2;
+}
+
+// Inverse of prismarine-chunk PaletteChunkSection getBlockIndex: (y << 8) | (z << 4) | x.
+function localCell(index) {
+    const mask = SECTION_WIDTH - 1;
+    return { x: index & mask, z: (index >> 4) & mask, y: (index >> 8) & mask };
+}
+
+// PaletteContainer.get returns palette[data.get(index)], the cell's current state. IndirectPaletteContainer.set
+// pushes onto the palette and never removes an entry, so the palette still names a block after it is gone.
+// The palette only decides that the section stores blocks. The cell read is the state that is present.
+function cellStateId(section, index, where) {
     const data = section.data;
-    if (Array.isArray(section.palette)) return section.palette;
-    if (data && Array.isArray(data.palette)) return data.palette;
-    if (data && typeof data.value === 'number') return [data.value];
     if (data && typeof data.get === 'function') {
-        const ids = [];
-        const seen = new Set();
-        for (let i = 0; i < BLOCK_SECTION_VOLUME; i++) {
-            const id = data.get(i);
-            if (typeof id !== 'number') throw new Error(`getNearbyBlockTypes: section cell ${i} is not a state id`);
-            if (!seen.has(id)) { seen.add(id); ids.push(id); }
-        }
-        return ids;
+        const id = data.get(index);
+        if (typeof id !== 'number') throw new Error(`nearby blocks: ${where} cell ${index} is not a state id`);
+        return id;
     }
-    throw new Error('getNearbyBlockTypes: a loaded section has no palette and no block storage');
+    if (data && typeof data.value === 'number') return data.value;
+    throw new Error(`nearby blocks: ${where} has no block storage. A palette without cell reads is not the blocks present (prismarine-chunk PaletteContainer).`);
 }
 
-export function getNearbyBlockTypes(bot, distance) {
-    /**
-     * Block names in the loaded chunk sections inside the view distance.
-     * @param {Bot} bot - The bot. Its world columns and registry supply the names.
-     * @param {number} distance - Radius in blocks, the server view distance times the chunk width.
-     * @returns {string[]} - Block names from those sections' palettes.
-     * @example
-     * let blocks = world.getNearbyBlockTypes(bot, world.nearbyBlockRadius(bot));
-     **/
-    requireScanNumber('getNearbyBlockTypes', 'distance', distance);
-    const chunkRadius = Math.floor(distance / CHUNK_WIDTH);
-    const found = [];
-    for (const column of columnsInView(bot, chunkRadius)) {
-        if (!Array.isArray(column.sections)) throw new Error('getNearbyBlockTypes: a loaded column has no sections');
-        for (const section of column.sections) {
-            for (const id of stateIdsInSection(section)) {
-                const registry = bot.registry;
-                if (!registry || !registry.blocksByStateId) throw new Error('getNearbyBlockTypes: bot.registry.blocksByStateId is missing');
-                const block = registry.blocksByStateId[id];
-                if (!block || typeof block.name !== 'string') throw new Error(`getNearbyBlockTypes: state id ${id} is not in the registry`);
-                if (!found.includes(block.name)) found.push(block.name);
+function nearbyStates(bot) {
+    const { eye, reach } = blockReach(bot);
+    const reach2 = reach * reach;
+    const registry = bot.registry;
+    if (!registry || !registry.blocksByStateId) throw new Error('nearby blocks: bot.registry.blocksByStateId is missing');
+    const stoodX = Math.floor(eye.x / CHUNK_WIDTH);
+    const stoodZ = Math.floor(eye.z / CHUNK_WIDTH);
+    let stood = false;
+    const ids = [];
+    const seen = new Set();
+    for (const col of bot.world.getColumns()) {
+        if (!col || !Number.isInteger(Number(col.chunkX)) || !Number.isInteger(Number(col.chunkZ)) || !col.column) {
+            throw new Error(`nearby blocks: a loaded column has no chunk coordinates (${JSON.stringify(col && { chunkX: col.chunkX, chunkZ: col.chunkZ })}).`);
+        }
+        const chunkX = Number(col.chunkX), chunkZ = Number(col.chunkZ);
+        const minX = chunkX * CHUNK_WIDTH, minZ = chunkZ * CHUNK_WIDTH;
+        if (!boxWithinReach(eye, reach2, minX, eye.y, minZ, minX + CHUNK_WIDTH, eye.y, minZ + CHUNK_WIDTH)) continue;
+        const column = col.column;
+        if (!Array.isArray(column.sections)) throw new Error(`nearby blocks: chunk ${chunkX},${chunkZ} has no sections`);
+        if (!Number.isInteger(column.minY)) {
+            throw new Error(`nearby blocks: chunk ${chunkX},${chunkZ} has no minY. Section Y is (blockY - minY) >> 4 (prismarine-chunk CommonChunkColumn).`);
+        }
+        if (chunkX === stoodX && chunkZ === stoodZ) {
+            stood = true;
+            const eyeSection = (Math.floor(eye.y) - column.minY) >> 4;
+            if (eyeSection < 0 || eyeSection >= column.sections.length || !column.sections[eyeSection]) {
+                throw new Error(`nearby blocks: chunk ${chunkX},${chunkZ} section ${eyeSection} (the section the bot stands in) is not loaded. A missing section is not an empty block list.`);
+            }
+        }
+        for (let si = 0; si < column.sections.length; si++) {
+            const originY = column.minY + si * SECTION_HEIGHT;
+            if (!boxWithinReach(eye, reach2, minX, originY, minZ, minX + CHUNK_WIDTH, originY + SECTION_HEIGHT, minZ + CHUNK_WIDTH)) continue;
+            const section = column.sections[si];
+            const where = `chunk ${chunkX},${chunkZ} section ${si} (y ${originY})`;
+            if (!section) {
+                throw new Error(`nearby blocks: ${where} is not loaded. A missing section is not an empty block list.`);
+            }
+            for (let i = 0; i < BLOCK_SECTION_VOLUME; i++) {
+                const local = localCell(i);
+                const wx = minX + local.x, wy = originY + local.y, wz = minZ + local.z;
+                if (dist2(eye.x, eye.y, eye.z, wx, wy, wz) > reach2) continue;
+                const id = cellStateId(section, i, where);
+                if (seen.has(id)) continue;
+                seen.add(id);
+                ids.push(id);
             }
         }
     }
-    return found;
+    if (!stood) {
+        throw new Error(`nearby blocks: chunk ${stoodX},${stoodZ} the bot stands in is not loaded. An unloaded chunk is not an empty block list.`);
+    }
+    const blocks = [];
+    for (const id of ids) {
+        const block = registry.blocksByStateId[id];
+        if (!block || typeof block.name !== 'string') throw new Error(`nearby blocks: state id ${id} is not in the registry`);
+        blocks.push({ name: block.name, metadata: block.metadata });
+    }
+    return blocks;
+}
+
+export function getNearbyBlocks(bot) {
+    /**
+     * Distinct block states within the pathfinder's block reach.
+     * @param {Bot} bot - The bot. The reach is GoalLookAtBlock.reach, measured from the bot's eye.
+     * @returns {Block[]} - One entry per state id confirmed present inside that reach, with name and metadata.
+     * @example
+     * let blocks = world.getNearbyBlocks(bot);
+     **/
+    return nearbyStates(bot);
+}
+
+export function getNearbyBlockTypes(bot) {
+    /**
+     * Block names within the pathfinder's block reach.
+     * @param {Bot} bot - The bot. Loaded sections supply the states; the reach is GoalLookAtBlock.reach.
+     * @returns {string[]} - Names of block states confirmed present inside that reach.
+     * @example
+     * let blocks = world.getNearbyBlockTypes(bot);
+     **/
+    const names = [];
+    for (const block of nearbyStates(bot)) if (!names.includes(block.name)) names.push(block.name);
+    return names;
 }
 
 export async function isClearPath(bot, target) {

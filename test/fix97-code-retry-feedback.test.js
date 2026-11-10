@@ -19,7 +19,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { readFileSync } from 'node:fs';
 import * as cd from '../src/models/call_durations.js';
-import { collapseRepeats, recoverTemplatedLines, structuredTrace } from '../src/agent/skill_graph.js';
+import { collapseRepeats, groupVaryingLines, recoverTemplatedLines, structuredTrace } from '../src/agent/skill_graph.js';
 import { codeRetryFeedback } from '../src/agent/voyager.js';
 import { CODE_PROMPT_DUMP, writeCodePromptDump } from '../src/models/code_prompt_dump.js';
 import { CODE_RETRY_78, observedChatWork } from './fixtures/code_retry_observation.js';
@@ -150,6 +150,7 @@ describe('fix97 code-retry feedback is compact by construction', () => {
         const stillGot = recovered.filter(l => l.startsWith('Still '));
         assert.strictEqual(stillGot.length, stillSrc.length);
         for (let i = 0; i < stillSrc.length; i++) assert.deepStrictEqual(nums(stillGot[i]), nums(stillSrc[i]), stillGot[i]);
+        assert.deepStrictEqual(recoverTemplatedLines(groupVaryingLines(output.join('\n'))).map(nums), output.map(nums));
         assert.ok(stillGot.some(l => l.startsWith('Still 200 blocks from -300,')));
         const gotoSrc = trace.filter(r => r.name === 'goToPosition').map(r => `${r.args} ${r.ownFail.join(' ')}`);
         const gotoGot = recovered.filter(l => l.includes('goToPosition('));
@@ -188,6 +189,15 @@ describe('fix97 code-retry feedback is compact by construction', () => {
         assert.match(readFileSync(CODE_PROMPT_DUMP, 'utf8'), /USER-OVERFLOW collectLogs birch_log/);
         assert.throws(() => writeCodePromptDump('system-only'), /user prompt must be text/);
         assert.throws(() => writeCodePromptDump('system-only', undefined), /undefined/);
+    });
+
+    it('interleaved lines keep an index so their order can be rebuilt', () => {
+        const text = ['alpha 1', 'beta 2', 'alpha 3', 'beta 4'].join('\n');
+        const grouped = groupVaryingLines(text);
+        assert.match(grouped, /at:/);
+        assert.deepStrictEqual(recoverTemplatedLines(grouped), ['alpha 1', 'beta 2', 'alpha 3', 'beta 4']);
+        assert.throws(() => groupVaryingLines(undefined), /text must be a string/);
+        assert.throws(() => recoverTemplatedLines(null), /text must be a string/);
     });
 
     it('three errors on one call keep the middle one', () => {

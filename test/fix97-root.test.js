@@ -18,7 +18,9 @@ import { readFileSync } from 'node:fs';
 import { edibleNames, planFoodAcquisition } from '../src/agent/food_backchain.js';
 import { buildContractManifest } from '../scripts/fix97_contract_manifest.js';
 import { nestedBotMemberError, getBareAPI, Coder } from '../src/agent/coder.js';
-import { getNearestBlocks, getNearestBlocksWhere, getNearbyBlockTypes, nearbyBlockRadius } from '../src/agent/library/world.js';
+import { getNearestBlocks, getNearestBlocksWhere, getNearbyBlockTypes, getNearbyBlocks, nearbyBlockRadius } from '../src/agent/library/world.js';
+import pf from 'mineflayer-pathfinder';
+import { Vec3 } from 'vec3';
 import { wrapBotForApiTiming } from '../src/utils/bot_api_timing.js';
 import { readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
@@ -116,16 +118,20 @@ describe('fix97 goal identity: Collect 1 apple stays Collect 1 apple', () => {
 });
 
 describe('fix97 contracts: a hallucinated number is refused, and the manifest is a dry run', () => {
-    it('an inventory comparison copies an observed count; a bare 55 is not one', () => {
+    it('an inventory comparison to an ungrounded literal is refused; a bare 55 is not one', () => {
         const v = mkV({});
         const skill = { name: 'checkOakLog', code: 'async function checkOakLog(bot) { return true; }', consumes: {}, effects: [] };
-        assert.strictEqual(v._validContract({ pre: 'c => c.pre.inv.oak_log < 55', post: 'c => true' }, skill), null);
+        assert.match(v._validContract({ pre: 'c => c.pre.inv.oak_log < 55', post: 'c => true' }, skill), /pre uses 55/);
+        const bare = { name: 'checkOakLog', code: 'async function checkOakLog(bot) { return 55; }', consumes: {}, effects: [] };
+        assert.strictEqual(v._validContract({ pre: 'c => true', post: 'c => true' }, bare), null);
         const ok = v._validContract({ pre: 'c => c.args.length >= 1 && c.args[0] === null', post: 'c => true' }, skill);
         assert.strictEqual(ok, null);
         const buried = { name: 'checkOakLog', code: 'async function checkOakLog(bot) { return 155; }', consumes: {}, effects: [], stats: { success: 5512, fail: 0 } };
-        assert.strictEqual(v._validContract({ pre: 'c => c.pre.inv.oak_log < 55', post: 'c => true' }, buried), null);
-        const observed = { ...skill, task: 'Check inventory for oak_log and confirm count (currently 55) to ensure input is valid for crafting oak_planks' };
-        assert.match(v._validContract({ pre: 'c => c.pre.inv.oak_log < 55', post: 'c => true' }, observed), /pre uses 55/);
+        const buriedReason = v._validContract({ pre: 'c => c.pre.inv.oak_log < 55', post: 'c => true' }, buried);
+        assert.match(buriedReason, /pre uses 55/);
+        assert.doesNotMatch(buriedReason, /155|5512/);
+        const goal = { ...skill, task: 'Collect 55 oak_log' };
+        assert.strictEqual(v._validContract({ pre: 'c => c.pre.inv.oak_log < 55', post: 'c => true' }, goal), null);
     });
 
     it('the manifest lists a 55 contract and does not apply; this checkout has no checkOakLog', () => {
@@ -136,7 +142,7 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         const manifest = buildContractManifest(fixture);
         assert.strictEqual(manifest.apply, false);
         assert.strictEqual(manifest.dryRun, true);
-        assert.deepStrictEqual(manifest.records.map(r => r.id), []);
+        assert.deepStrictEqual(manifest.records.map(r => r.id), ['checkOakLog.pre.55']);
         const live = JSON.parse(readFileSync(new URL('../bots/icefox2000/skills/index.json', import.meta.url), 'utf8'));
         const disk = buildContractManifest(live);
         assert.strictEqual(disk.checkOakLogPresent, false);
@@ -158,11 +164,13 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         assert.throws(() => Voyager.parseContract('function ( {'), /contract does not parse/);
         const commented = 'async function checkOakLog(bot) {\n  // currently 55\n  log(bot, "currently 55");\n  return true;\n}';
         const skill = { name: 'checkOakLog', code: commented, consumes: {}, effects: [] };
-        assert.strictEqual(v._validContract({ pre: 'c => c.pre.inv.oak_log < 55', post: 'c => true' }, skill), null);
+        assert.match(v._validContract({ pre: 'c => c.pre.inv.oak_log < 55', post: 'c => true' }, skill), /pre uses 55/);
+        assert.deepStrictEqual(Voyager.copiedInventoryHits({ ...skill, contract: { pre: 'c => true', post: 'c => true' } }, registry), []);
         assert.match(Voyager.prototype._learnContracts.toString(), /String\(e\.code\)/);
         assert.doesNotMatch(Voyager.prototype._learnContracts.toString(), /sourceForContractPrompt/);
         const coded = { name: 'checkOakLog', code: 'async function checkOakLog(bot) { const n = 55; return n; }', consumes: {}, effects: [] };
-        assert.strictEqual(v._validContract({ pre: 'c => c.pre.inv.oak_log < 55', post: 'c => true' }, coded), null);
+        assert.match(v._validContract({ pre: 'c => c.pre.inv.oak_log < 55', post: 'c => true' }, coded), /pre uses 55/);
+        assert.deepStrictEqual(Voyager.copiedInventoryHits({ ...coded, contract: { pre: 'c => true', post: 'c => true' } }, registry), []);
         const copied = { name: 'checkOakLog', code: 'async function checkOakLog(bot) { const counts = getInventoryCounts(bot); return counts.oak_log >= 55; }', consumes: {}, effects: [], promptCounts: { oak_log: 55 } };
         assert.match(v._validContract({ pre: 'c => c.pre.inv.oak_log >= 55', post: 'c => true' }, copied), /pre uses 55/);
     });
@@ -205,8 +213,8 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         assert.deepStrictEqual(manifest.reasonLines, manifest.records.map(r => r.verdict));
         for (const r of manifest.records) assert.ok(r.verdict.startsWith(r.id), r.verdict);
         const byId = Object.fromEntries(manifest.records.map(r => [r.id, r.verdict]));
-        assert.match(byId['checkOakLog.code.55'], /promptCounts count of oak_log/);
-        assert.match(byId['checkOakLog.pre.55'], /promptCounts count of oak_log/);
+        assert.match(byId['checkOakLog.code.55'], /not the parsed goal quantity of oak_log/);
+        assert.match(byId['checkOakLog.pre.55'], /not the parsed goal quantity of oak_log/);
         assert.strictEqual(manifest.checkOakLogPresent, true);
         const absent = [
             { name: 'smeltIronIntoIngot', code: 'async function smeltIronIntoIngot(bot) { const c = getInventoryCounts(bot); return c.raw_iron < 1; }', promptCounts: { raw_iron: 1 }, contract: { pre: 'c => true', post: 'c => true' } },
@@ -285,10 +293,84 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         assert.deepStrictEqual(manifest.records.map(r => r.id), ['checkOakLog.code.55', 'checkOakLog.pre.55']);
         assert.strictEqual(manifest.records.filter(r => r.id === 'checkOakLog.code.55').length, 1);
         const code55 = manifest.records.find(r => r.id === 'checkOakLog.code.55');
-        assert.match(code55.evidence, /task records oak_log at 55/);
-        assert.match(code55.evidence, /name:count/);
-        assert.doesNotMatch(code55.evidence, /promptCounts/);
-        assert.deepStrictEqual(Voyager.textCountPairs('oak_log 55 oak_planks', registry), [{ item: 'oak_log', n: 55 }]);
+        assert.match(code55.evidence, /not the parsed goal quantity of oak_log/);
+        assert.doesNotMatch(code55.evidence, /promptCounts|name:count|currently/);
+        const dirtTask = 'collectSurface: Collect 32 dirt blocks within 32 blocks of the current position to ensure tilling surface is available for planting wheat_seeds';
+        assert.ok(Voyager.goalQuantities(dirtTask).some(g => g.item === 'dirt' && g.n === 32));
+        assert.strictEqual(mkV({})._resolveGoal(dirtTask).count, 32);
+        assert.ok(!Voyager.goalQuantities(oakTask).some(g => g.n === 55));
+    });
+
+    it('the live check skills are the only records, and a kind-prefixed collect goal is not', () => {
+        const fn = (name, body = 'return true;') => `async function ${name}(bot) {\n  ${body}\n}`;
+        const oakTask = 'Check inventory for oak_log and confirm count (currently 55) to ensure input is valid for crafting oak_planks';
+        const leavesTask = 'Verify that oak_leaves count is currently 6 in inventory by checking item count';
+        const dirtTask = 'collectSurface: Collect 32 dirt blocks within 32 blocks of the current position to ensure tilling surface is available for planting wheat_seeds';
+        const dirtDesc = 'Collect 32 dirt blocks within 32 blocks of the current position to ensure tilling surface is available for planting wheat_seeds';
+        const skills = [
+            { name: 'craftToolSet', code: fn('craftToolSet'), contract: { pre: 'c => true', post: 'c => Object.keys(c.post.inv).filter(k=>k.endsWith(\'_pickaxe\')||k.endsWith(\'_axe\')||k.endsWith(\'_sword\')).length === 3' } },
+            { name: 'isSafeTarget', code: fn('isSafeTarget'), contract: { pre: 'c => c.args.length === 2 || (c.args.length === 3 && typeof c.args[2] === \'number\')', post: 'c => true' } },
+            { name: 'craftArmorSet', code: fn('craftArmorSet'), contract: { pre: 'c => true', post: 'c => Number(c.ret) === 0 || (Number(c.ret) > 0 && Number(c.ret) <= 4 && c.post.alive)' } },
+            { name: 'harvestCrop', code: fn('harvestCrop'), contract: { pre: 'c => true', post: 'c => Number(c.ret) >= 0 && Number(c.ret) <= (c.args[2]||4)' } },
+            { name: 'breakBlockAt', code: fn('breakBlockAt'), contract: { pre: 'c => c.pre.alive && c.args[0] != null && c.args[1] != null && c.args[2] != null', post: 'c => true' } },
+            { name: 'exploreForIronOre', code: fn('exploreForIronOre'), contract: { pre: 'c => true', post: 'c => c.dist(c.post.pos, {x: c.pre.pos.x + (c.args[0] % 3 - 1) * 40, y: c.pre.pos.y + Math.min(0, -8 - c.args[0] * 2), z: c.pre.pos.z}) <= 4' } },
+            { name: 'scanForIronOreBlocks', code: fn('scanForIronOreBlocks'), contract: { pre: 'c => true', post: 'c => c.post.alive && c.dist(c.pre.pos, c.post.pos) < 0.5 && c.post.alive' } },
+            { name: 'exploreForIronOreDeposit', code: fn('exploreForIronOreDeposit'), contract: { pre: 'c => true', post: 'c => c.dist(c.post.pos, {x: c.pre.pos.x, y: c.pre.pos.y, z: c.pre.pos.z}) <= 5' } },
+            { name: 'mineIronOreDeposit', code: fn('mineIronOreDeposit'), contract: { pre: 'c => c.pre.alive && typeof c.args[1] === \'number\' && typeof c.args[2] === \'number\' && (c.pre.inv.raw_iron || 0) - c.args[1] < c.args[2]', post: 'c => { const startRaw = c.args[1], goal = c.args[2]; return true; }' } },
+            { name: 'ensureStorageChestNearby', code: fn('ensureStorageChestNearby'), contract: { pre: 'c => true', post: 'c => c.ret !== true || (c.post.alive && c.post.dim === c.pre.dim && c.dist(c.pre.pos, c.post.pos) <= 64)' } },
+            { name: 'equipBestPickaxeForIronOre', code: fn('equipBestPickaxeForIronOre'), contract: { pre: 'c => true', post: 'c => { const tier = { wooden_pickaxe: 1, stone_pickaxe: 2, iron_pickaxe: 3, golden_pickaxe: 3, diamond_pickaxe: 4, netherite_pickaxe: 5 }; return tier.diamond_pickaxe === 4 && tier.netherite_pickaxe === 5; }' } },
+            { name: 'travelWestAvoidDeathHotspot', code: fn('travelWestAvoidDeathHotspot'), contract: { pre: 'c => true', post: 'c => c.dist(c.post.pos, {x:-178,y:53,z:107}) <= 8 && Math.abs(c.post.pos.y - 53) <= 6' } },
+            { name: 'verifyBlockType', code: fn('verifyBlockType'), contract: { pre: 'c => c.args[0] === -28 && c.args[1] === 73 && c.args[2] === 56 && c.pre.alive', post: 'c => true' } },
+            { name: 'chopDownTrees', code: fn('chopDownTrees'), contract: { pre: 'c => c.pre.sky > 5', post: 'c => true' } },
+            { name: 'removeItem', code: fn('removeItem'), contract: { pre: 'c => c.args[2] === 0', post: 'c => true' } },
+            { name: 'collectSurfaceDirt', code: fn('collectSurfaceDirt'), contract: { pre: 'c => c.pre.sky > 4 && c.pre.inv.iron_hoe !== undefined', post: 'c => true' } },
+            {
+                name: 'checkOakLog',
+                task: oakTask,
+                description: oakTask,
+                code: fn('checkOakLog', 'const inventory = getInventoryCounts(bot);\n  if (inventory && inventory.oak_log >= 55) { return true; }\n  if (inventory.oak_log >= 55) { return true; }\n  log(bot, \'FAILED: Oak log count is less than 55\');\n  return false;'),
+                contract: { pre: 'c => c.pre.inv.oak_log >= 55', post: 'c => c.ret', text: 'Check if oak_log count is at least 55 in the inventory.' },
+                stats: { success: 2, fail: 0, tasks: ['reach oak_log'] },
+                repairHistory: [{ evidence: 'failure only in non-library code checkOakLog (FAILED: Oak log count is less than 55 [food 0/20 health 10/20] | PRECONDITION violated: checkOakLog() does not satisfy its precondition c => c.pre.inv.oak_log >= 55)' }],
+            },
+            {
+                name: 'checkOakLeavesCount',
+                task: leavesTask,
+                description: leavesTask,
+                code: 'async function checkOakLeavesCount(bot) {\n  const inventory = getInventoryCounts(bot);\n  if (inventory.oak_leaves === 6) { return true; } else { return false; }\n}',
+                contract: { pre: 'c => c.pre.inv.oak_leaves === null', post: 'c => c.post.inv.oak_leaves === 6' },
+                stats: { success: 1, fail: 2, streakFail: 2, practiceRuns: 3 },
+                repairHistory: [],
+            },
+            {
+                name: 'collectDirtForTilling',
+                task: dirtTask,
+                description: dirtDesc,
+                code: 'async function collectDirtForTilling(bot, count = 32) {\n  let collected = 0;\n  while (collected < count) {\n    const block = getNearestBlocksWhere(bot, bl => bl.name === \'dirt\', 32, 1)[0];\n    if (!block) return collected;\n    collected += 1;\n  }\n  return collected;\n}',
+                contract: { pre: 'c => c.pre.inv.dirt >= 32 || c.pre.free >= 32', post: 'c => c.ret >= 32' },
+                repairHistory: [{ evidence: 'Pathfinding stopped: Cannot break stone with current tools. [food 4/20 health 16/20] | FAILED: navigation error: Path was stopped ...' }],
+            },
+            {
+                name: 'craftBirchPlanks',
+                task: 'Craft 4 birch_planks',
+                code: fn('craftBirchPlanks', 'const counts = getInventoryCounts(bot);\n  return counts.birch_planks >= 4;'),
+                contract: { pre: 'c => c.pre.inv.birch_planks >= 4', post: 'c => true' },
+            },
+            {
+                name: 'collectSevenDirt',
+                task: 'Collect 7 dirt',
+                code: fn('collectSevenDirt', 'const counts = getInventoryCounts(bot);\n  return counts.dirt >= 7;'),
+                contract: { pre: 'c => c.pre.inv.dirt >= 7', post: 'c => true' },
+            },
+        ];
+        const manifest = buildContractManifest(skills);
+        assert.ok(!Voyager.goalQuantities(leavesTask).some(g => g.item === 'oak_leaves' && g.n === 6));
+        assert.deepStrictEqual(manifest.records.map(r => r.id), [
+            'checkOakLog.code.55',
+            'checkOakLog.pre.55',
+            'checkOakLeavesCount.code.6',
+            'checkOakLeavesCount.post.6',
+        ]);
     });
 
     it('curriculum task text and the 21-entry texts do not throw or add records', () => {
@@ -373,13 +455,8 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
             'equipBestPickaxeForIronOre.post.4', 'equipBestPickaxeForIronOre.post.5', 'travelWestAvoidDeathHotspot.post.6',
             'verifyBlockType.pre.2', 'chopDownTrees.pre.5', 'removeItem.pre.2', 'collectSurfaceDirt.pre.4',
         ];
-        const statePairs = Voyager.textCountPairs(v._codeState(state), registry);
-        assert.ok(statePairs.some(p => p.item === 'oak_log' && p.n === 55));
-        assert.ok(statePairs.some(p => p.item === 'cobblestone' && p.n === 8));
-        assert.ok(!statePairs.some(p => p.item === 'oak_log' && p.n === 8));
         for (const text of texts) {
-            const pairs = Voyager.textCountPairs(text, registry);
-            assert.ok(Array.isArray(pairs), text);
+            Voyager.goalQuantities(text);
             for (const field of ['task', 'description', 'repairHistory']) {
                 const skills = base.map(s => {
                     const copy = { ...s, contract: { ...s.contract } };
@@ -610,15 +687,16 @@ describe('fix97 findBlocks refuses a non-numeric maxDistance or count', () => {
         assert.throws(() => getNearestBlocks(bot, null, names), /getNearestBlocks: distance must be a finite number, got \["iron_ore","deepslate_iron_ore"\]/);
         assert.throws(() => getNearestBlocks(bot, names, 32), /count must be a finite number, got undefined/);
         assert.throws(() => getNearestBlocksWhere(bot, () => true, names, 10000), /getNearestBlocksWhere: distance must be a finite number/);
-        assert.throws(() => getNearbyBlockTypes(bot, names), /getNearbyBlockTypes: distance must be a finite number/);
-        assert.throws(() => getNearbyBlockTypes(bot), /getNearbyBlockTypes: distance must be a finite number, got undefined/);
+        assert.throws(() => getNearbyBlockTypes(bot), /position/);
+        assert.throws(() => getNearbyBlocks(bot), /position/);
         assert.strictEqual(scanned, false);
         const sig = getBareAPI().byName.getNearestBlocks.sig;
         assert.match(sig, /block_types: string\|string\[\]\|null/);
         assert.match(sig, /distance: number/);
         assert.match(sig, /count: number/);
         assert.doesNotMatch(sig, /10000/);
-        assert.match(getBareAPI().byName.getNearbyBlockTypes.sig, /distance: number/);
+        assert.doesNotMatch(getBareAPI().byName.getNearbyBlockTypes.sig, /distance/);
+        assert.doesNotMatch(getBareAPI().byName.getNearbyBlocks.sig, /distance/);
         assert.doesNotMatch(getBareAPI().byName.getNearbyBlocks.sig, /=/);
         const { CHUNK_WIDTH } = require('prismarine-chunk/src/pc/common/constants.js');
         assert.throws(() => nearbyBlockRadius({}), /viewDistance/);
@@ -629,38 +707,69 @@ describe('fix97 findBlocks refuses a non-numeric maxDistance or count', () => {
         assert.strictEqual(nearbyBlockRadius({ game: { serverViewDistance: 10, simulationDistance: 5 } }), 10 * CHUNK_WIDTH);
         const { BLOCK_SECTION_VOLUME } = require('prismarine-chunk/src/pc/common/constants.js');
         const stoneId = registry.blocksByName.stone.defaultState;
+        const oakLogId = registry.blocksByName.oak_log.defaultState;
         const diamondId = registry.blocksByName.diamond_ore.defaultState;
-        const obsidianId = registry.blocksByName.obsidian.defaultState;
-        const bedrockId = registry.blocksByName.bedrock.defaultState;
+        const emeraldId = registry.blocksByName.emerald_ore.defaultState;
+        const eyeHeight = 1.62;
+        const reach = new pf.goals.GoalLookAtBlock(new Vec3(0, 0, 0), {}, { entityHeight: eyeHeight }).reach;
+        // diamond_ore 111 blocks below the feet, and emerald_ore 9 chunks away, are outside that reach.
+        const feetY = 64;
+        const diamondY = feetY - 111;
+        assert.ok(Math.abs((feetY + eyeHeight) - diamondY) > reach, `diamond_ore is ${Math.abs((feetY + eyeHeight) - diamondY)} blocks from the eye, beyond GoalLookAtBlock reach ${reach}`);
+        assert.ok(9 * CHUNK_WIDTH > reach, `emerald_ore 9 chunks away is beyond GoalLookAtBlock reach ${reach}`);
         let cellReads = 0;
-        let blockAtCalls = 0;
+        let farReads = 0;
+        const sections = Array.from({ length: 24 }, () => null);
+        const minY = -64;
+        const stoodSection = (feetY - minY) >> 4;
+        const stoneSection = { palette: [stoneId], data: { get() { cellReads += 1; return stoneId; } } };
+        sections[stoodSection - 1] = stoneSection;
+        sections[stoodSection] = {
+            palette: [stoneId, oakLogId],
+            data: { get() { cellReads += 1; return stoneId; } },
+        };
+        const diamondSection = (diamondY - minY) >> 4;
+        sections[diamondSection] = {
+            palette: [diamondId],
+            data: { get() { farReads += 1; throw new Error('diamond_ore section was read'); } },
+        };
         const viewBot = {
             game: { serverViewDistance: 10 },
             registry,
-            entity: { position: { x: 8, y: 64, z: 8 } },
-            blockAt() { blockAtCalls += 1; return null; },
-            findBlocks() { throw new Error('getNearbyBlockTypes must not scan the view-distance cube'); },
+            entity: { position: new Vec3(8, feetY, 8), eyeHeight },
+            blockAt() { return null; },
+            findBlocks() { throw new Error('nearby blocks must not call findBlocks'); },
             world: { getColumns() { return [
-                { chunkX: 0, chunkZ: 0, column: { sections: [
-                    { palette: [stoneId], data: { get() { throw new Error('a palette section is not walked cell by cell'); } } },
-                    { data: { get() { cellReads += 1; return stoneId; } } },
-                    null,
-                ] } },
-                { chunkX: 10, chunkZ: 0, column: { sections: [{ palette: [obsidianId] }] } },
-                { chunkX: 11, chunkZ: 0, column: { sections: [{ palette: [bedrockId] }] } },
-                { chunkX: 100, chunkZ: 0, column: { sections: [{ palette: [diamondId] }] } },
+                { chunkX: 0, chunkZ: 0, column: { minY, sections } },
+                { chunkX: 9, chunkZ: 0, column: { minY, sections: [{ palette: [emeraldId], data: { get() { farReads += 1; throw new Error('emerald_ore section was read'); } } }] } },
             ]; } },
         };
-        const nearbyNames = getNearbyBlockTypes(viewBot, nearbyBlockRadius(viewBot));
+        const nearbyNames = getNearbyBlockTypes(viewBot);
         const cube = (10 * CHUNK_WIDTH * 2 + 1) ** 3;
         assert.ok(nearbyNames.includes('stone'));
-        assert.ok(nearbyNames.includes('obsidian'));
-        assert.ok(!nearbyNames.includes('bedrock'));
-        assert.ok(!nearbyNames.includes('diamond_ore'));
-        assert.strictEqual(blockAtCalls, 0);
-        assert.strictEqual(cellReads, BLOCK_SECTION_VOLUME);
+        assert.ok(!nearbyNames.includes('oak_log'), 'a palette entry no cell still holds is not nearby');
+        assert.ok(!nearbyNames.includes('diamond_ore'), `diamond_ore is excluded because it is beyond GoalLookAtBlock reach ${reach}`);
+        assert.ok(!nearbyNames.includes('emerald_ore'), `emerald_ore is excluded because 9 chunks is beyond GoalLookAtBlock reach ${reach}`);
+        assert.strictEqual(farReads, 0);
+        assert.ok(cellReads > 0);
+        assert.ok(cellReads < BLOCK_SECTION_VOLUME, `cell reads ${cellReads} walked a whole section`);
+        assert.ok(cellReads < cube, `cell reads ${cellReads} against the view-distance cube ${cube}`);
+        const listed = getNearbyBlocks(viewBot);
+        assert.ok(listed.some(b => b.name === 'stone'));
+        assert.ok(!listed.some(b => b.name === 'diamond_ore' || b.name === 'oak_log' || b.name === 'emerald_ore'));
         assert.ok(cellReads < cube);
-        assert.throws(() => getNearbyBlockTypes({ game: { serverViewDistance: 10 }, registry, entity: { position: { x: 0, y: 0, z: 0 } } }, 16), /getColumns/);
+        const queriesSrc = readFileSync(new URL('../src/agent/commands/queries.js', import.meta.url), 'utf8');
+        assert.match(queriesSrc, /world\.getNearbyBlocks\(bot\)/);
+        assert.doesNotMatch(queriesSrc, /getNearbyBlocks\(bot,/);
+        assert.doesNotMatch(queriesSrc, /nearbyBlockRadius/);
+        assert.ok(cellReads < cube, `!nearbyBlocks uses getNearbyBlocks, whose cell reads ${cellReads} are inside the reach and not the view-distance cube ${cube}`);
+        const missing = Array.from({ length: 24 }, () => null);
+        assert.throws(() => getNearbyBlockTypes({
+            registry,
+            entity: { position: new Vec3(8, feetY, 8), eyeHeight },
+            world: { getColumns() { return [{ chunkX: 0, chunkZ: 0, column: { minY, sections: missing } }]; } },
+        }), /not loaded/);
+        assert.throws(() => getNearbyBlockTypes({ registry, entity: { position: new Vec3(8, feetY, 8), eyeHeight } }), /getColumns/);
         const { EventEmitter } = require('events');
         const client = new EventEmitter();
         const gameBot = {
