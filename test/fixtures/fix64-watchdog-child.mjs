@@ -2,7 +2,7 @@
 // forever on the main thread (argv[2] === 'spin') or stays healthy and exits 0 after a few armed beat periods.
 import { EventEmitter } from 'node:events';
 import { startMainThreadWatchdog } from '../../src/utils/main_thread_watchdog.js';
-import { startEventLoopStallGuard, pushStallPhase, stallPollIntervalMsForThreshold } from '../../src/utils/event_loop_guard.js';
+import { startEventLoopStallGuard, pushStallPhase, watchdogBeatPeriodMs } from '../../src/utils/event_loop_guard.js';
 
 const mode = process.argv[2];
 const gapMs = Number(process.argv[3]);
@@ -18,7 +18,7 @@ setTimeout(() => {
     if (mode === 'spin') {
         setImmediate(function spinForever() { for (;;) { /* never yields */ } });
     } else {
-        const limit = bot.__eventLoopStallThresholdMs + stallPollIntervalMsForThreshold(bot.__eventLoopStallThresholdMs);
-        setTimeout(() => process.exit(0), 3 * limit);
+        const poll = watchdogBeatPeriodMs();
+        setTimeout(() => process.exit(0), 3 * poll);
     }
 }, gapMs);

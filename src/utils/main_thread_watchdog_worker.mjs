@@ -45,7 +45,7 @@ for (;;) {
     const phaseStr = evidence.phases.length ? evidence.phases.join(' <- ') : '(no phase)';
     const call = currentCall();
     const codeStr = code === null ? 'no staged code published' : `${code.label} (${code.source.length} chars, staged ${code.at}; source in ${evidencePath})`;
-    writeSync(2, `[watchdog] MAIN THREAD BLOCKED: no heartbeat for ${Math.round(silent)}ms (limit ${limit}ms = learned keep_alive gap + beat period); `
+    writeSync(2, `[watchdog] MAIN THREAD BLOCKED: no heartbeat for ${Math.round(silent)}ms (limit ${limit}ms = vanilla keep-alive kick, 15000ms × 2); `
         + `phase_stack="${phaseStr}" skill="${evidence.skill}" stack="${evidence.stack}" bot_api_call="${call.call}"${call.unread ? ` (+${call.unread} bytes not held by the slot)` : ''} code="${codeStr}" at ${new Date().toISOString()}; SIGKILL pid ${pid} so the supervisor restarts it\n`);
     // fix65: the same evidence as a file the next process's learner reads (counts the hang against the trial candidate on
     // the stack). The kill happens even if the write throws.

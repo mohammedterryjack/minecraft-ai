@@ -122,7 +122,7 @@ export class Agent {
         this.bot.on('login', () => {
             this._backendWatch = armBackendReady({ logDir: this._backendLogDir });
             console.log(this.name, 'logged in!');
-            startMainThreadWatchdog(watchdogEvidencePath(`./bots/${this.name}`));   // fix64: off-thread; the guard below arms it with the learned keep_alive gap
+            startMainThreadWatchdog(watchdogEvidencePath(`./bots/${this.name}`));   // fix64: off-thread; the guard below arms it at the keep-alive kick bound
             startEventLoopStallGuard(this.bot);
             serverProxy.login();
             

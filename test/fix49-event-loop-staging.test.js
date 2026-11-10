@@ -1,5 +1,5 @@
 /**
- * fix49: event-loop stall threshold from observed server keep_alive; Nyquist poll; phase stack on STALL.
+ * fix49: event-loop stall threshold is the keep-alive kick bound; Nyquist poll; phase stack on STALL.
  */
 import { describe, it, before, afterEach } from 'node:test';
 import assert from 'node:assert';
@@ -10,6 +10,7 @@ import {
     stallThresholdMs,
     runStallPollTickForTest,
     withStallPhase,
+    KEEP_ALIVE_KICK_MS,
 } from '../src/utils/event_loop_guard.js';
 import { collectBareApiUsedInSource } from '../src/agent/coder.js';
 
@@ -20,26 +21,33 @@ describe('fix49: server keep_alive stall threshold', () => {
         _testBot = null;
     });
 
-    it('stallThresholdMs throws until two inbound keep_alive packets are observed', () => {
+    it('stallThresholdMs is the kick bound as soon as the guard starts, before any keep_alive', () => {
         const bus = new EventEmitter();
         const bot = { _client: bus };
+        assert.throws(() => stallThresholdMs(bot), /kick bound/);
         _testBot = bot;
         startEventLoopStallGuard(bot);
-        assert.throws(() => stallThresholdMs(bot), /not learned yet/);
+        assert.strictEqual(stallThresholdMs(bot), KEEP_ALIVE_KICK_MS);
         bus.emit('keep_alive', { keepAliveId: 1 });
-        assert.throws(() => stallThresholdMs(bot), /not learned yet/);
+        assert.strictEqual(stallThresholdMs(bot), KEEP_ALIVE_KICK_MS);
     });
 
-    it('stallThresholdMs equals observed gap between keep_alive packets', async () => {
+    it('a keep_alive gap shorter than the server interval leaves the threshold at the kick bound', () => {
         const bus = new EventEmitter();
         const bot = { _client: bus };
         _testBot = bot;
-        startEventLoopStallGuard(bot);
-        bus.emit('keep_alive', { keepAliveId: 1 });
-        await new Promise((r) => setTimeout(r, 37));
-        bus.emit('keep_alive', { keepAliveId: 2 });
-        const t = stallThresholdMs(bot);
-        assert.ok(t >= 30 && t <= 55, `expected ~37ms observed gap, got ${t}`);
+        const realNow = Date.now;
+        let now = 1_000_000;
+        Date.now = () => now;
+        try {
+            startEventLoopStallGuard(bot);
+            bus.emit('keep_alive', { keepAliveId: 1 });
+            now += 37;
+            bus.emit('keep_alive', { keepAliveId: 2 });
+            assert.strictEqual(stallThresholdMs(bot), KEEP_ALIVE_KICK_MS);
+        } finally {
+            Date.now = realNow;
+        }
     });
 });
 

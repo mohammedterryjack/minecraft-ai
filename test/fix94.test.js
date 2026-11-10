@@ -180,10 +180,12 @@ describe('fix94 backend ready', () => {
 });
 
 describe('fix94 current run already Done', () => {
-    it('a latest.log with no Starting minecraft server line throws', async () => {
+    it('a latest.log with no Starting minecraft server line is the current run from offset 0', async () => {
         const dir = await mkdtemp(path.join(tmpdir(), 'fix94-nostart-'));
         await writeFile(path.join(dir, 'latest.log'), OLD_DONE);
-        assert.throws(() => armBackendReady({ logDir: dir }), /Starting minecraft server/);
+        const handle = armBackendReady({ logDir: dir });
+        const line = await handle.ready;
+        assert.match(line, /Done \(146\.414s\)!/);
         await rm(dir, { recursive: true, force: true });
     });
 

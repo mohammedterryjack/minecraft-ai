@@ -5,9 +5,20 @@
 // https://nodejs.org/api/fs.html#caveats — a directory watch is not a poll. Re-read from
 // the saved offset on every event. Arm does not start at EOF: a refusal during startup
 // can land after the server has already written Done, and skipping that line waits forever.
-// The current run begins at the last "Starting minecraft server" line in latest.log. If that
-// run has already logged Done and no "Stopping server" follows it, resolve at once (exit 75).
-// Otherwise watch from that line. A Done from an earlier run that has since stopped does not count.
+// The current run is the bytes of latest.log. Vanilla log4j2.xml (server jar, and the
+// same appender wiki.vg documents) is a RollingRandomAccessFile: fileName logs/latest.log,
+// filePattern logs/%d{yyyy-MM-dd}-%i.log.gz, with TimeBasedTriggeringPolicy and
+// OnStartupTriggeringPolicy. TimeBasedTriggeringPolicy rolls when the smallest unit in
+// that %d pattern changes (Apache Log4j, Rolling file appenders:
+// https://logging.apache.org/log4j/2.x/manual/appenders/rolling-file.html — daily, at
+// midnight of the server timezone, on the next log event). The JVM keeps running, so
+// the "Starting minecraft server" line moves into the gzip and latest.log has none:
+// the current run starts at offset 0. OnStartupTriggeringPolicy rolls because a new
+// JVM started, and that JVM's start line is in the new latest.log. A new inode (the
+// roll replaced the file) or a shrunk file resets the offset to 0. Rotated .gz files
+// are not read. The launchd job's pid is not the run: the job's script exits 0 when
+// the screen session already exists, and the pid launchd reports is the screen
+// process.
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -17,15 +28,14 @@ export const STOPPING_MARK = 'Stopping server';
 // The first line of a server run, e.g. [12:04:00] [Server thread/INFO]: Starting minecraft server version 1.21.4
 export const START_MARK = 'Starting minecraft server';
 
-// Byte offset of the last START_MARK line. The line is located in the log text; the offset is
-// that line's start, not a fixed tail size.
+// Byte offset of the current run inside latest.log. A start line is a run boundary.
+// No start line means TimeBasedTriggeringPolicy already rolled that line into the dated
+// gzip while the JVM kept running, so the current run is the whole file.
 export function offsetOfCurrentRun(buf) {
     if (!Buffer.isBuffer(buf)) throw new Error('[fix94] latest.log bytes required');
     const text = buf.toString('utf8');
     const at = text.lastIndexOf(START_MARK);
-    if (at < 0) {
-        throw new Error(`[fix94] latest.log has no "${START_MARK}" line; cannot locate the current server run`);
-    }
+    if (at < 0) return 0;
     const newlineAt = text.lastIndexOf('\n', at);
     const lineStart = newlineAt < 0 ? 0 : newlineAt + 1;
     return Buffer.byteLength(text.slice(0, lineStart));
@@ -132,6 +142,8 @@ export function armBackendReady({ logDir }) {
         if (settled) return;
         const st = stat();
         if (!st) return;
+        // Log4j's roll replaces latest.log (new inode) or the file shrinks under the saved offset.
+        // Either one is a new file boundary: read from the start.
         if (ino === null || st.ino !== ino || st.size < offset) {
             ino = st.ino;
             offset = 0;
