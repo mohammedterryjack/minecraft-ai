@@ -86,22 +86,41 @@ function createMockBot() {
     const mockRegistry = {
         itemsByName: { oak_log: { id: 1 }, cobblestone: { id: 2 }, stone_pickaxe: { id: 3 }, iron_pickaxe: { id: 4 } },
         blocksByName: { oak_log: { id: 1 }, cobblestone: { id: 2 }, crafting_table: { id: 58 }, stone: { id: 3 } },
-        blocksByStateId: { [stoneStateId]: { name: 'stone', metadata: 0 } },
+        blocksByStateId: { [stoneStateId]: { name: 'stone', metadata: 0, boundingBox: 'block', transparent: false } },
         entitiesByName: { cow: { id: 92 }, pig: { id: 90 } },
     };
     // Login (play) grants viewDistance in chunks. observe() reads it; the client settings value is not a grant.
-    // minY and height are the mock world's own bounds. The standing chunk is loaded, so nearby blocks can confirm cells.
-    const game = { minY: -64, height: 384, maxHealth: 20, maxFood: 20, serverViewDistance: 10 };
+    // The view square shares one stone section and one air section. The eye stands in the air, on the stone.
+    const game = { minY: -64, height: 384, maxHealth: 20, maxFood: 20, serverViewDistance: 10, gameMode: 'survival', dimension: 'overworld' };
     const sectionCount = game.height / SECTION_HEIGHT;
     if (!Number.isInteger(sectionCount)) throw new Error('mock world height is not a whole number of sections');
-    const sections = Array.from({ length: sectionCount }, () => ({ data: { value: stoneStateId } }));
+    const eyeSection = (mockPosition.y - game.minY) >> 4;
+    const stoneSection = { palette: [stoneStateId], data: { value: stoneStateId } };
+    const airSection = { palette: [0], data: { value: 0 } };
+    const stoodX = Math.floor(mockPosition.x / CHUNK_WIDTH);
+    const stoodZ = Math.floor(mockPosition.z / CHUNK_WIDTH);
+    const columns = [];
+    for (let dz = -game.serverViewDistance; dz <= game.serverViewDistance; dz++) {
+        for (let dx = -game.serverViewDistance; dx <= game.serverViewDistance; dx++) {
+            columns.push({
+                chunkX: stoodX + dx,
+                chunkZ: stoodZ + dz,
+                column: { minY: game.minY, sections: Array.from({ length: sectionCount }, (_, si) => (si < eyeSection ? stoneSection : airSection)) },
+            });
+        }
+    }
     const mockWorld = {
         getBiome: () => ({ name: 'forest' }),
-        getColumns: () => [{
-            chunkX: Math.floor(mockPosition.x / CHUNK_WIDTH),
-            chunkZ: Math.floor(mockPosition.z / CHUNK_WIDTH),
-            column: { minY: game.minY, sections },
-        }],
+        getColumns: () => columns,
+        raycast(from, dir, range) {
+            for (let t = 0; t <= range + 0.05; t += 0.05) {
+                const x = Math.floor(from.x + dir.x * t);
+                const y = Math.floor(from.y + dir.y * t);
+                const z = Math.floor(from.z + dir.z * t);
+                if (y < mockPosition.y) return { position: { x, y, z } };
+            }
+            return null;
+        },
     };
     
     return {

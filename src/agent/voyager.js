@@ -3150,6 +3150,13 @@ Use only c; no other globals.`;
         const usedSlots = bot.inventory.items().length;
         const totalSlots = 36;
         const emptySlots = bot.inventory.emptySlotCount();
+        const seen = world.getNearbyBlocks(bot);
+        const nearbyBlocks = [];
+        const perceivedAt = {};
+        for (const b of seen) {
+            if (!nearbyBlocks.includes(b.name)) nearbyBlocks.push(b.name);
+            perceivedAt[b.name] = { x: b.x, y: b.y, z: b.z };
+        }
         return {
             position: `${p.x.toFixed(0)}, ${p.y.toFixed(0)}, ${p.z.toFixed(0)}`,
             distance_to_town: dTown,
@@ -3183,7 +3190,8 @@ Use only c; no other globals.`;
                 legs: bot.inventory.slots[7] ? bot.inventory.slots[7].name : 'empty',
                 feet: bot.inventory.slots[8] ? bot.inventory.slots[8].name : 'empty',
             },
-            nearby_blocks: world.getNearbyBlockTypes(bot),
+            nearby_blocks: nearbyBlocks,
+            perceived_at: perceivedAt,
             nearby_entities: world.getNearbyEntityTypes(bot),
             known_chests: this._getChestFacts(),
             threats: this._threats(),
@@ -3966,7 +3974,7 @@ Use only c; no other globals.`;
         const bot = this.agent.bot;
         if (!Array.isArray(state.nearby_blocks)) throw new Error('[fix81] _obtainPlanner: state.nearby_blocks (array) required');
         if (typeof bot.recipesAll !== 'function') throw new Error('[fix81] _obtainPlanner: bot.recipesAll required');
-        const near = new Set(state.nearby_blocks), memo = new Map();
+        const near = new Set(state.nearby_blocks), memo = new Map(), reached = new Map();
         // fix100: learned smelt edges are read once. plan() calls smeltInputs on every node; scanning goalStats
         // there made a hunger serve walk the whole history 20k times (12.5s at 1080 keys, 76s at 5000, Node 20).
         // The edges do not change during one synchronous plan, same as sourceMemo's game data.
@@ -3974,6 +3982,15 @@ Use only c; no other globals.`;
         // fix100: _edgeSuccess -> _resolveGoal -> countGoal re-reads minecraft-data and re-runs the goal regex on every
         // node. Recipe edges and the registry do not change during one synchronous plan.
         const edgeMemo = new Map();
+        // A source the bot can see is knowledge (nearby_blocks). Whether that block can be walked to is one
+        // pathfinder search of the perceived position, not membership of the set.
+        const reachableBlock = (block) => {
+            if (reached.has(block)) return reached.get(block);
+            const at = state.perceived_at && state.perceived_at[block];
+            const ok = at ? world.pathToBlock(bot, at).status === 'success' : false;
+            reached.set(block, ok);
+            return ok;
+        };
         return obtainPlanner({
             registry: bot.registry,
             recipesOf: id => bot.recipesAll(id, null, true),
@@ -3981,7 +3998,7 @@ Use only c; no other globals.`;
                 if (!memo.has(item)) memo.set(item, src.some(b => near.has(b)) || this._producers(item).length > 0);
                 return memo.get(item);
             },
-            present: block => near.has(block),
+            present: reachableBlock,
             proven: item => Object.hasOwn(this.progress.recipeEdges, item) && this.progress.recipeEdges[item].status === 'proven',
             edgeSuccess: (item, verb) => {
                 let byVerb = edgeMemo.get(item);
@@ -4297,17 +4314,24 @@ Use only c; no other globals.`;
         if (!pre.steps.length) {
             // fix87: a raw resource's game-data plan is "collect it from its source block", with nothing else missing
             // (a log drops by hand). That used to return null, so "no log in range" never became a reach need.
-            // A source block that is already observed nearby is a different failure: do not invent a reach need for it.
+            // A source the pathfinder can reach is a different failure: do not invent a reach need for it.
+            // Seeing the block is not that. Each seen source is one getPathTo of its perceived position.
             if (pre.how === 'collect') {
                 if (!Array.isArray(state.nearby_blocks)) throw new Error('[fix87] _failureNeeds: state.nearby_blocks required');
                 const src = this._obtainPlanner(state).sources(goal.item);
                 const near = new Set(state.nearby_blocks);
-                const missing = src.filter(b => !near.has(b));
-                if (src.length > 0 && missing.length === src.length) {
+                const usable = [];
+                for (const b of src) {
+                    if (!near.has(b)) continue;
+                    const at = state.perceived_at && state.perceived_at[b];
+                    if (!at) throw new Error(`[fix97] ${b} is perceived but has no position. Reachability is pathToBlock of that block, not membership of nearby_blocks.`);
+                    if (world.pathToBlock(this.agent.bot, at).status === 'success') usable.push(b);
+                }
+                if (src.length > 0 && usable.length === 0) {
                     const blocksByName = this.agent.bot.registry.blocksByName;
-                    const need = reachNeedForBlocks(blocksByName, missing, goal.count);
-                    if (need === null) throw new Error(`[fix87] LOUD: source blocks of ${goal.item} (${missing.join(', ')}) are not blocks in the game data`);
-                    console.error(`!!! [fix87] LOUD: "${task}": no source block within range (${missing.join(', ')}); reach need`);
+                    const need = reachNeedForBlocks(blocksByName, src, goal.count);
+                    if (need === null) throw new Error(`[fix87] LOUD: source blocks of ${goal.item} (${src.join(', ')}) are not blocks in the game data`);
+                    console.error(`!!! [fix87] LOUD: "${task}": no source block the pathfinder can reach (${src.join(', ')}); reach need`);
                     return [this._checkNeed(need, 'no source block in range')];
                 }
             }
@@ -5746,7 +5770,15 @@ Use only c; no other globals.`;
                     return false;
                 }
                 const ranked = [...pool].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-                const reach = `reach ${ranked[0]}`;
+                const chosen = ranked[0];
+                const at = state.perceived_at && state.perceived_at[chosen];
+                if (!at) throw new Error(`[fix97] reach ${chosen} has no perceived position. The pathfinder decides reachability of that block; nearby_blocks does not.`);
+                const path = world.pathToBlock(this.agent.bot, at);
+                if (path.status !== 'success') {
+                    console.log(`[psn] decompose skipped for "${task}": pathfinder status ${path.status} for ${chosen}`);
+                    return false;
+                }
+                const reach = `reach ${chosen}`;
                 if (reach !== task) subs.push(reach);
             } else {
                 for (const step of pre.plan) if (step !== task && !subs.includes(step)) subs.push(step);
@@ -6689,7 +6721,7 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         const callers = parentsOf(e.name, this._graph());
         const usedBuiltIn = builtInsCalled(getBareAPI().sigs, e.code);
         const apiList = this.unifiedAPIList(relevantSkills, usedBuiltIn);
-        const system = `You repair ONE skill in a Minecraft mineflayer skill library (PSN-style targeted fix). Return a single \`\`\`javascript code block containing ONLY the fixed function, with the SAME name and a compatible signature. First line inside the block: // DESCRIPTION: <one sentence>. Every loop must check bot.interrupt_code. If something still cannot be done, log(bot, 'FAILED: <reason>') and return a falsy value; no silent fallbacks. findBlock/findBlocks/nearestEntity/bot.entities/blockAt results can be null or empty: always null-check them before reading .position/.x or calling methods on them. bot.findBlocks(options): matching is a block id, an array of block ids, or a function; maxDistance and count are finite numbers. bot.findBlock(options) returns one block and does not take count; pass matching and maxDistance. getNearestBlocks(bot, block_types, distance, count): block_types is a block name or an array of names (null lists every block id); distance and count are finite numbers and are required. A list of names is not a distance. getNearbyBlockTypes(bot) lists blocks within the pathfinder's block reach; it does not take a radius. Call AVAILABLE FUNCTIONS by name. Do not paste their source into this function. If this function is too large to fix as one piece, say so in the description and keep the body a composition of the listed skills.
+        const system = `You repair ONE skill in a Minecraft mineflayer skill library (PSN-style targeted fix). Return a single \`\`\`javascript code block containing ONLY the fixed function, with the SAME name and a compatible signature. First line inside the block: // DESCRIPTION: <one sentence>. Every loop must check bot.interrupt_code. If something still cannot be done, log(bot, 'FAILED: <reason>') and return a falsy value; no silent fallbacks. findBlock/findBlocks/nearestEntity/bot.entities/blockAt results can be null or empty: always null-check them before reading .position/.x or calling methods on them. bot.findBlocks(options): matching is a block id, an array of block ids, or a function; maxDistance and count are finite numbers. bot.findBlock(options) returns one block and does not take count; pass matching and maxDistance. getNearestBlocks(bot, block_types, distance, count): block_types is a block name or an array of names (null lists every block id); distance and count are finite numbers and are required. A list of names is not a distance. getNearbyBlockTypes(bot) lists blocks the bot can see (loaded, inside the server view distance, a face open to air or another non-occluding block, confirmed by bot.world.raycast). It does not take a radius. Call AVAILABLE FUNCTIONS by name. Do not paste their source into this function. If this function is too large to fix as one piece, say so in the description and keep the body a composition of the listed skills.
 
 AVAILABLE FUNCTIONS (call by bare name, e.g. goToPosition(bot, x, y, z) - do NOT use skills.* or world.* prefix):
 ${apiList}
@@ -6974,7 +7006,7 @@ Each function must:
 - Have a compatible signature
 - Be preceded by // DESCRIPTION: <one sentence>
 
-Every loop must check bot.interrupt_code. If something cannot be done, log(bot, 'FAILED: <reason>') and return a falsy value; no silent fallbacks. findBlock/findBlocks/nearestEntity/bot.entities/blockAt results can be null or empty: always null-check them. bot.findBlocks(options): matching is a block id, an array of block ids, or a function; maxDistance and count are finite numbers. bot.findBlock(options) returns one block and does not take count; pass matching and maxDistance. getNearestBlocks(bot, block_types, distance, count): block_types is a block name or an array of names (null lists every block id); distance and count are finite numbers and are required. A list of names is not a distance. getNearbyBlockTypes(bot) lists blocks within the pathfinder's block reach; it does not take a radius.
+Every loop must check bot.interrupt_code. If something cannot be done, log(bot, 'FAILED: <reason>') and return a falsy value; no silent fallbacks. findBlock/findBlocks/nearestEntity/bot.entities/blockAt results can be null or empty: always null-check them. bot.findBlocks(options): matching is a block id, an array of block ids, or a function; maxDistance and count are finite numbers. bot.findBlock(options) returns one block and does not take count; pass matching and maxDistance. getNearestBlocks(bot, block_types, distance, count): block_types is a block name or an array of names (null lists every block id); distance and count are finite numbers and are required. A list of names is not a distance. getNearbyBlockTypes(bot) lists blocks the bot can see (loaded, inside the server view distance, a face open to air or another non-occluding block, confirmed by bot.world.raycast). It does not take a radius.
 Fix the child's own logic and how/when the caller uses it. No top-level call, no extra functions.
 
 AVAILABLE FUNCTIONS (call by bare name, e.g. goToPosition(bot, x, y, z) - do NOT use skills.* or world.* prefix):
@@ -7391,7 +7423,7 @@ IMPORTANT: All functions use bare names. Do NOT write skills.goToBlock or skills
 COMPOSE: build your function out of these skills (they can take arguments). Your new skill may take extra parameters with defaults, e.g. \`async function makeIronTools(bot, count = 1)\`. Do not create call cycles between skills, and do not call a skill from inside itself with the same parameters.${this.sharedHints?.length ? `
 SHARED CODE: these fragments are repeated in several skills; if you need this logic, put it in its own small reusable async function skill (named, with parameters) and call it, instead of inlining it again:
 ${this.sharedHints.map(h => '// used in ' + h.skills.join(', ') + '\n' + h.fragment).join('\n')}` : ''}
-Interrupts: the bot may be interrupted at any time (danger, getting stuck, a player talking). Every loop must start with \`if (bot.interrupt_code) return;\` and you must return immediately after any await when bot.interrupt_code is true. Every async function must contain an await. Never catch an error and keep looping; no unbounded loops (always cap attempts). There is no setTimeout/setInterval in scope; to wait use \`await sleep(ms)\`. findBlock/findBlocks/nearestEntity/bot.entities/blockAt results can be null or empty: always null-check them before reading .position/.x or calling methods on them. bot.findBlocks(options): matching is a block id, an array of block ids, or a function; maxDistance and count are finite numbers. bot.findBlock(options) returns one block and does not take count; pass matching and maxDistance. getNearestBlocks(bot, block_types, distance, count): block_types is a block name or an array of names (null lists every block id); distance and count are finite numbers and are required. A list of names is not a distance. getNearbyBlockTypes(bot) lists blocks within the pathfinder's block reach; it does not take a radius.`;
+Interrupts: the bot may be interrupted at any time (danger, getting stuck, a player talking). Every loop must start with \`if (bot.interrupt_code) return;\` and you must return immediately after any await when bot.interrupt_code is true. Every async function must contain an await. Never catch an error and keep looping; no unbounded loops (always cap attempts). There is no setTimeout/setInterval in scope; to wait use \`await sleep(ms)\`. findBlock/findBlocks/nearestEntity/bot.entities/blockAt results can be null or empty: always null-check them before reading .position/.x or calling methods on them. bot.findBlocks(options): matching is a block id, an array of block ids, or a function; maxDistance and count are finite numbers. bot.findBlock(options) returns one block and does not take count; pass matching and maxDistance. getNearestBlocks(bot, block_types, distance, count): block_types is a block name or an array of names (null lists every block id); distance and count are finite numbers and are required. A list of names is not a distance. getNearbyBlockTypes(bot) lists blocks the bot can see (loaded, inside the server view distance, a face open to air or another non-occluding block, confirmed by bot.world.raycast). It does not take a radius.`;
         // only `related` are shown as context; the library is already in the execution scope, so its source is not copied into the prompt
         // fix97: the comment above said the library is already in scope and its source is not copied. The next line pasted
         // the top 3 bodies anyway, so each rewrite was trained on (and returned) a longer function. Signature, description
@@ -7980,7 +8012,7 @@ Voyager.SEEDED_PRIMITIVES = [
     if (block.name === 'air' || block.name === 'water' || block.name === 'lava') {
         log(bot, \`No solid block at \${x}, \${y}, \${z}.\`); return false;
     }
-    if (bot.entity.position.distanceTo(block.position) > 4.5) {
+    if (!withinInteractionRange(bot, block.position)) {
         await goToPosition(bot, block.position.x, block.position.y, block.position.z, 4);
     }
     if (bot.game.gameMode !== 'creative') {

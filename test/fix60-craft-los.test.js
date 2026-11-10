@@ -42,6 +42,7 @@ function mockBot(world, feet, pathfinder) {
     Object.assign(pathfinder, { isMoving: () => false, isMining: () => false, isBuilding: () => false });
     return Object.assign(new EventEmitter(), {
         registry, world, output: '', interrupt_code: false,
+        game: { gameMode: 'survival' },
         entity: { position: feet.clone(), eyeHeight: 1.62 },
         inventory: { items: () => [] },
         canSeeBlock(block) {   // mineflayer's own implementation (blocks.js)

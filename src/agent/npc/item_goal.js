@@ -314,9 +314,12 @@ export class ItemGoal {
         let next = next_info.node;
         let quantity = next_info.quantity;
 
-        // Prevent unnecessary attempts to obtain blocks that are not nearby
-        if (next.type === 'block' && !world.getNearbyBlockTypes(this.agent.bot).includes(next.source) ||
-                next.type === 'hunt' && !world.getNearbyEntityTypes(this.agent.bot).includes(next.source)) {
+        // A block target is reachable only when a pathfinder search of that block succeeds. The perceived
+        // set says the bot can see a block of this name; it is not the reachability answer.
+        const seenAt = next.type === 'block' ? world.perceivedPosition(this.agent.bot, next.source) : null;
+        const blockUnreachable = next.type === 'block' && !(seenAt && world.pathToBlock(this.agent.bot, seenAt).status === 'success');
+        const huntUnseen = next.type === 'hunt' && !world.getNearbyEntityTypes(this.agent.bot).includes(next.source);
+        if (blockUnreachable || huntUnseen) {
             next.fails += 1;
 
             // If the bot has failed to obtain the block before, explore
