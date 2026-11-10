@@ -2674,7 +2674,7 @@ Use only c; no other globals.`;
         if (!bot._client) return;
         const model = this._ensureRestThreat();
         if (model.installed === true) return;
-        installProtocolFacts(bot, minecraftData(VERSION));
+        installProtocolFacts(bot, minecraftData(VERSION), model);
         model.installed = true;
     }
     _playableNamed(name) {

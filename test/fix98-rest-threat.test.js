@@ -11,8 +11,8 @@ import { Vec3 } from 'vec3';
 import { VitalsModel } from '../src/agent/vitals_model.js';
 import { CONTEXT_FULL } from '../src/models/ollama.js';
 import {
-    RestThreat, emptyRestStore, readRestStatistic, registryIds, clientCommandSpec,
-    installProtocolFacts, restFacts, bedItemNames, REST_STATISTIC,
+    RestThreat, emptyRestStore, readRestStatistic, restIdsFromData, learnRestId, clientCommandSpec,
+    installProtocolFacts, restFacts, bedItemNames, damageTypesFromData, REST_STATISTIC,
 } from '../src/agent/rest_threat.js';
 import minecraftData from 'minecraft-data';
 import { _setVersionForTest as loadMcData } from '../src/utils/mcdata.js';
@@ -94,6 +94,34 @@ describe('fix98: hunger and threat share one slot', () => {
     });
 });
 
+describe('fix98: the first sourced hurt raises rest', () => {
+    it('one hurt correlated with time_since_rest raises rest to that damage', () => {
+        const v = mkV();
+        v.restThreat.installed = true;
+        v.agent.bot.food = 20;
+        v.agent.bot.health = 20;
+        v.agent.bot.restSince = 40;
+        v.agent.bot.oxygenLevel = 300;
+        v.agent.bot.__fix98Hurt = { seq: 0, events: [] };
+        v.agent.bot.__fix98Damage = { seq: 0, events: [] };
+        assert.strictEqual(v.restThreat.restCandidate(v.agent.bot, 1, 0.01), null);
+        v.restThreat.lastHp = 20;
+        v.restThreat.seenSeq = 0;
+        v.agent.bot.__fix98Hurt = { seq: 1, events: [{ seq: 1, name: 'from-the-event' }] };
+        v.restThreat.onSample(v.agent.bot, 16);
+        v.agent.bot.health = 16;
+        const rest = v.restThreat.restCandidate(v.agent.bot, 1, 0.01);
+        assert.ok(rest);
+        assert.strictEqual(rest.value, 4);
+        assert.match(rest.by, /first sourced hurt/);
+        assert.strictEqual(v.restThreat.s.harmFloor, 40);
+        const candidates = v._urgentCandidates(v._hungerServeState());
+        assert.strictEqual(candidates.some(c => c.id === 'hunger'), false);
+        const winner = candidates.reduce((a, b) => b.value > a.value ? b : a);
+        assert.strictEqual(winner.id, 'rest');
+    });
+});
+
 describe('fix98: a threat interrupt is not blamed', () => {
     it('records kind threat and does not touch the skill or the goal backoff', () => {
         const v = mkV();
@@ -128,15 +156,28 @@ describe('fix98: a threat interrupt is not blamed', () => {
 
 describe('fix98: statistics packet', () => {
     it('a reply with no minecraft:time_since_rest throws and no counter is invented', () => {
-        const ids = registryIds();
+        const mc = minecraftData(VER);
+        assert.strictEqual(restIdsFromData(mc, null), null);
+        const ids = learnRestId({ entries: [
+            { categoryId: 2, statisticId: 9, value: 11 },
+            { categoryId: 1, statisticId: 3, value: 7 },
+        ] }, 11);
+        assert.deepStrictEqual(ids, { categoryId: 2, statisticId: 9 });
         assert.throws(
-            () => readRestStatistic({ entries: [{ categoryId: ids.categoryId, statisticId: ids.statisticId === 0 ? 1 : 0, value: 3 }] }),
+            () => readRestStatistic({ entries: [{ categoryId: 1, statisticId: 3, value: 7 }] }, ids),
             new RegExp(REST_STATISTIC),
+        );
+        assert.throws(
+            () => learnRestId({ entries: [
+                { categoryId: 2, statisticId: 9, value: 11 },
+                { categoryId: 1, statisticId: 3, value: 11 },
+            ] }, 11),
+            /matched/,
         );
         const model = new RestThreat(emptyRestStore());
         assert.strictEqual(Object.hasOwn(model, 'ticks'), false);
         assert.strictEqual(model.s.harmFloor, null);
-        const value = readRestStatistic({ entries: [{ categoryId: ids.categoryId, statisticId: ids.statisticId, value: 11 }] });
+        const value = readRestStatistic({ entries: [{ categoryId: ids.categoryId, statisticId: ids.statisticId, value: 11 }] }, ids);
         assert.strictEqual(value, 11);
     });
 
@@ -159,21 +200,52 @@ describe('fix98: statistics packet', () => {
                 on(name, fn) { bot._client.fn = fn; bot._client.event = name; },
             },
         };
+        bot.__fix98StatObserved = { name: REST_STATISTIC, value: 42 };
         installProtocolFacts(bot, minecraftData(VER));
         assert.strictEqual(packets.length, 1);
         assert.strictEqual(packets[0].name, 'client_command');
         assert.throws(() => bot._client.fn({ entries: [] }), new RegExp(REST_STATISTIC));
-        const ids = registryIds();
-        bot._client.fn({ entries: [{ categoryId: ids.categoryId, statisticId: ids.statisticId, value: 42 }] });
+        bot._client.fn({ entries: [{ categoryId: 2, statisticId: 9, value: 42 }] });
         assert.strictEqual(bot.restSince, 42);
+        assert.deepStrictEqual(bot.__fix98StatIds, { categoryId: 2, statisticId: 9 });
     });
 
-    it('a health loss with no entityHurt throws instead of inventing an attacker', () => {
+    it('starvation at food 0 with no entityHurt is non-entity damage and is recorded', () => {
         const model = new RestThreat(emptyRestStore());
         model.installed = true;
         model.lastHp = 20;
-        const bot = { restSince: 4, __fix98Hurt: { seq: 0, events: [] }, hurtBy: null };
-        assert.throws(() => model.onSample(bot, 12), /entityHurt was not delivered/);
+        const types = damageTypesFromData(minecraftData(VER));
+        const starve = Object.values(types).find(t => t.name.endsWith('starve'));
+        assert.ok(starve, 'damage-type registry names starvation');
+        const bot = {
+            food: 0,
+            oxygenLevel: 300,
+            restSince: 9,
+            entity: { id: 7 },
+            __fix98Hurt: { seq: 0, events: [] },
+            __fix98Damage: { seq: 0, events: [] },
+            __fix98DamageTypes: types,
+            hurtBy: 'must-not-stick',
+        };
+        assert.doesNotThrow(() => model.onSample(bot, 19));
+        assert.strictEqual(model.s.nonEntity.n, 1);
+        assert.strictEqual(model.s.nonEntity.sum, 1);
+        assert.strictEqual(model.s.nonEntity.last.entity, false);
+        assert.strictEqual(model.s.nonEntity.last.food, 0);
+        assert.strictEqual(model.s.nonEntity.last.oxygen, 300);
+        assert.strictEqual(model.s.nonEntity.last.type, null);
+        assert.strictEqual(model.s.pending, null);
+        assert.strictEqual(bot.hurtBy, null);
+        const starveId = Number(Object.entries(types).find(([, t]) => t === starve)[0]);
+        model.seenDamageSeq = 0;
+        bot.__fix98Damage = { seq: 1, events: [{ seq: 1, entityId: 7, sourceTypeId: starveId, sourceCauseId: 0, sourceDirectId: 0 }] };
+        assert.doesNotThrow(() => model.onSample(bot, 18));
+        assert.strictEqual(model.s.nonEntity.n, 2);
+        assert.strictEqual(model.s.nonEntity.last.type, starve.name);
+        assert.strictEqual(model.s.nonEntity.last.food, 0);
+        assert.strictEqual(model.s.nonEntity.last.entity, false);
+        bot.__fix98Damage = { seq: 2, events: [{ seq: 2, entityId: 7, sourceTypeId: -1, sourceCauseId: 0, sourceDirectId: 0 }] };
+        assert.throws(() => model.onSample(bot, 17), /damage_type registry/);
     });
 });
 

@@ -1,153 +1,134 @@
 // fix98: rest need and threat interrupt.
 // The rest statistic is minecraft:time_since_rest on the statistics packet (wiki Statistics).
-// The attacker is the entityHurt source (mineflayer damage_event). A health loss with no
-// entityHurt throws. A delivered event whose source id is absent is non-entity damage:
-// it is not an attacker and it is not invented from a nearby entity.
-// Protocol action ids and packet names come from the minecraft-data schema. Statistic ids
-// are the vanilla registry order (protocol id = index of the name). No tick count, no
+// Its protocol id comes from the server registry or from minecraft-data. Registry order is not
+// an id. When neither source has the mapping, request_stats must be proved against a value of
+// this statistic observed at the same moment; a miss or an ambiguous match throws.
+// A health loss with no entityHurt is non-entity damage. It is classified from the damage_event
+// packet and the damage-type registry (minecraft-data login registry, or the registry the server
+// sends on login), plus food and oxygen. It is recorded. It does not throw. A damage_event whose
+// own fields or type id are missing or malformed throws. An entityHurt with no source is not an
+// attacker and is not invented from a nearby entity.
+// Protocol action ids and packet names come from the minecraft-data schema. No tick count, no
 // distance, no mob name, no bed colour.
 
 export const REST_STATISTIC = 'minecraft:time_since_rest';
-const CUSTOM_CATEGORY = 'minecraft:custom';
+const DAMAGE_REGISTRY = 'minecraft:damage_type';
 
-// StatType registration order for the live version (protocol category id = index).
-const STAT_TYPES = [
-    'minecraft:mined',
-    'minecraft:crafted',
-    'minecraft:used',
-    'minecraft:broken',
-    'minecraft:picked_up',
-    'minecraft:dropped',
-    'minecraft:killed',
-    'minecraft:killed_by',
-    'minecraft:custom',
-];
-
-// Custom stat registration order for the live version (protocol statistic id = index).
-const CUSTOM_STATS = [
-    'minecraft:leave_game',
-    'minecraft:play_time',
-    'minecraft:total_world_time',
-    'minecraft:time_since_death',
-    'minecraft:time_since_rest',
-    'minecraft:sneak_time',
-    'minecraft:walk_one_cm',
-    'minecraft:crouch_one_cm',
-    'minecraft:sprint_one_cm',
-    'minecraft:walk_on_water_one_cm',
-    'minecraft:fall_one_cm',
-    'minecraft:climb_one_cm',
-    'minecraft:fly_one_cm',
-    'minecraft:walk_under_water_one_cm',
-    'minecraft:minecart_one_cm',
-    'minecraft:boat_one_cm',
-    'minecraft:pig_one_cm',
-    'minecraft:horse_one_cm',
-    'minecraft:aviate_one_cm',
-    'minecraft:swim_one_cm',
-    'minecraft:strider_one_cm',
-    'minecraft:jump',
-    'minecraft:drop',
-    'minecraft:damage_dealt',
-    'minecraft:damage_dealt_absorbed',
-    'minecraft:damage_dealt_resisted',
-    'minecraft:damage_taken',
-    'minecraft:damage_blocked_by_shield',
-    'minecraft:damage_absorbed',
-    'minecraft:damage_resisted',
-    'minecraft:deaths',
-    'minecraft:mob_kills',
-    'minecraft:animals_bred',
-    'minecraft:player_kills',
-    'minecraft:fish_caught',
-    'minecraft:talked_to_villager',
-    'minecraft:traded_with_villager',
-    'minecraft:eat_cake_slice',
-    'minecraft:fill_cauldron',
-    'minecraft:use_cauldron',
-    'minecraft:clean_armor',
-    'minecraft:clean_banner',
-    'minecraft:clean_shulker_box',
-    'minecraft:interact_with_brewingstand',
-    'minecraft:interact_with_beacon',
-    'minecraft:inspect_dropper',
-    'minecraft:inspect_hopper',
-    'minecraft:inspect_dispenser',
-    'minecraft:play_noteblock',
-    'minecraft:tune_noteblock',
-    'minecraft:pot_flower',
-    'minecraft:trigger_trapped_chest',
-    'minecraft:open_enderchest',
-    'minecraft:enchant_item',
-    'minecraft:play_record',
-    'minecraft:interact_with_furnace',
-    'minecraft:interact_with_crafting_table',
-    'minecraft:open_chest',
-    'minecraft:sleep_in_bed',
-    'minecraft:open_shulker_box',
-    'minecraft:open_barrel',
-    'minecraft:interact_with_blast_furnace',
-    'minecraft:interact_with_smoker',
-    'minecraft:interact_with_lectern',
-    'minecraft:interact_with_campfire',
-    'minecraft:interact_with_cartography_table',
-    'minecraft:interact_with_loom',
-    'minecraft:interact_with_stonecutter',
-    'minecraft:bell_ring',
-    'minecraft:raid_trigger',
-    'minecraft:raid_win',
-    'minecraft:interact_with_anvil',
-    'minecraft:interact_with_grindstone',
-    'minecraft:target_hit',
-    'minecraft:interact_with_smithing_table',
-];
-
-function indexOfName(names, wanted) {
-    const i = names.indexOf(wanted);
-    if (i < 0) throw new Error(`[fix98] registry has no ${wanted}`);
-    return i;
+function unwrapNbt(node) {
+    if (!node || typeof node !== 'object') return node;
+    if (Array.isArray(node)) return node;
+    if (Object.hasOwn(node, 'value') && Object.hasOwn(node, 'type') && !Object.hasOwn(node, 'name') && !Object.hasOwn(node, 'id')) {
+        return unwrapNbt(node.value);
+    }
+    return node;
 }
 
-export function registryIds() {
-    return {
-        categoryId: indexOfName(STAT_TYPES, CUSTOM_CATEGORY),
-        statisticId: indexOfName(CUSTOM_STATS, REST_STATISTIC),
-    };
+function fieldString(node, key) {
+    if (!node || typeof node !== 'object' || !Object.hasOwn(node, key)) return null;
+    const v = unwrapNbt(node[key]);
+    if (typeof v !== 'string' || v.length === 0) return null;
+    return v;
 }
 
-function categoryName(id) {
-    if (!Number.isInteger(id)) throw new Error(`[fix98] statistics categoryId is not an integer: ${JSON.stringify(id)}`);
-    if (id < 0 || id >= STAT_TYPES.length) return null;
-    return STAT_TYPES[id];
+function fieldInt(node, key) {
+    if (!node || typeof node !== 'object' || !Object.hasOwn(node, key)) return null;
+    const v = unwrapNbt(node[key]);
+    if (typeof v !== 'number' || !Number.isInteger(v)) return null;
+    return v;
 }
 
-function statName(id) {
-    if (!Number.isInteger(id)) throw new Error(`[fix98] statistics statisticId is not an integer: ${JSON.stringify(id)}`);
-    if (id < 0 || id >= CUSTOM_STATS.length) return null;
-    return CUSTOM_STATS[id];
+function walkFind(node, visit, seen) {
+    if (!node || typeof node !== 'object') return null;
+    if (seen.has(node)) return null;
+    seen.add(node);
+    const here = visit(node);
+    if (here !== null && here !== undefined) return here;
+    const kids = Array.isArray(node) ? node : Object.values(node);
+    for (const kid of kids) {
+        if (!kid || typeof kid !== 'object') continue;
+        const found = walkFind(kid, visit, seen);
+        if (found !== null && found !== undefined) return found;
+    }
+    return null;
 }
 
-function describeEntry(entry) {
-    const cat = categoryName(entry.categoryId);
-    if (cat === null) return `category ${entry.categoryId}/stat ${entry.statisticId}`;
-    if (cat !== CUSTOM_CATEGORY) return `${cat}#${entry.statisticId}`;
-    const stat = statName(entry.statisticId);
-    if (stat === null) return `${cat}#${entry.statisticId}`;
-    return `${cat}/${stat}`;
+function statIdsFromNode(node) {
+    const name = fieldString(node, 'name');
+    if (name !== REST_STATISTIC) return null;
+    const statisticId = fieldInt(node, 'statisticId');
+    const id = statisticId !== null ? statisticId : fieldInt(node, 'id');
+    const categoryId = fieldInt(node, 'categoryId');
+    const category = categoryId !== null ? categoryId : fieldInt(node, 'category');
+    if (id === null || category === null) {
+        throw new Error(`[fix98] registry entry for ${REST_STATISTIC} is missing categoryId or statisticId`);
+    }
+    return { categoryId: category, statisticId: id };
 }
 
-export function readRestStatistic(packet) {
+export function restIdsFromData(mcData, serverRegistry) {
+    if (serverRegistry !== null && serverRegistry !== undefined) {
+        const live = walkFind(serverRegistry, statIdsFromNode, new Set());
+        if (live) return live;
+    }
+    if (!mcData || typeof mcData !== 'object') throw new Error('[fix98] minecraft-data required to look up statistic ids');
+    if (mcData.stats) {
+        const fromStats = walkFind(mcData.stats, statIdsFromNode, new Set());
+        if (fromStats) return fromStats;
+    }
+    if (mcData.statistics) {
+        const fromStatistics = walkFind(mcData.statistics, statIdsFromNode, new Set());
+        if (fromStatistics) return fromStatistics;
+    }
+    if (mcData.loginPacket) return walkFind(mcData.loginPacket, statIdsFromNode, new Set());
+    return null;
+}
+
+function assertStatEntry(entry) {
+    if (!entry || typeof entry.categoryId !== 'number' || typeof entry.statisticId !== 'number' || typeof entry.value !== 'number') {
+        throw new Error(`[fix98] statistics entry is not numeric: ${JSON.stringify(entry)}`);
+    }
+    if (!Number.isInteger(entry.categoryId) || !Number.isInteger(entry.statisticId)) {
+        throw new Error(`[fix98] statistics entry is not numeric: ${JSON.stringify(entry)}`);
+    }
+}
+
+export function learnRestId(packet, observedValue) {
+    if (!packet || !Array.isArray(packet.entries)) {
+        throw new Error(`[fix98] statistics packet has no entries; cannot prove ${REST_STATISTIC}`);
+    }
+    if (typeof observedValue !== 'number') {
+        throw new Error(`[fix98] ${REST_STATISTIC} proof needs the value observed at the same moment as request_stats`);
+    }
+    const hits = [];
+    for (const entry of packet.entries) {
+        assertStatEntry(entry);
+        if (entry.value === observedValue) hits.push(entry);
+    }
+    if (hits.length === 0) {
+        throw new Error(`[fix98] ${REST_STATISTIC} value ${observedValue} matched no statistics entry`);
+    }
+    if (hits.length !== 1) {
+        throw new Error(`[fix98] ${REST_STATISTIC} value ${observedValue} matched ${hits.length} statistics entries; refusing to guess an id`);
+    }
+    return { categoryId: hits[0].categoryId, statisticId: hits[0].statisticId };
+}
+
+function assertRestIds(ids) {
+    if (!ids || !Number.isInteger(ids.categoryId) || !Number.isInteger(ids.statisticId)) {
+        throw new Error(`[fix98] no proved id for ${REST_STATISTIC}; the server registry and minecraft-data have no mapping, and the live proof has not matched a value`);
+    }
+}
+
+export function readRestStatistic(packet, ids) {
     if (!packet || !Array.isArray(packet.entries)) {
         throw new Error(`[fix98] statistics packet has no entries; ${REST_STATISTIC} was not delivered`);
     }
-    const ids = registryIds();
+    assertRestIds(ids);
     let found = null;
     const got = [];
     for (const entry of packet.entries) {
-        if (!entry || typeof entry.categoryId !== 'number' || typeof entry.statisticId !== 'number' || typeof entry.value !== 'number') {
-            throw new Error(`[fix98] statistics entry is not numeric: ${JSON.stringify(entry)}`);
-        }
-        got.push(describeEntry(entry));
+        assertStatEntry(entry);
+        got.push(`category ${entry.categoryId}/stat ${entry.statisticId}`);
         if (entry.categoryId === ids.categoryId && entry.statisticId === ids.statisticId) {
             if (found !== null) throw new Error(`[fix98] statistics packet listed ${REST_STATISTIC} more than once`);
             found = entry.value;
@@ -160,7 +141,47 @@ export function readRestStatistic(packet) {
     return found;
 }
 
-function packetName(node, typeName) {
+function damageTypeList(root) {
+    const found = walkFind(root, node => {
+        if (!node || typeof node !== 'object' || Array.isArray(node)) return null;
+        if (!Object.hasOwn(node, DAMAGE_REGISTRY)) return null;
+        return node[DAMAGE_REGISTRY];
+    }, new Set());
+    if (found === null || found === undefined) return null;
+    const list = unwrapNbt(found);
+    if (!Array.isArray(list)) throw new Error(`[fix98] ${DAMAGE_REGISTRY} registry is malformed`);
+    return list;
+}
+
+function damageTypeMap(list) {
+    const out = {};
+    for (const entry of list) {
+        const name = fieldString(entry, 'name');
+        const id = fieldInt(entry, 'id');
+        if (name === null || id === null) throw new Error(`[fix98] ${DAMAGE_REGISTRY} entry is missing name or id: ${JSON.stringify(entry)}`);
+        if (Object.hasOwn(out, String(id))) throw new Error(`[fix98] ${DAMAGE_REGISTRY} id ${id} is listed more than once`);
+        const element = entry && entry.element ? unwrapNbt(entry.element) : null;
+        out[id] = { name, messageId: element ? fieldString(element, 'message_id') : null };
+    }
+    if (Object.keys(out).length === 0) throw new Error(`[fix98] ${DAMAGE_REGISTRY} registry has no entries`);
+    return out;
+}
+
+export function damageTypesFromData(mcData) {
+    if (!mcData || !mcData.loginPacket) throw new Error('[fix98] minecraft-data login packet required for the damage-type registry');
+    const list = damageTypeList(mcData.loginPacket);
+    if (!list) throw new Error(`[fix98] minecraft-data login packet has no ${DAMAGE_REGISTRY} registry`);
+    return damageTypeMap(list);
+}
+
+export function damageTypesFromCodec(codec) {
+    if (codec === null || codec === undefined) return null;
+    const list = damageTypeList(codec);
+    if (!list) return null;
+    return damageTypeMap(list);
+}
+
+function findPacketName(node, typeName) {
     let found = null;
     const walk = (n) => {
         if (!n || typeof n !== 'object') return;
@@ -178,6 +199,26 @@ function packetName(node, typeName) {
         }
     };
     walk(node);
+    return found;
+}
+
+function packetName(node, typeName) {
+    const found = findPacketName(node, typeName);
+    if (found === null) throw new Error(`[fix98] protocol has no packet name for ${typeName}`);
+    return found;
+}
+
+function toClientPacketName(mcData, typeName) {
+    if (!mcData || !mcData.protocol) throw new Error('[fix98] minecraft-data protocol required');
+    let found = null;
+    for (const state of ['play', 'configuration']) {
+        const dir = mcData.protocol[state];
+        if (!dir || !dir.toClient || !dir.toClient.types) continue;
+        const name = findPacketName(dir.toClient.types, typeName);
+        if (name === null) continue;
+        if (found !== null && found !== name) throw new Error(`[fix98] protocol names ${typeName} as both ${found} and ${name}`);
+        found = name;
+    }
     if (found === null) throw new Error(`[fix98] protocol has no packet name for ${typeName}`);
     return found;
 }
@@ -220,15 +261,57 @@ function sourceName(source) {
     throw new Error('[fix98] entityHurt source entity has no name; refusing to invent an attacker');
 }
 
-export function installProtocolFacts(bot, mcData) {
+function hungerAir(bot) {
+    return {
+        food: typeof bot.food === 'number' ? bot.food : null,
+        oxygen: typeof bot.oxygenLevel === 'number' ? bot.oxygenLevel : null,
+    };
+}
+
+function assertDamageEvent(packet) {
+    if (!packet || typeof packet !== 'object') throw new Error('[fix98] damage_event packet is missing');
+    for (const key of ['entityId', 'sourceTypeId', 'sourceCauseId', 'sourceDirectId']) {
+        if (!Number.isInteger(packet[key])) {
+            throw new Error(`[fix98] damage_event ${key} is missing or malformed: ${JSON.stringify(packet[key])}`);
+        }
+    }
+}
+
+export function classifyDamage(bot, packet) {
+    assertDamageEvent(packet);
+    const types = bot.__fix98DamageTypes;
+    if (!types || typeof types !== 'object') throw new Error(`[fix98] ${DAMAGE_REGISTRY} registry was not delivered`);
+    const type = types[packet.sourceTypeId];
+    if (!type || typeof type.name !== 'string' || type.name.length === 0) {
+        throw new Error(`[fix98] damage_event sourceTypeId ${packet.sourceTypeId} is not in the ${DAMAGE_REGISTRY} registry`);
+    }
+    const body = hungerAir(bot);
+    return {
+        entity: false,
+        type: type.name,
+        messageId: type.messageId,
+        food: body.food,
+        oxygen: body.oxygen,
+        sourceCauseId: packet.sourceCauseId,
+        sourceDirectId: packet.sourceDirectId,
+    };
+}
+
+export function installProtocolFacts(bot, mcData, model) {
     if (!bot || typeof bot.on !== 'function') throw new Error('[fix98] bot.on is required to receive entityHurt');
     if (!bot._client || typeof bot._client.write !== 'function' || typeof bot._client.on !== 'function') {
         throw new Error('[fix98] bot._client is required to request the statistics packet');
     }
     if (bot.__fix98Facts === true) return;
     const spec = clientCommandSpec(mcData);
+    const damagePacket = toClientPacketName(mcData, 'packet_damage_event');
+    const registryPacket = toClientPacketName(mcData, 'packet_registry_data');
     bot.hurtBy = null;
     bot.__fix98Hurt = { seq: 0, events: [] };
+    bot.__fix98Damage = { seq: 0, events: [] };
+    bot.__fix98DamageTypes = damageTypesFromData(mcData);
+    let ids = restIdsFromData(mcData, null);
+    if (model && model.s && model.s.statIds) ids = model.s.statIds;
     bot.on('entityHurt', (entity, source) => {
         if (entity !== bot.entity) return;
         const name = sourceName(source);
@@ -236,8 +319,45 @@ export function installProtocolFacts(bot, mcData) {
         bot.__fix98Hurt.events.push({ seq: bot.__fix98Hurt.seq, name });
         if (name !== null) bot.hurtBy = name;
     });
+    bot._client.on(damagePacket, (packet) => {
+        assertDamageEvent(packet);
+        if (!bot.entity || packet.entityId !== bot.entity.id) return;
+        bot.__fix98Damage.seq += 1;
+        bot.__fix98Damage.events.push({
+            seq: bot.__fix98Damage.seq,
+            entityId: packet.entityId,
+            sourceTypeId: packet.sourceTypeId,
+            sourceCauseId: packet.sourceCauseId,
+            sourceDirectId: packet.sourceDirectId,
+        });
+    });
+    bot._client.on(registryPacket, (packet) => {
+        const codec = packet && packet.codec ? packet.codec : packet;
+        const types = damageTypesFromCodec(codec);
+        if (types) bot.__fix98DamageTypes = types;
+        const live = restIdsFromData(mcData, codec);
+        if (live) {
+            ids = live;
+            bot.__fix98StatIds = live;
+            if (model && model.s) model.s.statIds = live;
+        }
+    });
     bot._client.on(spec.reply, (packet) => {
-        bot.restSince = readRestStatistic(packet);
+        const observed = bot.__fix98StatObserved;
+        if (!ids) {
+            if (!observed || observed.name !== REST_STATISTIC || typeof observed.value !== 'number') {
+                throw new Error(`[fix98] no id for ${REST_STATISTIC} in the server registry or minecraft-data. request_stats needs the value observed at the same moment to prove the id`);
+            }
+            ids = learnRestId(packet, observed.value);
+            bot.__fix98StatIds = ids;
+            if (model && model.s) model.s.statIds = ids;
+        } else if (observed && observed.name === REST_STATISTIC && typeof observed.value === 'number') {
+            const got = readRestStatistic(packet, ids);
+            if (got !== observed.value) {
+                throw new Error(`[fix98] ${REST_STATISTIC} id does not match the value observed at the same moment: packet ${got}, observed ${observed.value}`);
+            }
+        }
+        bot.restSince = readRestStatistic(packet, ids);
     });
     bot._client.write(spec.write, { [spec.field]: spec.action });
     bot.__fix98Facts = true;
@@ -276,7 +396,10 @@ export function findBedBlock(bot) {
 }
 
 export function emptyRestStore() {
-    return { hurts: {}, runs: {}, harmFloor: null, pending: null, unhandled: { n: 0, sum: 0 } };
+    return {
+        hurts: {}, runs: {}, harmFloor: null, pending: null, unhandled: { n: 0, sum: 0 },
+        nonEntity: { n: 0, sum: 0, last: null }, statIds: null,
+    };
 }
 
 function assertStore(s) {
@@ -292,6 +415,10 @@ function assertStore(s) {
     if (!s.unhandled || typeof s.unhandled.n !== 'number' || typeof s.unhandled.sum !== 'number') {
         throw new Error('[fix98] restThreat.unhandled must be {n, sum}');
     }
+    if (!s.nonEntity || typeof s.nonEntity.n !== 'number' || typeof s.nonEntity.sum !== 'number') {
+        throw new Error('[fix98] restThreat.nonEntity must be {n, sum, last}');
+    }
+    if (s.statIds !== null) assertRestIds(s.statIds);
 }
 
 export class RestThreat {
@@ -301,6 +428,7 @@ export class RestThreat {
         this.installed = false;
         this.lastHp = null;
         this.seenSeq = 0;
+        this.seenDamageSeq = 0;
     }
 
     noteSourcedHurt(name, dmg, rest) {
@@ -324,30 +452,47 @@ export class RestThreat {
         if (this.installed !== true) return;
         if (typeof hp !== 'number') throw new Error(`[fix98] sample health must be a number, got ${JSON.stringify(hp)}`);
         const box = bot.__fix98Hurt;
-        if (!box || typeof box.seq !== 'number' || !Array.isArray(box.events)) {
-            throw new Error('[fix98] entityHurt listener was not installed');
+        const hurts = box && typeof box.seq === 'number' && Array.isArray(box.events) ? box : { seq: 0, events: [] };
+        if (box && (typeof box.seq !== 'number' || !Array.isArray(box.events))) {
+            throw new Error('[fix98] entityHurt record is malformed');
+        }
+        const damage = bot.__fix98Damage;
+        const packets = damage && typeof damage.seq === 'number' && Array.isArray(damage.events) ? damage : { seq: 0, events: [] };
+        if (damage && (typeof damage.seq !== 'number' || !Array.isArray(damage.events))) {
+            throw new Error('[fix98] damage_event record is malformed');
         }
         const prev = this.lastHp;
         this.lastHp = hp;
-        if (typeof prev !== 'number') {
-            this.seenSeq = box.seq;
+        const freshHurt = hurts.events.filter(e => e.seq > this.seenSeq);
+        const freshDamage = packets.events.filter(e => e.seq > this.seenDamageSeq);
+        this.seenSeq = hurts.seq;
+        this.seenDamageSeq = packets.seq;
+        if (typeof prev !== 'number' || !(hp < prev)) {
             bot.hurtBy = this.s.pending === null ? null : this.s.pending.name;
             return;
         }
-        if (!(hp < prev)) {
-            this.seenSeq = box.seq;
-            bot.hurtBy = this.s.pending === null ? null : this.s.pending.name;
-            return;
-        }
-        const fresh = box.events.filter(e => e.seq > this.seenSeq);
-        this.seenSeq = box.seq;
-        if (fresh.length === 0) throw new Error('[fix98] entityHurt was not delivered for a health loss; refusing to invent an attacker');
-        const sourced = fresh.filter(e => e.name !== null);
+        const sourced = freshHurt.filter(e => e.name !== null);
         if (sourced.length > 0) {
             const name = sourced[sourced.length - 1].name;
             this.noteSourcedHurt(name, prev - hp, bot.restSince);
+        } else {
+            this.noteNonEntity(bot, prev - hp, freshDamage);
         }
         bot.hurtBy = this.s.pending === null ? null : this.s.pending.name;
+    }
+
+    noteNonEntity(bot, dmg, packets) {
+        if (typeof dmg !== 'number' || !(dmg > 0)) throw new Error(`[fix98] hurt damage must be a positive number, got ${JSON.stringify(dmg)}`);
+        let info;
+        if (packets.length > 0) {
+            info = classifyDamage(bot, packets[packets.length - 1]);
+        } else {
+            const body = hungerAir(bot);
+            info = { entity: false, type: null, messageId: null, food: body.food, oxygen: body.oxygen, sourceCauseId: null, sourceDirectId: null };
+        }
+        this.s.nonEntity.n += 1;
+        this.s.nonEntity.sum += dmg;
+        this.s.nonEntity.last = { entity: false, type: info.type, messageId: info.messageId, food: info.food, oxygen: info.oxygen, dmg };
     }
 
     threatCandidate(posterior, draw) {
@@ -383,12 +528,13 @@ export class RestThreat {
         }
         if (!(n > 0)) throw new Error('[fix98] rest floor without hurt evidence');
         const mean = dmg / n;
-        return {
-            id: 'rest',
-            kind: 'need',
-            value: draw * mean * posterior,
-            by: `${REST_STATISTIC} ${bot.restSince} at or above the learned harm floor ${this.s.harmFloor}`,
-        };
+        // The first sourced hurt correlated with the rest statistic is the whole sample.
+        // Later hurts keep the Thompson draw. One hit raises the need; more deaths are not required.
+        const value = n === 1 ? mean * posterior : draw * mean * posterior;
+        const by = n === 1
+            ? `${REST_STATISTIC} ${bot.restSince} raised on the first sourced hurt (harm floor ${this.s.harmFloor})`
+            : `${REST_STATISTIC} ${bot.restSince} at or above the learned harm floor ${this.s.harmFloor}`;
+        return { id: 'rest', kind: 'need', value, by };
     }
 
     noteRun(name, s0, s1) {
