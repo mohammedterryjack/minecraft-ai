@@ -61,16 +61,34 @@ export function startMainThreadWatchdog(evidencePath) {
         transferList: [port2],
     });
     let workerAlive = true;
-    worker.on('error', (e) => { throw new Error(`[watchdog] LOUD FAIL: watchdog worker crashed: ${e && e.stack ? e.stack : e}`); });
-    worker.on('exit', (code) => {
+    let workerDeadReason = null;
+    // 'error' is emitted before 'exit'. A throw here reaches uncaughtException, then fatalExit, then
+    // process.exit, while 'exit' has not run. The flag has to be clear before that throw or process.exit
+    // waits on a worker that can no longer ack, and launchd never restarts.
+    const markWorkerDead = (reason) => {
         workerAlive = false;
-        // Wake a process.exit that is blocked in Atomics.wait. The exit event itself cannot run while the
-        // main thread is inside that wait, so a worker that dies earlier must be noticed before the wait.
+        workerDeadReason = reason;
         Atomics.store(ack, 0, 1);
         Atomics.notify(ack, 0);
+    };
+    worker.on('error', (e) => {
+        markWorkerDead('crashed');
+        throw new Error(`[watchdog] LOUD FAIL: watchdog worker crashed: ${e && e.stack ? e.stack : e}`);
+    });
+    worker.on('exit', (code) => {
+        markWorkerDead('exited');
+        // The exit event cannot run while the main thread is inside Atomics.wait, so a worker that
+        // dies earlier is marked dead by 'error' or by terminate() before any wait.
         if (_shuttingDown) return;
         throw new Error(`[watchdog] LOUD FAIL: watchdog worker exited (code ${code}); the main thread is unguarded`);
     });
+    // terminate() only emits 'exit' later. A process.exit in the same tick would still see the worker
+    // as alive. The flag is cleared on the call, before the returned promise settles.
+    const terminateWorker = worker.terminate.bind(worker);
+    worker.terminate = function () {
+        markWorkerDead('terminated');
+        return terminateWorker();
+    };
     worker.unref();
     port1.unref();
     _wd = { ctl, kaNs, ack, port: port1, worker, callLen, callBytes, encoder: new TextEncoder() };
@@ -81,12 +99,18 @@ export function startMainThreadWatchdog(evidencePath) {
     process.exit = function (code) {
         _shuttingDown = true;
         const finish = () => origExit.call(process, code);
-        if (!workerAlive) {
-            writeSync(2, '[watchdog] LOUD: process.exit with the watchdog worker already exited; not waiting for an ack from a dead worker\n');
+        // Wait only while the worker is alive and has reached its message loop, so the shutdown post
+        // has a thread that can store the ack. A crash, a terminate(), or a worker that has not
+        // reached that loop has no such path: say so and leave. Atomics.wait would not return.
+        const ackCanArrive = workerAlive && Atomics.load(ctl, READY) === 1;
+        if (!ackCanArrive) {
+            const why = !workerAlive
+                ? (workerDeadReason === 'exited' ? 'the watchdog worker already exited' : `the watchdog worker ${workerDeadReason}`)
+                : 'the watchdog worker is not ready to ack';
+            writeSync(2, `[watchdog] LOUD: process.exit with ${why}; not waiting for an ack from a dead worker\n`);
             finish();
             return;
         }
-        if (Atomics.load(ctl, READY) !== 1) { finish(); return; }
         try {
             port1.postMessage({ shutdown: true });
         } catch (e) {

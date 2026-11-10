@@ -25,6 +25,8 @@ const CHILD = fileURLToPath(new URL('./fixtures/fix100-keepalive-block-child.mjs
 const NATIVE_CHILD = fileURLToPath(new URL('./fixtures/fix100-native-block-child.mjs', import.meta.url));
 const HEALTHY_CHILD = fileURLToPath(new URL('./fixtures/fix100-healthy-then-block-child.mjs', import.meta.url));
 const DEAD_WORKER_CHILD = fileURLToPath(new URL('./fixtures/fix100-dead-worker-exit-child.mjs', import.meta.url));
+const CRASH_EXIT_CHILD = fileURLToPath(new URL('./fixtures/fix100-worker-crash-exit-child.mjs', import.meta.url));
+const TERMINATE_EXIT_CHILD = fileURLToPath(new URL('./fixtures/fix100-terminate-exit-child.mjs', import.meta.url));
 const START_AFTER_KEEPALIVE_MS = 13_000;
 const BLOCK_MS = 20_000;
 const INV = { oak_log: 23, diorite: 105, andesite: 60, raw_copper: 8, iron_helmet: 3, raw_iron: 85, torch: 80, oak_sapling: 18, granite: 64, coal: 15, stick: 1, cobbled_deepslate: 5, dark_oak_planks: 1, oak_button: 1, jukebox: 1, iron_sword: 1, music_disc_11: 1, honey_block: 1, cobblestone: 337, netherrack: 1, dirt: 261, birch_log: 6, oak_planks: 1 };
@@ -195,7 +197,7 @@ describe('fix100 event-loop phases', () => {
                     });
                 });
                 const c = connect(port, '127.0.0.1', () => c.write('x'));
-                c.on('error', () => {});
+                c.on('error', (err) => { assert.fail(`client socket error: ${err && err.stack ? err.stack : err}`); });
                 srv.on('error', reject);
             });
             assert.strictEqual(seen, false);
@@ -305,6 +307,34 @@ describe('fix100 watchdog', () => {
         assert.strictEqual(ended.signal, null, stderr);
         assert.strictEqual(ended.code, 0, stderr);
         assert.match(stderr, /LOUD: process.exit with the watchdog worker already exited/);
+        await rm(dir, { recursive: true, force: true });
+    });
+
+    it('a worker crash exits through uncaughtException and fatal instead of waiting for an ack', { timeout: watchdogBeatPeriodMs() }, async () => {
+        const dir = await mkdtemp(join(tmpdir(), 'fix100-crash-'));
+        const ev = join(dir, 'watchdog_kill.json');
+        const child = spawn(process.execPath, [CRASH_EXIT_CHILD, ev], { stdio: ['ignore', 'pipe', 'pipe'] });
+        let stderr = '';
+        child.stderr.on('data', (d) => { stderr += d; });
+        const ended = await new Promise((resolve) => child.on('exit', (code, signal) => resolve({ code, signal })));
+        assert.strictEqual(ended.signal, null, stderr);
+        assert.strictEqual(ended.code, 1, stderr);
+        assert.match(stderr, /LOUD FAIL: watchdog worker crashed/);
+        assert.match(stderr, /\[fatal\]/);
+        assert.match(stderr, /LOUD: process.exit with the watchdog worker crashed/);
+        await rm(dir, { recursive: true, force: true });
+    });
+
+    it('terminate and process.exit in the same tick do not wait for an ack', { timeout: watchdogBeatPeriodMs() }, async () => {
+        const dir = await mkdtemp(join(tmpdir(), 'fix100-term-'));
+        const ev = join(dir, 'watchdog_kill.json');
+        const child = spawn(process.execPath, [TERMINATE_EXIT_CHILD, ev], { stdio: ['ignore', 'pipe', 'pipe'] });
+        let stderr = '';
+        child.stderr.on('data', (d) => { stderr += d; });
+        const ended = await new Promise((resolve) => child.on('exit', (code, signal) => resolve({ code, signal })));
+        assert.strictEqual(ended.signal, null, stderr);
+        assert.strictEqual(ended.code, 0, stderr);
+        assert.match(stderr, /LOUD: process.exit with the watchdog worker terminated/);
         await rm(dir, { recursive: true, force: true });
     });
 });
