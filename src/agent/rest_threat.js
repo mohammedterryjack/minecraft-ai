@@ -13,11 +13,16 @@
 // attacker and is not invented from a nearby entity.
 // Protocol action ids and packet names come from the minecraft-data schema. No tick count, no
 // distance, no mob name, no bed colour.
+// A bed to sleep in is one observe() can see. Each candidate is one getPathTo. The chosen one
+// is walked with that same look-at goal. Interaction range is checked only for the sleep action.
+// No perceived bed the pathfinder can reach means the normal obtain path. Nothing else is tried.
 
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { gameReach, withinInteractionRange } from './library/world.js';
+import pf from 'mineflayer-pathfinder';
+import { Vec3 } from 'vec3';
+import { gameReach, pathToBlock, withinInteractionRange } from './library/world.js';
 
 export const REST_STATISTIC = 'minecraft:time_since_rest';
 const CUSTOM_STAT_REGISTRY = 'minecraft:custom_stat';
@@ -409,23 +414,85 @@ export function bedItemNames(bot) {
     return names;
 }
 
-export function findBedBlock(bot) {
-    if (!bot || typeof bot.findBlock !== 'function') throw new Error('[fix98] bot.findBlock was not delivered');
-    if (typeof bot.isABed !== 'function') throw new Error('[fix98] bot.isABed was not delivered');
-    const eyeHeight = bot.entity && bot.entity.eyeHeight;
-    if (typeof eyeHeight !== 'number' || !Number.isFinite(eyeHeight)) {
-        throw new Error('[fix98] bot.entity.eyeHeight was not delivered');
+export function perceivedBeds(bot, state) {
+    if (!state || !Array.isArray(state.nearby_blocks)) throw new Error('[fix98] observe().nearby_blocks was not delivered');
+    if (!state.perceived_at || typeof state.perceived_at !== 'object' || Array.isArray(state.perceived_at)) {
+        throw new Error('[fix98] observe().perceived_at was not delivered');
     }
-    // Sleep is a use. The bed has to be inside the interaction range. A block the bot can
-    // see, and a block the pathfinder can walk to, are not beds it can sleep in.
-    const reach = gameReach(bot);
-    const bed = bot.findBlock({
-        matching: block => bot.isABed(block) === true,
-        maxDistance: reach + eyeHeight,
-    });
-    if (bed === null) return null;
-    if (!bed.position || withinInteractionRange(bot, bed.position) !== true) return null;
-    return bed;
+    if (!bot || typeof bot.isABed !== 'function') throw new Error('[fix98] bot.isABed was not delivered');
+    const blocksByName = bot.registry && bot.registry.blocksByName;
+    if (!blocksByName) throw new Error('[fix98] bot.registry.blocksByName was not delivered');
+    const beds = [];
+    for (const name of state.nearby_blocks) {
+        if (typeof name !== 'string' || name.length === 0) throw new Error('[fix98] a perceived block has no name');
+        if (!Object.hasOwn(blocksByName, name)) throw new Error(`[fix98] perceived block ${name} is not in the game data`);
+        if (bot.isABed(blocksByName[name]) !== true) continue;
+        if (!Object.hasOwn(state.perceived_at, name)) {
+            throw new Error(`[fix98] ${name} is perceived but has no position`);
+        }
+        const at = state.perceived_at[name];
+        if (!at || !Number.isFinite(at.x) || !Number.isFinite(at.y) || !Number.isFinite(at.z)) {
+            throw new Error(`[fix98] ${name} perceived position is not finite`);
+        }
+        beds.push({ name, position: { x: at.x, y: at.y, z: at.z } });
+    }
+    return beds;
+}
+
+export function chooseReachableBed(bot, beds) {
+    if (!Array.isArray(beds)) throw new Error('[fix98] perceived beds were not delivered');
+    let chosen = null;
+    for (const bed of beds) {
+        const path = pathToBlock(bot, bed.position);
+        if (path.status !== 'success') continue;
+        if (typeof path.cost !== 'number' || !Number.isFinite(path.cost)) {
+            throw new Error(`[fix98] getPathTo succeeded for ${bed.name} without a finite cost`);
+        }
+        const betterCost = chosen === null || path.cost < chosen.cost;
+        const sameCostEarlierName = chosen !== null && path.cost === chosen.cost && bed.name < chosen.name;
+        if (betterCost || sameCostEarlierName) chosen = { name: bed.name, position: bed.position, cost: path.cost };
+    }
+    return chosen;
+}
+
+export function bedLookGoal(bot, position) {
+    const eyeHeight = bot.entity && bot.entity.eyeHeight;
+    if (typeof eyeHeight !== 'number' || !Number.isFinite(eyeHeight)) throw new Error('[fix98] bot.entity.eyeHeight was not delivered');
+    if (!bot.world) throw new Error('[fix98] bot.world was not delivered');
+    if (!position || !Number.isFinite(position.x) || !Number.isFinite(position.y) || !Number.isFinite(position.z)) {
+        throw new Error('[fix98] the bed position is not finite');
+    }
+    return new pf.goals.GoalLookAtBlock(new Vec3(position.x, position.y, position.z), bot.world, { entityHeight: eyeHeight, reach: gameReach(bot) });
+}
+
+export async function sleepInBed(bot, chosen) {
+    if (!chosen || !chosen.position) throw new Error('[fix98] the chosen bed was not delivered');
+    if (!bot.pathfinder || typeof bot.pathfinder.goto !== 'function') throw new Error('[fix98] bot.pathfinder.goto was not delivered');
+    if (typeof bot.blockAt !== 'function') throw new Error('[fix98] bot.blockAt was not delivered');
+    if (typeof bot.sleep !== 'function') throw new Error('[fix98] bot.sleep was not delivered');
+    if (typeof bot.isABed !== 'function') throw new Error('[fix98] bot.isABed was not delivered');
+    try {
+        await bot.pathfinder.goto(bedLookGoal(bot, chosen.position));
+    } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        const err = new Error(`[fix98] path to ${chosen.name} failed: ${message}`);
+        err.cause = e;
+        throw err;
+    }
+    const bed = bot.blockAt(new Vec3(chosen.position.x, chosen.position.y, chosen.position.z));
+    if (!bed || !bed.position) throw new Error(`[fix98] ${chosen.name} is not loaded at the perceived position`);
+    if (bot.isABed(bed) !== true) throw new Error(`[fix98] the block at the perceived bed is not a bed`);
+    if (withinInteractionRange(bot, bed.position) !== true) {
+        throw new Error(`[fix98] ${chosen.name} is not inside the interaction range for sleep`);
+    }
+    try {
+        await bot.sleep(bed);
+    } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        const err = new Error(`[fix98] bot.sleep rejected: ${message}`);
+        err.cause = e;
+        throw err;
+    }
 }
 
 export function emptyRestStore() {

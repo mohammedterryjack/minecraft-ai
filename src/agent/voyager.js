@@ -13,7 +13,7 @@ import { RepairMemory } from './repair_memory.js';
 import { IdlePractice } from './idle_practice.js';
 import { VitalsModel } from './vitals_model.js';   // fix58
 import { checkNeedSource, needInterruptSource, isUnblamedInterruptKind, sampleBeta, pickUrgentCandidate } from './urgent_need.js';   // fix80
-import { RestThreat, emptyRestStore, installProtocolFacts, restFacts, bedItemNames, findBedBlock } from './rest_threat.js';   // fix98
+import { RestThreat, emptyRestStore, installProtocolFacts, restFacts, bedItemNames, perceivedBeds, chooseReachableBed, sleepInBed } from './rest_threat.js';   // fix98
 import { peekPreconditionUnmet, clearPreconditionUnmet, checkNeed, reachNeedForBlocks } from './precondition.js';   // fix76; fix81: structured needs (markPreconditionUnmet is called by seeded code)
 import { SlotEffects } from './slot_effects.js';   // fix59
 import { obtainPlanner } from './recipe_plan.js';   // fix81
@@ -2875,17 +2875,11 @@ Use only c; no other globals.`;
         const bot = this.agent.bot;
         const raiser = this._ensureRestThreat().bestRestRaiser(name => this._playableNamed(name));
         if (raiser !== null) return await this._replayNeedRaiser(label, before, raiser.entry);
-        const bed = findBedBlock(bot);
-        if (bed !== null) {
-            if (typeof bot.sleep !== 'function') throw new Error('[fix98] bot.sleep was not delivered');
-            try {
-                await bot.sleep(bed);
-            } catch (e) {
-                const message = e instanceof Error ? e.message : String(e);
-                const err = new Error(`[fix98] bot.sleep rejected: ${message}`);
-                err.cause = e;
-                throw err;
-            }
+        // Same rule as a source block: the perceived set, then one getPathTo per candidate.
+        // Interaction range is the sleep action, after the path. No reachable bed is the obtain path.
+        const chosen = chooseReachableBed(bot, perceivedBeds(bot, before));
+        if (chosen !== null) {
+            await sleepInBed(bot, chosen);
             console.log(`[urgent-need] rested via bot.sleep (${winner.by})`);
             this._afterSuccess();
             return true;

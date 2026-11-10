@@ -9,11 +9,12 @@ import assert from 'node:assert';
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { Vec3 } from 'vec3';
+import pf from 'mineflayer-pathfinder';
 import { VitalsModel } from '../src/agent/vitals_model.js';
 import { CONTEXT_FULL } from '../src/models/ollama.js';
 import {
     RestThreat, emptyRestStore, readRestStatistic, resolveRestStatIds, loadCustomStatReport,
-    clientCommandSpec, installProtocolFacts, restFacts, bedItemNames, findBedBlock, damageTypesFromData,
+    clientCommandSpec, installProtocolFacts, restFacts, bedItemNames, damageTypesFromData,
     markRestUnavailable, REST_STATISTIC,
 } from '../src/agent/rest_threat.js';
 import minecraftData from 'minecraft-data';
@@ -62,7 +63,7 @@ function mkV() {
     v._curSub = null;
     v.currentTask = null;
     v.observe = () => ({
-        inventory: {}, nearby_blocks: [], position: '0, 64, 0',
+        inventory: {}, nearby_blocks: [], perceived_at: {}, position: '0, 64, 0',
         time: 'night (18000, hostiles spawn outdoors)',
         is_day: false, sleeping: false, sky_light: 0, time_since_rest: 3,
         health_value: 20, health_max: 20, food_value: 10, food_max: 20,
@@ -375,6 +376,7 @@ describe('fix98: rest serve chains a bed from game data', () => {
         v.observe = () => ({
             inventory: { cobblestone: 8 },
             nearby_blocks: ['cobblestone'],
+            perceived_at: { cobblestone: { x: 1, y: 64, z: 1 } },
             is_day: false,
             time: 'night (18000, hostiles spawn outdoors)',
             health_value: 20, health_max: 20, food_value: 10, food_max: 20,
@@ -395,28 +397,132 @@ describe('fix98: rest serve chains a bed from game data', () => {
         assert.ok(!tasks.some(t => /sleep/i.test(t)), tasks.join(' | '));
     });
 
-    it('a bed outside the interaction range is not a bed to sleep in', () => {
-        const bot = {
-            entity: { position: new Vec3(0, 64, 0), eyeHeight: 1.62 },
-            game: { gameMode: 'survival' },
-            isABed: () => true,
-            findBlock: () => ({ name: 'bed', position: new Vec3(0, 64, 30) }),
+    it('a bed perceived 10 blocks away gets pathed to and slept in', async () => {
+        const v = mkV();
+        const bot = v.agent.bot;
+        const bedPos = { x: 10, y: 64, z: 0 };
+        assert.strictEqual(Math.hypot(bedPos.x - bot.entity.position.x, bedPos.y - bot.entity.position.y, bedPos.z - bot.entity.position.z), 10);
+        const searched = [];
+        let walked = null;
+        let slept = null;
+        bot.world = {};
+        bot.registry = { blocksByName: { red_bed: { name: 'red_bed' } }, itemsByName: { red_bed: { name: 'red_bed' } } };
+        bot.isABed = block => block && block.name === 'red_bed';
+        bot.pathfinder = {
+            movements: { id: 'bot-movements' },
+            getPathTo(movements, goal) {
+                searched.push({ movements, goal });
+                return { status: 'success', cost: 12 };
+            },
+            async goto(goal) {
+                walked = goal;
+                bot.entity.position = new Vec3(9, 64, 0);
+            },
         };
-        assert.strictEqual(findBedBlock(bot), null);
-        const near = { name: 'bed', position: new Vec3(1, 64, 0) };
-        bot.findBlock = () => near;
-        assert.strictEqual(findBedBlock(bot), near);
+        bot.blockAt = () => ({ name: 'red_bed', position: new Vec3(bedPos.x, bedPos.y, bedPos.z) });
+        bot.sleep = async (block) => { slept = block; };
+        v._afterSuccess = () => { v.rested = true; };
+        v.observe = () => ({
+            inventory: {},
+            nearby_blocks: ['red_bed'],
+            perceived_at: { red_bed: bedPos },
+            is_day: false,
+            time: 'night (18000, hostiles spawn outdoors)',
+            health_value: 20, health_max: 20, food_value: 20, food_max: 20,
+            inventory_slots: '0/36', empty_inventory_slots: 36, threats: 'none',
+            equipment: { hand: 'empty' }, sleeping: false, sky_light: 0, time_since_rest: 3,
+        });
+        const ok = await v._serveRest({ by: 'floor' });
+        assert.strictEqual(ok, true);
+        assert.strictEqual(searched.length, 1);
+        assert.strictEqual(searched[0].movements, bot.pathfinder.movements);
+        assert.ok(searched[0].goal instanceof pf.goals.GoalLookAtBlock);
+        assert.strictEqual(searched[0].goal.pos.x, 10);
+        assert.ok(walked instanceof pf.goals.GoalLookAtBlock);
+        assert.strictEqual(walked.pos.x, 10);
+        assert.strictEqual(walked.pos.y, 64);
+        assert.strictEqual(walked.pos.z, 0);
+        assert.strictEqual(slept.name, 'red_bed');
+        assert.strictEqual(v.rested, true);
+    });
+
+    it('a perceived but unreachable bed is not chosen and the need goes to obtain', async () => {
+        const v = mkV();
+        const bed = Object.values(registry.blocksByName).find(b => typeof b.name === 'string' && b.name.endsWith('_bed'));
+        assert.ok(bed, 'game data has a bed block');
+        const cobble = registry.itemsByName.cobblestone;
+        let asked = null;
+        let walked = false;
+        let slept = false;
+        const bot = v.agent.bot;
+        bot.world = {};
+        bot.registry = registry;
+        bot.isABed = block => block && block.name === bed.name;
+        bot.pathfinder = {
+            movements: {},
+            getPathTo() { return { status: 'noPath', cost: 0 }; },
+            async goto() { walked = true; },
+        };
+        bot.blockAt = () => { throw new Error('blockAt is the sleep action, after a path'); };
+        bot.sleep = () => { slept = true; throw new Error('sleep should not run'); };
+        bot.recipesAll = (id) => {
+            asked = id;
+            if (id !== bed.id && id !== registry.itemsByName[bed.name].id) return [];
+            return [{ result: { id: registry.itemsByName[bed.name].id, count: 1 }, delta: [{ id: cobble.id, count: -1 }, { id: registry.itemsByName[bed.name].id, count: 1 }] }];
+        };
+        v.skills = [];
+        v.npGraph = null;
+        v.observe = () => ({
+            inventory: { cobblestone: 8 },
+            nearby_blocks: [bed.name, 'cobblestone'],
+            perceived_at: { [bed.name]: { x: 10, y: 64, z: 0 }, cobblestone: { x: 1, y: 64, z: 1 } },
+            is_day: false,
+            time: 'night (18000, hostiles spawn outdoors)',
+            health_value: 20, health_max: 20, food_value: 10, food_max: 20,
+            inventory_slots: '1/36', empty_inventory_slots: 35, threats: 'none',
+            equipment: { hand: 'empty' }, sleeping: false, sky_light: 0, time_since_rest: 8,
+        });
+        v.proposeTask = async () => { throw new Error('cold-start sleep task'); };
+        v.restThreat.installed = true;
+        bot.restSince = 8;
+        v.restThreat.noteSourcedHurt('from-the-event', 6, 4);
+        const winner = v._urgentCandidates(v._hungerServeState()).find(c => c.id === 'rest');
+        assert.ok(winner, 'rest is servable once a hurt has taught a floor');
+        const ok = await v._serveRest(winner);
+        assert.strictEqual(ok, true);
+        assert.strictEqual(walked, false);
+        assert.strictEqual(slept, false);
+        assert.ok(asked !== null, 'recipesAll was asked');
+        const tasks = v.progress.subgoals.map(s => s.task);
+        assert.ok(tasks.some(t => t.includes(bed.name)), tasks.join(' | '));
+        assert.ok(!tasks.some(t => /sleep/i.test(t)), tasks.join(' | '));
     });
 
     it('bot.sleep rejection is rethrown', async () => {
         const v = mkV();
+        const bot = v.agent.bot;
         const bed = { name: 'placed', position: new Vec3(1, 64, 0) };
-        v.agent.bot.isABed = () => true;
-        v.agent.bot.findBlock = () => bed;
-        v.agent.bot.registry = { itemsByName: { placed: { name: 'placed' } }, blocksByName: { placed: { name: 'placed' } } };
-        v.agent.bot.sleep = async () => { throw new Error('monsters nearby'); };
+        bot.world = {};
+        bot.isABed = block => block && block.name === 'placed';
+        bot.registry = { itemsByName: { placed: { name: 'placed' } }, blocksByName: { placed: { name: 'placed' } } };
+        bot.pathfinder = {
+            movements: {},
+            getPathTo: () => ({ status: 'success', cost: 1 }),
+            async goto() {},
+        };
+        bot.blockAt = () => bed;
+        bot.sleep = async () => { throw new Error('monsters nearby'); };
+        v.observe = () => ({
+            inventory: {},
+            nearby_blocks: ['placed'],
+            perceived_at: { placed: { x: 1, y: 64, z: 0 } },
+            is_day: false, sleeping: false, sky_light: 0, time_since_rest: 3,
+            health_value: 20, health_max: 20, food_value: 20, food_max: 20,
+            inventory_slots: '0/36', empty_inventory_slots: 36, threats: 'none',
+            equipment: { hand: 'empty' },
+        });
         v.restThreat.installed = true;
-        v.agent.bot.restSince = 3;
+        bot.restSince = 3;
         await assert.rejects(() => v._serveRest({ by: 'floor' }), /bot\.sleep rejected: monsters nearby/);
     });
 });
