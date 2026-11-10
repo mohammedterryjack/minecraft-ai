@@ -92,6 +92,61 @@ describe('fix97 food: an unreachable craft is not queued', () => {
         assert.strictEqual(chosen.item, 'cooked_beef');
     });
 
+    it('an unsearched fuel log is searched when the smelt chooses it, and only noPath rules it out', async () => {
+        const v = mkV({});
+        const calls = [];
+        v.agent.bot.game = { gameMode: 'survival' };
+        v.agent.bot.entity = { eyeHeight: 1.62, position: { x: 0, y: 64, z: 0 } };
+        v.agent.bot.world = {};
+        v.agent.bot.waitForTicks = async () => {};
+        v.agent.bot.pathfinder = {
+            movements: {},
+            tickTimeout: 40,
+            getPathFromTo: function * (movements, start, goal) {
+                calls.push(goal.pos.x);
+                yield { result: { status: goal.pos.x === 4 ? 'noPath' : 'success', cost: 1 } };
+            },
+        };
+        const inv = { beef: 1, cobblestone: 8 };
+        const open = {
+            inventory: inv,
+            nearby_blocks: ['oak_log', 'stone'],
+            perceived_at: { oak_log: { x: 3, y: 64, z: 1 }, stone: { x: 9, y: 64, z: 1 } },
+        };
+        assert.deepStrictEqual(calls, []);
+        const pre = v._obtainPlanner(open).prerequisites('cooked_beef', 1, inv);
+        assert.strictEqual(pre.how, 'smelt');
+        assert.strictEqual(pre.fuel, 'oak_log');
+        assert.deepStrictEqual(calls, [3]);
+        assert.strictEqual(open._reach.oak_log, 'success');
+        assert.strictEqual(Object.hasOwn(open._reach, 'stone'), false);
+        const chosen = v._obtainPlanner(open).cheapest(['cooked_beef'], 1, inv, true);
+        assert.strictEqual(chosen.item, 'cooked_beef');
+        const blocked = {
+            inventory: inv,
+            nearby_blocks: ['oak_log'],
+            perceived_at: { oak_log: { x: 4, y: 64, z: 1 } },
+        };
+        assert.throws(() => v._obtainPlanner(blocked).cheapest(['cooked_beef'], 1, inv, true), /none of cooked_beef is reachable/);
+        assert.strictEqual(blocked._reach.oak_log, 'noPath');
+        calls.length = 0;
+        v.agent.bot.pathfinder.getPathFromTo = function * (movements, start, goal) {
+            calls.push(goal.pos.x);
+            yield { result: { status: 'partial', path: [] } };
+            yield { result: { status: 'success', cost: 1 } };
+        };
+        const partial = {
+            inventory: inv,
+            nearby_blocks: ['oak_log'],
+            perceived_at: { oak_log: { x: 5, y: 64, z: 1 } },
+        };
+        assert.throws(() => v._obtainPlanner(partial).prerequisites('cooked_beef', 1, inv), /has not been searched/);
+        const continued = await v._withChosenSearches(partial, (plannerOf) => plannerOf().prerequisites('cooked_beef', 1, inv));
+        assert.strictEqual(continued.fuel, 'oak_log');
+        assert.strictEqual(partial._reach.oak_log, 'success');
+        assert.ok(calls.includes(5));
+    });
+
     it('egg and milk_bucket are obtains, not a missing recipe', () => {
         const v = mkV({});
         const planner = v._obtainPlanner({ inventory: {}, nearby_blocks: [] });
@@ -135,9 +190,11 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         assert.match(v._validContract({ pre: 'c => c.pre.inv.oak_log < 55', post: 'c => true' }, skill), /pre uses 55/);
         const bare = { name: 'checkOakLog', code: 'async function checkOakLog(bot) { return 55; }', consumes: {}, effects: [] };
         assert.strictEqual(v._validContract({ pre: 'c => true', post: 'c => true' }, bare), null);
-        const withArg = { name: 'checkOakLog', code: 'async function checkOakLog(bot, block) { return true; }', consumes: {}, effects: [] };
+        const withArg = { name: 'checkOakLog', code: 'async function checkOakLog(bot, block) { return block === null; }', consumes: {}, effects: [] };
         const ok = v._validContract({ pre: 'c => c.args.length >= 1 && c.args[0] === null', post: 'c => true' }, withArg);
         assert.strictEqual(ok, null);
+        const bareParam = { name: 'checkOakLog', code: 'async function checkOakLog(bot, block) { return true; }', consumes: {}, effects: [] };
+        assert.match(v._validContract({ pre: 'c => c.args[0] === null', post: 'c => true' }, bareParam), /parameter block has no sample for c\.args\[0\]/);
         const buried = { name: 'checkOakLog', code: 'async function checkOakLog(bot) { return 155; }', consumes: {}, effects: [], stats: { success: 5512, fail: 0 } };
         const buriedReason = v._validContract({ pre: 'c => c.pre.inv.oak_log < 55', post: 'c => true' }, buried);
         assert.match(buriedReason, /pre uses 55/);
@@ -238,6 +295,19 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         assert.match(v._validContract({ pre: 'c => c.args.length >= 2', post: 'c => true' }, skill), /arity 1/);
         const rest = { name: 'cookFood', code: 'async function cookFood(bot, count = 1, ...more) { return true; }', consumes: {}, effects: [] };
         assert.strictEqual(v._validContract({ pre: 'c => c.args[3] >= 1', post: 'c => true' }, rest), null);
+        const mid = { name: 'place', code: 'async function place(bot, a, b = 1, c = 2) { return true; }', consumes: {}, effects: [] };
+        assert.strictEqual(v._validContract({ pre: 'c => c.args.length === 2', post: 'c => true' }, mid), null);
+        assert.strictEqual(v._validContract({ pre: 'c => c.args.length === 1', post: 'c => true' }, mid), null);
+        assert.strictEqual(v._validContract({ pre: 'c => c.args.length === 3', post: 'c => true' }, mid), null);
+        assert.match(v._validContract({ pre: 'c => c.args.length === 4', post: 'c => true' }, mid), /parameters after bot are \(a, b = 1, c = 2\)/);
+        assert.match(v._validContract({ pre: 'c => c.args.length === 0', post: 'c => true' }, mid), /c\.args\.length compared to 0/);
+        const midRest = { name: 'place', code: 'async function place(bot, a, b = 1, c = 2, ...more) { return more; }', consumes: {}, effects: [] };
+        assert.strictEqual(v._validContract({ pre: 'c => c.args.length === 4', post: 'c => true' }, midRest), null);
+        const derived = { name: 'cookFood', code: 'async function cookFood(bot, count = Number("1")) { return count >= 1; }', consumes: {}, effects: [] };
+        assert.strictEqual(v._validContract({ pre: 'c => c.args[0] >= 1', post: 'c => true' }, derived), null);
+        const invented = { name: 'cookFood', code: 'async function cookFood(bot, count = Number("1")) { return true; }', consumes: {}, effects: [] };
+        assert.match(v._validContract({ pre: 'c => c.args[0] >= 1', post: 'c => true' }, invented), /parameter count has no sample for c\.args\[0\]/);
+        assert.strictEqual(v._validContract({ pre: 'c => true', post: 'c => true' }, invented), null);
     });
 
     it('parses a skill as a module and a contract as a parenthesized expression, and a comment or string is not a numeric literal', () => {

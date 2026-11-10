@@ -8,8 +8,9 @@
  * (collectSurface: Collect 32 dirt) is that parser's grammar. Task prose is not a source of counts.
  * A subscript, a distance, sky light, a tier, an argument count, or a tool-set size is not an inventory comparison.
  * Each record's verdict is one reason line.
- * A contract that reads c.args[i] past the function's arity, or compares c.args.length to anything other than
- * the required count or the arity, is a reset: contract, contractPrev, and contractFail are cleared and the code stays.
+ * A contract that reads c.args[i] past the function's arity, or compares c.args.length to a count outside
+ * the required count through the arity (or below the required count, when the function has a rest parameter),
+ * is a reset: contract, contractPrev, and contractFail are cleared and the code stays.
  * The predicate list is derived from the AST of each skill. No skill name is hard-coded.
  *
  *   node scripts/fix97_contract_manifest.js --bots-dir=bots/icefox2000

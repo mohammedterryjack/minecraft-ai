@@ -628,15 +628,7 @@ async function yieldSearchTurn(bot) {
     await bot.waitForTicks(1);
 }
 
-export async function pathToBlock(bot, position) {
-    /**
-     * Path cost to one block, searched until the pathfinder finds it or exhausts the loaded world.
-     * @param {Bot} bot - The bot. bot.pathfinder.movements is the Movements the A* uses.
-     * @param {Vec3} position - The chosen block.
-     * @returns {object} - status success or noPath, and the path cost.
-     * @example
-     * let path = await world.pathToBlock(bot, block.position);
-     **/
+function openSearch(bot, position) {
     if (!bot || !bot.pathfinder || typeof bot.pathfinder.getPathFromTo !== 'function') {
         throw new Error('reachability: bot.pathfinder.getPathFromTo steps the search across ticks (mineflayer-pathfinder index.js:75). It is missing.');
     }
@@ -649,11 +641,58 @@ export async function pathToBlock(bot, position) {
     }
     const { movements, goal } = lookGoal(bot, position);
     // thinkTimeout (index.js:40, default 5000) is a machine-speed cap. The loaded columns bound the open set.
-    const gen = bot.pathfinder.getPathFromTo(movements, bot.entity.position, goal, { timeout: Number.POSITIVE_INFINITY, tickTimeout: tick });
+    return bot.pathfinder.getPathFromTo(movements, bot.entity.position, goal, { timeout: Number.POSITIVE_INFINITY, tickTimeout: tick });
+}
+
+function yieldResult(step) {
+    const result = step.value && step.value.result;
+    if (!result || typeof result.status !== 'string') {
+        throw new Error(`reachability: getPathFromTo yielded ${JSON.stringify(result && result.status)}.`);
+    }
+    return result;
+}
+
+function returnedResult(step) {
+    const finished = step.value && step.value.result;
+    if (finished && (finished.status === 'partial' || finished.status === 'timeout')) {
+        throw new Error(`reachability: getPathFromTo returned ${finished.status}. A partial result is not unreachable (mineflayer-pathfinder lib/astar.js compute).`);
+    }
+    if (finished && (finished.status === 'success' || finished.status === 'noPath')) return finished;
+    throw new Error('reachability: getPathFromTo ended without a result (mineflayer-pathfinder index.js:75).');
+}
+
+function rejectUnfinished(result) {
+    if (result.status === 'timeout') {
+        throw new Error('reachability: the search stopped on thinkTimeout (mineflayer-pathfinder index.js:40, lib/astar.js:73). The loaded world bounds the search. A timer does not.');
+    }
+    throw new Error(`reachability: getPathFromTo returned ${result.status}. Expected success, noPath, or partial (mineflayer-pathfinder lib/astar.js compute).`);
+}
+
+// The first slice when it is already success or noPath. null means the slice is partial: pathToBlock
+// continues that search across ticks. A partial slice is not success and not noPath.
+export function pathToBlockReady(bot, position) {
+    const gen = openSearch(bot, position);
+    const step = gen.next();
+    if (step.done) return returnedResult(step);
+    const result = yieldResult(step);
+    if (result.status === 'success' || result.status === 'noPath') return result;
+    if (result.status === 'partial') return null;
+    rejectUnfinished(result);
+}
+
+export async function pathToBlock(bot, position) {
+    /**
+     * Path cost to one block, searched until the pathfinder finds it or exhausts the loaded world.
+     * @param {Bot} bot - The bot. bot.pathfinder.movements is the Movements the A* uses.
+     * @param {Vec3} position - The chosen block.
+     * @returns {object} - status success or noPath, and the path cost.
+     * @example
+     * let path = await world.pathToBlock(bot, block.position);
+     **/
+    const gen = openSearch(bot, position);
     let step = gen.next();
     while (!step.done) {
-        const result = step.value && step.value.result;
-        if (!result || typeof result.status !== 'string') throw new Error(`reachability: getPathFromTo yielded ${JSON.stringify(result && result.status)}.`);
+        const result = yieldResult(step);
         if (result.status === 'success' || result.status === 'noPath') return result;
         // Not yet known. The next gen.next() is another tickTimeout slice (index.js:41); it does not run
         // until the event loop has had a turn, so the search never blocks for more than one slice.
@@ -662,17 +701,9 @@ export async function pathToBlock(bot, position) {
             step = gen.next();
             continue;
         }
-        if (result.status === 'timeout') {
-            throw new Error('reachability: the search stopped on thinkTimeout (mineflayer-pathfinder index.js:40, lib/astar.js:73). The loaded world bounds the search. A timer does not.');
-        }
-        throw new Error(`reachability: getPathFromTo returned ${result.status}. Expected success, noPath, or partial (mineflayer-pathfinder lib/astar.js compute).`);
+        rejectUnfinished(result);
     }
-    const finished = step.value && (step.value.result || step.value);
-    if (finished && (finished.status === 'partial' || finished.status === 'timeout')) {
-        throw new Error(`reachability: getPathFromTo returned ${finished.status}. A partial result is not unreachable (mineflayer-pathfinder lib/astar.js compute).`);
-    }
-    if (finished && (finished.status === 'success' || finished.status === 'noPath')) return finished;
-    throw new Error('reachability: getPathFromTo ended without a result (mineflayer-pathfinder index.js:75).');
+    return returnedResult(step);
 }
 
 function dist2(ax, ay, az, bx, by, bz) {

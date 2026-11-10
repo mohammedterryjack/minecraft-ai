@@ -1367,6 +1367,12 @@ Use only c; no other globals.`;
             if (counts) {
                 const args = Voyager.contractArgProblems(ct[k], skill);
                 if (args.length) return `${k}: ${args.map(p => p.text).join('; ')}`;
+                for (const i of Voyager.contractArgIndexes(ct[k])) {
+                    if (!Number.isInteger(i) || i < 0) continue;
+                    if (i >= counts.arity) continue;
+                    if (counts.known[i]) continue;
+                    return `${k}: parameter ${counts.names[i]} has no sample for c.args[${i}] (${counts.params[i]}). It has no literal default and the body does not compare it to a literal.`;
+                }
             }
             const shape = this._contractShapeProblem(ct[k], counts);
             if (shape) return `${k}: ${shape}`;
@@ -1730,7 +1736,8 @@ Use only c; no other globals.`;
         return Voyager.copiedCountComparisons(code, entries, registry).map(h => `\`${h.item} ${h.op} ${h.n}\` copies ${h.item}'s count from the state in this prompt. That count is what is held right now. Read it with getInventoryCounts(bot) when the function runs.`);
     }
     // c.args is the call's arguments after bot. required is how many of those have no default. arity is all of them
-    // when the function has no rest parameter.
+    // when the function has no rest parameter. A sample is a literal default or a literal the body compares the
+    // parameter to. A missing sample is not filled in.
     static skillArgCounts(skill) {
         if (!skill || typeof skill.code !== 'string' || typeof skill.name !== 'string') throw new Error('[fix97] skillArgCounts needs the skill name and code');
         const ast = Voyager.parseSkill(skill.code);
@@ -1742,7 +1749,9 @@ Use only c; no other globals.`;
         const params = fn.params.slice(1);
         let rest = false, required = 0, arity = 0;
         const listed = [];
+        const names = [];
         const samples = [];
+        const known = [];
         for (const p of params) {
             if (p.type === 'RestElement') {
                 rest = true;
@@ -1751,14 +1760,89 @@ Use only c; no other globals.`;
             }
             arity += 1;
             listed.push(skill.code.slice(p.start, p.end));
-            if (p.type === 'AssignmentPattern' && p.right && p.right.type === 'Literal') samples.push(p.right.value);
-            else samples.push(0);
+            const sample = Voyager.parameterSample(fn, p);
+            names.push(sample.name);
+            known.push(sample.found);
+            samples.push(sample.found ? sample.value : undefined);
             if (p.type !== 'AssignmentPattern') required += 1;
         }
-        return { required, arity, rest, params: listed, samples };
+        return { required, arity, rest, params: listed, names, samples, known };
+    }
+    static literalOf(node) {
+        if (!node) return null;
+        if (node.type === 'Literal') return { value: node.value };
+        if (node.type === 'UnaryExpression' && (node.operator === '+' || node.operator === '-') && node.argument && node.argument.type === 'Literal' && typeof node.argument.value === 'number') {
+            return { value: node.operator === '-' ? -node.argument.value : node.argument.value };
+        }
+        if (node.type === 'TemplateLiteral' && node.expressions.length === 0 && node.quasis.length === 1) {
+            return { value: node.quasis[0].value.cooked };
+        }
+        return null;
+    }
+    static parameterSample(fn, param) {
+        const nameNode = param.type === 'AssignmentPattern' ? param.left : param;
+        if (!nameNode || nameNode.type !== 'Identifier') return { found: false, name: '?' };
+        const name = nameNode.name;
+        if (param.type === 'AssignmentPattern') {
+            const lit = Voyager.literalOf(param.right);
+            if (lit) return { found: true, name, value: lit.value };
+        }
+        const binds = (p) => {
+            if (!p) return false;
+            if (p.type === 'RestElement') return binds(p.argument);
+            if (p.type === 'AssignmentPattern') return binds(p.left);
+            return p.type === 'Identifier' && p.name === name;
+        };
+        const COMPARE = new Set(['===', '==', '!==', '!=', '<', '<=', '>', '>=']);
+        let found = null;
+        const walk = (node) => {
+            if (!node || typeof node.type !== 'string' || found) return;
+            if (node.type === 'FunctionDeclaration' || node.type === 'FunctionExpression' || node.type === 'ArrowFunctionExpression') {
+                if ((node.params || []).some(binds)) return;
+            }
+            if (node.type === 'BinaryExpression' && COMPARE.has(node.operator)) {
+                let lit = null;
+                if (node.left.type === 'Identifier' && node.left.name === name) lit = Voyager.literalOf(node.right);
+                else if (node.right.type === 'Identifier' && node.right.name === name) lit = Voyager.literalOf(node.left);
+                if (lit) { found = lit; return; }
+            }
+            for (const v of Object.values(node)) {
+                if (Array.isArray(v)) { for (const x of v) walk(x); }
+                else if (v && typeof v === 'object' && typeof v.type === 'string') walk(v);
+            }
+        };
+        walk(fn.body);
+        return found ? { found: true, name, value: found.value } : { found: false, name };
+    }
+    static contractArgIndexes(src) {
+        const ast = Voyager.parseContract(src);
+        const root = ast.body[0].expression;
+        const param = root.params && root.params.length && root.params[0].type === 'Identifier' ? root.params[0].name : null;
+        const indexes = [];
+        if (!param) return indexes;
+        const walk = (n) => {
+            if (!n || typeof n.type !== 'string') return;
+            if (n.type === 'MemberExpression' && n.computed && n.property && n.property.type === 'Literal' && typeof n.property.value === 'number') {
+                const path = Voyager.memberPath(n.object, param);
+                if (path && path.length === 1 && path[0] === 'args' && Number.isInteger(n.property.value)) indexes.push(n.property.value);
+            }
+            for (const v of Object.values(n)) {
+                if (Array.isArray(v)) { for (const x of v) walk(x); }
+                else if (v && typeof v === 'object' && typeof v.type === 'string') walk(v);
+            }
+        };
+        walk(root);
+        return indexes;
+    }
+    // A c.args.length literal is legal from the required count through the arity, and at or above the required
+    // count when the function has a rest parameter.
+    static argsLengthAllowed(counts, n) {
+        if (!counts || typeof n !== 'number') return false;
+        if (counts.rest) return n >= counts.required;
+        return n >= counts.required && n <= counts.arity;
     }
     // c.args is the arguments after bot. An index at or past arity cannot hold unless the function has a rest
-    // parameter. c.args.length is the required count or the arity; any other comparison is the same miss.
+    // parameter. c.args.length may be any count from the required count through the arity.
     static contractArgProblems(src, skill) {
         const counts = Voyager.skillArgCounts(skill);
         if (!counts) throw new Error(`[fix97] ${skill.name} has no function; c.args has no parameter list`);
@@ -1790,9 +1874,12 @@ Use only c; no other globals.`;
                 if (lengthSide(n.left) || lengthSide(n.right)) {
                     const other = lengthSide(n.left) ? n.right : n.left;
                     const nLit = other && other.type === 'Literal' && typeof other.value === 'number' ? other.value : null;
-                    if (nLit !== counts.required && nLit !== counts.arity) {
+                    if (!Voyager.argsLengthAllowed(counts, nLit)) {
                         const shown = nLit === null ? 'a non-literal' : String(nLit);
-                        push(`length:${shown}`, { kind: 'length', n: nLit, text: `${skill.name} parameters after bot are (${list}); c.args.length compared to ${shown}, not the required count ${counts.required} or the arity ${counts.arity}` });
+                        const range = counts.rest
+                            ? `a count from the required count ${counts.required} up`
+                            : `a count from the required count ${counts.required} through the arity ${counts.arity}`;
+                        push(`length:${shown}`, { kind: 'length', n: nLit, text: `${skill.name} parameters after bot are (${list}); c.args.length compared to ${shown}, not ${range}` });
                     }
                 }
             }
@@ -2002,7 +2089,7 @@ Use only c; no other globals.`;
         for (const use of Voyager.contractLiteralUses(src)) {
             const n = use.n;
             if (n === 0 || n === 1) continue;
-            if (argCounts && use.path && use.path.length === 2 && use.path[0] === 'args' && use.path[1] === 'length' && (n === argCounts.required || (!argCounts.rest && n === argCounts.arity))) continue;
+            if (argCounts && use.path && use.path.length === 2 && use.path[0] === 'args' && use.path[1] === 'length' && Voyager.argsLengthAllowed(argCounts, n)) continue;
             const matched = facts.filter(f => f.n === n && Voyager.factMatches(f, use.path));
             if (matched.length) continue;
             const pathItem = use.path && use.path.length ? use.path[use.path.length - 1] : null;
@@ -2454,7 +2541,7 @@ Use only c; no other globals.`;
             if (Array.isArray(rp.needs) && rp.needs.length > 0) {
                 const seen = this.observe();
                 await this._judgeItems(seen, this._needItems(rp.needs), true);
-                if (this._chainNeeds(label, rp.needs, seen)) {
+                if (await this._withChosenSearches(seen, () => this._chainNeeds(label, rp.needs, seen))) {
                     console.log(`[urgent-need] ${st.best.entry.name} lacked an input; backchained`);
                     return true;
                 }
@@ -2528,13 +2615,15 @@ Use only c; no other globals.`;
         const edibles = edibleNames(registry);
         await this._judgeItems(before, edibles, false);
         const inv = before.inventory;
-        const planner = this._obtainPlanner(before);
-        const plan = planFoodAcquisition({
-            edibles,
-            inventory: inv,
-            cheapest: (items, count, inventory) => planner.cheapest(items, count, inventory, true),
-            prerequisites: (item, count, inventory) => planner.prerequisites(item, count, inventory),
-            entityDroppersFor: (item) => entityDroppers(registry, item),
+        const plan = await this._withChosenSearches(before, (plannerOf) => {
+            const planner = plannerOf();
+            return planFoodAcquisition({
+                edibles,
+                inventory: inv,
+                cheapest: (items, count, inventory) => planner.cheapest(items, count, inventory, true),
+                prerequisites: (item, count, inventory) => planner.prerequisites(item, count, inventory),
+                entityDroppersFor: (item) => entityDroppers(registry, item),
+            });
         });
         if (plan.executable) {
             const beforeFood = this.agent.bot.food;
@@ -3845,7 +3934,7 @@ Use only c; no other globals.`;
         let needs = null;
         if (!ok && !libFault && !cut && !misrouted) {
             await this._judgeItems(after, this._goalSourceItems(task), true);
-            needs = this._failureNeeds(task, reported, failTrace, after);
+            needs = await this._withChosenSearches(after, () => this._failureNeeds(task, reported, failTrace, after));
         }
         const reason = !ok ? this._failureReason(failTrace) : null;   // fix89: FAILED lines already on the trace
 
@@ -4197,14 +4286,35 @@ Use only c; no other globals.`;
         // node. Recipe edges and the registry do not change during one synchronous plan.
         const edgeMemo = new Map();
         // A source the bot can see is knowledge (nearby_blocks). Whether that block can be walked to is one
-        // pathfinder search of the perceived position, not membership of the set.
+        // pathfinder search of the perceived position, not membership of the set. A source nobody has searched
+        // is searched when this plan chooses it. Only noPath is unreachable.
         const reachableBlock = (block) => {
             if (reached.has(block)) return reached.get(block);
             const at = state.perceived_at && state.perceived_at[block];
-            const status = at && state._reach && Object.hasOwn(state._reach, block) ? state._reach[block] : null;
-            const ok = status === 'success';
-            reached.set(block, ok);
-            return ok;
+            if (!at) {
+                reached.set(block, false);
+                return false;
+            }
+            let status = state._reach && Object.hasOwn(state._reach, block) ? state._reach[block] : null;
+            if (status === null) {
+                const ready = world.pathToBlockReady(bot, at);
+                if (ready) {
+                    if (!state._reach) state._reach = {};
+                    state._reach[block] = ready.status;
+                    status = ready.status;
+                } else {
+                    const err = new Error(`[fix97] ${block} is nearby and has not been searched. Reachability is pathToBlock of that block, not membership of nearby_blocks.`);
+                    err.unsearchedBlock = block;
+                    throw err;
+                }
+            }
+            if (status === 'noPath') {
+                reached.set(block, false);
+                return false;
+            }
+            if (status !== 'success') throw new Error(`[fix97] ${block} reach status ${JSON.stringify(status)} is not success or noPath`);
+            reached.set(block, true);
+            return true;
         };
         return obtainPlanner({
             registry: bot.registry,
@@ -4227,6 +4337,24 @@ Use only c; no other globals.`;
                 return [...inputs];
             },
         });
+    }
+    // A plan that chooses a perceived source whose search is still partial throws unsearchedBlock. Search that
+    // block with pathToBlock (which continues across ticks) and plan again. Only noPath stays unreachable.
+    async _withChosenSearches(state, run) {
+        const seen = new Set();
+        for (;;) {
+            try {
+                return run(() => this._obtainPlanner(state));
+            } catch (err) {
+                if (!err || typeof err.unsearchedBlock !== 'string') throw err;
+                if (seen.has(err.unsearchedBlock)) throw new Error(`[fix97] ${err.unsearchedBlock} was searched and still has no reach status`);
+                seen.add(err.unsearchedBlock);
+                await this._judgeTargets(state, [err.unsearchedBlock], false);
+                if (!state._reach || !Object.hasOwn(state._reach, err.unsearchedBlock)) {
+                    throw new Error(`[fix97] ${err.unsearchedBlock} is nearby and was not searched`);
+                }
+            }
+        }
     }
     // fix96: observed success of an item's producer edge (progress.recipeEdges runs/fails), the fix90 posterior. 1 when there is
     //        no edge, or the edge is another verb than the one asked (verb null: whatever its verb).
@@ -5986,7 +6114,7 @@ Use only c; no other globals.`;
             }
             await this._judgeTargets(state, perceived, true);
             const inv = state.inventory || {};
-            const pre = planner.prerequisites(goal.item, goal.count, inv);
+            const pre = await this._withChosenSearches(state, (plannerOf) => plannerOf().prerequisites(goal.item, goal.count, inv));
             const subs = [];
             if (pre.how === 'collect') {
                 if (!src.length) throw new Error(`[fix97] LOUD: ${goal.item} is collected but the game data names no source block`);
@@ -7610,7 +7738,7 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
         if (rp && !rp.ok && Array.isArray(rp.needs)) {
             const seen = this.observe();
             await this._judgeItems(seen, this._needItems(rp.needs), true);
-            if (this._chainNeeds(this._chainOwner(task), rp.needs, seen)) return true;
+            if (await this._withChosenSearches(seen, () => this._chainNeeds(this._chainOwner(task), rp.needs, seen))) return true;
         }
         // fix55: a skill goal is that skill; its failure is already blamed/queued for repair by _attribute, so no new code is written for it
         if (goalKind.kind === 'skill') { console.log(`[voyager] skill goal ${task} failed its learned post-contract; repair of the skill handles it (no code generation)`); return true; }
@@ -7905,10 +8033,10 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             clearPreconditionUnmet(bot);
             const seen = this.observe();
             await this._judgeItems(seen, this._goalSourceItems(task), true);
-            const needs = this._failureNeeds(task, reported, lastTrace, seen);
+            const needs = await this._withChosenSearches(seen, () => this._failureNeeds(task, reported, lastTrace, seen));
             if (needs !== null) await this._judgeItems(seen, this._needItems(needs), true);
             this._noteEdgeOutcome(task, false);
-            if (needs !== null && this._chainNeeds(this._chainOwner(task), needs, seen)) return true;
+            if (needs !== null && await this._withChosenSearches(seen, () => this._chainNeeds(this._chainOwner(task), needs, seen))) return true;
         }
         // fix19 (1): failed twice (recently) or cut off -> decompose
         const fails = this.progress.failed.slice(-20).filter(t => t === task).length;
