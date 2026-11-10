@@ -481,7 +481,12 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
             };
             v.skills = [stored];
             v._repairQueue = [];
-            v._checkContracts([{ name: 'clearSlots', argv: [], rv: true, fail: false, s0: state(4), s1: state(5), delta: {}, parent: -1, depth: 0 }], true);
+            const logs = [];
+            const orig = console.log;
+            console.log = (...a) => logs.push(a.join(' '));
+            try { v._checkContracts([{ name: 'clearSlots', argv: [], rv: true, fail: false, s0: state(4), s1: state(5), delta: {}, parent: -1, depth: 0 }], true); }
+            finally { console.log = orig; }
+            assert.ok(logs.some(l => l.startsWith('!!! [contract] LOUD:') && l.includes('cannot be checked') && l.includes(expected)));
             assert.deepStrictEqual(fatals, []);
             assert.strictEqual(stored.contractFail, expected);
             assert.strictEqual(v._repairQueue.length, 1);
@@ -494,6 +499,46 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         assert.strictEqual(v._validContract({ pre: 'c => true', post: 'c => c.post.inv[c.args[0]] > 0' }, nested), null);
         assert.strictEqual(v._validContract({ pre: 'c => true', post: "c => c.delta['iron_helmet'] > 0" }, { name: 'smeltHelm', code: 'async function smeltHelm(bot) { return true; }', effects: [] }), null);
         assert.strictEqual(v._validContract({ pre: 'c => true', post: 'c => c.ret === true' }, { name: 'did', code: 'async function did(bot) { return true; }', effects: [] }), null);
+    });
+
+    it('a repair that returns another undecidable contract is one learned rejection, so the next trace does not queue it', async () => {
+        const first = 'c => { const { post, pre } = c; return post.free > pre.free }';
+        const second = 'c => c["po"+"st"].free > 0';
+        let expected;
+        try { Voyager.contractReadsReturn(first); }
+        catch (err) { expected = err.message; }
+        const v = mkV({});
+        v._saveSkills = () => {};
+        v._repairQueue = [];
+        const state = (free) => ({ pos: { x: 0, y: 64, z: 0 }, hp: 20, food: 20, sky: 15, alive: true, dim: 'overworld', inv: {}, free, eq: { heldItem: null } });
+        const stored = {
+            name: 'clearSlots',
+            description: 'free a slot',
+            effects: [],
+            code: 'async function clearSlots(bot) { return true; }',
+            stats: { success: 0, fail: 0, streakFail: 0, tasks: [] },
+            contract: { pre: 'c => true', post: first, text: 'a free slot' },
+        };
+        v.skills = [stored];
+        const trace = [{ name: 'clearSlots', argv: [], rv: true, fail: false, s0: state(4), s1: state(5), delta: {}, parent: -1, depth: 0 }];
+        v._checkContracts(trace, true);
+        assert.strictEqual(v._repairQueue.length, 1);
+        const evidence = v._repairQueue[0].evidence;
+        assert.strictEqual(evidence, expected);
+        v._repairQueue = [];
+        let asks = 0;
+        v._ask = async () => {
+            asks++;
+            return JSON.stringify({ clearSlots: { pre: 'c => true', post: second, text: 'still hidden' } });
+        };
+        const n = await v._learnContracts([stored], 'contract repair', evidence);
+        assert.strictEqual(n, 0);
+        assert.strictEqual(asks, 1);
+        assert.strictEqual(stored.contract.post, first);
+        assert.strictEqual(v._sameContractRepairRejected(stored, evidence), true);
+        v._checkContracts(trace, true);
+        assert.deepStrictEqual(v._repairQueue, []);
+        assert.strictEqual(asks, 1);
     });
 
     it('a failed call is not a sample, so craftItem(null) and mineBlocks(oak_log, oak_log) do not refuse their pres', () => {

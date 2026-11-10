@@ -3009,7 +3009,7 @@ Use only c; no other globals.`;
                 if (problem === null && typeof e.contract.post === 'string') problem = Voyager.contractReturnProblem(e.contract.post);
                 if (problem !== null) {
                     e.contractFail = problem;
-                    console.log(`[contract] ${e.name} contract cannot be checked: ${problem}`);
+                    console.log(`!!! [contract] LOUD: ${e.name} contract cannot be checked: ${problem}`);
                     this._queueContractFix(e, problem);
                     continue;
                 }
@@ -3196,14 +3196,17 @@ Use only c; no other globals.`;
             if (bad) {
                 e.contractFail = bad;
                 console.log(`[contract] FAILED for ${e.name}: ${bad}`);
-                // The refusal is the repair. A repair already in progress is that queue item;
-                // queueing the same refusal again would call the model on every step.
-                if (why !== 'contract repair' && ct) {
-                    let problem = null;
-                    if (typeof ct.pre === 'string') problem = Voyager.contractReturnProblem(ct.pre);
-                    if (problem === null && typeof ct.post === 'string') problem = Voyager.contractReturnProblem(ct.post);
-                    if (problem !== null) this._queueContractFix(e, bad);
-                }
+                let problem = null;
+                if (ct && typeof ct.pre === 'string') problem = Voyager.contractReturnProblem(ct.pre);
+                if (problem === null && ct && typeof ct.post === 'string') problem = Voyager.contractReturnProblem(ct.post);
+                if (problem !== null && why === 'contract repair') {
+                    // The repair returned another contract whose c.ret cannot be decided. The stored
+                    // contract is unchanged, so the next trace would queue the same evidence and call
+                    // the model again. failedRepairSigs is the loop detector: skill hash plus this
+                    // evidence, with no timer and no cap.
+                    console.log(`!!! [contract] LOUD: contract repair of ${e.name} returned a contract whose c.ret cannot be decided (${bad})`);
+                    this._proposalOutcome(e, 'rejected undecidable contract', this._repairSig(e.name, fixNote));
+                } else if (problem !== null) this._queueContractFix(e, bad);
                 continue;
             }
             delete e.contractFail;
