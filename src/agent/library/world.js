@@ -579,8 +579,8 @@ export function withinInteractionRange(bot, pos) {
 // or noPath. Callers only see those two. A partial that arrives as a finished answer is a search that stopped
 // early: that throws, and nothing records it as a reach result.
 function lookGoal(bot, position) {
-    if (!bot || !bot.pathfinder || typeof bot.pathfinder.getPathTo !== 'function') {
-        throw new Error('reachability: bot.pathfinder.getPathTo is missing (mineflayer-pathfinder index.js).');
+    if (!bot || !bot.pathfinder || !bot.pathfinder.movements) {
+        throw new Error('reachability: bot.pathfinder.movements is missing. The search is the A* with the bot\'s Movements (mineflayer-pathfinder index.js).');
     }
     const movements = bot.pathfinder.movements;
     if (!movements) throw new Error('reachability: bot.pathfinder.movements is missing. The search is the A* with the bot\'s Movements.');
@@ -604,30 +604,28 @@ function finishedPath(result, where) {
     return result;
 }
 
-// Sync callers (a planner that already has its answer, or a test double with only getPathTo). A bot whose
-// pathfinder has getPathFromTo must not be answered from one slice: pathToBlock steps that generator.
-export function pathStatusSync(bot, position) {
-    /**
-     * One finished pathfinder result. Refuses a bot that can continue the search, and a partial slice.
-     * @param {Bot} bot - The bot. bot.pathfinder.movements is the Movements the A* uses.
-     * @param {Vec3} position - The chosen block.
-     * @returns {object} - status success or noPath, and the path cost.
-     * @example
-     * let path = world.pathStatusSync(bot, block.position);
-     **/
-    if (bot && bot.pathfinder && typeof bot.pathfinder.getPathFromTo === 'function') {
-        throw new Error('reachability: bot.pathfinder.getPathFromTo steps the search across ticks (mineflayer-pathfinder index.js:75). pathStatusSync will not take one slice. A partial result is not unreachable.');
+// The pathfinder's own ordering for "nearest block to look at" (mineflayer-pathfinder lib/goals.js GoalLookAtBlock.heuristic).
+export function lookHeuristic(bot, position) {
+    if (!position || !Number.isFinite(position.x) || !Number.isFinite(position.y) || !Number.isFinite(position.z)) {
+        throw new Error('reachability: the target position is not finite.');
     }
-    const { movements, goal } = lookGoal(bot, position);
-    return finishedPath(bot.pathfinder.getPathTo(movements, goal), 'getPathTo');
+    const pos = bot && bot.entity && bot.entity.position;
+    if (!pos || !Number.isFinite(pos.x) || !Number.isFinite(pos.y) || !Number.isFinite(pos.z)) {
+        throw new Error('reachability: bot.entity.position is missing. GoalLookAtBlock.heuristic measures from it (mineflayer-pathfinder lib/goals.js).');
+    }
+    const eyeHeight = bot.entity.eyeHeight;
+    if (typeof eyeHeight !== 'number' || !Number.isFinite(eyeHeight)) {
+        throw new Error('reachability: bot.entity.eyeHeight is missing.');
+    }
+    const goal = new pf.goals.GoalLookAtBlock(new Vec3(position.x, position.y, position.z), bot.world, { entityHeight: eyeHeight, reach: gameReach(bot) });
+    return goal.heuristic(pos);
 }
 
 async function yieldSearchTurn(bot) {
-    if (typeof bot.waitForTicks === 'function') {
-        await bot.waitForTicks(1);
-        return;
+    if (!bot || typeof bot.waitForTicks !== 'function') {
+        throw new Error('reachability: bot.waitForTicks is missing. A partial search waits one tick (mineflayer bot.waitForTicks).');
     }
-    await new Promise(resolve => { setImmediate(resolve); });
+    await bot.waitForTicks(1);
 }
 
 export async function pathToBlock(bot, position) {
@@ -639,7 +637,9 @@ export async function pathToBlock(bot, position) {
      * @example
      * let path = await world.pathToBlock(bot, block.position);
      **/
-    if (!bot || !bot.pathfinder || typeof bot.pathfinder.getPathFromTo !== 'function') return pathStatusSync(bot, position);
+    if (!bot || !bot.pathfinder || typeof bot.pathfinder.getPathFromTo !== 'function') {
+        throw new Error('reachability: bot.pathfinder.getPathFromTo steps the search across ticks (mineflayer-pathfinder index.js:75). It is missing.');
+    }
     const tick = bot.pathfinder.tickTimeout;
     if (typeof tick !== 'number' || !(tick > 0)) {
         throw new Error('reachability: bot.pathfinder.tickTimeout is missing (mineflayer-pathfinder index.js:41 is the per-tick budget). A search is not stopped by a made-up budget.');
@@ -667,6 +667,11 @@ export async function pathToBlock(bot, position) {
         }
         throw new Error(`reachability: getPathFromTo returned ${result.status}. Expected success, noPath, or partial (mineflayer-pathfinder lib/astar.js compute).`);
     }
+    const finished = step.value && (step.value.result || step.value);
+    if (finished && (finished.status === 'partial' || finished.status === 'timeout')) {
+        throw new Error(`reachability: getPathFromTo returned ${finished.status}. A partial result is not unreachable (mineflayer-pathfinder lib/astar.js compute).`);
+    }
+    if (finished && (finished.status === 'success' || finished.status === 'noPath')) return finished;
     throw new Error('reachability: getPathFromTo ended without a result (mineflayer-pathfinder index.js:75).');
 }
 
@@ -1069,20 +1074,27 @@ function indexSection(idx, ctx, cx, cz, si, column) {
     return sec;
 }
 
+function bumpVis(idx) {
+    idx.visGen += 1;
+    idx.vis = null;
+}
+
 function buildColumn(idx, ctx, cx, cz) {
     const selfKey = `${cx},${cz}`;
     const col = ctx.columns.get(selfKey);
-    if (!col) return;
-    const column = col.column;
-    if (!Number.isInteger(column.minY) || !Array.isArray(column.sections)) {
-        throw new Error(`nearby blocks: chunk ${cx},${cz} has no minY or sections.`);
+    if (!col || !col.column || !Number.isInteger(col.column.minY) || !Array.isArray(col.column.sections)) {
+        throw new Error(`nearby blocks: chunk ${cx},${cz} is queued in the view and is not loaded. A missing column is not an empty block list.`);
     }
+    const column = col.column;
     rememberWaiters(idx, selfKey);
     const started = performance.now();
     const sections = new Array(column.sections.length);
     for (let si = 0; si < column.sections.length; si++) sections[si] = indexSection(idx, ctx, cx, cz, si, column);
-    idx.columns.set(selfKey, { sections });
-    idx.chunkMs.push(performance.now() - started);
+    const ms = performance.now() - started;
+    idx.columns.set(selfKey, { sections, ms });
+    idx.builds += 1;
+    idx.buildMs += ms;
+    bumpVis(idx);
 }
 
 function enqueueColumn(idx, ctx, cx, cz) {
@@ -1100,15 +1112,21 @@ function enqueueView(idx, ctx) {
 }
 
 function indexReport(idx) {
+    const perChunkMs = [];
     let ms = 0;
-    for (const t of idx.chunkMs) ms += t;
+    for (const rec of idx.columns.values()) {
+        perChunkMs.push(rec.ms);
+        ms += rec.ms;
+    }
     return {
-        chunks: idx.chunkMs.length,
+        chunks: idx.columns.size,
         ms,
         cellReads: idx.cellReads,
         sectionsBuilt: idx.sectionsBuilt,
         sectionsSkipped: idx.sectionsSkipped,
-        perChunkMs: idx.chunkMs.slice(),
+        perChunkMs,
+        builds: idx.builds,
+        buildMs: idx.buildMs,
     };
 }
 
@@ -1132,6 +1150,7 @@ function scheduleIndex(bot, idx) {
             idx.queue.length = 0;
             idx.pending.clear();
             const waiting = idx.drain.splice(0);
+            if (waiting.length === 0) throw err;
             for (const w of waiting) w.reject(err);
             return;
         }
@@ -1148,53 +1167,115 @@ function chunkCorner(corner, event) {
 }
 
 function dropColumn(idx, key) {
-    idx.columns.delete(key);
+    const had = idx.columns.delete(key);
     rememberWaiters(idx, key);
     idx.pending.delete(key);
     idx.queue = idx.queue.filter(job => `${job.cx},${job.cz}` !== key);
+    if (had) bumpVis(idx);
+}
+
+function clearFace(sec, bit) {
+    for (const [pack, cell] of sec.cells) {
+        if ((cell.mask & bit) === 0) continue;
+        cell.mask &= ~bit;
+        if (cell.mask === 0) sec.cells.delete(pack);
+    }
+    sec.states.clear();
+    for (const cell of sec.cells.values()) sec.states.add(cell.id);
+}
+
+// The shared face of an already-indexed neighbour. Loading opens it; unloading closes it.
+// This does not build the neighbour column.
+function refreshBoundary(idx, ctx, cx, cz, face) {
+    const key = `${cx},${cz}`;
+    const rec = idx.columns.get(key);
+    if (!rec) return;
+    const col = ctx.columns.get(key);
+    if (!col || !col.column || !Number.isInteger(col.column.minY) || !Array.isArray(col.column.sections)) return;
+    const column = col.column;
+    const bit = 1 << face;
+    const [fx, fy, fz] = FACES[face];
+    let changed = false;
+    for (let si = 0; si < rec.sections.length; si++) {
+        const sec = rec.sections[si];
+        if (!sec) continue;
+        const before = sec.cells.size;
+        clearFace(sec, bit);
+        if (sec.cells.size !== before) changed = true;
+        const { originY, where } = sectionWhere(cx, cz, column, si);
+        const info = sectionInfo(column, si, where, ctx.registry, idx.open);
+        if (info.kind === 'air') continue;
+        const minX = cx * CHUNK_WIDTH, minZ = cz * CHUNK_WIDTH;
+        for (const [x, y, z] of facePositions(minX, originY, minZ, face)) {
+            const id = info.kind === 'solid' ? info.id : readIndexedCell(ctx, x, y, z, idx);
+            if (id === 0 || id === null) continue;
+            if (!faceOpen(ctx, idx, key, x, y, z, fx, fy, fz, null)) continue;
+            const pack = `${x},${y},${z}`;
+            const prev = sec.cells.get(pack);
+            if (!prev || (prev.mask & bit) === 0) changed = true;
+            putCell(sec, x, y, z, id, bit);
+        }
+    }
+    if (changed) bumpVis(idx);
+}
+
+function patchNeighborFaces(idx, ctx, cx, cz) {
+    for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const face = dx === 1 ? 0 : dx === -1 ? 1 : dz === 1 ? 4 : 5;
+        refreshBoundary(idx, ctx, cx + dx, cz + dz, face ^ 1);
+    }
+}
+
+function dropOutsideView(idx, ctx) {
+    if (idx.viewX === ctx.stoodX && idx.viewZ === ctx.stoodZ && idx.viewR === ctx.radius) return;
+    const gone = [];
+    for (const key of idx.columns.keys()) {
+        const [cx, cz] = key.split(',').map(Number);
+        if (!inView(ctx, cx, cz)) gone.push({ cx, cz, key });
+    }
+    idx.queue = idx.queue.filter(job => inView(ctx, job.cx, job.cz));
+    for (const key of [...idx.pending]) {
+        const [cx, cz] = key.split(',').map(Number);
+        if (!inView(ctx, cx, cz)) idx.pending.delete(key);
+    }
+    for (const g of gone) dropColumn(idx, g.key);
+    for (const g of gone) patchNeighborFaces(idx, ctx, g.cx, g.cz);
+    idx.viewX = ctx.stoodX;
+    idx.viewZ = ctx.stoodZ;
+    idx.viewR = ctx.radius;
 }
 
 function onColumnLoad(bot, idx, corner) {
     const { cx, cz } = chunkCorner(corner, 'chunkColumnLoad');
-    const key = `${cx},${cz}`;
-    const waiting = idx.waiters.get(key);
-    idx.waiters.delete(key);
-    dropColumn(idx, key);
-    let ctx;
-    try { ctx = viewContext(bot); } catch (err) { throw err; }
+    const ctx = viewContext(bot);
+    dropColumn(idx, `${cx},${cz}`);
     enqueueColumn(idx, ctx, cx, cz);
-    if (waiting) {
-        for (const other of waiting) {
-            dropColumn(idx, other);
-            const [ox, oz] = other.split(',');
-            enqueueColumn(idx, ctx, Number(ox), Number(oz));
-        }
-    }
+    patchNeighborFaces(idx, ctx, cx, cz);
     scheduleIndex(bot, idx);
 }
 
 function onColumnUnload(bot, idx, corner) {
     const { cx, cz } = chunkCorner(corner, 'chunkColumnUnload');
+    const ctx = viewContext(bot);
     dropColumn(idx, `${cx},${cz}`);
-    let ctx;
-    try { ctx = viewContext(bot); } catch (err) { throw err; }
-    for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
-        const ox = cx + dx, oz = cz + dz;
-        if (!idx.columns.has(`${ox},${oz}`)) continue;
-        dropColumn(idx, `${ox},${oz}`);
-        enqueueColumn(idx, ctx, ox, oz);
-    }
-    scheduleIndex(bot, idx);
+    patchNeighborFaces(idx, ctx, cx, cz);
 }
 
 function reindexSectionAt(idx, ctx, x, y, z, done) {
     const cx = Math.floor(x / CHUNK_WIDTH), cz = Math.floor(z / CHUNK_WIDTH);
+    if (!inView(ctx, cx, cz)) return;
     const key = `${cx},${cz}`;
-    const built = idx.columns.get(key);
     const col = ctx.columns.get(key);
-    if (!built || !col) return;
+    const built = idx.columns.get(key);
+    if (!col) return;
+    if (!built) {
+        if (idx.pending.has(key)) return;
+        throw new Error(`nearby blocks: chunk ${cx},${cz} is loaded in the view and is neither indexed nor pending.`);
+    }
     const column = col.column;
-    if (!Number.isInteger(column.minY) || !Array.isArray(column.sections)) return;
+    if (!Number.isInteger(column.minY) || !Array.isArray(column.sections)) {
+        throw new Error(`nearby blocks: chunk ${cx},${cz} has no minY or sections.`);
+    }
     const si = (y - column.minY) >> 4;
     if (si < 0 || si >= column.sections.length) return;
     const token = `${key}:${si}`;
@@ -1212,22 +1293,28 @@ function onBlockUpdate(bot, idx, oldBlock, newBlock) {
     const done = new Set();
     reindexSectionAt(idx, ctx, pos.x, pos.y, pos.z, done);
     for (const [fx, fy, fz] of FACES) reindexSectionAt(idx, ctx, pos.x + fx, pos.y + fy, pos.z + fz, done);
+    // Visibility was confirmed from the last eye cell through these sections. A cell change there can open or
+    // close a ray. A change outside that set cannot: the walk never entered it.
+    if (idx.reachedKeys) {
+        for (const token of done) if (idx.reachedKeys.has(token)) { bumpVis(idx); break; }
+    }
 }
 
 function ensureIndex(bot) {
     let idx = perceivedIndex.get(bot);
     if (idx) return idx;
+    if (!bot.world || typeof bot.world.on !== 'function') {
+        throw new Error('nearby blocks: bot.world.on is missing. chunkColumnLoad, chunkColumnUnload, and blockUpdate are forwarded on the world (mineflayer lib/plugins/blocks.js forwardedEvents).');
+    }
     idx = {
         columns: new Map(), queue: [], pending: new Set(), waiters: new Map(), drain: [], pumping: false,
-        cellReads: 0, sectionsBuilt: 0, sectionsSkipped: 0, chunkMs: [], open: new Map(),
+        cellReads: 0, sectionsBuilt: 0, sectionsSkipped: 0, builds: 0, buildMs: 0, open: new Map(),
+        visGen: 0, vis: null, reachedKeys: new Set(),
     };
     perceivedIndex.set(bot, idx);
-    const target = bot.world && typeof bot.world.on === 'function' ? bot.world : (typeof bot.on === 'function' ? bot : null);
-    if (target) {
-        target.on('chunkColumnLoad', corner => onColumnLoad(bot, idx, corner));
-        target.on('chunkColumnUnload', corner => onColumnUnload(bot, idx, corner));
-        target.on('blockUpdate', (oldBlock, newBlock) => onBlockUpdate(bot, idx, oldBlock, newBlock));
-    }
+    bot.world.on('chunkColumnLoad', corner => onColumnLoad(bot, idx, corner));
+    bot.world.on('chunkColumnUnload', corner => onColumnUnload(bot, idx, corner));
+    bot.world.on('blockUpdate', (oldBlock, newBlock) => onBlockUpdate(bot, idx, oldBlock, newBlock));
     return idx;
 }
 
@@ -1240,9 +1327,9 @@ export function indexPerceivedChunks(bot) {
      * let built = await world.indexPerceivedChunks(bot);
      **/
     const idx = ensureIndex(bot);
-    let ctx;
-    try { ctx = viewContext(bot); } catch (err) { return Promise.reject(err); }
+    const ctx = viewContext(bot);
     if (!ctx.columns.has(standingKey(ctx))) return Promise.reject(missingStanding(ctx));
+    dropOutsideView(idx, ctx);
     enqueueView(idx, ctx);
     if (!idx.queue.length && !idx.pumping) return Promise.resolve(indexReport(idx));
     return new Promise((resolve, reject) => {
@@ -1303,7 +1390,7 @@ function reachedSections(ctx, idx) {
         const secOriginY = col.column.minY + cur.si * SECTION_HEIGHT;
         const secOriginX = cur.cx * CHUNK_WIDTH;
         const secOriginZ = cur.cz * CHUNK_WIDTH;
-        reached.push({ sec, originX: secOriginX, originY: secOriginY, originZ: secOriginZ });
+        reached.push({ sec, originX: secOriginX, originY: secOriginY, originZ: secOriginZ, cx: cur.cx, cz: cur.cz, si: cur.si });
         for (let face = 0; face < FACE_COUNT; face++) {
             if (cur.entry < 0) {
                 if ((cur.exits & (1 << face)) === 0) continue;
@@ -1330,13 +1417,79 @@ function reachedSections(ctx, idx) {
     return reached;
 }
 
-function confirmVisible(bot, ctx, idx, onlyName) {
+// A column that is not loaded is not on this ray. stateAt still throws when a loaded in-view column is asked
+// for and missing; the caller only asks stateAt once the column is in the loaded set.
+function rayState(ctx, x, y, z) {
+    const cx = Math.floor(x / CHUNK_WIDTH), cz = Math.floor(z / CHUNK_WIDTH);
+    if (Math.abs(cx - ctx.view.stoodX) > ctx.view.radius || Math.abs(cz - ctx.view.stoodZ) > ctx.view.radius) return null;
+    if (!ctx.columns.has(`${cx},${cz}`)) return null;
+    return stateAt(ctx.columns, x, y, z, ctx.view);
+}
+
+// Amanatides & Woo, "A Fast Voxel Traversal Algorithm for Ray Tracing" (Eurographics 1987,
+// http://www.cse.yorku.ca/~amana/research/grid.pdf). The ray is parameterized so t = 1 is the face center.
+// The target cell is a hit even when that cell does not occlude. The first other occluding cell is a miss.
+function ddaHit(ctx, idx, eye, cell, point) {
+    let x = Math.floor(eye.x), y = Math.floor(eye.y), z = Math.floor(eye.z);
+    let steps = 0;
+    if (x === cell.x && y === cell.y && z === cell.z) return { hit: true, steps };
+    const dx = point.x - eye.x, dy = point.y - eye.y, dz = point.z - eye.z;
+    const stepX = dx === 0 ? 0 : (dx > 0 ? 1 : -1);
+    const stepY = dy === 0 ? 0 : (dy > 0 ? 1 : -1);
+    const stepZ = dz === 0 ? 0 : (dz > 0 ? 1 : -1);
+    const tDeltaX = stepX === 0 ? Infinity : Math.abs(1 / dx);
+    const tDeltaY = stepY === 0 ? Infinity : Math.abs(1 / dy);
+    const tDeltaZ = stepZ === 0 ? Infinity : Math.abs(1 / dz);
+    let tMaxX = stepX === 0 ? Infinity : (stepX > 0 ? (Math.floor(eye.x) + 1 - eye.x) / dx : (Math.floor(eye.x) - eye.x) / dx);
+    let tMaxY = stepY === 0 ? Infinity : (stepY > 0 ? (Math.floor(eye.y) + 1 - eye.y) / dy : (Math.floor(eye.y) - eye.y) / dy);
+    let tMaxZ = stepZ === 0 ? Infinity : (stepZ > 0 ? (Math.floor(eye.z) + 1 - eye.z) / dz : (Math.floor(eye.z) - eye.z) / dz);
+    while (true) {
+        if (x === cell.x && y === cell.y && z === cell.z) return { hit: true, steps };
+        const id = rayState(ctx, x, y, z);
+        if (id === null || !nonOccluding(ctx.registry, id, idx.open)) return { hit: false, steps };
+        const xFirst = tMaxX <= tMaxY && tMaxX <= tMaxZ;
+        const yFirst = !xFirst && tMaxY <= tMaxZ;
+        const tNext = xFirst ? tMaxX : yFirst ? tMaxY : tMaxZ;
+        // t = 1 is the face center, which lies on the target cell's face (Amanatides & Woo). Accumulated
+        // boundary times can land a fraction past 1 while the walk is still in the air cell beside that face.
+        // The cell across the boundary is the target, so that face counts.
+        if (tNext > 1) {
+            const nx = x + (xFirst ? stepX : 0);
+            const ny = y + (yFirst ? stepY : 0);
+            const nz = z + (!xFirst && !yFirst ? stepZ : 0);
+            return { hit: nx === cell.x && ny === cell.y && nz === cell.z, steps };
+        }
+        if (xFirst) { x += stepX; tMaxX += tDeltaX; }
+        else if (yFirst) { y += stepY; tMaxY += tDeltaY; }
+        else { z += stepZ; tMaxZ += tDeltaZ; }
+        steps += 1;
+    }
+}
+
+// The walk is a function of the eye's block and the states in the sections the visibility BFS can enter.
+// A move inside that block does not change the origin cell, so the key is the cell, not the point inside it.
+// visGen changes when a reached section is reindexed or the indexed columns change, which is the other half:
+// the same cell after a dig is a different walk. Either half alone is wrong.
+function visKey(ctx, idx) {
+    const eye = ctx.eye;
+    return `${Math.floor(eye.x)},${Math.floor(eye.y)},${Math.floor(eye.z)},${idx.visGen}`;
+}
+
+function confirmVisible(ctx, idx, onlyName) {
+    const key = visKey(ctx, idx);
+    if (idx.vis && idx.vis.key === key) {
+        if (onlyName) {
+            const hit = idx.vis.found.find(b => b.name === onlyName);
+            return { position: hit ? { x: hit.x, y: hit.y, z: hit.z } : null, raycasts: 0, ddaRays: 0, ddaSteps: 0, candidates: 0, sectionsReached: idx.vis.sectionsReached };
+        }
+        return { found: idx.vis.found, raycasts: 0, ddaRays: 0, ddaSteps: 0, candidates: 0, sectionsReached: idx.vis.sectionsReached };
+    }
     const eye = ctx.eye;
     const confirmed = new Set();
     const found = [];
     let candidates = 0;
-    let raycasts = 0;
-    const eyeVec = new Vec3(eye.x, eye.y, eye.z);
+    let ddaRays = 0;
+    let ddaSteps = 0;
     const wants = (id) => {
         const block = ctx.registry.blocksByStateId[id];
         if (!block || typeof block.name !== 'string') throw new Error(`nearby blocks: state id ${id} is not in the registry`);
@@ -1344,6 +1497,9 @@ function confirmVisible(bot, ctx, idx, onlyName) {
         return !confirmed.has(id);
     };
     const reached = reachedSections(ctx, idx);
+    const reachedKeys = new Set();
+    for (const node of reached) reachedKeys.add(`${node.cx},${node.cz}:${node.si}`);
+    idx.reachedKeys = reachedKeys;
     const halfX = CHUNK_WIDTH / 2;
     const halfY = SECTION_HEIGHT / 2;
     reached.sort((a, b) => dist2(eye.x, eye.y, eye.z, a.originX + halfX, a.originY + halfY, a.originZ + halfX)
@@ -1355,7 +1511,6 @@ function confirmVisible(bot, ctx, idx, onlyName) {
         let pending = false;
         for (const id of sec.states) if (wants(id)) pending = true;
         if (!pending) continue;
-        // One section's facing faces, not the view's. Later sections of a confirmed state are not copied.
         const facing = [];
         for (const cell of sec.cells.values()) {
             if (!wants(cell.id)) continue;
@@ -1371,35 +1526,49 @@ function confirmVisible(bot, ctx, idx, onlyName) {
         candidates += facing.length;
         for (const item of facing) {
             if (!wants(item.cell.id)) continue;
-            const dir = new Vec3(item.point.x - eye.x, item.point.y - eye.y, item.point.z - eye.z);
-            const range = Math.sqrt(item.d);
-            if (!(range > 0)) continue;
-            raycasts += 1;
-            const hit = bot.world.raycast(eyeVec, dir.normalize(), range);
+            if (!(item.d > 0)) continue;
+            ddaRays += 1;
+            const walk = ddaHit(ctx, idx, eye, item.cell, item.point);
+            ddaSteps += walk.steps;
+            if (!walk.hit) continue;
             const cell = item.cell;
-            if (!hit || !hit.position || hit.position.x !== cell.x || hit.position.y !== cell.y || hit.position.z !== cell.z) continue;
             if (onlyName) { foundAt = { x: cell.x, y: cell.y, z: cell.z }; break; }
             confirmed.add(cell.id);
             const block = ctx.registry.blocksByStateId[cell.id];
             found.push({ name: block.name, metadata: block.metadata, x: cell.x, y: cell.y, z: cell.z });
         }
     }
-    if (onlyName) return { position: foundAt, raycasts, candidates, sectionsReached: reached.length };
-    return { found, raycasts, candidates, sectionsReached: reached.length };
+    if (!onlyName) idx.vis = { key, found, candidates, sectionsReached: reached.length };
+    if (onlyName) return { position: foundAt, raycasts: 0, ddaRays, ddaSteps, candidates, sectionsReached: reached.length };
+    return { found, raycasts: 0, ddaRays, ddaSteps, candidates, sectionsReached: reached.length };
+}
+
+function indexNote(idx, ctx) {
+    let loaded = 0;
+    let indexed = 0;
+    for (const key of ctx.columns.keys()) {
+        const [cx, cz] = key.split(',').map(Number);
+        if (!inView(ctx, cx, cz)) continue;
+        loaded += 1;
+        if (idx.columns.has(key)) indexed += 1;
+    }
+    const phrase = indexed === loaded ? 'index complete' : 'index incomplete';
+    return `${phrase}, ${indexed} of ${loaded} chunks`;
 }
 
 function perceivedBlocks(bot) {
     const ctx = viewContext(bot);
     if (!ctx.columns.has(standingKey(ctx))) throw missingStanding(ctx);
-    if (typeof bot.world.raycast !== 'function') {
-        throw new Error('nearby blocks: bot.world.raycast is missing (prismarine-world docs/API.md World.raycast).');
-    }
     const idx = ensureIndex(bot);
+    dropOutsideView(idx, ctx);
     if (!idx.columns.has(standingKey(ctx))) buildColumn(idx, ctx, ctx.stoodX, ctx.stoodZ);
     enqueueView(idx, ctx);
     scheduleIndex(bot, idx);
-    const seen = confirmVisible(bot, ctx, idx, null);
-    perceivedStat.set(bot, { cellReads: 0, candidates: seen.candidates, raycasts: seen.raycasts, sectionsRead: 0, sectionsSkipped: 0, sectionsReached: seen.sectionsReached });
+    const seen = confirmVisible(ctx, idx, null);
+    perceivedStat.set(bot, {
+        cellReads: 0, candidates: seen.candidates, raycasts: seen.raycasts, ddaRays: seen.ddaRays, ddaSteps: seen.ddaSteps,
+        sectionsRead: 0, sectionsSkipped: 0, sectionsReached: seen.sectionsReached, indexNote: indexNote(idx, ctx),
+    });
     return seen.found;
 }
 
@@ -1409,10 +1578,7 @@ export async function perceivedPosition(bot, name) {
     const ctx = viewContext(bot);
     const idx = perceivedIndex.get(bot);
     if (!idx || !idx.columns.has(standingKey(ctx))) throw missingStanding(ctx);
-    if (typeof bot.world.raycast !== 'function') {
-        throw new Error('perceivedPosition: bot.world.raycast is missing (prismarine-world docs/API.md World.raycast).');
-    }
-    const seen = confirmVisible(bot, ctx, idx, name);
+    const seen = confirmVisible(ctx, idx, name);
     return seen.position;
 }
 
@@ -1425,7 +1591,7 @@ export function perceivedStats(bot) {
 export function getNearbyBlocks(bot) {
     /**
      * One confirmed visible instance of each block state the bot can see.
-     * Loaded, inside the server view distance, a face open to a non-occluding block, and bot.world.raycast hits it.
+     * Loaded, inside the server view distance, a face open to a non-occluding block, and a voxel walk of block states hits it.
      * @param {Bot} bot - The bot. The scan does not take a radius.
      * @returns {Block[]} - name, metadata, and the block position of that instance.
      * @example

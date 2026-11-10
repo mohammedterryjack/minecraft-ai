@@ -16,10 +16,10 @@ import assert from 'node:assert';
 import { createRequire } from 'node:module';
 import { readFileSync } from 'node:fs';
 import { edibleNames, planFoodAcquisition } from '../src/agent/food_backchain.js';
-import { buildContractManifest } from '../scripts/fix97_contract_manifest.js';
+import { applyContractResets, buildContractManifest } from '../scripts/fix97_contract_manifest.js';
 import { nestedBotMemberError, getBareAPI, Coder } from '../src/agent/coder.js';
-import { getNearestBlocks, getNearestBlocksWhere, getNearbyBlockTypes, getNearbyBlocks, nearbyBlockRadius, perceivedStats, perceivedBuildStats, indexPerceivedChunks, pathToBlock, pathStatusSync } from '../src/agent/library/world.js';
-import { buildLayeredWorld } from './layered_terrain.js';
+import { getNearestBlocks, getNearestBlocksWhere, getNearbyBlockTypes, getNearbyBlocks, nearbyBlockRadius, perceivedStats, perceivedBuildStats, indexPerceivedChunks, pathToBlock } from '../src/agent/library/world.js';
+import { buildServerTerrain, makeServerChunk, serverHeight } from './server_terrain.js';
 import { gunzipSync } from 'node:zlib';
 import pf from 'mineflayer-pathfinder';
 import { Vec3 } from 'vec3';
@@ -111,8 +111,13 @@ describe('fix97 goal identity: Collect 1 apple stays Collect 1 apple', () => {
         v.agent.bot.game = { gameMode: 'survival' };
         v.agent.bot.entity = { eyeHeight: 1.62, position: { x: 0, y: 64, z: 0 } };
         v.agent.bot.world = {};
-        v.agent.bot.pathfinder = { movements: {}, getPathTo: () => ({ status: 'success', cost: 1 }) };
-        v.observe = () => ({ inventory: {}, nearby_blocks: ['dirt'] });
+        v.agent.bot.waitForTicks = async () => {};
+        v.agent.bot.pathfinder = {
+            movements: {},
+            tickTimeout: 40,
+            getPathFromTo: function * () { yield { result: { status: 'success', cost: 1 } }; },
+        };
+        v.observe = () => ({ inventory: {}, nearby_blocks: ['dirt'], perceived_at: {} });
         assert.strictEqual(await v._decompose('Collect 1 apple', 'no apples'), false);
         assert.strictEqual(v.progress.decomposed['Collect 1 apple'], undefined);
         v.observe = () => ({ inventory: {}, nearby_blocks: ['oak_leaves', 'dirt'], perceived_at: { oak_leaves: { x: 1, y: 70, z: 1 } } });
@@ -130,7 +135,8 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         assert.match(v._validContract({ pre: 'c => c.pre.inv.oak_log < 55', post: 'c => true' }, skill), /pre uses 55/);
         const bare = { name: 'checkOakLog', code: 'async function checkOakLog(bot) { return 55; }', consumes: {}, effects: [] };
         assert.strictEqual(v._validContract({ pre: 'c => true', post: 'c => true' }, bare), null);
-        const ok = v._validContract({ pre: 'c => c.args.length >= 1 && c.args[0] === null', post: 'c => true' }, skill);
+        const withArg = { name: 'checkOakLog', code: 'async function checkOakLog(bot, block) { return true; }', consumes: {}, effects: [] };
+        const ok = v._validContract({ pre: 'c => c.args.length >= 1 && c.args[0] === null', post: 'c => true' }, withArg);
         assert.strictEqual(ok, null);
         const buried = { name: 'checkOakLog', code: 'async function checkOakLog(bot) { return 155; }', consumes: {}, effects: [], stats: { success: 5512, fail: 0 } };
         const buriedReason = v._validContract({ pre: 'c => c.pre.inv.oak_log < 55', post: 'c => true' }, buried);
@@ -174,6 +180,64 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         for (const name of ['tossClutterSafe', 'ensureInventorySpaceForApple', 'verifyInventoryAndChest']) {
             assert.ok(!manifest.records.some(r => r.id.startsWith(`${name}.`)), name);
         }
+        assert.deepStrictEqual(manifest.resets.map(r => r.id).sort(), [
+            'checkForAppleTrees.pre.args[0]',
+            'confirmInventoryUpdate.pre.args[0]',
+            'confirmInventoryUpdate.pre.args[1]',
+            'cookFood.pre.args[1]',
+            'gatherOakLog.pre.args[0]',
+            'harvestCrop.post.args[2]',
+            'recommendTillingAction.post.args[0]',
+            'removeItem.pre.args[2]',
+            'tossOneRawCopper.pre.args[0]',
+            'tossOneRawCopper.pre.args[1]',
+            'verifyBlockType.pre.args[0]',
+            'verifyBlockType.pre.args[1]',
+            'verifyBlockType.pre.args[2]',
+            'verifyInventorySlots.post.args[1]',
+            'verifyInventorySlots.pre.args[1]',
+        ]);
+        const cleared = JSON.parse(JSON.stringify(skills));
+        const applied = applyContractResets(cleared);
+        assert.strictEqual(applied.length, manifest.resets.length);
+        const resetNames = new Set(manifest.resets.map(r => r.skill));
+        assert.strictEqual(resetNames.size, 10);
+        for (const skill of cleared) {
+            if (!resetNames.has(skill.name)) continue;
+            assert.strictEqual(Object.hasOwn(skill, 'contract'), false, skill.name);
+            assert.strictEqual(Object.hasOwn(skill, 'contractPrev'), false, skill.name);
+            assert.strictEqual(Object.hasOwn(skill, 'contractFail'), false, skill.name);
+            assert.strictEqual(typeof skill.code, 'string');
+        }
+        const kept = cleared.find(s => s.name === 'checkOakLog');
+        assert.ok(kept.contract && kept.contract.pre);
+    });
+
+    it('a call argument does not excuse an inventory comparison; a non-item count does', () => {
+        const sleep = {
+            name: 'checkOakLog',
+            code: 'async function checkOakLog(bot) { await sleep(bot, 55); const counts = getInventoryCounts(bot); return counts.oak_log < 55; }',
+            contract: { pre: 'c => c.pre.inv.oak_log < 55', post: 'c => true' },
+        };
+        assert.ok(Voyager.copiedInventoryHits(sleep, registry).some(h => h.where === 'pre' && h.item === 'oak_log' && h.n === 55));
+        const apple = {
+            name: 'ensureInventorySpaceForApple',
+            code: 'async function ensureInventorySpaceForApple(bot) { const emptySlots = bot.inventory.emptySlotCount(); return emptySlots < 10; }',
+            contract: { pre: 'c => c.pre.inv.pink_petals < 10', post: 'c => true' },
+        };
+        assert.ok(!Voyager.copiedInventoryHits(apple, registry).some(h => h.item === 'pink_petals'));
+    });
+
+    it('c.args past the parameters after bot is rejected, and the error names that list', () => {
+        const v = mkV({});
+        const skill = { name: 'cookFood', code: 'async function cookFood(bot, count = 1) { return true; }', consumes: {}, effects: [] };
+        const reason = v._validContract({ pre: 'c => c.args[1] >= 1', post: 'c => true' }, skill);
+        assert.match(reason, /parameters after bot are \(count = 1\)/);
+        assert.match(reason, /c\.args\[1\]/);
+        assert.strictEqual(v._validContract({ pre: 'c => c.args[0] >= 1 && c.args.length === 1', post: 'c => true' }, skill), null);
+        assert.match(v._validContract({ pre: 'c => c.args.length >= 2', post: 'c => true' }, skill), /arity 1/);
+        const rest = { name: 'cookFood', code: 'async function cookFood(bot, count = 1, ...more) { return true; }', consumes: {}, effects: [] };
+        assert.strictEqual(v._validContract({ pre: 'c => c.args[3] >= 1', post: 'c => true' }, rest), null);
     });
 
     it('parses a skill as a module and a contract as a parenthesized expression, and a comment or string is not a numeric literal', () => {
@@ -255,7 +319,7 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
     });
 
     it('the 21 live-index hits keep only an inventory count equal to the count the skill was generated from', () => {
-        const fn = (name, body = 'return true;') => `async function ${name}(bot) {\n  ${body}\n}`;
+        const fn = (name, body = 'return true;') => `async function ${name}(bot, a, b, c = 0) {\n  ${body}\n}`;
         const oakTask = 'Check inventory for oak_log and confirm count (currently 55) to ensure input is valid for crafting oak_planks';
         const skills = [
             { name: 'craftToolSet', code: fn('craftToolSet'), contract: { pre: 'c => true', post: 'c => Object.keys(c.post.inv).filter(k=>k.endsWith(\'_pickaxe\')||k.endsWith(\'_axe\')||k.endsWith(\'_sword\')).length === 3' } },
@@ -325,7 +389,7 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
     });
 
     it('the live check skills are the only records, and a kind-prefixed collect goal is not', () => {
-        const fn = (name, body = 'return true;') => `async function ${name}(bot) {\n  ${body}\n}`;
+        const fn = (name, body = 'return true;') => `async function ${name}(bot, a, b, c = 0) {\n  ${body}\n}`;
         const oakTask = 'Check inventory for oak_log and confirm count (currently 55) to ensure input is valid for crafting oak_planks';
         const leavesTask = 'Verify that oak_leaves count is currently 6 in inventory by checking item count';
         const dirtTask = 'collectSurface: Collect 32 dirt blocks within 32 blocks of the current position to ensure tilling surface is available for planting wheat_seeds';
@@ -543,7 +607,12 @@ describe('fix97 code state and decompose limits', () => {
         v.agent.bot.game = { gameMode: 'survival' };
         v.agent.bot.entity = { eyeHeight: 1.62, position: { x: 0, y: 64, z: 0 } };
         v.agent.bot.world = {};
-        v.agent.bot.pathfinder = { movements: {}, getPathTo: () => ({ status: 'success', cost: 1 }) };
+        v.agent.bot.waitForTicks = async () => {};
+        v.agent.bot.pathfinder = {
+            movements: {},
+            tickTimeout: 40,
+            getPathFromTo: function * () { yield { result: { status: 'success', cost: 1 } }; },
+        };
         v.observe = () => ({ inventory: {}, nearby_blocks: ['oak_leaves'], perceived_at: { oak_leaves: { x: 1, y: 70, z: 1 } } });
         assert.strictEqual(await v._decompose('Collect 1 apple', 'overflow'), true);
         assert.strictEqual(await v._decompose('Collect 1 apple', 'again'), false);
@@ -810,7 +879,7 @@ describe('fix97 findBlocks refuses a non-numeric maxDistance or count', () => {
             entity: { position: new Vec3(8, feetY, 8), eyeHeight },
             blockAt() { return null; },
             findBlocks() { throw new Error('nearby blocks must not call findBlocks'); },
-            world: { getColumns() { return columns; }, raycast },
+            world: { getColumns() { return columns; }, on() {} },
         };
         const nearbyNames = getNearbyBlockTypes(viewBot);
         const stats = perceivedStats(viewBot);
@@ -829,7 +898,8 @@ describe('fix97 findBlocks refuses a non-numeric maxDistance or count', () => {
         assert.ok(cellReads < cube, `cell reads ${cellReads} against the view-distance cube ${cube}`);
         assert.ok(stats.candidates > 0 && stats.candidates < BLOCK_SECTION_VOLUME, `candidates ${stats.candidates} allocated a section or more`);
         assert.ok(stats.candidates < cube);
-        assert.ok(stats.raycasts > 0 && stats.raycasts <= stats.candidates);
+        assert.strictEqual(stats.raycasts, 0);
+        assert.ok(stats.ddaSteps > 0 && stats.ddaRays > 0 && stats.ddaRays <= stats.candidates);
         const listed = getNearbyBlocks(viewBot);
         const stone = listed.find(b => b.name === 'stone');
         assert.ok(stone, 'an exposed stone is in the block list');
@@ -852,20 +922,20 @@ describe('fix97 findBlocks refuses a non-numeric maxDistance or count', () => {
             game: { serverViewDistance: viewDistance, gameMode: 'survival' },
             registry,
             entity: { position: new Vec3(8, feetY, 8), eyeHeight },
-            world: { getColumns() { return missingNeighbor; }, raycast },
+            world: { getColumns() { return missingNeighbor; }, on() {} },
         }));
         const notStanding = columns.filter(c => !(c.chunkX === 0 && c.chunkZ === 0));
         assert.throws(() => getNearbyBlockTypes({
             game: { serverViewDistance: viewDistance, gameMode: 'survival' },
             registry,
             entity: { position: new Vec3(8, feetY, 8), eyeHeight },
-            world: { getColumns() { return notStanding; }, raycast },
+            world: { getColumns() { return notStanding; }, on() {} },
         }), /standing in/);
         assert.throws(() => getNearbyBlockTypes({
             game: { serverViewDistance: viewDistance },
             registry,
             entity: { position: new Vec3(8, feetY, 8), eyeHeight },
-            world: { getColumns() { return holeColumns; }, raycast },
+            world: { getColumns() { return holeColumns; }, on() {} },
         }), /not loaded/);
         assert.throws(() => getNearbyBlockTypes({ game: { serverViewDistance: viewDistance }, registry, entity: { position: new Vec3(8, feetY, 8), eyeHeight } }), /getColumns/);
         const { EventEmitter } = require('events');
@@ -986,12 +1056,14 @@ describe('fix97 reachability is a pathfinder search per target', () => {
         v.agent.bot.game = { gameMode: 'survival' };
         v.agent.bot.entity = { eyeHeight: 1.62, position: { x: 0, y: 64, z: 0 } };
         v.agent.bot.world = {};
+        v.agent.bot.waitForTicks = async () => {};
         v.agent.bot.pathfinder = {
             movements: { id: 'bot-movements' },
-            getPathTo(movements, goal) {
+            tickTimeout: 40,
+            getPathFromTo: function * (movements, start, goal) {
                 assert.strictEqual(movements, v.agent.bot.pathfinder.movements);
                 calls.push(goal.pos.x);
-                return { status: goal.pos.x === 4 ? 'noPath' : 'success', cost: goal.pos.x };
+                yield { result: { status: goal.pos.x === 4 ? 'noPath' : 'success', cost: goal.pos.x } };
             },
         };
         const src = v._obtainPlanner({ inventory: {}, nearby_blocks: [], perceived_at: {} }).sources('raw_iron');
@@ -1001,18 +1073,20 @@ describe('fix97 reachability is a pathfinder search per target', () => {
             nearby_blocks: [...src, 'dirt'],
             perceived_at: { [src[0]]: { x: 4, y: 12, z: 4 }, [src[1]]: { x: 8, y: 12, z: 4 } },
         };
+        assert.deepStrictEqual(calls, [], 'an unjudged source is not a path status');
+        assert.throws(() => v._pathStatus(state, src[0]), /has not been searched/);
+        await v._judgeTargets(state, src, false);
         const pre = v._obtainPlanner(state).prerequisites('raw_iron', 1, state.inventory);
         assert.strictEqual(pre.how, 'collect');
         assert.deepStrictEqual(calls, [4, 8], `pathfinder targets were ${calls.join(', ')} for sources ${src.join(', ')}`);
         calls.length = 0;
         const namedOnly = { inventory: { stone_pickaxe: 1 }, nearby_blocks: [src[0], 'dirt'], perceived_at: {} };
-        v._obtainPlanner(namedOnly).prerequisites('raw_iron', 1, namedOnly.inventory);
+        await v._judgeTargets(namedOnly, src, false);
         assert.deepStrictEqual(calls, [], 'a nearby name with no perceived position is not a pathfinder target');
         const direct = await pathToBlock(v.agent.bot, { x: 8, y: 12, z: 4 });
         assert.strictEqual(direct.status, 'success');
-        v.agent.bot.pathfinder.getPathTo = () => ({ status: 'partial', path: [] });
+        v.agent.bot.pathfinder.getPathFromTo = function * () { return { result: { status: 'partial', path: [] } }; };
         await assert.rejects(pathToBlock(v.agent.bot, { x: 8, y: 12, z: 4 }), /partial/);
-        assert.throws(() => pathStatusSync(v.agent.bot, { x: 8, y: 12, z: 4 }), /partial/);
     });
     it('getPathFromTo is stepped until it finishes, and a partial slice is not a reach need', async () => {
         const v = mkV({});
@@ -1020,6 +1094,7 @@ describe('fix97 reachability is a pathfinder search per target', () => {
         v.agent.bot.game = { gameMode: 'survival' };
         v.agent.bot.entity = { eyeHeight: 1.62, position: { x: 0, y: 64, z: 0 } };
         v.agent.bot.world = {};
+        v.agent.bot.waitForTicks = async () => {};
         v.agent.bot.pathfinder = {
             movements: { id: 'bot-movements' },
             tickTimeout: 40,
@@ -1036,8 +1111,9 @@ describe('fix97 reachability is a pathfinder search per target', () => {
             nearby_blocks: [...src, 'dirt'],
             perceived_at: { [src[0]]: { x: 4, y: 12, z: 4 }, [src[1]]: { x: 8, y: 12, z: 4 } },
         };
-        assert.throws(() => v._obtainPlanner(state).prerequisites('raw_iron', 1, state.inventory), /not unreachable/);
-        await v._noteReach(state);
+        assert.deepStrictEqual(calls, []);
+        assert.throws(() => v._pathStatus(state, src[0]), /has not been searched/);
+        await v._judgeTargets(state, src, false);
         const pre = v._obtainPlanner(state).prerequisites('raw_iron', 1, state.inventory);
         assert.strictEqual(pre.how, 'collect');
         assert.deepStrictEqual(calls, [4, 8]);
@@ -1078,8 +1154,10 @@ describe('fix97 observe on a view-distance world', () => {
         const { performance } = require('perf_hooks');
         const viewDistance = 10;
         const minY = -64;
-        const feetY = 64;
-        const world = await buildLayeredWorld(registry, viewDistance, true);
+        const feetY = serverHeight(8, 8) + 1;
+        const world = await buildServerTerrain(registry, viewDistance, { plants: true });
+        world.setBlockStateId(new Vec3(9, serverHeight(9, 8) + 1, 8), registry.blocksByName.wheat.defaultState);
+        world.setBlockStateId(new Vec3(10, serverHeight(10, 8) + 1, 8), registry.blocksByName.sugar_cane.defaultState);
         const bot = {
             game: { serverViewDistance: viewDistance, gameMode: 'survival', dimension: 'overworld', minY, height: 384 },
             registry,
@@ -1090,7 +1168,7 @@ describe('fix97 observe on a view-distance world', () => {
             heldItem: null,
             time: { timeOfDay: 6000 },
             entities: {},
-            entity: { position: new Vec3(3.5, feetY, 3.5), eyeHeight: 1.62 },
+            entity: { position: new Vec3(8.5, feetY, 8.5), eyeHeight: 1.62 },
             inventory: { items: () => [], emptySlotCount: () => 36, slots: new Array(46).fill(null) },
             world,
         };
@@ -1111,53 +1189,84 @@ describe('fix97 observe on a view-distance world', () => {
         const t0 = performance.now();
         const state = v.observe();
         const ms = performance.now() - t0;
+        const stats = perceivedStats(bot);
         const t1 = performance.now();
         const second = v.observe();
         const secondMs = performance.now() - t1;
-        const stats = perceivedStats(bot);
+        const secondStats = perceivedStats(bot);
         const build = perceivedBuildStats(bot);
         const { BLOCK_SECTION_VOLUME } = require('prismarine-chunk/src/pc/common/constants.js');
-        assert.ok(state.nearby_blocks.includes('grass_block'));
-        assert.ok(state.nearby_blocks.includes('oak_log'));
-        assert.ok(state.nearby_blocks.includes('oak_leaves'));
+        for (const name of ['grass_block', 'oak_log', 'oak_leaves', 'water', 'short_grass', 'poppy', 'wheat', 'sugar_cane']) {
+            assert.ok(state.nearby_blocks.includes(name), `${name} missing from ${state.nearby_blocks.join(',')}`);
+        }
+        assert.ok(!state.nearby_blocks.includes('copper_block'), 'buried copper_block is seen from the surface');
+        assert.ok(!state.nearby_blocks.includes('emerald_ore'), 'enclosed emerald_ore is seen from the surface');
         assert.ok(!state.nearby_blocks.includes('bedrock'));
-        assert.ok(!state.nearby_blocks.includes('deepslate'));
-        assert.ok(!state.nearby_blocks.includes('stone'), 'cave stone is not perceived from the surface');
-        assert.ok(!state.nearby_blocks.includes('diamond_ore'));
+        assert.match(state.perception, /^index complete, \d+ of \d+ chunks$/);
         assert.ok(stats.sectionsReached > 0 && stats.sectionsReached < build.sectionsBuilt);
         assert.ok(stats.candidates > 0 && stats.candidates < BLOCK_SECTION_VOLUME, `candidates ${stats.candidates}`);
-        assert.ok(stats.raycasts > 0 && stats.raycasts < BLOCK_SECTION_VOLUME, `raycasts ${stats.raycasts}`);
+        assert.strictEqual(stats.raycasts, 0);
+        assert.ok(stats.ddaSteps > 0 && stats.ddaRays > 0);
         assert.deepStrictEqual(second.nearby_blocks, state.nearby_blocks);
+        assert.strictEqual(secondStats.ddaSteps, 0);
+        assert.strictEqual(secondStats.raycasts, 0);
         assert.strictEqual(stats.cellReads, 0);
         assert.strictEqual(build.cellReads, built.cellReads);
         assert.strictEqual(built.chunks, (viewDistance * 2 + 1) ** 2);
         assert.ok(ms < 2000, `observe took ${ms} ms`);
         assert.ok(secondMs < 2000, `second observe took ${secondMs} ms`);
-        console.log(`[fix97] layered view-distance ${viewDistance}: index ${built.chunks} chunks in ${built.ms.toFixed(1)} ms (${perChunk.toFixed(2)} ms/chunk, max ${maxChunk.toFixed(2)}), cell reads ${built.cellReads}, sections ${built.sectionsBuilt} skipped ${built.sectionsSkipped}, heap +${((heapAfterIndex - heapBefore) / 1e6).toFixed(1)} MB; observe ${ms.toFixed(1)} ms then ${secondMs.toFixed(1)} ms, sections reached ${stats.sectionsReached}, candidates ${stats.candidates}, raycasts ${stats.raycasts}, names ${state.nearby_blocks.join(',')}`);
+        console.log(`[fix97] server terrain view-distance ${viewDistance}: index ${built.chunks} chunks in ${built.ms.toFixed(1)} ms (${perChunk.toFixed(2)} ms/chunk, max ${maxChunk.toFixed(2)}), cell reads ${built.cellReads}, sections ${built.sectionsBuilt} skipped ${built.sectionsSkipped}, heap +${((heapAfterIndex - heapBefore) / 1e6).toFixed(1)} MB; observe ${ms.toFixed(1)} ms then ${secondMs.toFixed(1)} ms, sections reached ${stats.sectionsReached}, candidates ${stats.candidates}, dda ${stats.ddaRays}/${stats.ddaSteps}, names ${state.nearby_blocks.join(',')}`);
     });
 
     it('a cave the bot is standing in is perceived, and a dug shaft makes that cave visible from the surface', async () => {
         const viewDistance = 2;
-        const world = await buildLayeredWorld(registry, viewDistance, true);
+        const world = await buildServerTerrain(registry, viewDistance, { plants: false });
+        const column = makeServerChunk(registry, 0, 0);
+        let cy = null;
+        for (let y = 10; y < 45; y++) if (column.getBlockStateId(new Vec3(5, y, 5)) === 0) { cy = y; break; }
+        assert.ok(cy !== null, 'the enclosed cave has no air cell');
         const make = (x, y, z) => ({
             game: { serverViewDistance: viewDistance, gameMode: 'survival' },
             registry,
             entity: { position: new Vec3(x, y, z), eyeHeight: 1.62 },
             world,
         });
-        const surface = make(5.5, 64, 5.5);
+        const top = serverHeight(5, 5);
+        const surface = make(5.5, top + 1, 5.5);
         await indexPerceivedChunks(surface);
         const above = getNearbyBlockTypes(surface);
         assert.ok(above.includes('grass_block'));
-        assert.ok(!above.includes('stone'), `surface saw ${above.join(',')}`);
-        const inside = make(5.5, 21, 5.5);
+        assert.ok(!above.includes('emerald_ore'), `surface saw ${above.join(',')}`);
+        const inside = make(5.5, cy + 1, 5.5);
         await indexPerceivedChunks(inside);
         const cave = getNearbyBlockTypes(inside);
-        assert.ok(cave.includes('stone'), `cave saw ${cave.join(',')}`);
-        assert.ok(!cave.includes('grass_block'), `cave saw ${cave.join(',')}`);
-        for (let y = 23; y <= 63; y++) world.setBlockStateId(new Vec3(5, y, 5), 0);
+        assert.ok(cave.includes('emerald_ore'), `cave saw ${cave.join(',')}`);
+        world.setBlockStateId(new Vec3(5, cy - 1, 5), registry.blocksByName.emerald_ore.defaultState);
+        for (let y = cy + 4; y <= top; y++) world.setBlockStateId(new Vec3(5, y, 5), 0);
         const opened = getNearbyBlockTypes(surface);
-        assert.ok(opened.includes('stone'), `shaft saw ${opened.join(',')}`);
+        assert.ok(opened.includes('emerald_ore'), `shaft saw ${opened.join(',')}`);
         assert.ok(opened.includes('grass_block'));
+    });
+
+    it('says the index is incomplete until every loaded column is built, and a crossing builds only the new columns', async () => {
+        const viewDistance = 1;
+        const world = await buildServerTerrain(registry, viewDistance, { plants: false });
+        const bot = {
+            game: { serverViewDistance: viewDistance, gameMode: 'survival' },
+            registry,
+            entity: { position: new Vec3(8.5, serverHeight(8, 8) + 1, 8.5), eyeHeight: 1.62 },
+            world,
+        };
+        getNearbyBlockTypes(bot);
+        assert.match(perceivedStats(bot).indexNote, /^index incomplete, \d+ of \d+ chunks$/);
+        await indexPerceivedChunks(bot);
+        getNearbyBlockTypes(bot);
+        assert.match(perceivedStats(bot).indexNote, /^index complete, \d+ of \d+ chunks$/);
+        const before = perceivedBuildStats(bot).builds;
+        for (let cz = -viewDistance; cz <= viewDistance; cz++) world.setColumn(viewDistance + 1, cz, makeServerChunk(registry, viewDistance + 1, cz));
+        for (let cz = -viewDistance; cz <= viewDistance; cz++) world.unloadColumn(-viewDistance, cz);
+        bot.entity.position = new Vec3(16 + 8.5, serverHeight(24, 8) + 1, 8.5);
+        await indexPerceivedChunks(bot);
+        assert.strictEqual(perceivedBuildStats(bot).builds - before, viewDistance * 2 + 1);
     });
 });

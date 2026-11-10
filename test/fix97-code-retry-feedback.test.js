@@ -198,6 +198,12 @@ describe('fix97 code-retry feedback is compact by construction', () => {
         assert.deepStrictEqual(recoverTemplatedLines(grouped), ['alpha 1', 'beta 2', 'alpha 3', 'beta 4']);
         const suffixed = 'stood at the chest (x2)';
         assert.strictEqual(recoverTemplatedLines(groupVaryingLines(suffixed)).join('\n'), suffixed);
+        const fuzz = ['plain', 'a\\b', 'a\\\\b', 'foo \\(x2)', 'foo \\\\(x2)', 'tail (x2)', 'tail (x7)', 'mix \\ end (x3)', 'odd \\\\\\ (x4)'];
+        for (const line of fuzz) {
+            assert.strictEqual(recoverTemplatedLines(groupVaryingLines(line)).join('\n'), line, JSON.stringify(line));
+        }
+        const many = ['alpha 1', 'a\\\\b', 'tail (x2)', 'alpha 3', 'a\\\\b'];
+        assert.deepStrictEqual(recoverTemplatedLines(groupVaryingLines(many.join('\n'))), many);
         assert.throws(() => groupVaryingLines(undefined), /text must be a string/);
         assert.throws(() => recoverTemplatedLines(null), /text must be a string/);
     });

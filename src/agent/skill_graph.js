@@ -709,10 +709,9 @@ export function groupVaryingLines(text) {
         const slots = g.rows[0] ? g.rows[0].length : 0;
         const constant = g.rows.every(row => sameNumbers(row, g.rows[0]));
         if (n === 1 && inOrder) {
-            // A raw line that already ends in ` (xN)` is the group header grammar (groupHeader). Escaping that
-            // suffix keeps one copy. A generated header is `body (xN)` and is not escaped.
-            const raw = groupHeader(g.first);
-            out.push(raw && raw.n >= 2 ? g.first.replace(/ \(x(\d+)\)$/, ' \\(x$1)') : g.first);
+            // A generated header is `body (xN)` and is not escaped. A raw line escapes `\` and then a trailing
+            // ` (xN)`, so the escape is reversible even when the line already contained a backslash.
+            out.push(encodeRaw(g.first));
             continue;
         }
         const header = constant ? g.first : template;
@@ -726,6 +725,16 @@ export function groupVaryingLines(text) {
 }
 function slotLine(line) {
     return typeof line === 'string' && (/^  at: /.test(line) || /^  \{\d+\}: /.test(line));
+}
+function encodeRaw(line) {
+    const doubled = line.replaceAll('\\', '\\\\');
+    return doubled.replace(/ \(x(\d+)\)$/, ' \\(x$1)');
+}
+function decodeRaw(line) {
+    const marked = line.match(/^(.*?)(\\+)\(x(\d+)\)$/);
+    let text = line;
+    if (marked && marked[2].length % 2 === 1) text = `${marked[1]}${marked[2].slice(1)}(x${marked[3]})`;
+    return text.replaceAll('\\\\', '\\');
 }
 function groupHeader(line) {
     if (typeof line !== 'string') return null;
@@ -811,10 +820,8 @@ export function recoverTemplatedLines(text) {
     const out = [];
     for (let i = 0; i < lines.length; i++) {
         if (/^  (?:at: |\{\d+\}: )/.test(lines[i])) throw new Error(`[fix97] series slot has no template: ${lines[i]}`);
-        const escaped = lines[i].match(/^(.*) \\\(x(\d+)\)$/);
-        if (escaped) { out.push(`${escaped[1]} (x${escaped[2]})`); continue; }
         const first = readGroup(lines, i);
-        if (!first) { out.push(lines[i]); continue; }
+        if (!first) { out.push(decodeRaw(lines[i])); continue; }
         if (!first.at) {
             out.push(...linesOfGroup(first));
             i = first.next - 1;
