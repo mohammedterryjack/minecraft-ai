@@ -2875,9 +2875,10 @@ Use only c; no other globals.`;
         const bot = this.agent.bot;
         const raiser = this._ensureRestThreat().bestRestRaiser(name => this._playableNamed(name));
         if (raiser !== null) return await this._replayNeedRaiser(label, before, raiser.entry);
-        // Same rule as a source block: the perceived set, then one getPathTo per candidate.
+        // Same rule as a source block: the perceived set, then pathToBlock per candidate.
+        // pathToBlock steps getPathFromTo. Only noPath is unreachable. A partial result is not stored.
         // Interaction range is the sleep action, after the path. No reachable bed is the obtain path.
-        const chosen = chooseReachableBed(bot, perceivedBeds(bot, before));
+        const chosen = await chooseReachableBed(bot, perceivedBeds(bot, before));
         if (chosen !== null) {
             await sleepInBed(bot, chosen);
             console.log(`[urgent-need] rested via bot.sleep (${winner.by})`);

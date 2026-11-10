@@ -13,8 +13,10 @@
 // attacker and is not invented from a nearby entity.
 // Protocol action ids and packet names come from the minecraft-data schema. No tick count, no
 // distance, no mob name, no bed colour.
-// A bed to sleep in is one observe() can see. Each candidate is one getPathTo. The chosen one
-// is walked with that same look-at goal. Interaction range is checked only for the sleep action.
+// A bed to sleep in is one observe() can see. observe() reads the section visibility index.
+// Each candidate is one pathToBlock, which steps getPathFromTo until success or noPath.
+// Only noPath means unreachable. A partial result is not a result and is not stored.
+// The chosen one is walked with that same look-at goal. Interaction range is checked only for the sleep action.
 // No perceived bed the pathfinder can reach means the normal obtain path. Nothing else is tried.
 
 import { readFileSync } from 'node:fs';
@@ -439,14 +441,22 @@ export function perceivedBeds(bot, state) {
     return beds;
 }
 
-export function chooseReachableBed(bot, beds) {
+export async function chooseReachableBed(bot, beds) {
     if (!Array.isArray(beds)) throw new Error('[fix98] perceived beds were not delivered');
     let chosen = null;
     for (const bed of beds) {
-        const path = pathToBlock(bot, bed.position);
-        if (path.status !== 'success') continue;
+        const path = await pathToBlock(bot, bed.position);
+        if (!path || typeof path.status !== 'string') {
+            throw new Error(`[fix98] ${bed.name} path status was not delivered`);
+        }
+        // pathToBlock returns only success or noPath. noPath is the open set exhausted.
+        // Any other status is an unfinished search. It is not unreachable, and it is not kept.
+        if (path.status === 'noPath') continue;
+        if (path.status !== 'success') {
+            throw new Error(`[fix98] ${bed.name} path status ${path.status} is not unreachable (mineflayer-pathfinder index.js tickTimeout; lib/astar.js compute).`);
+        }
         if (typeof path.cost !== 'number' || !Number.isFinite(path.cost)) {
-            throw new Error(`[fix98] getPathTo succeeded for ${bed.name} without a finite cost`);
+            throw new Error(`[fix98] pathToBlock succeeded for ${bed.name} without a finite cost`);
         }
         const betterCost = chosen === null || path.cost < chosen.cost;
         const sameCostEarlierName = chosen !== null && path.cost === chosen.cost && bed.name < chosen.name;

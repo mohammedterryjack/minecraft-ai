@@ -446,6 +446,58 @@ describe('fix98: rest serve chains a bed from game data', () => {
         assert.strictEqual(v.rested, true);
     });
 
+    it('a bed that needs more than one tick of search is chosen and slept in', async () => {
+        const v = mkV();
+        const bot = v.agent.bot;
+        const bedPos = { x: 10, y: 64, z: 0 };
+        const turns = [];
+        let turn = 0;
+        let walked = null;
+        let slept = null;
+        bot.world = {};
+        bot.waitForTicks = async () => { turn += 1; };
+        bot.registry = { blocksByName: { red_bed: { name: 'red_bed' } }, itemsByName: { red_bed: { name: 'red_bed' } } };
+        bot.isABed = block => block && block.name === 'red_bed';
+        bot.pathfinder = {
+            movements: { id: 'bot-movements' },
+            tickTimeout: 40,
+            getPathTo() { throw new Error('getPathTo takes one slice'); },
+            getPathFromTo: function * () {
+                turns.push(turn);
+                yield { result: { status: 'partial', path: [] } };
+                turns.push(turn);
+                yield { result: { status: 'partial', path: [] } };
+                turns.push(turn);
+                yield { result: { status: 'success', cost: 12, path: [] } };
+            },
+            async goto(goal) {
+                walked = goal;
+                bot.entity.position = new Vec3(9, 64, 0);
+            },
+        };
+        bot.blockAt = () => ({ name: 'red_bed', position: new Vec3(bedPos.x, bedPos.y, bedPos.z) });
+        bot.sleep = async (block) => { slept = block; };
+        v._afterSuccess = () => { v.rested = true; };
+        v.observe = () => ({
+            inventory: {},
+            nearby_blocks: ['red_bed'],
+            perceived_at: { red_bed: bedPos },
+            is_day: false,
+            time: 'night (18000, hostiles spawn outdoors)',
+            health_value: 20, health_max: 20, food_value: 20, food_max: 20,
+            inventory_slots: '0/36', empty_inventory_slots: 36, threats: 'none',
+            equipment: { hand: 'empty' }, sleeping: false, sky_light: 0, time_since_rest: 3,
+        });
+        const ok = await v._serveRest({ by: 'floor' });
+        assert.strictEqual(ok, true);
+        assert.deepStrictEqual(turns, [0, 1, 2], 'each partial slice yields before the next tickTimeout slice');
+        assert.strictEqual(turn, 2);
+        assert.ok(walked instanceof pf.goals.GoalLookAtBlock);
+        assert.strictEqual(walked.pos.x, 10);
+        assert.strictEqual(slept.name, 'red_bed');
+        assert.strictEqual(v.rested, true);
+    });
+
     it('a perceived but unreachable bed is not chosen and the need goes to obtain', async () => {
         const v = mkV();
         const bed = Object.values(registry.blocksByName).find(b => typeof b.name === 'string' && b.name.endsWith('_bed'));
