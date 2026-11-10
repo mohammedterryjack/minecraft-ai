@@ -18,7 +18,9 @@ import { readFileSync } from 'node:fs';
 import { edibleNames, planFoodAcquisition } from '../src/agent/food_backchain.js';
 import { buildContractManifest } from '../scripts/fix97_contract_manifest.js';
 import { nestedBotMemberError, getBareAPI, Coder } from '../src/agent/coder.js';
-import { getNearestBlocks, getNearestBlocksWhere, getNearbyBlockTypes, getNearbyBlocks, nearbyBlockRadius, perceivedStats, pathToBlock } from '../src/agent/library/world.js';
+import { getNearestBlocks, getNearestBlocksWhere, getNearbyBlockTypes, getNearbyBlocks, nearbyBlockRadius, perceivedStats, perceivedBuildStats, indexPerceivedChunks, pathToBlock, pathStatusSync } from '../src/agent/library/world.js';
+import { buildLayeredWorld } from './layered_terrain.js';
+import { gunzipSync } from 'node:zlib';
 import pf from 'mineflayer-pathfinder';
 import { Vec3 } from 'vec3';
 import { wrapBotForApiTiming } from '../src/utils/bot_api_timing.js';
@@ -146,14 +148,31 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         const manifest = buildContractManifest(fixture);
         assert.strictEqual(manifest.apply, false);
         assert.strictEqual(manifest.dryRun, true);
-        assert.deepStrictEqual(manifest.records.map(r => r.id), ['checkOakLog.pre.55']);
+        assert.deepStrictEqual(manifest.records.map(r => r.id), ['checkOakLog.pre.oak_log.55']);
         const live = JSON.parse(readFileSync(new URL('../bots/icefox2000/skills/index.json', import.meta.url), 'utf8'));
         const disk = buildContractManifest(live);
         assert.strictEqual(disk.checkOakLogPresent, false);
         assert.strictEqual(disk.apply, false);
         assert.deepStrictEqual(disk.records.map(r => r.id), []);
-        for (const id of ['checkOakLog.code.55', 'checkOakLog.pre.55', 'smeltIronIntoIngot.code.1', 'mineBlocks.pre.2', 'craftItem.pre.2', 'craftArmorSet.post.4']) {
+        for (const id of ['checkOakLog.code.oak_log.55', 'checkOakLog.pre.oak_log.55', 'smeltIronIntoIngot.code.1', 'mineBlocks.pre.2', 'craftItem.pre.2', 'craftArmorSet.post.4']) {
             assert.ok(!disk.records.some(r => r.id === id), id);
+        }
+    });
+
+    it('the live 163-skill index records only copied counts, with the item in the id', () => {
+        const skills = JSON.parse(gunzipSync(readFileSync(new URL('./fixtures/icefox-live-index.json.gz', import.meta.url))));
+        assert.strictEqual(skills.length, 163);
+        const manifest = buildContractManifest(skills);
+        assert.deepStrictEqual(manifest.records.map(r => r.id).sort(), [
+            'checkOakLeavesCount.code.oak_leaves.6',
+            'checkOakLeavesCount.post.oak_leaves.6',
+            'checkOakLog.code.oak_log.55',
+            'checkOakLog.pre.oak_log.55',
+            'confirmInventoryUpdate.code.oak_leaves.6',
+            'confirmInventoryUpdate.post.oak_leaves.6',
+        ]);
+        for (const name of ['tossClutterSafe', 'ensureInventorySpaceForApple', 'verifyInventoryAndChest']) {
+            assert.ok(!manifest.records.some(r => r.id.startsWith(`${name}.`)), name);
         }
     });
 
@@ -211,14 +230,14 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         ];
         const manifest = buildContractManifest(skills);
         assert.deepStrictEqual(manifest.records.map(r => r.id), [
-            'checkOakLog.code.55',
-            'checkOakLog.pre.55',
+            'checkOakLog.code.oak_log.55',
+            'checkOakLog.pre.oak_log.55',
         ]);
         assert.deepStrictEqual(manifest.reasonLines, manifest.records.map(r => r.verdict));
         for (const r of manifest.records) assert.ok(r.verdict.startsWith(r.id), r.verdict);
         const byId = Object.fromEntries(manifest.records.map(r => [r.id, r.verdict]));
-        assert.match(byId['checkOakLog.code.55'], /not the parsed goal quantity of oak_log/);
-        assert.match(byId['checkOakLog.pre.55'], /not the parsed goal quantity of oak_log/);
+        assert.match(byId['checkOakLog.code.oak_log.55'], /not the parsed goal quantity of oak_log/);
+        assert.match(byId['checkOakLog.pre.oak_log.55'], /not the parsed goal quantity of oak_log/);
         assert.strictEqual(manifest.checkOakLogPresent, true);
         const absent = [
             { name: 'smeltIronIntoIngot', code: 'async function smeltIronIntoIngot(bot) { const c = getInventoryCounts(bot); return c.raw_iron < 1; }', promptCounts: { raw_iron: 1 }, contract: { pre: 'c => true', post: 'c => true' } },
@@ -294,9 +313,9 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         ];
         for (const id of wrong) assert.ok(!manifest.records.some(r => r.id === id), id);
         assert.strictEqual(Voyager.countIsGameFact(registry, 'dirt', 7), false);
-        assert.deepStrictEqual(manifest.records.map(r => r.id), ['checkOakLog.code.55', 'checkOakLog.pre.55']);
-        assert.strictEqual(manifest.records.filter(r => r.id === 'checkOakLog.code.55').length, 1);
-        const code55 = manifest.records.find(r => r.id === 'checkOakLog.code.55');
+        assert.deepStrictEqual(manifest.records.map(r => r.id), ['checkOakLog.code.oak_log.55', 'checkOakLog.pre.oak_log.55']);
+        assert.strictEqual(manifest.records.filter(r => r.id === 'checkOakLog.code.oak_log.55').length, 1);
+        const code55 = manifest.records.find(r => r.id === 'checkOakLog.code.oak_log.55');
         assert.match(code55.evidence, /not the parsed goal quantity of oak_log/);
         assert.doesNotMatch(code55.evidence, /promptCounts|name:count|currently/);
         const dirtTask = 'collectSurface: Collect 32 dirt blocks within 32 blocks of the current position to ensure tilling surface is available for planting wheat_seeds';
@@ -370,10 +389,10 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         const manifest = buildContractManifest(skills);
         assert.ok(!Voyager.goalQuantities(leavesTask).some(g => g.item === 'oak_leaves' && g.n === 6));
         assert.deepStrictEqual(manifest.records.map(r => r.id), [
-            'checkOakLog.code.55',
-            'checkOakLog.pre.55',
-            'checkOakLeavesCount.code.6',
-            'checkOakLeavesCount.post.6',
+            'checkOakLog.code.oak_log.55',
+            'checkOakLog.pre.oak_log.55',
+            'checkOakLeavesCount.code.oak_leaves.6',
+            'checkOakLeavesCount.post.oak_leaves.6',
         ]);
     });
 
@@ -471,14 +490,14 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
                 const manifest = buildContractManifest(skills);
                 for (const id of wrong) assert.ok(!manifest.records.some(r => r.id === id), `${field} ${JSON.stringify(text).slice(0, 80)} -> ${id}`);
                 const ids = manifest.records.map(r => r.id);
-                for (const id of ids) assert.ok(id === 'checkOakLog.code.55' || id === 'checkOakLog.pre.55', `${field} produced ${id} from ${JSON.stringify(text).slice(0, 120)}`);
+                for (const id of ids) assert.ok(id === 'checkOakLog.code.oak_log.55' || id === 'checkOakLog.pre.oak_log.55', `${field} produced ${id} from ${JSON.stringify(text).slice(0, 120)}`);
             }
         }
         const withState = base.map(s => ({ ...s, contract: { ...s.contract }, description: v._compactState(state), repairHistory: [{ evidence: oakEvidence }] }));
         const oak = withState.find(s => s.name === 'checkOakLog');
         oak.task = oakTask;
         const manifest = buildContractManifest(withState);
-        assert.deepStrictEqual(manifest.records.map(r => r.id).sort(), ['checkOakLog.code.55', 'checkOakLog.pre.55']);
+        assert.deepStrictEqual(manifest.records.map(r => r.id).sort(), ['checkOakLog.code.oak_log.55', 'checkOakLog.pre.oak_log.55']);
     });
 });
 
@@ -795,6 +814,9 @@ describe('fix97 findBlocks refuses a non-numeric maxDistance or count', () => {
         };
         const nearbyNames = getNearbyBlockTypes(viewBot);
         const stats = perceivedStats(viewBot);
+        const readsAfterIndex = cellReads;
+        getNearbyBlockTypes(viewBot);
+        assert.strictEqual(cellReads, readsAfterIndex, 'a second observe does not re-read indexed sections');
         const cube = (viewDistance * CHUNK_WIDTH * 2 + 1) ** 3;
         assert.ok(nearbyNames.includes('stone'), 'an exposed stone face the ray hits is perceived');
         assert.ok(!nearbyNames.includes('dirt'), 'dirt behind the wall is occluded');
@@ -825,6 +847,20 @@ describe('fix97 findBlocks refuses a non-numeric maxDistance or count', () => {
                 holeColumns.push({ chunkX: cx, chunkZ: cz, column: { minY, sections: cx === 0 && cz === 0 ? hole : Array.from({ length: 24 }, () => stoneOnly) } });
             }
         }
+        const missingNeighbor = columns.filter(c => !(c.chunkX === 1 && c.chunkZ === 0));
+        assert.doesNotThrow(() => getNearbyBlockTypes({
+            game: { serverViewDistance: viewDistance, gameMode: 'survival' },
+            registry,
+            entity: { position: new Vec3(8, feetY, 8), eyeHeight },
+            world: { getColumns() { return missingNeighbor; }, raycast },
+        }));
+        const notStanding = columns.filter(c => !(c.chunkX === 0 && c.chunkZ === 0));
+        assert.throws(() => getNearbyBlockTypes({
+            game: { serverViewDistance: viewDistance, gameMode: 'survival' },
+            registry,
+            entity: { position: new Vec3(8, feetY, 8), eyeHeight },
+            world: { getColumns() { return notStanding; }, raycast },
+        }), /standing in/);
         assert.throws(() => getNearbyBlockTypes({
             game: { serverViewDistance: viewDistance },
             registry,
@@ -944,7 +980,7 @@ describe('fix97 the incomplete useEvidence throw is unreachable', () => {
 });
 
 describe('fix97 reachability is a pathfinder search per target', () => {
-    it('the food planner calls getPathTo once for each source it still has to judge', () => {
+    it('the food planner calls getPathTo once for each source it still has to judge', async () => {
         const v = mkV({});
         const calls = [];
         v.agent.bot.game = { gameMode: 'survival' };
@@ -972,47 +1008,51 @@ describe('fix97 reachability is a pathfinder search per target', () => {
         const namedOnly = { inventory: { stone_pickaxe: 1 }, nearby_blocks: [src[0], 'dirt'], perceived_at: {} };
         v._obtainPlanner(namedOnly).prerequisites('raw_iron', 1, namedOnly.inventory);
         assert.deepStrictEqual(calls, [], 'a nearby name with no perceived position is not a pathfinder target');
-        const direct = pathToBlock(v.agent.bot, { x: 8, y: 12, z: 4 });
+        const direct = await pathToBlock(v.agent.bot, { x: 8, y: 12, z: 4 });
+        assert.strictEqual(direct.status, 'success');
+        v.agent.bot.pathfinder.getPathTo = () => ({ status: 'partial', path: [] });
+        await assert.rejects(pathToBlock(v.agent.bot, { x: 8, y: 12, z: 4 }), /partial/);
+        assert.throws(() => pathStatusSync(v.agent.bot, { x: 8, y: 12, z: 4 }), /partial/);
+    });
+    it('getPathFromTo is stepped until it finishes, and a partial slice is not a reach need', async () => {
+        const v = mkV({});
+        const calls = [];
+        v.agent.bot.game = { gameMode: 'survival' };
+        v.agent.bot.entity = { eyeHeight: 1.62, position: { x: 0, y: 64, z: 0 } };
+        v.agent.bot.world = {};
+        v.agent.bot.pathfinder = {
+            movements: { id: 'bot-movements' },
+            tickTimeout: 40,
+            getPathTo() { throw new Error('getPathTo takes one slice'); },
+            getPathFromTo: function * (movements, start, goal) {
+                calls.push(goal.pos.x);
+                yield { result: { status: 'partial', path: [] } };
+                yield { result: { status: goal.pos.x === 4 ? 'noPath' : 'success', cost: goal.pos.x } };
+            },
+        };
+        const src = v._obtainPlanner({ inventory: {}, nearby_blocks: [], perceived_at: {} }).sources('raw_iron');
+        const state = {
+            inventory: { stone_pickaxe: 1 },
+            nearby_blocks: [...src, 'dirt'],
+            perceived_at: { [src[0]]: { x: 4, y: 12, z: 4 }, [src[1]]: { x: 8, y: 12, z: 4 } },
+        };
+        assert.throws(() => v._obtainPlanner(state).prerequisites('raw_iron', 1, state.inventory), /not unreachable/);
+        await v._noteReach(state);
+        const pre = v._obtainPlanner(state).prerequisites('raw_iron', 1, state.inventory);
+        assert.strictEqual(pre.how, 'collect');
+        assert.deepStrictEqual(calls, [4, 8]);
+        const direct = await pathToBlock(v.agent.bot, { x: 8, y: 12, z: 4 });
         assert.strictEqual(direct.status, 'success');
     });
 });
 
 describe('fix97 observe on a view-distance world', () => {
-    it('a terrain with caves and buried ore stays cheap', () => {
+    it('layered terrain is indexed once per chunk and observe reads that index', async () => {
         const { performance } = require('perf_hooks');
-        const Chunk = require('prismarine-chunk')(VER);
-        const World = require('prismarine-world')(registry);
-        const world = new World(null).sync;
-        const stoneId = registry.blocksByName.stone.defaultState;
-        const diamondId = registry.blocksByName.diamond_ore.defaultState;
         const viewDistance = 10;
         const minY = -64;
-        const probe = new Chunk({ minY, worldHeight: 384 });
-        const Section = probe.sections[0].constructor;
-        const stoneSection = new Section({ singleValue: stoneId, maxBitsPerBlock: probe.maxBitsPerBlock });
-        const airSection = probe.sections[probe.sections.length - 1];
         const feetY = 64;
-        const eyeSection = (feetY - minY) >> 4;
-        const side = viewDistance * 2 + 1;
-        const exposedSurface = side * side * 16 * 16;
-        assert.ok(exposedSurface >= 3000, `surface exposes ${exposedSurface} blocks`);
-        for (let cz = -viewDistance; cz <= viewDistance; cz++) {
-            for (let cx = -viewDistance; cx <= viewDistance; cx++) {
-                const column = new Chunk({ minY, worldHeight: 384 });
-                for (let si = 0; si < column.sections.length; si++) {
-                    column.sections[si] = si < eyeSection ? stoneSection : airSection;
-                }
-                if (cx === 0 && cz === 0) {
-                    column.sections[1] = new Section({ singleValue: stoneId, maxBitsPerBlock: probe.maxBitsPerBlock });
-                    column.setBlockStateId({ x: 8, y: feetY - 111, z: 8 }, diamondId);
-                    column.sections[6] = new Section({ singleValue: stoneId, maxBitsPerBlock: probe.maxBitsPerBlock });
-                    for (let z = 0; z < 16; z++) for (let x = 0; x < 16; x++) for (let y = 40; y < 48; y++) {
-                        if ((x + y + z) % 2 === 0) column.setBlockStateId({ x, y, z }, 0);
-                    }
-                }
-                world.setColumn(cx, cz, column);
-            }
-        }
+        const world = await buildLayeredWorld(registry, viewDistance, true);
         const bot = {
             game: { serverViewDistance: viewDistance, gameMode: 'survival', dimension: 'overworld', minY, height: 384 },
             registry,
@@ -1023,7 +1063,7 @@ describe('fix97 observe on a view-distance world', () => {
             heldItem: null,
             time: { timeOfDay: 6000 },
             entities: {},
-            entity: { position: new Vec3(8.5, feetY, 8.5), eyeHeight: 1.62 },
+            entity: { position: new Vec3(3.5, feetY, 3.5), eyeHeight: 1.62 },
             inventory: { items: () => [], emptySlotCount: () => 36, slots: new Array(46).fill(null) },
             world,
         };
@@ -1035,23 +1075,31 @@ describe('fix97 observe on a view-distance world', () => {
         v._threats = () => 'none';
         v._deathHotspots = () => 'none';
         if (typeof global.gc === 'function') global.gc();
-        const before = process.memoryUsage().heapUsed;
+        const heapBefore = process.memoryUsage().heapUsed;
+        const built = await indexPerceivedChunks(bot);
+        if (typeof global.gc === 'function') global.gc();
+        const heapAfterIndex = process.memoryUsage().heapUsed;
+        const perChunk = built.chunks ? built.ms / built.chunks : 0;
+        const maxChunk = built.perChunkMs.reduce((m, t) => t > m ? t : m, 0);
         const t0 = performance.now();
         const state = v.observe();
         const ms = performance.now() - t0;
-        const heapDelta = process.memoryUsage().heapUsed - before;
-        let retained = null;
-        if (typeof global.gc === 'function') {
-            global.gc();
-            retained = process.memoryUsage().heapUsed - before;
-        }
+        const t1 = performance.now();
+        const second = v.observe();
+        const secondMs = performance.now() - t1;
         const stats = perceivedStats(bot);
-        const cube = (viewDistance * 16 * 2 + 1) ** 3;
-        assert.ok(state.nearby_blocks.includes('stone'));
-        assert.ok(!state.nearby_blocks.includes('diamond_ore'));
-        assert.ok(stats.cellReads < cube / 100, `cell reads ${stats.cellReads}`);
-        assert.ok(stats.candidates < 20000, `candidates ${stats.candidates}`);
+        const build = perceivedBuildStats(bot);
+        assert.ok(state.nearby_blocks.includes('grass_block'));
+        assert.ok(state.nearby_blocks.includes('oak_log'));
+        assert.ok(state.nearby_blocks.includes('oak_leaves'));
+        assert.ok(!state.nearby_blocks.includes('bedrock'));
+        assert.ok(!state.nearby_blocks.includes('deepslate'));
+        assert.deepStrictEqual(second.nearby_blocks, state.nearby_blocks);
+        assert.strictEqual(stats.cellReads, 0);
+        assert.strictEqual(build.cellReads, built.cellReads);
+        assert.strictEqual(built.chunks, (viewDistance * 2 + 1) ** 2);
         assert.ok(ms < 2000, `observe took ${ms} ms`);
-        console.log(`[fix97] observe view-distance 10: ${ms.toFixed(1)} ms, heap delta ${heapDelta} bytes${retained === null ? '' : `, retained after gc ${retained} bytes`}, cell reads ${stats.cellReads}, candidates ${stats.candidates}, raycasts ${stats.raycasts}, sections read ${stats.sectionsRead}, skipped ${stats.sectionsSkipped}, exposed surface blocks ${exposedSurface}`);
+        assert.ok(secondMs < 2000, `second observe took ${secondMs} ms`);
+        console.log(`[fix97] layered view-distance ${viewDistance}: index ${built.chunks} chunks in ${built.ms.toFixed(1)} ms (${perChunk.toFixed(2)} ms/chunk, max ${maxChunk.toFixed(2)}), cell reads ${built.cellReads}, sections ${built.sectionsBuilt} skipped ${built.sectionsSkipped}, heap +${((heapAfterIndex - heapBefore) / 1e6).toFixed(1)} MB; observe ${ms.toFixed(1)} ms then ${secondMs.toFixed(1)} ms, candidates ${stats.candidates}, raycasts ${stats.raycasts}, names ${state.nearby_blocks.join(',')}`);
     });
 });

@@ -708,7 +708,13 @@ export function groupVaryingLines(text) {
         const n = g.rows.length;
         const slots = g.rows[0] ? g.rows[0].length : 0;
         const constant = g.rows.every(row => sameNumbers(row, g.rows[0]));
-        if (n === 1 && inOrder) { out.push(g.first); continue; }
+        if (n === 1 && inOrder) {
+            // A raw line that already ends in ` (xN)` is the group header grammar (groupHeader). Escaping that
+            // suffix keeps one copy. A generated header is `body (xN)` and is not escaped.
+            const raw = groupHeader(g.first);
+            out.push(raw && raw.n >= 2 ? g.first.replace(/ \(x(\d+)\)$/, ' \\(x$1)') : g.first);
+            continue;
+        }
         const header = constant ? g.first : template;
         out.push(`${header} (x${n})`);
         if (!inOrder) out.push(`  at: ${encodeSeries(g.at)}`);
@@ -805,6 +811,8 @@ export function recoverTemplatedLines(text) {
     const out = [];
     for (let i = 0; i < lines.length; i++) {
         if (/^  (?:at: |\{\d+\}: )/.test(lines[i])) throw new Error(`[fix97] series slot has no template: ${lines[i]}`);
+        const escaped = lines[i].match(/^(.*) \\\(x(\d+)\)$/);
+        if (escaped) { out.push(`${escaped[1]} (x${escaped[2]})`); continue; }
         const first = readGroup(lines, i);
         if (!first) { out.push(lines[i]); continue; }
         if (!first.at) {

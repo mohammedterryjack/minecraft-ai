@@ -571,16 +571,11 @@ export function withinInteractionRange(bot, pos) {
 }
 
 // One pathfinder search for one chosen block. The cost is the A* result, never membership of the perceived set.
-// mineflayer-pathfinder index.js: bot.pathfinder.getPathTo(movements, goal) runs AStar with the bot's Movements.
-export function pathToBlock(bot, position) {
-    /**
-     * Path cost to one block, from the pathfinder's own search.
-     * @param {Bot} bot - The bot. bot.pathfinder.movements is the Movements the A* uses.
-     * @param {Vec3} position - The chosen block.
-     * @returns {object} - The getPathTo result (status, cost).
-     * @example
-     * let path = world.pathToBlock(bot, block.position);
-     **/
+// mineflayer-pathfinder index.js getPathTo (lines 64-71) takes only the first yield of getPathFromTo.
+// lib/astar.js compute() returns 'partial' when that slice exceeds tickTimeout (index.js:41) and 'timeout'
+// when the whole search exceeds thinkTimeout (index.js:40, astar.js:73). 'noPath' is the open set exhausted
+// (astar.js:121). A partial or timeout result has not been searched. The loaded world is the bound.
+function lookGoal(bot, position) {
     if (!bot || !bot.pathfinder || typeof bot.pathfinder.getPathTo !== 'function') {
         throw new Error('reachability: bot.pathfinder.getPathTo is missing (mineflayer-pathfinder index.js).');
     }
@@ -595,22 +590,84 @@ export function pathToBlock(bot, position) {
     }
     if (!bot.world) throw new Error('reachability: bot.world is missing. GoalLookAtBlock raycasts through the world.');
     const goal = new pf.goals.GoalLookAtBlock(new Vec3(position.x, position.y, position.z), bot.world, { entityHeight: eyeHeight, reach: gameReach(bot) });
-    const result = bot.pathfinder.getPathTo(movements, goal);
-    if (!result || typeof result.status !== 'string') throw new Error(`reachability: getPathTo returned ${JSON.stringify(result && result.status)}.`);
+    return { movements, goal };
+}
+
+function finishedPath(result, where) {
+    if (!result || typeof result.status !== 'string') throw new Error(`reachability: ${where} returned ${JSON.stringify(result && result.status)}.`);
+    if (result.status === 'partial' || result.status === 'timeout') {
+        throw new Error(`reachability: ${where} returned ${result.status}. That search is not finished and is not unreachable (mineflayer-pathfinder index.js:64-71 takes one tickTimeout slice; lib/astar.js:70 returns partial, line 73 returns timeout).`);
+    }
     return result;
+}
+
+// Sync callers (a planner that already has its answer, or a test double with only getPathTo). A bot whose
+// pathfinder has getPathFromTo must not be answered from one slice: pathToBlock steps that generator.
+export function pathStatusSync(bot, position) {
+    /**
+     * One finished pathfinder result. Refuses a bot that can continue the search, and a partial slice.
+     * @param {Bot} bot - The bot. bot.pathfinder.movements is the Movements the A* uses.
+     * @param {Vec3} position - The chosen block.
+     * @returns {object} - status success or noPath, and the path cost.
+     * @example
+     * let path = world.pathStatusSync(bot, block.position);
+     **/
+    if (bot && bot.pathfinder && typeof bot.pathfinder.getPathFromTo === 'function') {
+        throw new Error('reachability: bot.pathfinder.getPathFromTo steps the search across ticks (mineflayer-pathfinder index.js:75). pathStatusSync will not take one slice. A partial result is not unreachable.');
+    }
+    const { movements, goal } = lookGoal(bot, position);
+    return finishedPath(bot.pathfinder.getPathTo(movements, goal), 'getPathTo');
+}
+
+async function yieldSearchTurn(bot) {
+    if (typeof bot.waitForTicks === 'function') {
+        await bot.waitForTicks(1);
+        return;
+    }
+    await new Promise(resolve => { setImmediate(resolve); });
+}
+
+export async function pathToBlock(bot, position) {
+    /**
+     * Path cost to one block, searched until the pathfinder finds it or exhausts the loaded world.
+     * @param {Bot} bot - The bot. bot.pathfinder.movements is the Movements the A* uses.
+     * @param {Vec3} position - The chosen block.
+     * @returns {object} - status success or noPath, and the path cost.
+     * @example
+     * let path = await world.pathToBlock(bot, block.position);
+     **/
+    if (!bot || !bot.pathfinder || typeof bot.pathfinder.getPathFromTo !== 'function') return pathStatusSync(bot, position);
+    const tick = bot.pathfinder.tickTimeout;
+    if (typeof tick !== 'number' || !(tick > 0)) {
+        throw new Error('reachability: bot.pathfinder.tickTimeout is missing (mineflayer-pathfinder index.js:41 is the per-tick budget). A search is not stopped by a made-up budget.');
+    }
+    if (!bot.entity || !bot.entity.position) {
+        throw new Error('reachability: bot.entity.position is missing. getPathFromTo starts there (mineflayer-pathfinder index.js:69).');
+    }
+    const { movements, goal } = lookGoal(bot, position);
+    // thinkTimeout (index.js:40, default 5000) is a machine-speed cap. The loaded columns bound the open set.
+    const gen = bot.pathfinder.getPathFromTo(movements, bot.entity.position, goal, { timeout: Number.POSITIVE_INFINITY, tickTimeout: tick });
+    let step = gen.next();
+    while (!step.done) {
+        const result = step.value && step.value.result;
+        if (!result || typeof result.status !== 'string') throw new Error(`reachability: getPathFromTo yielded ${JSON.stringify(result && result.status)}.`);
+        if (result.status === 'success' || result.status === 'noPath') return result;
+        if (result.status === 'partial') {
+            await yieldSearchTurn(bot);
+            step = gen.next();
+            continue;
+        }
+        if (result.status === 'timeout') {
+            throw new Error('reachability: the search stopped on thinkTimeout (mineflayer-pathfinder index.js:40, lib/astar.js:73). The loaded world bounds the search. A timer does not.');
+        }
+        throw new Error(`reachability: getPathFromTo returned ${result.status}. Expected success, noPath, or partial (mineflayer-pathfinder lib/astar.js compute).`);
+    }
+    throw new Error('reachability: getPathFromTo ended without a result (mineflayer-pathfinder index.js:75).');
 }
 
 function dist2(ax, ay, az, bx, by, bz) {
     const dx = ax - bx, dy = ay - by, dz = az - bz;
     return dx * dx + dy * dy + dz * dz;
-}
-
-// Distance squared from the eye to the closest point of the half-open box [min, max).
-function boxDist2(eye, minX, minY, minZ, maxX, maxY, maxZ) {
-    const px = eye.x < minX ? minX : eye.x >= maxX ? maxX : eye.x;
-    const py = eye.y < minY ? minY : eye.y >= maxY ? maxY : eye.y;
-    const pz = eye.z < minZ ? minZ : eye.z >= maxZ ? maxZ : eye.z;
-    return dist2(eye.x, eye.y, eye.z, px, py, pz);
 }
 
 // Inverse of prismarine-chunk PaletteChunkSection getBlockIndex: (y << 8) | (z << 4) | x.
@@ -634,7 +691,7 @@ function cellStateId(section, index, where) {
 }
 
 const FACES = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]];
-const perceivedAt = new WeakMap();
+const perceivedIndex = new WeakMap();
 const perceivedStat = new WeakMap();
 
 // A full opaque cube hides the face against it. Air and every other non-full or transparent block does not.
@@ -679,7 +736,7 @@ function stateAt(index, x, y, z, view) {
     const cx = Math.floor(x / CHUNK_WIDTH), cz = Math.floor(z / CHUNK_WIDTH);
     if (Math.abs(cx - view.stoodX) > view.radius || Math.abs(cz - view.stoodZ) > view.radius) return null;
     const col = index.get(`${cx},${cz}`);
-    if (!col) return null;
+    if (!col) throw new Error(`nearby blocks: chunk ${cx},${cz} is inside the view and is not loaded. A missing column is not an empty block list.`);
     const column = col.column;
     if (!Number.isInteger(column.minY) || !Array.isArray(column.sections)) {
         throw new Error(`nearby blocks: chunk ${cx},${cz} has no minY or sections.`);
@@ -694,115 +751,448 @@ function stateAt(index, x, y, z, view) {
     return cellStateId(section, cell, `chunk ${cx},${cz} section ${si}`);
 }
 
-// Perceived block types.
-// Let V be the server view distance in chunks (https://minecraft.wiki/w/Render_distance: the client holds the
-// square of chunks within V of the center). S is the sections in that square, (2V+1)^2 times the column height.
-// 1. Index those columns. O((2V+1)^2). A missing column or a null section throws. Nothing cube-sized is allocated.
-// 2. Order sections by distance from the eye to the section box. O(S log S) section pointers.
-// 3. A section whose palette states are all already confirmed, or only air, is not cell-read. The palette is only
-//    the candidate list (IndirectPaletteContainer.set never drops an entry).
-// 4. Otherwise stream its 4096 cells. A cell with a neighbor that does not occlude is a candidate for its state.
-//    One record per such cell, dropped once that state is confirmed. Not a position cube.
-// 5. Raycast candidates nearest first (bot.world.raycast; prismarine-world docs/API.md World.raycast). Stop a state
-//    at the first hit on that block. A buried block has no open face, so it is never raycast.
-// Cell reads are O(U * 4096) for U sections that still hold an unconfirmed state, not O((2V*16+1)^3).
-function perceivedBlocks(bot) {
+// Perceived blocks are the exposed faces of loaded chunks inside the server view distance
+// (https://minecraft.wiki/w/Render_distance). Buried cells never gain a face, so they are indexed once when the
+// chunk loads and not read again on the next step. mineflayer forwards chunkColumnLoad, chunkColumnUnload, and
+// blockUpdate from the world (mineflayer lib/plugins/blocks.js forwardedEvents; prismarine-world worldsync.js).
+// observe() raycasts the indexed faces. It does not walk sections.
+function viewContext(bot) {
     const eye = eyeOf(bot);
     const registry = bot.registry;
     if (!registry || !registry.blocksByStateId) throw new Error('nearby blocks: bot.registry.blocksByStateId is missing');
     const radius = serverChunkRadius(bot);
     const stoodX = Math.floor(eye.x / CHUNK_WIDTH);
     const stoodZ = Math.floor(eye.z / CHUNK_WIDTH);
-    const view = { stoodX, stoodZ, radius };
-    const index = columnIndex(bot);
+    return { eye, registry, radius, stoodX, stoodZ, columns: columnIndex(bot), view: { stoodX, stoodZ, radius } };
+}
+
+function standingKey(ctx) {
+    return `${ctx.stoodX},${ctx.stoodZ}`;
+}
+
+function missingStanding(ctx) {
+    return new Error(`nearby blocks: the chunk the bot is standing in (${ctx.stoodX},${ctx.stoodZ}) is not loaded.`);
+}
+
+function inView(ctx, cx, cz) {
+    return Math.abs(cx - ctx.stoodX) <= ctx.radius && Math.abs(cz - ctx.stoodZ) <= ctx.radius;
+}
+
+function sectionWhere(cx, cz, column, si) {
+    const originY = column.minY + si * SECTION_HEIGHT;
+    return { originY, where: `chunk ${cx},${cz} section ${si} (y ${originY})` };
+}
+
+function sectionInfo(column, si, where, registry, open) {
+    const section = column.sections[si];
+    if (!section) throw new Error(`nearby blocks: ${where} is not loaded. A missing section is not an empty block list.`);
+    const ids = paletteIds(section, where);
+    if (ids.every(id => id === 0)) return { kind: 'air', section };
+    if (ids.length === 1 && !nonOccluding(registry, ids[0], open)) return { kind: 'solid', section, id: ids[0] };
+    if (ids.every(id => nonOccluding(registry, id, open))) return { kind: 'clear', section };
+    return { kind: 'mixed', section };
+}
+
+function neighborSection(ctx, x, y, z, idx, selfKey) {
+    const cx = Math.floor(x / CHUNK_WIDTH), cz = Math.floor(z / CHUNK_WIDTH);
+    if (!inView(ctx, cx, cz)) return { kind: 'hidden' };
+    const key = `${cx},${cz}`;
+    const col = ctx.columns.get(key);
+    if (!col) {
+        if (selfKey) {
+            let list = idx.waiters.get(key);
+            if (!list) { list = new Set(); idx.waiters.set(key, list); }
+            list.add(selfKey);
+        }
+        return { kind: 'hidden' };
+    }
+    const column = col.column;
+    if (!Number.isInteger(column.minY) || !Array.isArray(column.sections)) {
+        throw new Error(`nearby blocks: chunk ${cx},${cz} has no minY or sections.`);
+    }
+    const si = (y - column.minY) >> 4;
+    if (si < 0 || si >= column.sections.length) return { kind: 'hidden' };
+    const { originY, where } = sectionWhere(cx, cz, column, si);
+    const info = sectionInfo(column, si, where, ctx.registry, idx.open);
+    return { ...info, where, originY, minX: cx * CHUNK_WIDTH, minZ: cz * CHUNK_WIDTH };
+}
+
+function readIndexedCell(ctx, x, y, z, idx) {
+    idx.cellReads += 1;
+    return stateAt(ctx.columns, x, y, z, ctx.view);
+}
+
+function faceOpen(ctx, idx, selfKey, x, y, z, fx, fy, fz, ownCells) {
+    const nx = x + fx, ny = y + fy, nz = z + fz;
+    if (ownCells) {
+        const lx = nx - ownCells.minX, ly = ny - ownCells.originY, lz = nz - ownCells.minZ;
+        if (lx >= 0 && lx < CHUNK_WIDTH && ly >= 0 && ly < SECTION_HEIGHT && lz >= 0 && lz < CHUNK_WIDTH) {
+            const id = ownCells.ids[(ly << 8) | (lz << 4) | lx];
+            return nonOccluding(ctx.registry, id, idx.open);
+        }
+    }
+    const info = neighborSection(ctx, nx, ny, nz, idx, selfKey);
+    if (info.kind === 'hidden') return false;
+    if (info.kind === 'air' || info.kind === 'clear') return true;
+    if (info.kind === 'solid') return false;
+    const id = readIndexedCell(ctx, nx, ny, nz, idx);
+    return nonOccluding(ctx.registry, id, idx.open);
+}
+
+function facePositions(minX, originY, minZ, face) {
+    const [fx, fy, fz] = FACES[face];
+    const out = [];
+    if (fx !== 0) {
+        const x = minX + (fx > 0 ? CHUNK_WIDTH - 1 : 0);
+        for (let y = 0; y < SECTION_HEIGHT; y++) for (let z = 0; z < CHUNK_WIDTH; z++) out.push([x, originY + y, minZ + z]);
+    } else if (fy !== 0) {
+        const y = originY + (fy > 0 ? SECTION_HEIGHT - 1 : 0);
+        for (let x = 0; x < CHUNK_WIDTH; x++) for (let z = 0; z < CHUNK_WIDTH; z++) out.push([minX + x, y, minZ + z]);
+    } else {
+        const z = minZ + (fz > 0 ? CHUNK_WIDTH - 1 : 0);
+        for (let x = 0; x < CHUNK_WIDTH; x++) for (let y = 0; y < SECTION_HEIGHT; y++) out.push([minX + x, originY + y, z]);
+    }
+    return out;
+}
+
+function putCell(cells, x, y, z, id, bit) {
+    if (id === 0) return;
+    const pack = `${x},${y},${z}`;
+    const prev = cells.get(pack);
+    if (prev) { prev.mask |= bit; return; }
+    cells.set(pack, { x, y, z, id, mask: bit });
+}
+
+function rememberWaiters(idx, selfKey) {
+    for (const list of idx.waiters.values()) list.delete(selfKey);
+}
+
+function buildColumn(idx, ctx, cx, cz) {
+    const selfKey = `${cx},${cz}`;
+    const col = ctx.columns.get(selfKey);
+    if (!col) return;
+    const column = col.column;
+    if (!Number.isInteger(column.minY) || !Array.isArray(column.sections)) {
+        throw new Error(`nearby blocks: chunk ${cx},${cz} has no minY or sections.`);
+    }
+    rememberWaiters(idx, selfKey);
+    const cells = new Map();
+    const started = performance.now();
+    const minX = cx * CHUNK_WIDTH, minZ = cz * CHUNK_WIDTH;
+    for (let si = 0; si < column.sections.length; si++) {
+        const { originY, where } = sectionWhere(cx, cz, column, si);
+        const info = sectionInfo(column, si, where, ctx.registry, idx.open);
+        idx.sectionsBuilt += 1;
+        if (info.kind === 'air') { idx.sectionsSkipped += 1; continue; }
+        if (info.kind === 'solid') {
+            let opened = false;
+            for (let face = 0; face < FACES.length; face++) {
+                const [fx, fy, fz] = FACES[face];
+                const probe = neighborSection(ctx, minX + (fx > 0 ? CHUNK_WIDTH - 1 : 0) + fx, originY + (fy > 0 ? SECTION_HEIGHT - 1 : 0) + fy, minZ + (fz > 0 ? CHUNK_WIDTH - 1 : 0) + fz, idx, selfKey);
+                if (probe.kind === 'solid' || probe.kind === 'hidden') continue;
+                const positions = facePositions(minX, originY, minZ, face);
+                if (probe.kind === 'air' || probe.kind === 'clear') {
+                    opened = true;
+                    for (const [x, y, z] of positions) putCell(cells, x, y, z, info.id, 1 << face);
+                    continue;
+                }
+                for (const [x, y, z] of positions) {
+                    if (!faceOpen(ctx, idx, selfKey, x, y, z, fx, fy, fz, null)) continue;
+                    opened = true;
+                    putCell(cells, x, y, z, info.id, 1 << face);
+                }
+            }
+            if (!opened) idx.sectionsSkipped += 1;
+            continue;
+        }
+        const ids = new Int32Array(BLOCK_SECTION_VOLUME);
+        for (let i = 0; i < BLOCK_SECTION_VOLUME; i++) {
+            idx.cellReads += 1;
+            ids[i] = cellStateId(info.section, i, where);
+        }
+        const own = { ids, minX, originY, minZ };
+        for (let i = 0; i < BLOCK_SECTION_VOLUME; i++) {
+            const id = ids[i];
+            if (id === 0) continue;
+            const local = localCell(i);
+            const x = minX + local.x, y = originY + local.y, z = minZ + local.z;
+            for (let face = 0; face < FACES.length; face++) {
+                const [fx, fy, fz] = FACES[face];
+                if (!faceOpen(ctx, idx, selfKey, x, y, z, fx, fy, fz, own)) continue;
+                putCell(cells, x, y, z, id, 1 << face);
+            }
+        }
+    }
+    idx.columns.set(selfKey, { cells });
+    idx.chunkMs.push(performance.now() - started);
+}
+
+function enqueueColumn(idx, ctx, cx, cz) {
+    const key = `${cx},${cz}`;
+    if (!inView(ctx, cx, cz) || !ctx.columns.has(key)) return;
+    if (idx.columns.has(key) || idx.pending.has(key)) return;
+    idx.pending.add(key);
+    idx.queue.push({ cx, cz });
+}
+
+function enqueueView(idx, ctx) {
+    for (let dz = -ctx.radius; dz <= ctx.radius; dz++) {
+        for (let dx = -ctx.radius; dx <= ctx.radius; dx++) enqueueColumn(idx, ctx, ctx.stoodX + dx, ctx.stoodZ + dz);
+    }
+}
+
+function indexReport(idx) {
+    let ms = 0;
+    for (const t of idx.chunkMs) ms += t;
+    return {
+        chunks: idx.chunkMs.length,
+        ms,
+        cellReads: idx.cellReads,
+        sectionsBuilt: idx.sectionsBuilt,
+        sectionsSkipped: idx.sectionsSkipped,
+        perChunkMs: idx.chunkMs.slice(),
+    };
+}
+
+function scheduleIndex(bot, idx) {
+    if (idx.pumping) return;
+    idx.pumping = true;
+    const step = () => {
+        if (!idx.queue.length) {
+            idx.pumping = false;
+            const waiting = idx.drain.splice(0);
+            const report = indexReport(idx);
+            for (const w of waiting) w.resolve(report);
+            return;
+        }
+        const job = idx.queue.shift();
+        idx.pending.delete(`${job.cx},${job.cz}`);
+        try {
+            buildColumn(idx, viewContext(bot), job.cx, job.cz);
+        } catch (err) {
+            idx.pumping = false;
+            idx.queue.length = 0;
+            idx.pending.clear();
+            const waiting = idx.drain.splice(0);
+            for (const w of waiting) w.reject(err);
+            return;
+        }
+        setImmediate(step);
+    };
+    setImmediate(step);
+}
+
+function chunkCorner(corner, event) {
+    if (!corner || !Number.isFinite(corner.x) || !Number.isFinite(corner.z)) {
+        throw new Error(`nearby blocks: ${event} has no column corner (prismarine-world worldsync.js).`);
+    }
+    return { cx: Math.floor(corner.x / CHUNK_WIDTH), cz: Math.floor(corner.z / CHUNK_WIDTH) };
+}
+
+function dropColumn(idx, key) {
+    idx.columns.delete(key);
+    rememberWaiters(idx, key);
+    idx.pending.delete(key);
+    idx.queue = idx.queue.filter(job => `${job.cx},${job.cz}` !== key);
+}
+
+function onColumnLoad(bot, idx, corner) {
+    const { cx, cz } = chunkCorner(corner, 'chunkColumnLoad');
+    const key = `${cx},${cz}`;
+    const waiting = idx.waiters.get(key);
+    idx.waiters.delete(key);
+    dropColumn(idx, key);
+    let ctx;
+    try { ctx = viewContext(bot); } catch (err) { throw err; }
+    enqueueColumn(idx, ctx, cx, cz);
+    if (waiting) {
+        for (const other of waiting) {
+            dropColumn(idx, other);
+            const [ox, oz] = other.split(',');
+            enqueueColumn(idx, ctx, Number(ox), Number(oz));
+        }
+    }
+    scheduleIndex(bot, idx);
+}
+
+function onColumnUnload(bot, idx, corner) {
+    const { cx, cz } = chunkCorner(corner, 'chunkColumnUnload');
+    dropColumn(idx, `${cx},${cz}`);
+    let ctx;
+    try { ctx = viewContext(bot); } catch (err) { throw err; }
+    for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const ox = cx + dx, oz = cz + dz;
+        if (!idx.columns.has(`${ox},${oz}`)) continue;
+        dropColumn(idx, `${ox},${oz}`);
+        enqueueColumn(idx, ctx, ox, oz);
+    }
+    scheduleIndex(bot, idx);
+}
+
+function recomputeCell(idx, ctx, x, y, z) {
+    const cx = Math.floor(x / CHUNK_WIDTH), cz = Math.floor(z / CHUNK_WIDTH);
+    const built = idx.columns.get(`${cx},${cz}`);
+    if (!built || !ctx.columns.has(`${cx},${cz}`)) return;
+    const col = ctx.columns.get(`${cx},${cz}`);
+    const column = col.column;
+    const si = (y - column.minY) >> 4;
+    if (!Number.isInteger(column.minY) || si < 0 || si >= column.sections.length) return;
+    const { originY, where } = sectionWhere(cx, cz, column, si);
+    const info = sectionInfo(column, si, where, ctx.registry, idx.open);
+    const pack = `${x},${y},${z}`;
+    if (info.kind === 'air') { built.cells.delete(pack); return; }
+    let id = info.kind === 'solid' ? info.id : readIndexedCell(ctx, x, y, z, idx);
+    if (id === 0) { built.cells.delete(pack); return; }
+    let mask = 0;
+    const selfKey = `${cx},${cz}`;
+    for (let face = 0; face < FACES.length; face++) {
+        const [fx, fy, fz] = FACES[face];
+        if (faceOpen(ctx, idx, selfKey, x, y, z, fx, fy, fz, null)) mask |= 1 << face;
+    }
+    if (mask === 0) built.cells.delete(pack);
+    else built.cells.set(pack, { x, y, z, id, mask });
+}
+
+function onBlockUpdate(bot, idx, oldBlock, newBlock) {
+    const pos = (newBlock && newBlock.position) || (oldBlock && oldBlock.position);
+    if (!pos || !Number.isFinite(pos.x) || !Number.isFinite(pos.y) || !Number.isFinite(pos.z)) {
+        throw new Error('nearby blocks: blockUpdate has no position (prismarine-world worldsync.js _emitBlockUpdate).');
+    }
+    const ctx = viewContext(bot);
+    recomputeCell(idx, ctx, pos.x, pos.y, pos.z);
+    for (const [fx, fy, fz] of FACES) recomputeCell(idx, ctx, pos.x + fx, pos.y + fy, pos.z + fz);
+}
+
+function ensureIndex(bot) {
+    let idx = perceivedIndex.get(bot);
+    if (idx) return idx;
+    idx = {
+        columns: new Map(), queue: [], pending: new Set(), waiters: new Map(), drain: [], pumping: false,
+        cellReads: 0, sectionsBuilt: 0, sectionsSkipped: 0, chunkMs: [], open: new Map(),
+    };
+    perceivedIndex.set(bot, idx);
+    const target = bot.world && typeof bot.world.on === 'function' ? bot.world : (typeof bot.on === 'function' ? bot : null);
+    if (target) {
+        target.on('chunkColumnLoad', corner => onColumnLoad(bot, idx, corner));
+        target.on('chunkColumnUnload', corner => onColumnUnload(bot, idx, corner));
+        target.on('blockUpdate', (oldBlock, newBlock) => onBlockUpdate(bot, idx, oldBlock, newBlock));
+    }
+    return idx;
+}
+
+export function indexPerceivedChunks(bot) {
+    /**
+     * Index exposed faces of loaded chunks in the server view. One chunk yields to the event loop before the next.
+     * @param {Bot} bot - The bot.
+     * @returns {Promise<object>} - chunks built, total build ms, cell reads, and per-chunk ms.
+     * @example
+     * let built = await world.indexPerceivedChunks(bot);
+     **/
+    const idx = ensureIndex(bot);
+    let ctx;
+    try { ctx = viewContext(bot); } catch (err) { return Promise.reject(err); }
+    if (!ctx.columns.has(standingKey(ctx))) return Promise.reject(missingStanding(ctx));
+    enqueueView(idx, ctx);
+    if (!idx.queue.length && !idx.pumping) return Promise.resolve(indexReport(idx));
+    return new Promise((resolve, reject) => {
+        idx.drain.push({ resolve, reject });
+        scheduleIndex(bot, idx);
+    });
+}
+
+export function perceivedBuildStats(bot) {
+    /**
+     * Cost of the exposed-face index. This is the one-time build, not a step.
+     * @param {Bot} bot - The bot.
+     * @returns {object} - chunks, ms, cellReads, sectionsBuilt, perChunkMs.
+     * @example
+     * let cost = world.perceivedBuildStats(bot);
+     **/
+    const idx = perceivedIndex.get(bot);
+    if (!idx) throw new Error('perceivedBuildStats: the exposed index has not been built for this bot');
+    return indexReport(idx);
+}
+
+function nearestFace(eye, cell) {
+    let best = null;
+    let bestD = Infinity;
+    for (let face = 0; face < FACES.length; face++) {
+        if ((cell.mask & (1 << face)) === 0) continue;
+        const [fx, fy, fz] = FACES[face];
+        const point = { x: cell.x + 0.5 + fx * 0.5, y: cell.y + 0.5 + fy * 0.5, z: cell.z + 0.5 + fz * 0.5 };
+        const d = dist2(eye.x, eye.y, eye.z, point.x, point.y, point.z);
+        if (d < bestD) { bestD = d; best = point; }
+    }
+    return best;
+}
+
+function confirmVisible(bot, ctx, idx, onlyName) {
+    const exposed = [];
+    for (let dz = -ctx.radius; dz <= ctx.radius; dz++) {
+        for (let dx = -ctx.radius; dx <= ctx.radius; dx++) {
+            const built = idx.columns.get(`${ctx.stoodX + dx},${ctx.stoodZ + dz}`);
+            if (!built) continue;
+            for (const cell of built.cells.values()) {
+                if (onlyName) {
+                    const block = ctx.registry.blocksByStateId[cell.id];
+                    if (!block || block.name !== onlyName) continue;
+                }
+                exposed.push(cell);
+            }
+        }
+    }
+    const eye = ctx.eye;
+    exposed.sort((a, b) => dist2(eye.x, eye.y, eye.z, a.x + 0.5, a.y + 0.5, a.z + 0.5) - dist2(eye.x, eye.y, eye.z, b.x + 0.5, b.y + 0.5, b.z + 0.5));
+    const confirmed = new Set();
+    const found = [];
+    let raycasts = 0;
+    const eyeVec = new Vec3(eye.x, eye.y, eye.z);
+    for (const cell of exposed) {
+        if (!onlyName && confirmed.has(cell.id)) continue;
+        const face = nearestFace(eye, cell);
+        if (!face) continue;
+        const dir = new Vec3(face.x - eye.x, face.y - eye.y, face.z - eye.z);
+        const range = Math.sqrt(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
+        if (!(range > 0)) continue;
+        raycasts += 1;
+        const hit = bot.world.raycast(eyeVec, dir.normalize(), range);
+        if (!hit || !hit.position || hit.position.x !== cell.x || hit.position.y !== cell.y || hit.position.z !== cell.z) continue;
+        if (onlyName) return { position: { x: cell.x, y: cell.y, z: cell.z }, raycasts, candidates: exposed.length };
+        confirmed.add(cell.id);
+        const block = ctx.registry.blocksByStateId[cell.id];
+        if (!block || typeof block.name !== 'string') throw new Error(`nearby blocks: state id ${cell.id} is not in the registry`);
+        found.push({ name: block.name, metadata: block.metadata, x: cell.x, y: cell.y, z: cell.z });
+    }
+    if (onlyName) return { position: null, raycasts, candidates: exposed.length };
+    return { found, raycasts, candidates: exposed.length };
+}
+
+function perceivedBlocks(bot) {
+    const ctx = viewContext(bot);
+    if (!ctx.columns.has(standingKey(ctx))) throw missingStanding(ctx);
     if (typeof bot.world.raycast !== 'function') {
         throw new Error('nearby blocks: bot.world.raycast is missing (prismarine-world docs/API.md World.raycast).');
     }
-    const open = new Map();
-    const confirmed = new Set();
-    const found = [];
-    const at = {};
-    const stats = { cellReads: 0, candidates: 0, raycasts: 0, sectionsRead: 0, sectionsSkipped: 0 };
-    const sections = [];
-    for (let dz = -radius; dz <= radius; dz++) {
-        for (let dx = -radius; dx <= radius; dx++) {
-            const chunkX = stoodX + dx, chunkZ = stoodZ + dz;
-            const col = index.get(`${chunkX},${chunkZ}`);
-            if (!col) throw new Error(`nearby blocks: chunk ${chunkX},${chunkZ} is inside view distance ${radius} and is not loaded. An unloaded chunk is not an empty block list.`);
-            const column = col.column;
-            if (!Array.isArray(column.sections)) throw new Error(`nearby blocks: chunk ${chunkX},${chunkZ} has no sections`);
-            if (!Number.isInteger(column.minY)) {
-                throw new Error(`nearby blocks: chunk ${chunkX},${chunkZ} has no minY. Section Y is (blockY - minY) >> 4 (prismarine-chunk CommonChunkColumn).`);
-            }
-            const minX = chunkX * CHUNK_WIDTH, minZ = chunkZ * CHUNK_WIDTH;
-            for (let si = 0; si < column.sections.length; si++) {
-                const originY = column.minY + si * SECTION_HEIGHT;
-                const where = `chunk ${chunkX},${chunkZ} section ${si} (y ${originY})`;
-                if (!column.sections[si]) throw new Error(`nearby blocks: ${where} is not loaded. A missing section is not an empty block list.`);
-                sections.push({
-                    section: column.sections[si], where, minX, minZ, originY,
-                    dist2: boxDist2(eye, minX, originY, minZ, minX + CHUNK_WIDTH, originY + SECTION_HEIGHT, minZ + CHUNK_WIDTH),
-                });
-            }
-        }
-    }
-    sections.sort((a, b) => a.dist2 - b.dist2);
-    const eyeVec = new Vec3(eye.x, eye.y, eye.z);
-    let pending = [];
-    for (let s = 0; s < sections.length; s++) {
-        const nextDist = s + 1 < sections.length ? sections[s + 1].dist2 : Infinity;
-        const sec = sections[s];
-        const ids = paletteIds(sec.section, sec.where);
-        if (ids.every(id => id === 0 || confirmed.has(id))) { stats.sectionsSkipped += 1; continue; }
-        stats.sectionsRead += 1;
-        for (let i = 0; i < BLOCK_SECTION_VOLUME; i++) {
-            const id = cellStateId(sec.section, i, sec.where);
-            stats.cellReads += 1;
-            if (id === 0 || confirmed.has(id)) continue;
-            const local = localCell(i);
-            const x = sec.minX + local.x, y = sec.originY + local.y, z = sec.minZ + local.z;
-            let face = null;
-            let faceD = Infinity;
-            for (const [fx, fy, fz] of FACES) {
-                const nid = stateAt(index, x + fx, y + fy, z + fz, view);
-                if (nid === null || !nonOccluding(registry, nid, open)) continue;
-                const point = { x: x + 0.5 + fx * 0.5, y: y + 0.5 + fy * 0.5, z: z + 0.5 + fz * 0.5 };
-                const d = dist2(eye.x, eye.y, eye.z, point.x, point.y, point.z);
-                if (d < faceD) { faceD = d; face = point; }
-            }
-            if (!face) continue;
-            stats.candidates += 1;
-            pending.push({ id, x, y, z, face, dist2: dist2(eye.x, eye.y, eye.z, x, y, z) });
-        }
-        const ready = [];
-        const later = [];
-        for (const c of pending) (c.dist2 <= nextDist ? ready : later).push(c);
-        ready.sort((a, b) => a.dist2 - b.dist2);
-        for (const c of ready) {
-            if (confirmed.has(c.id)) continue;
-            const dir = new Vec3(c.face.x - eye.x, c.face.y - eye.y, c.face.z - eye.z);
-            const range = Math.sqrt(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
-            if (!(range > 0)) continue;
-            stats.raycasts += 1;
-            const hit = bot.world.raycast(eyeVec, dir.normalize(), range);
-            if (!hit || !hit.position || hit.position.x !== c.x || hit.position.y !== c.y || hit.position.z !== c.z) continue;
-            confirmed.add(c.id);
-            const block = registry.blocksByStateId[c.id];
-            if (!block || typeof block.name !== 'string') throw new Error(`nearby blocks: state id ${c.id} is not in the registry`);
-            found.push({ name: block.name, metadata: block.metadata, x: c.x, y: c.y, z: c.z });
-            at[block.name] = { x: c.x, y: c.y, z: c.z };
-        }
-        pending = later.filter(c => !confirmed.has(c.id));
-    }
-    perceivedAt.set(bot, at);
-    perceivedStat.set(bot, stats);
-    return found;
+    const idx = ensureIndex(bot);
+    if (!idx.columns.has(standingKey(ctx))) buildColumn(idx, ctx, ctx.stoodX, ctx.stoodZ);
+    enqueueView(idx, ctx);
+    scheduleIndex(bot, idx);
+    const seen = confirmVisible(bot, ctx, idx, null);
+    perceivedStat.set(bot, { cellReads: 0, candidates: seen.candidates, raycasts: seen.raycasts, sectionsRead: 0, sectionsSkipped: 0 });
+    return seen.found;
 }
 
-export function perceivedPosition(bot, name) {
-    const at = perceivedAt.get(bot);
-    if (!at || !Object.hasOwn(at, name)) return null;
-    return at[name];
+export async function perceivedPosition(bot, name) {
+    if (typeof name !== 'string' || name.length === 0) throw new Error('perceivedPosition: a block name is required.');
+    await indexPerceivedChunks(bot);
+    const ctx = viewContext(bot);
+    const idx = perceivedIndex.get(bot);
+    if (!idx || !idx.columns.has(standingKey(ctx))) throw missingStanding(ctx);
+    if (typeof bot.world.raycast !== 'function') {
+        throw new Error('perceivedPosition: bot.world.raycast is missing (prismarine-world docs/API.md World.raycast).');
+    }
+    const seen = confirmVisible(bot, ctx, idx, name);
+    return seen.position;
 }
 
 export function perceivedStats(bot) {

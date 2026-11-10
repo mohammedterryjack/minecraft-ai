@@ -38,7 +38,7 @@ export function buildContractManifest(skills) {
     for (const skill of skills) {
         if (!skill || typeof skill.name !== 'string') throw new Error('[fix97] skill entry has no name');
         for (const hit of Voyager.copiedInventoryHits(skill, registry)) {
-            const id = `${skill.name}.${hit.where}.${hit.n}`;
+            const id = `${skill.name}.${hit.where}.${hit.item}.${hit.n}`;
             const evidence = evidenceOf(skill, hit);
             if (seen.has(id)) {
                 const prev = records.find(r => r.id === id);
