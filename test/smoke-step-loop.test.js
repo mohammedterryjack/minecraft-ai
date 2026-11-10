@@ -112,6 +112,7 @@ function createMockBot() {
     const mockWorld = {
         getBiome: () => ({ name: 'forest' }),
         getColumns: () => columns,
+        on() {},
         raycast(from, dir, range) {
             for (let t = 0; t <= range + 0.05; t += 0.05) {
                 const x = Math.floor(from.x + dir.x * t);

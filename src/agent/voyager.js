@@ -16,6 +16,7 @@ import { checkNeedSource, needInterruptSource, isUnblamedInterruptKind, sampleBe
 import { peekPreconditionUnmet, clearPreconditionUnmet, checkNeed, reachNeedForBlocks } from './precondition.js';   // fix76; fix81: structured needs (markPreconditionUnmet is called by seeded code)
 import { SlotEffects } from './slot_effects.js';   // fix59
 import { obtainPlanner } from './recipe_plan.js';   // fix81
+import { itemSourceBlocks } from '../utils/item_sources.js';
 import { stackableCounts, emptySlotsToFit, roomFor, surplusFromConsumption, inventoryStacks, capacityPlan } from './slot_room.js';   // fix84, fix92
 // fix14: crash-safe writes (tmp file + rename)
 export function writeAtomic(fp, text) { const tmp = `${fp}.tmp-${process.pid}`; writeFileSync(tmp, text); renameSync(tmp, fp); }
@@ -1267,13 +1268,15 @@ Use only c; no other globals.`;
     _compileContract(src) { const f = makeCompartment(this._getContractEndowments()).evaluate(`(${src})`); if (typeof f !== 'function') throw new Error('not a function'); return f; }
     // fix86: a learned contract is checked against the real snapshot shape (plain pos, string heldItem, c.dist).
     //        c.post.pos.dist and c.post.eq.heldItem.type are not on that shape, so they cannot be learned.
-    _contractShapeProblem(src) {
+    _contractShapeProblem(src, counts) {
         const { root, param } = this._parseContract(src);
         if (param === null) return null;
         const pos = { x: 0, y: 64, z: 0 };
         const eq = { heldItem: 'iron_axe', offHand: null, helmet: null, chestplate: null, leggings: null, boots: null };
         const state = { pos, hp: skills.VITALS_MAX.health, food: skills.VITALS_MAX.food, oxygen: skills.VITALS_MAX.health, sky: 15, alive: true, dim: 'overworld', inv: {}, free: 0, eq };
-        const sample = { args: [0, 'oak_log', 1], ret: true, pre: state, post: state, delta: {}, dist: (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z), game: { item: () => true, block: () => true, drops: () => [], harvestTools: () => null } };
+        const args = counts && Array.isArray(counts.samples) ? counts.samples : [];
+        const list = counts && counts.params && counts.params.length ? counts.params.join(', ') : 'none';
+        const sample = { args, ret: true, pre: state, post: state, delta: {}, dist: (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z), game: { item: () => true, block: () => true, drops: () => [], harvestTools: () => null } };
         const problems = [];
         const unwrap = n => (n && n.type === 'ChainExpression' ? n.expression : n);
         const check = (node, calling) => {
@@ -1289,6 +1292,11 @@ Use only c; no other globals.`;
                 if (Array.isArray(cur)) {
                     const idx = Number(key), numeric = String(idx) === key && Number.isInteger(idx);
                     if (key !== 'length' && !numeric) { problems.push(`c.${path.join('.')} is not on the contract state`); return; }
+                    // No parameter list (the contract is checked on its own) is not arity 0. A learned skill's list is.
+                    if (numeric && counts && idx >= counts.arity && !counts.rest) {
+                        problems.push(`c.args[${idx}] is past arity ${counts.arity}; parameters after bot are (${list})`);
+                        return;
+                    }
                     if (!last || calling) { problems.push(`c.${path.join('.')} is not on the contract state (an argument is a primitive)`); return; }
                     return;
                 }
@@ -1353,8 +1361,17 @@ Use only c; no other globals.`;
         if (tools !== null) return tools;
         const postRead = Voyager.contractPreReadsPost(ct.pre);
         if (postRead !== null) return `pre reads c.${postRead} (state after the call); a precondition may read c.pre and c.args only`;
-        for (const k of ['pre', 'post']) { const shape = this._contractShapeProblem(ct[k]); if (shape) return `${k}: ${shape}`; }
-        const c = this._contractCtx({ args: [0, 64, 0, 'x', 1], ret: true, pre: s, post: s, delta: {} });
+        const counts = skill && typeof skill.code === 'string' ? Voyager.skillArgCounts(skill) : null;
+        if (skill && typeof skill.code === 'string' && !counts) return `${skill.name} has no function; c.args has no parameter list`;
+        for (const k of ['pre', 'post']) {
+            if (counts) {
+                const args = Voyager.contractArgProblems(ct[k], skill);
+                if (args.length) return `${k}: ${args.map(p => p.text).join('; ')}`;
+            }
+            const shape = this._contractShapeProblem(ct[k], counts);
+            if (shape) return `${k}: ${shape}`;
+        }
+        const c = this._contractCtx({ args: counts ? counts.samples : [], ret: true, pre: s, post: s, delta: {} });
         try { for (const k of ['pre', 'post']) { const r = this._compileContract(ct[k])(c); if (typeof r !== 'boolean') return `${k} returned ${r === undefined ? 'undefined' : JSON.stringify(r)} (${typeof r}), not a boolean`; } } catch (e) { return `throws: ${e.message}`; }
         // fix86: an equip post is checked against the skill's traced successful returns (or a string it returns).
         //        heldItem is that string, not an item with .type. Posts that also read delta/inv are about the inventory, not this probe.
@@ -1370,7 +1387,7 @@ Use only c; no other globals.`;
         for (const p of probes) {
             if (!p || !Object.hasOwn(p, 'rv') || !Object.hasOwn(p, 'heldItem')) throw new Error(`[fix86] return probe for ${skill.name} is missing rv or heldItem`);
             const post = { ...s, eq: { ...eq, heldItem: p.heldItem } };
-            const ctx = this._contractCtx({ args: [0, 64, 0, 'x', 1], ret: p.rv, pre: s, post, delta: {} });
+            const ctx = this._contractCtx({ args: counts ? counts.samples : [], ret: p.rv, pre: s, post, delta: {} });
             let r;
             try { r = this._compileContract(ct.post)(ctx); }
             catch (e) { return `post throws on the skill's return ${JSON.stringify(p.rv)}: ${e.message}`; }
@@ -1650,11 +1667,6 @@ Use only c; no other globals.`;
                 }
                 return;
             }
-            if (n.type === 'CallExpression') {
-                for (const arg of n.arguments || []) {
-                    if (arg && arg.type === 'Literal' && typeof arg.value === 'number') slotNs.add(arg.value);
-                }
-            }
             consider(n);
             for (const v of Object.values(n)) {
                 if (Array.isArray(v)) { for (const x of v) walk(x); }
@@ -1685,8 +1697,8 @@ Use only c; no other globals.`;
         const isItem = (item) => Object.hasOwn(registry.itemsByName, item);
         const hits = [];
         // A keep is `count - N` passed to a discard: N is how many of that item to leave, not a count that was observed.
-        // A contract ceiling (`<` / `<=`) is the same kind of cap when the code uses N as an argument or against something
-        // that is not that item's inventory count, and never compares the item itself to N.
+        // A contract ceiling (`<` / `<=`) is the same kind of cap when the code compares N to something that is not
+        // that item's inventory count, and never compares the item itself to N. A call argument is not that comparison.
         const take = (h, where) => {
             if (!isItem(h.item)) return;
             if (isGoal(h.item, h.n)) return;
@@ -1729,12 +1741,68 @@ Use only c; no other globals.`;
         if (!fn) return null;
         const params = fn.params.slice(1);
         let rest = false, required = 0, arity = 0;
+        const listed = [];
+        const samples = [];
         for (const p of params) {
-            if (p.type === 'RestElement') { rest = true; break; }
+            if (p.type === 'RestElement') {
+                rest = true;
+                listed.push(skill.code.slice(p.start, p.end));
+                break;
+            }
             arity += 1;
+            listed.push(skill.code.slice(p.start, p.end));
+            if (p.type === 'AssignmentPattern' && p.right && p.right.type === 'Literal') samples.push(p.right.value);
+            else samples.push(0);
             if (p.type !== 'AssignmentPattern') required += 1;
         }
-        return { required, arity, rest };
+        return { required, arity, rest, params: listed, samples };
+    }
+    // c.args is the arguments after bot. An index at or past arity cannot hold unless the function has a rest
+    // parameter. c.args.length is the required count or the arity; any other comparison is the same miss.
+    static contractArgProblems(src, skill) {
+        const counts = Voyager.skillArgCounts(skill);
+        if (!counts) throw new Error(`[fix97] ${skill.name} has no function; c.args has no parameter list`);
+        const ast = Voyager.parseContract(src);
+        const root = ast.body[0].expression;
+        const param = root.params && root.params.length && root.params[0].type === 'Identifier' ? root.params[0].name : null;
+        if (!param) return [];
+        const COMPARE = new Set(['<', '<=', '>', '>=', '==', '===', '!=', '!==']);
+        const list = counts.params.length ? counts.params.join(', ') : 'none';
+        const problems = [];
+        const seen = new Set();
+        const push = (id, problem) => { if (seen.has(id)) return; seen.add(id); problems.push(problem); };
+        const walk = (n) => {
+            if (!n || typeof n.type !== 'string') return;
+            if (n.type === 'MemberExpression' && n.computed && n.property && n.property.type === 'Literal' && typeof n.property.value === 'number') {
+                const path = Voyager.memberPath(n.object, param);
+                if (path && path.length === 1 && path[0] === 'args') {
+                    const i = n.property.value;
+                    if (!Number.isInteger(i) || i < 0 || (!counts.rest && i >= counts.arity)) {
+                        push(`index:${i}`, { kind: 'index', index: i, text: `${skill.name} parameters after bot are (${list}); c.args[${i}] is past arity ${counts.arity}` });
+                    }
+                }
+            }
+            if (n.type === 'BinaryExpression' && COMPARE.has(n.operator)) {
+                const lengthSide = (node) => {
+                    const path = Voyager.memberPath(node, param);
+                    return path && path.length === 2 && path[0] === 'args' && path[1] === 'length';
+                };
+                if (lengthSide(n.left) || lengthSide(n.right)) {
+                    const other = lengthSide(n.left) ? n.right : n.left;
+                    const nLit = other && other.type === 'Literal' && typeof other.value === 'number' ? other.value : null;
+                    if (nLit !== counts.required && nLit !== counts.arity) {
+                        const shown = nLit === null ? 'a non-literal' : String(nLit);
+                        push(`length:${shown}`, { kind: 'length', n: nLit, text: `${skill.name} parameters after bot are (${list}); c.args.length compared to ${shown}, not the required count ${counts.required} or the arity ${counts.arity}` });
+                    }
+                }
+            }
+            for (const v of Object.values(n)) {
+                if (Array.isArray(v)) { for (const x of v) walk(x); }
+                else if (v && typeof v === 'object' && typeof v.type === 'string') walk(v);
+            }
+        };
+        walk(root);
+        return problems;
     }
     static memberPath(node, param) {
         if (!node || !param) return null;
@@ -2385,7 +2453,7 @@ Use only c; no other globals.`;
             //        replaying the raiser. The next step leaves the step to that chain (_needServePending).
             if (Array.isArray(rp.needs) && rp.needs.length > 0) {
                 const seen = this.observe();
-                await this._noteReach(seen);
+                await this._judgeItems(seen, this._needItems(rp.needs), true);
                 if (this._chainNeeds(label, rp.needs, seen)) {
                     console.log(`[urgent-need] ${st.best.entry.name} lacked an input; backchained`);
                     return true;
@@ -2457,8 +2525,8 @@ Use only c; no other globals.`;
     async _serveLearnedFood(st, before) {
         const registry = this.agent.bot.registry;
         if (!registry) throw new Error('[fix93] bot.registry required to plan food from game data');
-        await this._noteReach(before);
         const edibles = edibleNames(registry);
+        await this._judgeItems(before, edibles, false);
         const inv = before.inventory;
         const planner = this._obtainPlanner(before);
         const plan = planFoodAcquisition({
@@ -2779,7 +2847,7 @@ Use only c; no other globals.`;
         const capacity = this._prepareTossSignals();
         if (capacity) {
             const seen = this.observe();
-            await this._noteReach(seen);
+            await this._judgeItems(seen, this._capacityItems(capacity.req), false);
             const plan = this._buildCapacityPlan(capacity.req, seen, capacity.slotsNeeded);
             this.agent.bot.__capacityPlan = plan.removals;
         }
@@ -3239,6 +3307,7 @@ Use only c; no other globals.`;
             },
             nearby_blocks: nearbyBlocks,
             perceived_at: perceivedAt,
+            perception: world.perceivedStats(bot).indexNote,
             nearby_entities: world.getNearbyEntityTypes(bot),
             known_chests: this._getChestFacts(),
             threats: this._threats(),
@@ -3775,7 +3844,7 @@ Use only c; no other globals.`;
         // fix81: what the failed run lacked (not for a misroute: the wrong skill's needs are not the goal's)
         let needs = null;
         if (!ok && !libFault && !cut && !misrouted) {
-            await this._noteReach(after);
+            await this._judgeItems(after, this._goalSourceItems(task), true);
             needs = this._failureNeeds(task, reported, failTrace, after);
         }
         const reason = !ok ? this._failureReason(failTrace) : null;   // fix89: FAILED lines already on the trace
@@ -4024,7 +4093,7 @@ Use only c; no other globals.`;
     // pathToBlock returns only success or noPath. A partial slice stays inside that search and is never stored
     // here. mineflayer-pathfinder index.js:64-71 takes one tickTimeout yield; lib/astar.js:70 returns 'partial'
     // and line 73 'timeout'. 'noPath' (line 121) is the open set exhausted, and that is the unreachable answer.
-    _pathStatus(state, name, at) {
+    _pathStatus(state, name) {
         if (state && state._reach && Object.hasOwn(state._reach, name)) {
             const status = state._reach[name];
             if (status !== 'success' && status !== 'noPath') {
@@ -4032,23 +4101,88 @@ Use only c; no other globals.`;
             }
             return status;
         }
-        const pf = this.agent.bot && this.agent.bot.pathfinder;
-        if (pf && typeof pf.getPathFromTo === 'function') {
-            throw new Error(`[fix97] ${name} has not been searched to completion. bot.pathfinder.getPathFromTo steps the search (mineflayer-pathfinder index.js:75). A partial result is not unreachable (index.js:41,64-71; lib/astar.js:70).`);
-        }
-        return world.pathStatusSync(this.agent.bot, at).status;
+        throw new Error(`[fix97] ${name} has not been searched. bot.pathfinder.getPathFromTo steps the search (mineflayer-pathfinder index.js:75). A partial result is not unreachable.`);
     }
-    async _noteReach(state) {
-        if (!state || !state.perceived_at || typeof state.perceived_at !== 'object') return state;
-        const pf = this.agent.bot && this.agent.bot.pathfinder;
-        if (!pf || typeof pf.getPathFromTo !== 'function') return state;
+    // One search per block this decision will use, nearest by GoalLookAtBlock.heuristic first. A step does not
+    // search every block the eye can see. stopAtSuccess returns the first success: that is the nearest one.
+    async _judgeTargets(state, names, stopAtSuccess) {
+        if (!Array.isArray(names)) throw new Error('[fix97] _judgeTargets needs the block names of this decision');
+        // An observation with no positions has nothing to search. Unjudged is not success and not noPath.
+        if (!state || !state.perceived_at || typeof state.perceived_at !== 'object') return null;
         if (!state._reach) state._reach = {};
-        for (const [name, pos] of Object.entries(state.perceived_at)) {
-            if (Object.hasOwn(state._reach, name)) continue;
-            const result = await world.pathToBlock(this.agent.bot, pos);
-            state._reach[name] = result.status;
+        const bot = this.agent.bot;
+        const pending = [];
+        for (const name of names) {
+            if (typeof name !== 'string' || name.length === 0) throw new Error('[fix97] a judged block name is not a string');
+            if (Object.hasOwn(state._reach, name)) {
+                if (stopAtSuccess && state._reach[name] === 'success') return name;
+                continue;
+            }
+            if (!Object.hasOwn(state.perceived_at, name)) continue;
+            pending.push(name);
         }
-        return state;
+        if (!pending.length) {
+            if (!stopAtSuccess) return null;
+            for (const name of names) if (state._reach[name] === 'success') return name;
+            return null;
+        }
+        const pf = bot && bot.pathfinder;
+        if (!pf || typeof pf.getPathFromTo !== 'function') {
+            throw new Error('[fix97] bot.pathfinder.getPathFromTo is missing. Reachability is one search of the chosen block (mineflayer-pathfinder index.js:75).');
+        }
+        pending.sort((a, b) => world.lookHeuristic(bot, state.perceived_at[a]) - world.lookHeuristic(bot, state.perceived_at[b]));
+        let found = null;
+        for (const name of pending) {
+            const result = await world.pathToBlock(bot, state.perceived_at[name]);
+            state._reach[name] = this._pathStatus({ _reach: { [name]: result.status } }, name);
+            if (result.status === 'success') {
+                found = name;
+                if (stopAtSuccess) return name;
+            }
+        }
+        return found;
+    }
+    _perceivedSources(state, items) {
+        if (!state || !state.perceived_at || typeof state.perceived_at !== 'object') return [];
+        if (!Array.isArray(items) || items.length === 0) return [];
+        const registry = this.agent && this.agent.bot && this.agent.bot.registry;
+        const names = [];
+        const seen = new Set();
+        for (const item of items) {
+            if (typeof item !== 'string' || item.length === 0) continue;
+            for (const block of itemSourceBlocks(registry, item)) {
+                if (seen.has(block) || !Object.hasOwn(state.perceived_at, block)) continue;
+                seen.add(block);
+                names.push(block);
+            }
+        }
+        return names;
+    }
+    async _judgeItems(state, items, stopAtSuccess) {
+        return this._judgeTargets(state, this._perceivedSources(state, items), stopAtSuccess);
+    }
+    _goalSourceItems(task) {
+        const goal = this._resolveGoal(task);
+        const items = [];
+        if (goal && typeof goal.item === 'string') items.push(goal.item);
+        if (goal && typeof goal.input === 'string') items.push(goal.input);
+        return items;
+    }
+    _needItems(needs) {
+        const items = [];
+        for (const n of needs || []) {
+            if (!n || typeof n !== 'object') continue;
+            if (typeof n.item === 'string') items.push(n.item);
+            if (Array.isArray(n.anyOf)) for (const a of n.anyOf) if (typeof a === 'string') items.push(a);
+        }
+        return items;
+    }
+    _capacityItems(req) {
+        const goal = this._resolveGoal(req.parent);
+        const items = [req.item];
+        if (goal && typeof goal.item === 'string') items.push(goal.item);
+        if (goal && typeof goal.input === 'string') items.push(goal.input);
+        return items;
     }
     _obtainPlanner(state) {
         const bot = this.agent.bot;
@@ -4067,7 +4201,8 @@ Use only c; no other globals.`;
         const reachableBlock = (block) => {
             if (reached.has(block)) return reached.get(block);
             const at = state.perceived_at && state.perceived_at[block];
-            const ok = at ? this._pathStatus(state, block, at) === 'success' : false;
+            const status = at && state._reach && Object.hasOwn(state._reach, block) ? state._reach[block] : null;
+            const ok = status === 'success';
             reached.set(block, ok);
             return ok;
         };
@@ -4401,11 +4536,20 @@ Use only c; no other globals.`;
                 const src = this._obtainPlanner(state).sources(goal.item);
                 const near = new Set(state.nearby_blocks);
                 const usable = [];
+                const unjudged = [];
                 for (const b of src) {
                     if (!near.has(b)) continue;
                     const at = state.perceived_at && state.perceived_at[b];
                     if (!at) throw new Error(`[fix97] ${b} is perceived but has no position. Reachability is pathToBlock of that block, not membership of nearby_blocks.`);
-                    if (this._pathStatus(state, b, at) === 'success') usable.push(b);
+                    const status = state._reach && Object.hasOwn(state._reach, b) ? state._reach[b] : null;
+                    if (status === 'success') usable.push(b);
+                    else if (status === null) unjudged.push(b);
+                    else if (status !== 'noPath') throw new Error(`[fix97] ${b} reach status ${JSON.stringify(status)} is not success or noPath`);
+                }
+                // stopAtSuccess leaves only sources past a success unjudged, and a success is usable.
+                // A nearby source nobody searched is not unreachable.
+                if (usable.length === 0 && unjudged.length > 0) {
+                    throw new Error(`[fix97] ${unjudged.join(', ')} is nearby and has not been searched. Reachability is pathToBlock of that block, not membership of nearby_blocks.`);
                 }
                 if (src.length > 0 && usable.length === 0) {
                     const blocksByName = this.agent.bot.registry.blocksByName;
@@ -4753,7 +4897,7 @@ Use only c; no other globals.`;
         const live = emptySlotsToFit(bot.registry, stackableCounts(bot), req.item, req.count);
         if (live < 1) throw new Error(`[fix92] LOUD: ${req.item} already fits; tossClutter plan is stale`);
         const seen = this.observe();
-        await this._noteReach(seen);
+        await this._judgeItems(seen, this._capacityItems(req), false);
         const plan = this._buildCapacityPlan(req, seen, live);
         if (plan.freed < live) throw new Error(`[fix92] LOUD: tossClutter plan is stale; it frees ${plan.freed} of ${live} slot(s) for ${req.item}`);
         bot.__capacityPlan = plan.removals;
@@ -5833,13 +5977,18 @@ Use only c; no other globals.`;
         const goal = smeltGoal(task) || countGoal(task) || parseVerboseGoal(task);
         if (goal && typeof goal.item === 'string' && Number.isInteger(goal.count)) {
             const state = this.observe();
-            await this._noteReach(state);
-            const inv = state.inventory || {};
             const planner = this._obtainPlanner(state);
+            const src = planner.sources(goal.item);
+            const inputSrc = typeof goal.input === 'string' ? planner.sources(goal.input) : [];
+            const perceived = [];
+            for (const block of [...src, ...inputSrc]) {
+                if (state.perceived_at && Object.hasOwn(state.perceived_at, block) && !perceived.includes(block)) perceived.push(block);
+            }
+            await this._judgeTargets(state, perceived, true);
+            const inv = state.inventory || {};
             const pre = planner.prerequisites(goal.item, goal.count, inv);
             const subs = [];
             if (pre.how === 'collect') {
-                const src = planner.sources(goal.item);
                 if (!src.length) throw new Error(`[fix97] LOUD: ${goal.item} is collected but the game data names no source block`);
                 if (!Array.isArray(state.nearby_blocks)) throw new Error(`[fix97] observe().nearby_blocks must be an array to choose a source of ${goal.item}`);
                 const edges = this.progress.recipeEdges;
@@ -5851,13 +6000,10 @@ Use only c; no other globals.`;
                     console.log(`[psn] decompose skipped for "${task}": no source of ${goal.item} is present or proven (${src.join(', ')})`);
                     return false;
                 }
-                const ranked = [...pool].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-                const chosen = ranked[0];
-                const at = state.perceived_at && state.perceived_at[chosen];
-                if (!at) throw new Error(`[fix97] reach ${chosen} has no perceived position. The pathfinder decides reachability of that block; nearby_blocks does not.`);
-                const status = this._pathStatus(state, chosen, at);
-                if (status !== 'success') {
-                    console.log(`[psn] decompose skipped for "${task}": pathfinder status ${status} for ${chosen}`);
+                const poolSeen = pool.filter(block => state.perceived_at && Object.hasOwn(state.perceived_at, block));
+                const chosen = await this._judgeTargets(state, poolSeen, true);
+                if (!chosen) {
+                    console.log(`[psn] decompose skipped for "${task}": no perceived source of ${goal.item} is reachable (${pool.join(', ')})`);
                     return false;
                 }
                 const reach = `reach ${chosen}`;
@@ -7463,7 +7609,7 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
         if (rp && !rp.ok && !rp.interrupted) this._noteEdgeOutcome(task, false);
         if (rp && !rp.ok && Array.isArray(rp.needs)) {
             const seen = this.observe();
-            await this._noteReach(seen);
+            await this._judgeItems(seen, this._needItems(rp.needs), true);
             if (this._chainNeeds(this._chainOwner(task), rp.needs, seen)) return true;
         }
         // fix55: a skill goal is that skill; its failure is already blamed/queued for repair by _attribute, so no new code is written for it
@@ -7758,8 +7904,9 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             const bot = this.agent.bot, reported = peekPreconditionUnmet(bot);
             clearPreconditionUnmet(bot);
             const seen = this.observe();
-            await this._noteReach(seen);
+            await this._judgeItems(seen, this._goalSourceItems(task), true);
             const needs = this._failureNeeds(task, reported, lastTrace, seen);
+            if (needs !== null) await this._judgeItems(seen, this._needItems(needs), true);
             this._noteEdgeOutcome(task, false);
             if (needs !== null && this._chainNeeds(this._chainOwner(task), needs, seen)) return true;
         }

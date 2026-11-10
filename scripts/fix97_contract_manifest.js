@@ -7,11 +7,14 @@
  * The goal quantity comes from countGoal / smeltGoal / ensureGoal / reachGoal. A leading "kind:" label
  * (collectSurface: Collect 32 dirt) is that parser's grammar. Task prose is not a source of counts.
  * A subscript, a distance, sky light, a tier, an argument count, or a tool-set size is not an inventory comparison.
- * Nothing is reset. Each record's verdict is one reason line.
+ * Each record's verdict is one reason line.
+ * A contract that reads c.args[i] past the function's arity, or compares c.args.length to anything other than
+ * the required count or the arity, is a reset: contract, contractPrev, and contractFail are cleared and the code stays.
+ * The predicate list is derived from the AST of each skill. No skill name is hard-coded.
  *
  *   node scripts/fix97_contract_manifest.js --bots-dir=bots/icefox2000
  */
-import { readFileSync } from 'fs';
+import { readFileSync, writeFileSync } from 'fs';
 import { join, resolve } from 'path';
 import { fileURLToPath } from 'url';
 import { createRequire } from 'module';
@@ -29,6 +32,50 @@ const CAUSE = {
 function evidenceOf(skill, hit) {
     const comparison = `${hit.item} ${hit.op} ${hit.n}`;
     return `${skill.name} compares inventory ${comparison}. ${hit.n} is not the parsed goal quantity of ${hit.item}, not a minecraft-data stack or recipe count for ${hit.item}, and not 0 or 1.`;
+}
+
+export function contractArityResets(skills) {
+    if (!Array.isArray(skills)) throw new Error('[fix97] skill index must be an array');
+    const resets = [];
+    const seen = new Set();
+    for (const skill of skills) {
+        if (!skill || typeof skill.name !== 'string') throw new Error('[fix97] skill entry has no name');
+        if (!skill.contract || typeof skill.contract !== 'object') continue;
+        if (typeof skill.code !== 'string') throw new Error(`[fix97] ${skill.name} has a contract and no code`);
+        for (const where of ['pre', 'post']) {
+            const src = skill.contract[where];
+            if (typeof src !== 'string') continue;
+            for (const problem of Voyager.contractArgProblems(src, skill)) {
+                const id = problem.kind === 'index'
+                    ? `${skill.name}.${where}.args[${problem.index}]`
+                    : `${skill.name}.${where}.args.length.${problem.n}`;
+                if (seen.has(id)) continue;
+                seen.add(id);
+                resets.push({
+                    id,
+                    skill: skill.name,
+                    where,
+                    kind: problem.kind,
+                    index: problem.kind === 'index' ? problem.index : null,
+                    n: problem.kind === 'length' ? problem.n : null,
+                    text: problem.text,
+                });
+            }
+        }
+    }
+    return resets;
+}
+
+export function applyContractResets(skills) {
+    const resets = contractArityResets(skills);
+    const names = new Set(resets.map(r => r.skill));
+    for (const skill of skills) {
+        if (!names.has(skill.name)) continue;
+        delete skill.contract;
+        delete skill.contractPrev;
+        delete skill.contractFail;
+    }
+    return resets;
 }
 
 export function buildContractManifest(skills) {
@@ -67,6 +114,7 @@ export function buildContractManifest(skills) {
         scanned: skills.length,
         reasonLines,
         records,
+        resets: contractArityResets(skills),
     };
 }
 
@@ -81,7 +129,13 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1
     if (!bots) throw new Error('[fix97] --bots-dir=bots/icefox2000 required');
     const indexPath = join(bots, 'skills', 'index.json');
     const skills = JSON.parse(readFileSync(indexPath, 'utf8'));
-    const manifest = buildContractManifest(skills);
-    manifest.index = indexPath;
-    process.stdout.write(JSON.stringify(manifest, null, 2) + '\n');
+    if (process.argv.includes('--apply')) {
+        const resets = applyContractResets(skills);
+        writeFileSync(indexPath, JSON.stringify(skills, null, 2));
+        process.stdout.write(JSON.stringify({ apply: true, resets }, null, 2) + '\n');
+    } else {
+        const manifest = buildContractManifest(skills);
+        manifest.index = indexPath;
+        process.stdout.write(JSON.stringify(manifest, null, 2) + '\n');
+    }
 }

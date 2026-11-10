@@ -82,7 +82,13 @@ function mkV({ inv, nearby, failTasks = [] }) {
             game: { gameMode: 'survival' },
             entity: { eyeHeight: 1.62, position: { x: 0, y: 64, z: 0 } },
             world: {},
-            pathfinder: { movements: {}, getPathTo: () => ({ status: 'success', cost: 1 }) },
+            waitForTicks: async () => {},
+            pathfinder: {
+                movements: {},
+                tickTimeout: 40,
+                getPathTo: () => ({ status: 'success', cost: 1 }),
+                getPathFromTo: function * () { yield { result: { status: 'success', cost: 1 } }; },
+            },
         },
         openChat() {},
     };
@@ -108,10 +114,12 @@ function mkV({ inv, nearby, failTasks = [] }) {
     // the real _replay's contract: a failed run returns its structured needs (rp.needs from _failureNeeds)
     v._replay = async (task) => {
         v.ran.push(task);
-        if (failTasks.includes(task)) return { ok: false, name: 'r', reason: 'test: failed', needs: v._failureNeeds(task, null, null, v.observe()) };
+        const seen = v.observe();
+        await v._judgeItems(seen, v._goalSourceItems(task), true);
+        if (failTasks.includes(task)) return { ok: false, name: 'r', reason: 'test: failed', needs: v._failureNeeds(task, null, null, seen) };
         const res = applyTask(task, inv, nearby);
         if (res.ok) return { ok: true, name: 'r' };
-        return { ok: false, name: 'r', reason: 'test world: cannot', needs: v._failureNeeds(task, res.reported, null, v.observe()) };
+        return { ok: false, name: 'r', reason: 'test world: cannot', needs: v._failureNeeds(task, res.reported, null, seen) };
     };
     v._cursorLimited = () => true;   // code generation is not reached: every failure here names what it lacks
     return v;
