@@ -410,9 +410,11 @@ describe('fix98: rest serve chains a bed from game data', () => {
         bot.isABed = block => block && block.name === 'red_bed';
         bot.pathfinder = {
             movements: { id: 'bot-movements' },
-            getPathTo(movements, goal) {
+            tickTimeout: 40,
+            getPathTo() { throw new Error('getPathTo takes one slice'); },
+            *getPathFromTo(movements, _start, goal) {
                 searched.push({ movements, goal });
-                return { status: 'success', cost: 12 };
+                yield { result: { status: 'success', cost: 12, path: [] } };
             },
             async goto(goal) {
                 walked = goal;
@@ -512,7 +514,11 @@ describe('fix98: rest serve chains a bed from game data', () => {
         bot.isABed = block => block && block.name === bed.name;
         bot.pathfinder = {
             movements: {},
-            getPathTo() { return { status: 'noPath', cost: 0 }; },
+            tickTimeout: 40,
+            getPathTo() { throw new Error('getPathTo takes one slice'); },
+            *getPathFromTo() {
+                yield { result: { status: 'noPath', cost: 0, path: [] } };
+            },
             async goto() { walked = true; },
         };
         bot.blockAt = () => { throw new Error('blockAt is the sleep action, after a path'); };
@@ -559,7 +565,11 @@ describe('fix98: rest serve chains a bed from game data', () => {
         bot.registry = { itemsByName: { placed: { name: 'placed' } }, blocksByName: { placed: { name: 'placed' } } };
         bot.pathfinder = {
             movements: {},
-            getPathTo: () => ({ status: 'success', cost: 1 }),
+            tickTimeout: 40,
+            getPathTo() { throw new Error('getPathTo takes one slice'); },
+            *getPathFromTo() {
+                yield { result: { status: 'success', cost: 1, path: [] } };
+            },
             async goto() {},
         };
         bot.blockAt = () => bed;
@@ -616,6 +626,7 @@ describe('fix98: prompt facts', () => {
                 getBiome: () => 1,
                 getColumns: () => columns,
                 raycast: () => null,
+                on() {},
             },
             findBlocks: () => [],
             blockAt: () => ({ skyLight: 0 }),
