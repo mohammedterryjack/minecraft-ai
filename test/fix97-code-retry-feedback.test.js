@@ -9,13 +9,17 @@
  * Inventory: 0 empty slots, 1043 total items.
  * collapseRepeats only merges consecutive identical lines, so those 60 FAILs and the pathfinder lines (coordinates
  * and timestamps change) all stayed, and the behaviour log repeated the same lines as the trace and the output.
+ * Lines that differ only by numbers are one template. Each slot is an exact run, an arithmetic range, or the values.
  * contextBlocked and promptCounts do not compact this feedback.
+ * The 789 calls are not the executor replaying a failed call. _run calls actions.runAction once; the 5-minute
+ * timeout is that one run of main(). The calls are whatever the generated code did until the timeout. The stall
+ * stop resets when pathfinding enters a new 2-block cell, so a travel loop is not stopped as a repeated failure.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { readFileSync } from 'node:fs';
 import * as cd from '../src/models/call_durations.js';
-import { collapseRepeats, structuredTrace } from '../src/agent/skill_graph.js';
+import { collapseRepeats, recoverTemplatedLines, structuredTrace } from '../src/agent/skill_graph.js';
 import { codeRetryFeedback } from '../src/agent/voyager.js';
 import { CODE_PROMPT_DUMP, writeCodePromptDump } from '../src/models/code_prompt_dump.js';
 import { CODE_RETRY_78, observedChatWork } from './fixtures/code_retry_observation.js';
@@ -130,9 +134,6 @@ describe('fix97 code-retry feedback is compact by construction', () => {
         assert.strictEqual(feedback.split('1043').length - 1, 2);
         assert.ok(feedback.includes('stripped_birch_wood'));
         assert.ok(feedback.includes('self_preservation: left the lava'));
-        assert.ok(feedback.includes('-100,'), feedback);
-        assert.ok(feedback.includes('-300,'), feedback);
-        assert.ok(feedback.includes('-499,'), feedback);
         const traceSection = feedback.split('Execution output:')[0];
         let calls = 0;
         for (const line of traceSection.split('\n')) {
@@ -141,9 +142,23 @@ describe('fix97 code-retry feedback is compact by construction', () => {
             calls += m ? Number(m[1]) : 1;
         }
         assert.strictEqual(calls, 789);
-        const traceLines = structuredTrace(trace).split('\n');
-        assert.ok(traceLines.some(l => l.includes('collectLogs(4,"birch_log")') && l.includes('(x60)')));
-        assert.ok(traceLines.filter(l => l.includes('goToPosition')).length > 1);
+        const traceLines = structuredTrace(trace);
+        assert.ok(traceLines.includes('collectLogs(4,"birch_log")') && traceLines.includes('(x60)'));
+        const recovered = recoverTemplatedLines(feedback);
+        const nums = line => [...line.matchAll(/-?\d+(?:\.\d+)?/g)].map(m => Number(m[0]));
+        const stillSrc = output.filter(l => l.startsWith('Still '));
+        const stillGot = recovered.filter(l => l.startsWith('Still '));
+        assert.strictEqual(stillGot.length, stillSrc.length);
+        for (let i = 0; i < stillSrc.length; i++) assert.deepStrictEqual(nums(stillGot[i]), nums(stillSrc[i]), stillGot[i]);
+        assert.ok(stillGot.some(l => l.startsWith('Still 200 blocks from -300,')));
+        const gotoSrc = trace.filter(r => r.name === 'goToPosition').map(r => `${r.args} ${r.ownFail.join(' ')}`);
+        const gotoGot = recovered.filter(l => l.includes('goToPosition('));
+        assert.strictEqual(gotoGot.length, gotoSrc.length);
+        for (let i = 0; i < gotoSrc.length; i++) assert.deepStrictEqual(nums(gotoGot[i]), nums(gotoSrc[i]));
+        const wanted = new Set();
+        for (const line of [...output, ...trace.flatMap(r => [r.args, ...r.ownFail])]) for (const n of nums(line)) wanted.add(n);
+        const got = new Set(recovered.flatMap(nums));
+        for (const n of wanted) assert.ok(got.has(n), `missing ${n}`);
 
         const system = 's'.repeat(CODE_RETRY_78.systemMessageChars);
         const user = `Task: ${CODE_RETRY_78.task}\n--- feedback from last attempt ---\n${feedback}\n`;
@@ -152,9 +167,8 @@ describe('fix97 code-retry feedback is compact by construction', () => {
         const unfitted = tokensOf(system, rawUser);
         const overflowMargin = unfitted.tokens - NUM_CTX;
         assert.ok(overflowMargin > 0, `the uncollapsed retry was ${unfitted.tokens} tokens, ${overflowMargin} over num_ctx ${NUM_CTX}`);
-        // Identical lines collapse. Lines that differ, including by a coordinate, stay. This shape's distinct lines are still over num_ctx.
-        assert.ok(fitted.tokens < unfitted.tokens, `grouped ${fitted.tokens} tokens, raw ${unfitted.tokens}, feedback ${feedback.length} chars`);
-        assert.ok(feedback.includes('Still 200 blocks from -300,'));
+        assert.ok(fitted.tokens < NUM_CTX, `code-retry prompt ${fitted.tokens} tokens, num_ctx ${NUM_CTX}, feedback ${feedback.length} chars`);
+        console.log(`[fix97] 789-call code-retry prompt ${fitted.tokens} tokens (feedback ${feedback.length} chars, raw ${unfitted.tokens} tokens)`);
     });
 
     it('the compose-retry prompt is dumped before the code model is called, including when the call throws', async () => {
@@ -199,8 +213,9 @@ describe('fix97 code-retry feedback is compact by construction', () => {
             record('mineBlock', '["stone"]', false, [], -1, 0),
         ];
         const text = structuredTrace(trace);
-        assert.ok(text.includes('-> 0 FAIL (x2)'));
-        assert.ok(text.includes('-> 3 FAIL'));
+        assert.ok(text.includes('-> {0} FAIL (x3)'));
+        assert.ok(text.includes('{0}: 0, 3, 0'));
+        assert.deepStrictEqual(recoverTemplatedLines(text).map(l => l.match(/-> (-?\d+)/)[1]), ['0', '3', '0']);
         assert.ok(!text.includes('-> 0 FAIL (x3)'));
         assert.ok(!text.includes('-> 0 (x3)'));
     });
@@ -208,8 +223,9 @@ describe('fix97 code-retry feedback is compact by construction', () => {
     it('gained counts +0, +4, +0 stay two values', () => {
         const output = ['Gained +0 oak_log', 'Gained +4 oak_log', 'Gained +0 oak_log'].join('\n');
         const feedback = codeRetryFeedback({ cut: null, output, trace: [], critique: '', invFull: null, behaviorLog: '' });
-        assert.ok(feedback.includes('Gained +0 oak_log (x2)'));
-        assert.ok(feedback.includes('Gained +4 oak_log'));
+        assert.ok(feedback.includes('Gained +{0} oak_log (x3)'));
+        assert.ok(feedback.includes('{0}: 0, 4, 0'));
+        assert.deepStrictEqual(recoverTemplatedLines(feedback).filter(l => l.startsWith('Gained')).map(l => l.match(/\+(\d+)/)[1]), ['0', '4', '0']);
         assert.ok(!feedback.includes('Gained +0 oak_log (x3)'));
         assert.ok(!feedback.includes('+0 (x3)'));
     });

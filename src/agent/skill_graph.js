@@ -579,26 +579,170 @@ export function traceText(trace) {
 export function factKey(line) {
     return String(line).replace(/-?\d+(?:\.\d+)?/g, '#').replace(/\s+/g, ' ').trim();
 }
-// Identical lines are one fact with a count. A line that differs, including by a number, is a different value and is listed.
-// Nothing is cut.
+// Lines that share every word and differ only by numbers are one template. Each numeric slot is a series:
+// an exact run (`16 x 4`), an arithmetic range (`0..399 step 1, x400`), or the values themselves.
+// Zero-padding is not part of the value: `00` and `0` are the same number. Nothing is sliced.
+const NUMERIC_TOKEN = /-?\d+(?:\.\d+)?/g;
+function numericSlots(line) {
+    const values = [];
+    const template = line.replace(NUMERIC_TOKEN, (m) => {
+        values.push(Number(m));
+        return `{${values.length - 1}}`;
+    });
+    return { template, values };
+}
+function sameNumbers(a, b) {
+    return a.length === b.length && a.every((v, i) => v === b[i]);
+}
+function runLength(values, i) {
+    let j = i + 1;
+    while (j < values.length && values[j] === values[i]) j += 1;
+    return j - i;
+}
+function arithmeticLength(values, i) {
+    if (i + 2 >= values.length) return 1;
+    if (!Number.isInteger(values[i]) || !Number.isInteger(values[i + 1])) return 1;
+    const step = values[i + 1] - values[i];
+    if (step === 0) return 1;
+    let j = i + 2;
+    while (j < values.length && Number.isInteger(values[j]) && values[j] - values[j - 1] === step) j += 1;
+    return j - i;
+}
+function formatNum(n) {
+    return String(n);
+}
+// One slot's values, in order. A constant run of 2 or more is `v x N`. An integer arithmetic run of 3 or more
+// is `start..end step k, xN`. Anything shorter is written out. The pieces are separated by `; `.
+function encodeSeries(values) {
+    const parts = [];
+    let i = 0;
+    while (i < values.length) {
+        const constant = runLength(values, i);
+        const arithmetic = arithmeticLength(values, i);
+        if (constant >= 2 && constant >= arithmetic) {
+            parts.push(`${formatNum(values[i])} x ${constant}`);
+            i += constant;
+            continue;
+        }
+        if (arithmetic >= 3) {
+            const step = values[i + 1] - values[i];
+            const end = values[i] + (arithmetic - 1) * step;
+            parts.push(`${formatNum(values[i])}..${formatNum(end)} step ${formatNum(step)}, x${arithmetic}`);
+            i += arithmetic;
+            continue;
+        }
+        const start = i;
+        i += 1;
+        while (i < values.length && runLength(values, i) < 2 && arithmeticLength(values, i) < 3) i += 1;
+        parts.push(values.slice(start, i).map(formatNum).join(', '));
+    }
+    return parts.join('; ');
+}
+function expandSeries(spec) {
+    const parts = String(spec).split(';').map(s => s.trim()).filter(s => s.length > 0);
+    const out = [];
+    for (const p of parts) {
+        let m = p.match(/^(-?\d+(?:\.\d+)?) x (\d+)$/);
+        if (m) {
+            const v = Number(m[1]);
+            const n = Number(m[2]);
+            if (!Number.isInteger(n) || n < 1) throw new Error(`[fix97] series run is not a count: ${p}`);
+            for (let i = 0; i < n; i++) out.push(v);
+            continue;
+        }
+        m = p.match(/^(-?\d+(?:\.\d+)?)\.\.(-?\d+(?:\.\d+)?) step (-?\d+(?:\.\d+)?), x(\d+)$/);
+        if (m) {
+            const start = Number(m[1]), end = Number(m[2]), step = Number(m[3]), n = Number(m[4]);
+            if (!Number.isInteger(n) || n < 2 || !Number.isInteger(step) || step === 0) throw new Error(`[fix97] series range is not an integer step: ${p}`);
+            const produced = [];
+            for (let i = 0; i < n; i++) {
+                const v = start + i * step;
+                if (!Number.isInteger(v)) throw new Error(`[fix97] series range left the integers: ${p}`);
+                produced.push(v);
+            }
+            if (produced[produced.length - 1] !== end) throw new Error(`[fix97] series range ${p} ended at ${produced[produced.length - 1]}`);
+            out.push(...produced);
+            continue;
+        }
+        if (p.length === 0) throw new Error('[fix97] series has an empty piece');
+        for (const tok of p.split(',')) {
+            const t = tok.trim();
+            if (!/^-?\d+(?:\.\d+)?$/.test(t)) throw new Error(`[fix97] series value is not a number: ${JSON.stringify(t)}`);
+            out.push(Number(t));
+        }
+    }
+    return out;
+}
 export function groupVaryingLines(text) {
     const lines = String(text || '').split('\n').filter(l => l.trim().length > 0);
     const groups = new Map();
     const order = [];
     for (const line of lines) {
-        let g = groups.get(line);
-        if (!g) { g = 0; groups.set(line, 0); order.push(line); }
-        groups.set(line, (g || 0) + 1);
+        const { template, values } = numericSlots(line);
+        let g = groups.get(template);
+        if (!g) { g = { first: line, rows: [] }; groups.set(template, g); order.push(template); }
+        g.rows.push(values);
     }
-    return order.map(line => {
-        const n = groups.get(line);
-        return n > 1 ? `${line} (x${n})` : line;
-    }).join('\n');
+    const out = [];
+    for (const template of order) {
+        const g = groups.get(template);
+        const n = g.rows.length;
+        if (n === 1) { out.push(g.first); continue; }
+        const slots = g.rows[0].length;
+        const constant = g.rows.every(row => sameNumbers(row, g.rows[0]));
+        if (constant) { out.push(`${g.first} (x${n})`); continue; }
+        out.push(`${template} (x${n})`);
+        for (let s = 0; s < slots; s++) out.push(`  {${s}}: ${encodeSeries(g.rows.map(row => row[s]))}`);
+    }
+    return out.join('\n');
+}
+// Expand a templated block back to the lines it was built from. A line that was not templated is returned as written.
+// `recoverTemplatedLines(groupVaryingLines(text))` is those lines, with each numeric token written in decimal.
+export function recoverTemplatedLines(text) {
+    const lines = String(text || '').split('\n');
+    const out = [];
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (/^  \{\d+\}: /.test(line)) throw new Error(`[fix97] series slot has no template: ${line}`);
+        const marked = line.match(/^(.*) \(x(\d+)\)$/);
+        const nextIsSlot = lines[i + 1] && /^  \{\d+\}: /.test(lines[i + 1]);
+        if (marked && nextIsSlot) {
+            const template = marked[1];
+            const n = Number(marked[2]);
+            if (!Number.isInteger(n) || n < 2) throw new Error(`[fix97] template count is not a repeat: ${line}`);
+            const slots = [];
+            while (lines[i + 1] && /^  \{(\d+)\}: /.test(lines[i + 1])) {
+                const sm = lines[i + 1].match(/^  \{(\d+)\}: (.*)$/);
+                slots[Number(sm[1])] = expandSeries(sm[2]);
+                i += 1;
+            }
+            const expected = (template.match(/\{\d+\}/g) || []).length;
+            if (slots.length !== expected) throw new Error(`[fix97] template ${template} has ${expected} slots and ${slots.length} series`);
+            for (let s = 0; s < slots.length; s++) {
+                if (!slots[s] || slots[s].length !== n) throw new Error(`[fix97] slot {${s}} of ${template} has ${slots[s] ? slots[s].length : 0} values for ${n} lines`);
+            }
+            for (let r = 0; r < n; r++) {
+                let rebuilt = template;
+                for (let s = slots.length - 1; s >= 0; s--) rebuilt = rebuilt.replaceAll(`{${s}}`, String(slots[s][r]));
+                out.push(rebuilt);
+            }
+            continue;
+        }
+        if (marked && !/\{\d+\}/.test(marked[1]) && !nextIsSlot) {
+            const n = Number(marked[2]);
+            if (Number.isInteger(n) && n >= 2) {
+                for (let k = 0; k < n; k++) out.push(marked[1]);
+                continue;
+            }
+        }
+        out.push(line);
+    }
+    return out;
 }
 function callErrorText(r) {
     const lines = [];
     if (Array.isArray(r.ownFail)) lines.push(...r.ownFail.filter(l => typeof l === 'string' && l.length > 0));
-    return groupVaryingLines(lines.join('\n')).split('\n').join(' | ');
+    return collapseRepeats(lines).join(' | ');
 }
 function outcomeText(r) {
     return r.err ? `threw ${r.err}` : `${r.ret}${r.ok ? '' : ' FAIL'}`;
@@ -608,34 +752,20 @@ function callHead(trace, r) {
     const args = r.args.replace(/^\[|\]$/g, '');
     return `${parent ? parent + ' > ' : ''}${r.name}(${args}) -> ${outcomeText(r)}`;
 }
-function callSignature(trace, r) {
-    const parent = Number.isInteger(r.parent) && r.parent >= 0 && r.parent < trace.length ? trace[r.parent].name : '';
-    return `${parent}|${r.name}|${factKey(r.args)}|${outcomeText(r)}|${callErrorText(r)}`;
-}
-// One entry per distinct call. The key includes the outcome and the error text, so a different return or a different
-// error is its own line with its own count. Identical calls, including ones interleaved with others, share a count.
+// One line per call, then lines that differ only by numbers share a template. The outcome and the error stay in the
+// line, so a different return or a different sentence is a different template. The series keeps every value.
 export function structuredTrace(trace) {
     if (!Array.isArray(trace)) throw new Error('structuredTrace: trace array required');
-    const groups = new Map();
-    const order = [];
+    const lines = [];
     for (let i = 0; i < trace.length; i++) {
         const r = trace[i];
         if (!r || typeof r.name !== 'string' || r.name.length === 0) throw new Error(`structuredTrace: record ${i} has no name`);
         if (typeof r.args !== 'string') throw new Error(`structuredTrace: ${r.name} args are not text`);
-        const key = callSignature(trace, r);
-        let g = groups.get(key);
-        if (!g) { g = []; groups.set(key, g); order.push(key); }
-        g.push(r);
+        const errors = callErrorText(r);
+        lines.push(`${callHead(trace, r)}${errors ? ' | ' + errors : ''}`);
     }
-    const lines = order.map(key => {
-        const recs = groups.get(key);
-        const head = callHead(trace, recs[0]);
-        const errors = callErrorText(recs[0]);
-        const count = recs.length > 1 ? ` (x${recs.length})` : '';
-        return `${head}${count}${errors ? ' | ' + errors : ''}`;
-    });
     if (trace.untraced > 0) lines.push(`(${trace.untraced} further call(s) ran after the trace's ${trace.length} records and were not recorded)`);
-    return lines.join('\n');
+    return groupVaryingLines(lines.join('\n'));
 }
 // credit assignment: blame the deepest failing call; a failing leaf (hand-written primitive, no skill deps) is never edited,
 // so responsibility moves to its caller (PSN calling_pattern_issues -> caller_fix); otherwise the callee itself (callee_fix).
