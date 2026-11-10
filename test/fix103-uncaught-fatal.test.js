@@ -1,8 +1,8 @@
 /**
  * fix103: an uncaughtException or unhandledRejection while a step is running is fatal.
  * It is not pushed onto progress.failed and it is not learned.
- * The wedge child shows why resuming is unsafe: the throw is inside the deserializer push,
- * cb() never runs, and the next keep_alive is not delivered.
+ * The wedge child installs the same process handlers as voyager.js and fatalExit from fatal.js.
+ * The throw is inside the deserializer push. Fixed code exits 1 before the next keep_alive.
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -10,7 +10,8 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { Voyager } from '../src/agent/voyager.js';
 
-const WEDGE = fileURLToPath(new URL('./fixtures/fix103-wedge-child.cjs', import.meta.url));
+const WEDGE = fileURLToPath(new URL('./fixtures/fix103-wedge-child.mjs', import.meta.url));
+const ROOT = fileURLToPath(new URL('..', import.meta.url));
 
 function runningStep() {
     const failed = [];
@@ -51,20 +52,20 @@ describe('fix103 process errors are fatal', () => {
         assert.strictEqual(v._crash, undefined);
     });
 
-    it('a swallowed throw inside the deserializer push wedges the packet pipeline', async () => {
-        const child = spawn(process.execPath, [WEDGE], { stdio: ['ignore', 'pipe', 'pipe'] });
+    it('a block_change throw is fatal and no later keep_alive is delivered', async () => {
+        const child = spawn(process.execPath, [WEDGE, ROOT], { stdio: ['ignore', 'pipe', 'pipe'] });
         let stdout = '';
         let stderr = '';
         child.stdout.on('data', (buf) => { stdout += buf; });
         child.stderr.on('data', (buf) => { stderr += buf; });
         const ended = await new Promise((resolve) => child.on('exit', (code) => resolve(code)));
-        assert.strictEqual(ended, 0, `${stderr}\n${stdout}`);
-        const report = JSON.parse(stdout);
-        assert.deepStrictEqual(report.delivered, ['keep_alive 1', 'block_change']);
-        assert.strictEqual(report.swallowed, 1);
-        assert.strictEqual(report.deserializerWriting, true);
-        assert.strictEqual(report.splitterWriting, true);
-        assert.strictEqual(report.wedged, true);
-        assert.match(stderr, /nearby blocks: chunk 6,6/);
+        assert.strictEqual(ended, 1, `${stderr}\n${stdout}`);
+        assert.match(stderr, /\[fatal\] UNCAUGHT EXCEPTION/);
+        assert.doesNotMatch(stdout, /SAVED/);
+        assert.doesNotMatch(stdout, /"alive":true/);
+        const snap = JSON.parse(stdout.trim().split('\n')[0]);
+        assert.deepStrictEqual(snap.failed, []);
+        assert.deepStrictEqual(snap.delivered, ['keep_alive 1', 'block_change']);
+        assert.ok(!snap.delivered.some((line) => line.startsWith('keep_alive ') && line !== 'keep_alive 1'));
     });
 });

@@ -180,7 +180,8 @@ export function planReset(botDir, goal, fromIso, toIso) {
         }
         if (progress.recipeEdges !== null && typeof progress.recipeEdges === 'object' && !Array.isArray(progress.recipeEdges)) {
             for (const [item, edge] of Object.entries(progress.recipeEdges)) {
-                if (edge === null || typeof edge !== 'object' || edge.task !== goal) continue;
+                if (edge === null || typeof edge !== 'object' || Array.isArray(edge)) throw new Error(`fix103-reset: ${progressPath} recipeEdges[${JSON.stringify(item)}] is not an object: ${JSON.stringify(edge)}`);
+                if (edge.task !== goal) continue;
                 manual.push(`${progressPath} recipeEdges[${JSON.stringify(item)}] task=${JSON.stringify(goal)} runs=${JSON.stringify(edge.runs)} fails=${JSON.stringify(edge.fails)} has no per-run timestamp; left in place`);
             }
         }
@@ -204,7 +205,8 @@ export function planReset(botDir, goal, fromIso, toIso) {
         if (Array.isArray(progress.subgoals)) {
             for (let i = 0; i < progress.subgoals.length; i++) {
                 const row = progress.subgoals[i];
-                if (row !== null && typeof row === 'object' && (row.task === goal || row.parent === goal)) {
+                if (row === null || typeof row !== 'object' || Array.isArray(row)) throw new Error(`fix103-reset: ${progressPath} subgoals[${i}] is not an object: ${JSON.stringify(row)}`);
+                if (row.task === goal || row.parent === goal) {
                     manual.push(`${progressPath} subgoals[${i}] task=${JSON.stringify(row.task)} parent=${JSON.stringify(row.parent)} has no timestamp; left in place`);
                 }
             }
@@ -225,7 +227,8 @@ export function planReset(botDir, goal, fromIso, toIso) {
         }
         if (progress.deathSpots !== null && typeof progress.deathSpots === 'object' && !Array.isArray(progress.deathSpots)) {
             for (const [cell, spot] of Object.entries(progress.deathSpots)) {
-                if (spot === null || typeof spot !== 'object' || !Array.isArray(spot.tasks)) continue;
+                if (spot === null || typeof spot !== 'object' || Array.isArray(spot)) throw new Error(`fix103-reset: ${progressPath} deathSpots[${JSON.stringify(cell)}] is not an object: ${JSON.stringify(spot)}`);
+                if (!Array.isArray(spot.tasks)) throw new Error(`fix103-reset: ${progressPath} deathSpots[${JSON.stringify(cell)}].tasks is not an array: ${JSON.stringify(spot.tasks)}`);
                 if (!spot.tasks.includes(goal)) continue;
                 manual.push(`${progressPath} deathSpots[${JSON.stringify(cell)}].tasks includes ${JSON.stringify(goal)} but times (len ${Array.isArray(spot.times) ? spot.times.length : 'missing'}) are not paired with tasks (len ${spot.tasks.length}); left in place`);
             }
@@ -233,16 +236,17 @@ export function planReset(botDir, goal, fromIso, toIso) {
     }
 
     if (index !== null) {
-        for (const skill of index) {
-            if (skill === null || typeof skill !== 'object' || typeof skill.name !== 'string') continue;
+        for (let i = 0; i < index.length; i++) {
+            const skill = index[i];
+            if (skill === null || typeof skill !== 'object' || Array.isArray(skill) || typeof skill.name !== 'string') throw new Error(`fix103-reset: ${indexPath}[${i}] is not a skill object with a name: ${JSON.stringify(skill)}`);
             if (!Array.isArray(skill.repairHistory)) continue;
             const kept = [];
-            for (let i = 0; i < skill.repairHistory.length; i++) {
-                const row = skill.repairHistory[i];
-                requireObject(row, `${indexPath} ${skill.name}.repairHistory[${i}]`);
-                if (!Object.hasOwn(row, 'at')) throw new Error(`fix103-reset: ${indexPath} ${skill.name}.repairHistory[${i}] has no at; refusing to guess whether it is inside the window`);
+            for (let h = 0; h < skill.repairHistory.length; h++) {
+                const row = skill.repairHistory[h];
+                requireObject(row, `${indexPath} ${skill.name}.repairHistory[${h}]`);
+                if (!Object.hasOwn(row, 'at')) throw new Error(`fix103-reset: ${indexPath} ${skill.name}.repairHistory[${h}] has no at; refusing to guess whether it is inside the window`);
                 if (!Object.hasOwn(row, 'task')) {
-                    manual.push(`${indexPath} ${skill.name}.repairHistory[${i}] has no task (at ${JSON.stringify(row.at)}); left in place`);
+                    manual.push(`${indexPath} ${skill.name}.repairHistory[${h}] has no task (at ${JSON.stringify(row.at)}); left in place`);
                     kept.push(row);
                     continue;
                 }
@@ -250,13 +254,13 @@ export function planReset(botDir, goal, fromIso, toIso) {
                     kept.push(row);
                     continue;
                 }
-                const t = timeOf(row.at, `${indexPath} ${skill.name}.repairHistory[${i}].at`);
+                const t = timeOf(row.at, `${indexPath} ${skill.name}.repairHistory[${h}].at`);
                 if (!inWindow(t, from, to)) {
                     kept.push(row);
                     continue;
                 }
                 mark(files, indexPath);
-                changes.push(`REMOVE ${indexPath} ${skill.name}.repairHistory[${i}] at ${new Date(t).toISOString()} task=${JSON.stringify(goal)}`);
+                changes.push(`REMOVE ${indexPath} ${skill.name}.repairHistory[${h}] at ${new Date(t).toISOString()} task=${JSON.stringify(goal)}`);
             }
             if (kept.length !== skill.repairHistory.length) skill.repairHistory = kept;
         }
@@ -342,7 +346,7 @@ export function planReset(botDir, goal, fromIso, toIso) {
 
     if (needs !== null && needs.observations !== null && typeof needs.observations === 'object' && !Array.isArray(needs.observations)) {
         for (const [key, obs] of Object.entries(needs.observations)) {
-            if (obs === null || typeof obs !== 'object') continue;
+            if (obs === null || typeof obs !== 'object' || Array.isArray(obs)) throw new Error(`fix103-reset: ${needsPath} observations[${JSON.stringify(key)}] is not an object: ${JSON.stringify(obs)}`);
             if (!Object.hasOwn(obs, 'lastRun')) {
                 manual.push(`${needsPath} observations[${JSON.stringify(key)}] has no lastRun; the runs counter was not edited`);
                 continue;

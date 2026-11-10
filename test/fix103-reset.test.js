@@ -143,6 +143,62 @@ describe('fix103 reset script', () => {
         rmSync(root, { recursive: true, force: true });
     });
 
+    it('a malformed row throws and writes nothing', () => {
+        const cases = [
+            {
+                pattern: /recipeEdges\["iron_ore"\] is not an object/,
+                file: (root) => join(root, 'skills', 'progress.json'),
+                plant(path) {
+                    const progress = read(path);
+                    progress.recipeEdges.iron_ore = null;
+                    writeJson(path, progress);
+                },
+            },
+            {
+                pattern: /subgoals\[0\] is not an object/,
+                file: (root) => join(root, 'skills', 'progress.json'),
+                plant(path) {
+                    const progress = read(path);
+                    progress.subgoals = [null];
+                    writeJson(path, progress);
+                },
+            },
+            {
+                pattern: /deathSpots\["0,0"\] is not an object/,
+                file: (root) => join(root, 'skills', 'progress.json'),
+                plant(path) {
+                    const progress = read(path);
+                    progress.deathSpots = { '0,0': null };
+                    writeJson(path, progress);
+                },
+            },
+            {
+                pattern: /index\.json\[0\] is not a skill object/,
+                file: (root) => join(root, 'skills', 'index.json'),
+                plant(path) { writeJson(path, [null]); },
+            },
+            {
+                pattern: /observations\["collectblock"\] is not an object/,
+                file: (root) => join(root, 'needs_produces.json'),
+                plant(path) {
+                    const needs = read(path);
+                    needs.observations.collectblock = null;
+                    writeJson(path, needs);
+                },
+            },
+        ];
+        for (const item of cases) {
+            const root = fixture();
+            const path = item.file(root);
+            item.plant(path);
+            const before = readFileSync(path, 'utf8');
+            assert.throws(() => resetLearned(root, GOAL, FROM, TO, true, () => {}), item.pattern);
+            assert.strictEqual(readFileSync(path, 'utf8'), before);
+            assert.strictEqual(existsSync(`${path}.fix103-bak`), false);
+            rmSync(root, { recursive: true, force: true });
+        }
+    });
+
     it('a goal record with no timestamp writes nothing', () => {
         const root = fixture();
         const memoryPath = join(root, 'repair_memory.json');

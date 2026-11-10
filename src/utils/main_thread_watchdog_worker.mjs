@@ -175,7 +175,7 @@ function codeForFile(c) {
     return { label: c.label, source: c.source, at: c.at };
 }
 
-function kill(reason, silentMs, limit, kaAgeMs, killClock) {
+function kill(reason, silentMs, limit, kaAgeMs, killClock, intervalMs) {
     dead = true;
     if (frames === null) {
         frames = 'stack not captured';
@@ -189,8 +189,14 @@ function kill(reason, silentMs, limit, kaAgeMs, killClock) {
         : Object.hasOwn(recorded, 'endedAt') ? `${recorded.label} (finished ${recorded.endedAt}; not running)`
         : `${recorded.label} (${recorded.source.length} chars, staged ${recorded.at}; source in ${evidencePath})`;
     const popped = Object.hasOwn(evidence, 'lastPopped') ? ` lastPopped="${evidence.lastPopped}" at ${evidence.at}` : '';
-    // A keep-alive deadline while heartbeats are still arriving is a pipeline that stopped reading packets.
-    const headline = killClock === 'keep-alive' && silentMs < limit ? 'KEEP-ALIVE NOT PROCESSED' : 'MAIN THREAD BLOCKED';
+    // intervalMs is halfNs, the beat interval the capture already uses. A heartbeat younger than that
+    // is still arriving, so a keep-alive kill means the packet was not read (live log: 2369ms).
+    // A block silent for a whole beat interval is the main thread, even when the keep-alive clock fired
+    // and the silence is still under the 30s kill limit (the 20s hunger serve).
+    if (typeof intervalMs !== 'number' || !Number.isFinite(intervalMs)) {
+        throw new Error(`[watchdog] intervalMs must be the beat interval, got ${intervalMs}`);
+    }
+    const headline = killClock === 'keep-alive' && silentMs < intervalMs ? 'KEEP-ALIVE NOT PROCESSED' : 'MAIN THREAD BLOCKED';
     writeSync(2, `[watchdog] ${headline}: ${reason}; `
         + `phase_stack="${phaseStr}"${popped} skill="${evidence.skill}" stack="${evidence.stack}" bot_api_call="${call.call}"${call.unread ? ` (+${call.unread} bytes not held by the slot)` : ''} code="${codeStr}" inspector="${shown}" at ${new Date().toISOString()}; SIGKILL pid ${pid} so the supervisor restarts it\n`);
     try {
@@ -263,7 +269,7 @@ async function loop() {
             const reason = kaKill
                 ? `last keep-alive ${kaMs}ms ago (limit ${limit}ms = vanilla keep-alive kick, ${intervalMs}ms × 2); heartbeat age ${beatMs}ms (evidence, not the kill clock)`
                 : `no heartbeat for ${beatMs}ms (limit ${limit}ms = vanilla keep-alive kick, ${intervalMs}ms × 2)`;
-            kill(reason, Math.round(beatMs), limit, kaMs === null ? null : Math.round(kaMs), kaKill ? 'keep-alive' : 'heartbeat');
+            kill(reason, Math.round(beatMs), limit, kaMs === null ? null : Math.round(kaMs), kaKill ? 'keep-alive' : 'heartbeat', intervalMs);
             return;
         }
         let waitNs = limitNs;
