@@ -133,7 +133,7 @@ function mkV({ inv, nearby, skills, runs }) {
     v._prefetchPlan = () => {};
     v._curSub = null;
     v.ran = [];
-    v.observe = () => ({ inventory: { ...inv }, nearby_blocks: [...nearby], empty_inventory_slots: 0 });
+    v.observe = () => ({ inventory: { ...inv }, nearby_blocks: [...nearby], empty_inventory_slots: 0, is_day: true });
     v._findReplay = task => ({ name: `route_${task.replace(/ /g, '_')}`, call: '' });
     v._structuredReplay = v._findReplay;
     v._embedReplay = async () => null;

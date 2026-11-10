@@ -132,7 +132,7 @@ function mkV({ vitals, food = 17, health = 18, skillsList }) {
     v._repairQueue = [];
     v._afterSuccess = () => {};
     v.proposeTask = async () => { throw new Error('proposeTask should not run when a measured raiser exists or was learned out'); };
-    v.observe = () => ({ inventory: {}, nearby_blocks: [], position: '0,64,0', time: 'day 0', food_value: food });
+    v.observe = () => ({ inventory: {}, nearby_blocks: [], position: '0,64,0', time: 'day 0', food_value: food, is_day: true });
     return v;
 }
 

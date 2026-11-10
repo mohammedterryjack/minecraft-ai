@@ -241,7 +241,7 @@ describe('fix86: underground, no logs, the chain reaches a log through a learned
         v._afterSuccess = () => {};
         v._prefetchPlan = () => {};
         v._curSub = null;
-        v.observe = () => ({ inventory: { ...inv }, nearby_blocks: [...nearby], empty_inventory_slots: 4, position: `${position.x}, ${position.y}, ${position.z}`, food_value: 20, health_value: 20 });
+        v.observe = () => ({ inventory: { ...inv }, nearby_blocks: [...nearby], empty_inventory_slots: 4, position: `${position.x}, ${position.y}, ${position.z}`, food_value: 20, health_value: 20, is_day: true });
         v.ran = [];
         v._embedReplay = async () => null;
         v._backchain = async () => null;

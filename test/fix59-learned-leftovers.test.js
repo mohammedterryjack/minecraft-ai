@@ -173,7 +173,7 @@ describe('fix59 (4): hp/food max from VITALS_MAX everywhere', () => {
             v._hutBuilt = () => false; v._cursorLimited = () => false; v._logPromptBreakdown = () => {}; v._saveProgress = () => {};
             let prompt = null;
             v._askLocal = async (sys, user) => { prompt = user; return '{"reasoning":"r","task":"eatFood","context":""}'; };
-            await v.proposeTask({ position: '0, 32, 0', biome: 'plains', time: 'day (1)', health_value: 17, health_max: 40, food_value: 12, food_max: 30, inventory_slots: '1/36', empty_inventory_slots: 35, threats: 'none', inventory: {}, nearby_blocks: [], equipment: { hand: 'empty' } });
+            await v.proposeTask({ position: '0, 32, 0', biome: 'plains', time: 'day (1)', health_value: 17, health_max: 40, food_value: 12, food_max: 30, inventory_slots: '1/36', empty_inventory_slots: 35, threats: 'none', inventory: {}, nearby_blocks: [], equipment: { hand: 'empty' }, is_day: true, sleeping: false, sky_light: 15, time_since_rest: 1 });
             assert.match(prompt, /current_health: 17\/40\ncurrent_food: 12\/30 \(30\/30 = full\)/);
         } finally { Object.assign(skills.VITALS_MAX, saved); }
     });

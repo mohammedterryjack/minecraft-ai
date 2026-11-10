@@ -86,7 +86,7 @@ function rig({ food = 20, health = 20, subgoals, decomposed, completed, complete
     v._afterSuccess = () => {};
     for (const m of ['_checkHomeGround', '_watchWindows', '_watchDimension', '_oneshot', '_requeueDeferred', '_prefetchPlan']) v[m] = () => {};
     for (const m of ['_queueApiLintRepairs', '_gateTrial', '_backfillContracts', '_refactor', '_prune', '_generalise', '_split', '_retention', '_idlePractice']) v[m] = async () => false;
-    v.observe = () => ({ inventory: {}, nearby_blocks: [], position: '0,64,0', time: 'day 0', food_value: food });
+    v.observe = () => ({ inventory: {}, nearby_blocks: [], position: '0,64,0', time: 'day 0', food_value: food, is_day: true });
     v.pursued = [];
     v._pursueProposedTask = async (task) => { v.pursued.push(task); return false; };
     v.proposeTask = async () => { throw new Error('proposeTask should not run'); };
@@ -96,7 +96,7 @@ function rig({ food = 20, health = 20, subgoals, decomposed, completed, complete
 describe('fix91: a rejected cold-start does not consume the step', () => {
     it('the queued subgoal is dequeued and run in the same step', async () => {
         const v = rig({ food: 17, health: 18 });
-        const stateKey = 'inv:;near:';
+        const stateKey = 'inv:;near:;is_day:true';
         v.progress.goalFailStates = [{ task: 'Get 1 cooked_mutton', ok: false, reason: 'replay failed', state: stateKey }];
         v.proposeTask = async () => ({ task: 'Get 1 cooked_mutton', reasoning: 'the bot is hungry', context: '' });
         Math.random = () => 0.999;
@@ -218,7 +218,7 @@ describe('fix91: a dead head does not block a live subgoal', () => {
                 { task: 'Mine 1 iron_ore', parent: 'Get 1 cooked_mutton', depth: 1 },
             ],
             decomposed: { 'Get 1 cooked_mutton': { subs: ['Mine 1 iron_ore'], skills: [], at: 1, reason: 'needs' } },
-            goalFailStates: [{ task: 'Get 1 cooked_mutton', ok: false, reason: 'replay failed', state: 'inv:;near:' }],
+            goalFailStates: [{ task: 'Get 1 cooked_mutton', ok: false, reason: 'replay failed', state: 'inv:;near:;is_day:true' }],
         });
         Math.random = () => 0.999;
         await v._step();

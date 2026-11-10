@@ -106,6 +106,7 @@ function mkV({ inv, nearby, failTasks = [] }) {
         nearby_blocks: [...nearby],
         perceived_at: Object.fromEntries(nearby.map((name, i) => [name, { x: i + 1, y: 64, z: 1 }])),
         empty_inventory_slots: 1,
+        is_day: true,
     });
     v._findReplay = task => ({ name: `route_${task.replace(/ /g, '_')}`, call: '' });
     v._structuredReplay = v._findReplay;

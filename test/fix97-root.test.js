@@ -660,6 +660,7 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         v.npGraph = { getFactsText: () => '' };
         const state = {
             inventory: { cobblestone: 8, oak_log: 55 }, position: '0, 64, 0', biome: 'plains', time: 'day (1000)',
+            is_day: true, sleeping: false, sky_light: 15, time_since_rest: 1,
             health_value: 20, health_max: 20, food_value: 17, food_max: 20, inventory_slots: '2/36', empty_inventory_slots: 34,
             equipment: { hand: 'empty', off_hand: 'empty', head: 'empty', torso: 'empty', legs: 'empty', feet: 'empty' },
             threats: 'none', nearby_blocks: ['oak_log', 'stone'], nearby_entities: [], dimension: 'overworld',
@@ -1362,7 +1363,10 @@ describe('fix97 observe on a view-distance world', () => {
             food: 20,
             oxygenLevel: 300,
             heldItem: null,
-            time: { timeOfDay: 6000 },
+            time: { timeOfDay: 6000, isDay: true },
+            isSleeping: false,
+            restSince: 0,
+            blockAt: () => ({ skyLight: 15 }),
             entities: {},
             entity: { position: new Vec3(8.5, feetY, 8.5), eyeHeight: 1.62 },
             inventory: { items: () => [], emptySlotCount: () => 36, slots: new Array(46).fill(null) },
