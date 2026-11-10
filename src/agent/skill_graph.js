@@ -673,69 +673,155 @@ function expandSeries(spec) {
     }
     return out;
 }
+function requireText(fn, text) {
+    if (typeof text !== 'string') {
+        const shown = text === undefined ? 'undefined' : text === null ? 'null' : typeof text;
+        throw new Error(`[fix97] ${fn}: text must be a string, got ${shown}`);
+    }
+}
 export function groupVaryingLines(text) {
-    const lines = String(text || '').split('\n').filter(l => l.trim().length > 0);
+    requireText('groupVaryingLines', text);
+    const lines = text.split('\n').filter(l => l.trim().length > 0);
     const groups = new Map();
     const order = [];
-    for (const line of lines) {
+    lines.forEach((line, index) => {
         const { template, values } = numericSlots(line);
         let g = groups.get(template);
-        if (!g) { g = { first: line, rows: [] }; groups.set(template, g); order.push(template); }
+        if (!g) { g = { first: line, rows: [], at: [] }; groups.set(template, g); order.push(template); }
         g.rows.push(values);
+        g.at.push(index);
+    });
+    // First-seen grouping pulls every row of a template together, so interleaved facts lose their order.
+    // When that happens each row keeps the index it had in this text (`at:`), and the series of indexes
+    // is the same encoding as the values. A text whose groups are already in order needs no index.
+    let cursor = 0;
+    let inOrder = true;
+    for (const template of order) {
+        for (const index of groups.get(template).at) {
+            if (index !== cursor) inOrder = false;
+            cursor += 1;
+        }
     }
     const out = [];
     for (const template of order) {
         const g = groups.get(template);
         const n = g.rows.length;
-        if (n === 1) { out.push(g.first); continue; }
-        const slots = g.rows[0].length;
+        const slots = g.rows[0] ? g.rows[0].length : 0;
         const constant = g.rows.every(row => sameNumbers(row, g.rows[0]));
-        if (constant) { out.push(`${g.first} (x${n})`); continue; }
-        out.push(`${template} (x${n})`);
-        for (let s = 0; s < slots; s++) out.push(`  {${s}}: ${encodeSeries(g.rows.map(row => row[s]))}`);
+        if (n === 1 && inOrder) { out.push(g.first); continue; }
+        const header = constant ? g.first : template;
+        out.push(`${header} (x${n})`);
+        if (!inOrder) out.push(`  at: ${encodeSeries(g.at)}`);
+        if (!constant) {
+            for (let s = 0; s < slots; s++) out.push(`  {${s}}: ${encodeSeries(g.rows.map(row => row[s]))}`);
+        }
     }
     return out.join('\n');
 }
-// Expand a templated block back to the lines it was built from. A line that was not templated is returned as written.
+function slotLine(line) {
+    return typeof line === 'string' && (/^  at: /.test(line) || /^  \{\d+\}: /.test(line));
+}
+function groupHeader(line) {
+    if (typeof line !== 'string') return null;
+    const m = line.match(/^(.*) \(x(\d+)\)$/);
+    if (!m) return null;
+    const n = Number(m[2]);
+    if (!Number.isInteger(n) || n < 1) return null;
+    return { body: m[1], n };
+}
+function readGroup(lines, i) {
+    const header = groupHeader(lines[i]);
+    if (!header) return null;
+    if (!slotLine(lines[i + 1])) {
+        if (header.n >= 2 && !/\{\d+\}/.test(header.body)) return { body: header.body, n: header.n, at: null, slots: null, next: i + 1 };
+        return null;
+    }
+    let j = i + 1;
+    let at = null;
+    const slots = [];
+    let sawSlot = false;
+    while (j < lines.length && slotLine(lines[j])) {
+        if (lines[j].startsWith('  at: ')) {
+            if (at) throw new Error(`[fix97] template ${header.body} has two order indexes`);
+            at = expandSeries(lines[j].slice(6));
+        } else {
+            const sm = lines[j].match(/^  \{(\d+)\}: (.*)$/);
+            slots[Number(sm[1])] = expandSeries(sm[2]);
+            sawSlot = true;
+        }
+        j += 1;
+    }
+    return { body: header.body, n: header.n, at, slots: sawSlot ? slots : null, next: j };
+}
+function linesOfGroup(g) {
+    if (!g.slots) {
+        const copies = [];
+        for (let k = 0; k < g.n; k++) copies.push(g.body);
+        return copies;
+    }
+    const expected = (g.body.match(/\{\d+\}/g) || []).length;
+    if (g.slots.length !== expected) throw new Error(`[fix97] template ${g.body} has ${expected} slots and ${g.slots.length} series`);
+    for (let s = 0; s < g.slots.length; s++) {
+        if (!g.slots[s] || g.slots[s].length !== g.n) throw new Error(`[fix97] slot {${s}} of ${g.body} has ${g.slots[s] ? g.slots[s].length : 0} values for ${g.n} lines`);
+    }
+    const rows = [];
+    for (let r = 0; r < g.n; r++) {
+        let rebuilt = g.body;
+        for (let s = g.slots.length - 1; s >= 0; s--) rebuilt = rebuilt.replaceAll(`{${s}}`, String(g.slots[s][r]));
+        rows.push(rebuilt);
+    }
+    return rows;
+}
+function placeGroups(groups) {
+    const rows = groups.map(g => ({ g, lines: linesOfGroup(g) }));
+    let count = 0;
+    let max = -1;
+    for (const row of rows) {
+        if (!row.g.at || row.g.at.length !== row.lines.length) throw new Error(`[fix97] template ${row.g.body} order index has ${row.g.at ? row.g.at.length : 0} positions for ${row.lines.length} lines`);
+        for (const index of row.g.at) {
+            if (!Number.isInteger(index) || index < 0) throw new Error(`[fix97] order index ${index} is not a position`);
+            if (index > max) max = index;
+        }
+        count += row.lines.length;
+    }
+    if (max + 1 !== count) throw new Error(`[fix97] order index does not cover ${count} lines (max ${max})`);
+    const placed = new Array(count);
+    for (const row of rows) {
+        for (let r = 0; r < row.lines.length; r++) {
+            const index = row.g.at[r];
+            if (placed[index] !== undefined) throw new Error(`[fix97] order index ${index} is used twice`);
+            placed[index] = row.lines[r];
+        }
+    }
+    if (placed.some(line => line === undefined)) throw new Error('[fix97] order index has a hole');
+    return placed;
+}
+// Expand a templated block back to the lines it was built from, in their original order.
+// An `at:` series is the index of each row. A block with no `at:` was already in order.
 // `recoverTemplatedLines(groupVaryingLines(text))` is those lines, with each numeric token written in decimal.
 export function recoverTemplatedLines(text) {
-    const lines = String(text || '').split('\n');
+    requireText('recoverTemplatedLines', text);
+    const lines = text.split('\n');
     const out = [];
     for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-        if (/^  \{\d+\}: /.test(line)) throw new Error(`[fix97] series slot has no template: ${line}`);
-        const marked = line.match(/^(.*) \(x(\d+)\)$/);
-        const nextIsSlot = lines[i + 1] && /^  \{\d+\}: /.test(lines[i + 1]);
-        if (marked && nextIsSlot) {
-            const template = marked[1];
-            const n = Number(marked[2]);
-            if (!Number.isInteger(n) || n < 2) throw new Error(`[fix97] template count is not a repeat: ${line}`);
-            const slots = [];
-            while (lines[i + 1] && /^  \{(\d+)\}: /.test(lines[i + 1])) {
-                const sm = lines[i + 1].match(/^  \{(\d+)\}: (.*)$/);
-                slots[Number(sm[1])] = expandSeries(sm[2]);
-                i += 1;
-            }
-            const expected = (template.match(/\{\d+\}/g) || []).length;
-            if (slots.length !== expected) throw new Error(`[fix97] template ${template} has ${expected} slots and ${slots.length} series`);
-            for (let s = 0; s < slots.length; s++) {
-                if (!slots[s] || slots[s].length !== n) throw new Error(`[fix97] slot {${s}} of ${template} has ${slots[s] ? slots[s].length : 0} values for ${n} lines`);
-            }
-            for (let r = 0; r < n; r++) {
-                let rebuilt = template;
-                for (let s = slots.length - 1; s >= 0; s--) rebuilt = rebuilt.replaceAll(`{${s}}`, String(slots[s][r]));
-                out.push(rebuilt);
-            }
+        if (/^  (?:at: |\{\d+\}: )/.test(lines[i])) throw new Error(`[fix97] series slot has no template: ${lines[i]}`);
+        const first = readGroup(lines, i);
+        if (!first) { out.push(lines[i]); continue; }
+        if (!first.at) {
+            out.push(...linesOfGroup(first));
+            i = first.next - 1;
             continue;
         }
-        if (marked && !/\{\d+\}/.test(marked[1]) && !nextIsSlot) {
-            const n = Number(marked[2]);
-            if (Number.isInteger(n) && n >= 2) {
-                for (let k = 0; k < n; k++) out.push(marked[1]);
-                continue;
-            }
+        const groups = [first];
+        let j = first.next;
+        while (j < lines.length) {
+            const next = readGroup(lines, j);
+            if (!next || !next.at) break;
+            groups.push(next);
+            j = next.next;
         }
-        out.push(line);
+        out.push(...placeGroups(groups));
+        i = j - 1;
     }
     return out;
 }

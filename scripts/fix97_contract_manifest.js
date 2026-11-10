@@ -3,14 +3,11 @@
  * fix97: dry-run manifest of copied inventory counts.
  * A record is a comparison whose one side resolves to an inventory count of item X
  * (c.pre.inv.X, c.post.inv.X, c.delta.X, or a getInventoryCounts binding) and whose other side is a numeric literal
- * equal to the count of X observed when the skill was generated. A subscript, a distance, sky light, a tier, an
- * argument count, or a tool-set size is not that comparison. A goal quantity ("Craft 4 birch_planks") is not the
- * observation. Nothing is reset. Each record's verdict is one reason line.
- *
- * The observation is promptCounts when the skill stored it. Otherwise it is the task, the description, or a
- * repairHistory evidence: the curriculum writes the task from the inventory it just observed, and that state lists
- * items as name:count. The number is paired with the nearest item id in that text. The word that introduced the
- * number is not matched.
+ * that is not X's goal quantity, not a minecraft-data stack or recipe count for X, and not 0 or 1.
+ * The goal quantity comes from countGoal / smeltGoal / ensureGoal / reachGoal. A leading "kind:" label
+ * (collectSurface: Collect 32 dirt) is that parser's grammar. Task prose is not a source of counts.
+ * A subscript, a distance, sky light, a tier, an argument count, or a tool-set size is not an inventory comparison.
+ * Nothing is reset. Each record's verdict is one reason line.
  *
  *   node scripts/fix97_contract_manifest.js --bots-dir=bots/icefox2000
  */
@@ -26,15 +23,12 @@ const registry = require('minecraft-data')(settings.minecraft_version);
 
 const CAUSE = {
     fix: 'fix97',
-    name: 'a comparison of an inventory count of item X to a numeric literal equal to the count of X observed when the skill was generated',
+    name: 'a comparison of an inventory count of item X to a numeric literal that is not the parsed goal quantity of X, not a minecraft-data stack or recipe count for X, and not 0 or 1',
 };
 
 function evidenceOf(skill, hit) {
     const comparison = `${hit.item} ${hit.op} ${hit.n}`;
-    if (hit.source === 'promptCounts') {
-        return `${skill.name} promptCounts records ${hit.item} at ${hit.n}. That is the inventory in the code prompt when the skill was generated. The comparison ${comparison} copies it. It is not the goal quantity of ${hit.item}.`;
-    }
-    return `${skill.name} ${hit.source} records ${hit.item} at ${hit.n}: ${JSON.stringify(hit.quote)}. The curriculum writes that text from the inventory it observed, and that state lists items as name:count. The comparison ${comparison} copies that count. It is not the goal quantity of ${hit.item}.`;
+    return `${skill.name} compares inventory ${comparison}. ${hit.n} is not the parsed goal quantity of ${hit.item}, not a minecraft-data stack or recipe count for ${hit.item}, and not 0 or 1.`;
 }
 
 export function buildContractManifest(skills) {
@@ -59,7 +53,7 @@ export function buildContractManifest(skills) {
                 path: wherePath,
                 cause: CAUSE,
                 evidence,
-                verdict: `${id}: the ${hit.where} compares ${hit.item} ${hit.op} ${hit.n}, and ${hit.n} is the ${hit.source} count of ${hit.item}. The count was observed when the skill was generated. It is not a threshold.`,
+                verdict: `${id}: the ${hit.where} compares ${hit.item} ${hit.op} ${hit.n}. ${hit.n} is not the parsed goal quantity of ${hit.item}, not a minecraft-data stack or recipe count for ${hit.item}, and not 0 or 1.`,
                 apply: false,
             });
         }
