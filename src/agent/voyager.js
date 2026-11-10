@@ -29,7 +29,7 @@ import minecraftData from 'minecraft-data';
 import { Ollama, CONTEXT_FULL } from '../models/ollama.js';
 import { setCallDurationStore } from '../models/call_durations.js';
 import { setMovementStore, learnedKinds, recordStep, recordCut, stepBound, noteUnbounded } from '../utils/movement_model.js';
-import { signatureOf, depsOf, missingCalls, installViolations, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf, thrownIn, declaredNames, skillSourceViolations, splitGeneratedCode, oneFunctionFeedback, entryCallFeedback, markerCallsMissing, markerGateNames, collapseRepeats, parsesAsScript, pastedLibrarySkills, groupVaryingLines, structuredTrace } from './skill_graph.js';
+import { signatureOf, depsOf, missingCalls, installViolations, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf, thrownIn, declaredNames, skillSourceViolations, splitGeneratedCode, oneFunctionFeedback, entryCallFeedback, markerCallsMissing, markerGateNames, collapseRepeats, parsesAsScript, pastedLibrarySkills, groupVaryingLines, structuredTrace, flatCopy } from './skill_graph.js';
 import { writeCodePromptDump } from '../models/code_prompt_dump.js';
 import { getBareAPI, collectBareApiUsedInSource, PRECONDITION_UNMET_BINDING } from './coder.js';   // fix40: unified bare-name API helper
 import { withStallPhase } from '../utils/event_loop_guard.js';
@@ -154,7 +154,9 @@ export function codeRetryFeedback({ cut, output, trace, critique, invFull, behav
     if (critique.length) parts.push(`Critic: ${critique}`);
     if (inv.length) parts.push(`Inventory fact: ${inv}`);
     if (behaviorFacts) parts.push(`Chat/behaviour log:\n${behaviorFacts}`);
-    return parts.join('\n');
+    // fix102: a one-line output is the same string split returned, and the template above keeps that slice.
+    // The retry loop holds this text after the run's output should be collectable.
+    return flatCopy(parts.join('\n'));
 }
 let NAMES = null;
 function knownNames() {
@@ -1196,7 +1198,9 @@ export class Voyager {
     _repairSig(target, evidence) {
         const skill = this.skills.find(s => s.name === target);
         const hash = this._skillHash(skill);
-        return `${target}:${hash}:${(evidence || '').slice(0, 100).replace(/\s+/g, ' ')}`;
+        // fix102: failedRepairSigs keeps this key. slice(0, 100) of a failure line is a view of that line's parent,
+        // so a line cut from the run output would pin the whole output for as long as the signature is remembered.
+        return flatCopy(`${target}:${hash}:${(evidence || '').slice(0, 100).replace(/\s+/g, ' ')}`);
     }
     // fix87: a contract repair that already came back with the same pre/post for this evidence, and the skill hash has not changed
     _sameContractRepairRejected(e, evidence) {
@@ -3008,7 +3012,7 @@ Use only c; no other globals.`;
                 if (typeof e.contract.pre === 'string') problem = Voyager.contractReturnProblem(e.contract.pre);
                 if (problem === null && typeof e.contract.post === 'string') problem = Voyager.contractReturnProblem(e.contract.post);
                 if (problem !== null) {
-                    e.contractFail = problem;
+                    e.contractFail = flatCopy(problem);
                     console.log(`!!! [contract] LOUD: ${e.name} contract cannot be checked: ${problem}`);
                     this._queueContractFix(e, problem);
                     continue;
@@ -3069,7 +3073,7 @@ Use only c; no other globals.`;
                 }
                 r.ok = false; r.fail = true; if (k === 'pre') r.preFail = true;
                 if (k === 'pre') this._contractNeed(e, c, r);   // fix81: which inventory item the violated precondition lacks
-                r.ownFail = [...(r.ownFail || []), `${k === 'pre' ? 'PRECONDITION' : 'POSTCONDITION'} violated: ${Voyager.contractCallFacts(e.name, r.argv, k, e.contract[k])}${e.contract.text ? ` (${e.contract.text})` : ''} (post pos ${r.s1.pos ? [r.s1.pos.x, r.s1.pos.y, r.s1.pos.z].map(Math.round).join(',') : '?'}, sky ${r.s1.sky}, alive ${r.s1.alive})`];
+                r.ownFail = [...(r.ownFail || []), flatCopy(`${k === 'pre' ? 'PRECONDITION' : 'POSTCONDITION'} violated: ${Voyager.contractCallFacts(e.name, r.argv, k, e.contract[k])}${e.contract.text ? ` (${e.contract.text})` : ''} (post pos ${r.s1.pos ? [r.s1.pos.x, r.s1.pos.y, r.s1.pos.z].map(Math.round).join(',') : '?'}, sky ${r.s1.sky}, alive ${r.s1.alive})`)];
                 // fix51: enhanced VIOLATED logging with exact context for debugging
                 const stateInfo = `pre.inv=${JSON.stringify(r.s0.inv)}, post.inv=${JSON.stringify(r.s1.inv)}, delta=${JSON.stringify(r.delta)}`;
                 // fix51: analyze why the contract failed by evaluating sub-expressions
@@ -3091,7 +3095,7 @@ Use only c; no other globals.`;
                 if (added && pending && e.contract && e.contract.seeded !== true) {
                     const bad = this._validContract(e.contract, e);
                     if (bad) {
-                        e.contractFail = bad;
+                        e.contractFail = flatCopy(bad);
                         console.log(`[contract] ${e.name} recorded call rejected the contract: ${bad}`);
                         this._queueContractFix(e, bad);
                     } else delete e.contractFail;
@@ -3172,7 +3176,9 @@ Use only c; no other globals.`;
         }
         const rq = [...(this._repairQueue || [])];
         if (rq.some(x => x.target === e.name && x.kind === 'contract_fix')) return;
-        rq.unshift({ target: e.name, leaf: e.name, path: [e.name], kind: 'contract_fix', swallowed: false, evidence: why, task: 'contract check', trace: '', depth: 99 });
+        // fix102: the repair queue keeps this evidence. A contract/LOUD reason built from a failure line is still a view
+        // of the run output until it is copied.
+        rq.unshift({ target: e.name, leaf: e.name, path: [e.name], kind: 'contract_fix', swallowed: false, evidence: flatCopy(why), task: 'contract check', trace: '', depth: 99 });
         this._repairQueue = rq;
     }
     // learn contracts for a batch of skills with one code-model call; invalid ones fail loudly (no default contract)
@@ -3194,7 +3200,7 @@ Use only c; no other globals.`;
             const ct = out?.[e.name], bad = this._validContract(ct, e);
             e.contractTried = Date.now();
             if (bad) {
-                e.contractFail = bad;
+                e.contractFail = flatCopy(bad);
                 console.log(`[contract] FAILED for ${e.name}: ${bad}`);
                 let problem = null;
                 if (ct && typeof ct.pre === 'string') problem = Voyager.contractReturnProblem(ct.pre);
@@ -5045,7 +5051,9 @@ Use only c; no other globals.`;
             }
         }
         if (best === null) return null;
-        return `${best.name}: ${best.line}`;
+        // fix102: goalFailStates keeps this reason. A template that includes a failure line would keep
+        // that line's parent alive if the line were still a slice of the run output, so store a flat copy.
+        return flatCopy(`${best.name}: ${best.line}`);
     }
     _checkNeed(need, source) { return { ...checkNeed(need, source), source }; }
     // fix81: chain on what the failed goal lacks (not only on the goal item). Each need becomes a subgoal in
@@ -5750,7 +5758,7 @@ Use only c; no other globals.`;
         if (!this.progress) throw new Error('[fix97] progress required to record a split failure');
         if (!Object.hasOwn(this.progress, 'splitFailures')) this.progress.splitFailures = [];
         if (!Array.isArray(this.progress.splitFailures)) throw new Error('[fix97] progress.splitFailures must be an array');
-        this.progress.splitFailures.push({ name, hash: this._hashReply(code), why: String(why) });
+        this.progress.splitFailures.push({ name, hash: this._hashReply(code), why: flatCopy(why) });
         this._saveProgress();
     }
     _detectSplit() {
@@ -6344,6 +6352,10 @@ Use only c; no other globals.`;
         if (bound === null) console.log(`[idle-practice] ${skill.name}: no observed run duration yet; uncapped, ends when it returns or the code-model call completes`);
         const traceWas = bot.__psnTrace;
         clearPreconditionUnmet(bot);   // fix76: only a marker this run sets can void its verdict
+        // fix102: ActionManager clears bot.output before each traced run (clearBotLogs in _executeAction,
+        // and again when it takes the summary). Idle practice calls main() itself, so the previous run's
+        // output stayed on the bot and the next run appended to it.
+        bot.output = '';
         const stateBefore = this.observe();   // fix70: measured right before this run
         const practiceStart = Date.now();
         // fix70: the practice run is over only when the skill's own code has returned (live 01:07:52Z: pickupNearbyItems
@@ -7368,7 +7380,7 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
                 console.log(`[psn] WARN: repair of ${b.target} with same failure signature already failed (skill unchanged, dedup): ${sig.slice(0, 80)}`);
                 continue;
             }
-            rq.push({ ...b, task, trace: traceText(trace), peers: bs.map(x => x.target), sig }); console.log(`[psn] queued REPAIR of ${b.target} (${rq.length} in queue)`);
+            rq.push({ ...b, task, trace: flatCopy(traceText(trace)), peers: bs.map(x => x.target), sig }); console.log(`[psn] queued REPAIR of ${b.target} (${rq.length} in queue)`);
             pendingSigs.add(sig);
         }
         rq.sort((a, b) => (b.depth ?? 0) - (a.depth ?? 0)); this._repairQueue = rq;
