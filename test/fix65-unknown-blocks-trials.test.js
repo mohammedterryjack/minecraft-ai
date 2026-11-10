@@ -8,7 +8,7 @@
  *    b) candidate outcomes were read before death/stall/timeout attribution, so a cut candidate was skipped as `intr`;
  *    c) a hang killed the process before any outcome was written. A trial journal + the watchdog's evidence file now count
  *       it on the next start.
- * 3) ARMED is logged only when a keep_alive gap falls outside the spread of gaps seen before it.
+ * 3) ARMED is logged only when the grounded keep_alive budget rises (a new maximum). A shorter gap stays silent.
  */
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert';
@@ -225,8 +225,8 @@ describe('fix65: trial candidates are retired by the learner', () => {
     });
 });
 
-describe('fix65: ARMED is logged only when the keep_alive gap leaves its learned spread', () => {
-    it('gaps inside the spread seen so far stay silent; a new min or max logs', () => {
+describe('fix65: ARMED is logged only when the grounded keep_alive budget rises', () => {
+    it('a new maximum logs; a shorter gap does not log and does not replace the threshold', () => {
         const realNow = Date.now, realLog = console.log;
         const lines = [];
         let now = 1_000_000;
@@ -242,7 +242,7 @@ describe('fix65: ARMED is logged only when the keep_alive gap leaves its learned
             Date.now = realNow; console.log = realLog;
         }
         const armed = lines.filter(l => l.includes('stall guard ARMED'));
-        assert.deepStrictEqual(armed.map(l => Number(l.match(/currently (\d+)ms/)[1])), [15030, 15034, 15178, 15000]);
-        assert.strictEqual(bot.__eventLoopStallThresholdMs, 15050, 'the threshold still tracks the latest gap');
+        assert.deepStrictEqual(armed.map(l => Number(l.match(/currently (\d+)ms/)[1])), [15030, 15034, 15178]);
+        assert.strictEqual(bot.__eventLoopStallThresholdMs, 15178);
     });
 });

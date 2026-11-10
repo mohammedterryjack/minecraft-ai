@@ -18,7 +18,7 @@ setTimeout(() => {
     if (mode === 'spin') {
         setImmediate(function spinForever() { for (;;) { /* never yields */ } });
     } else {
-        const limit = bot.__eventLoopStallThresholdMs + stallPollIntervalMsForThreshold(bot.__eventLoopStallThresholdMs);
-        setTimeout(() => process.exit(0), 3 * limit);
+        const poll = stallPollIntervalMsForThreshold(bot.__eventLoopStallThresholdMs);
+        setTimeout(() => process.exit(0), 3 * poll);
     }
 }, gapMs);

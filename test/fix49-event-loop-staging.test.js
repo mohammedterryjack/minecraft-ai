@@ -10,6 +10,7 @@ import {
     stallThresholdMs,
     runStallPollTickForTest,
     withStallPhase,
+    KEEP_ALIVE_INTERVAL_MS,
 } from '../src/utils/event_loop_guard.js';
 import { collectBareApiUsedInSource } from '../src/agent/coder.js';
 
@@ -30,16 +31,22 @@ describe('fix49: server keep_alive stall threshold', () => {
         assert.throws(() => stallThresholdMs(bot), /not learned yet/);
     });
 
-    it('stallThresholdMs equals observed gap between keep_alive packets', async () => {
+    it('a keep_alive gap shorter than the server interval leaves the threshold at that interval', () => {
         const bus = new EventEmitter();
         const bot = { _client: bus };
         _testBot = bot;
-        startEventLoopStallGuard(bot);
-        bus.emit('keep_alive', { keepAliveId: 1 });
-        await new Promise((r) => setTimeout(r, 37));
-        bus.emit('keep_alive', { keepAliveId: 2 });
-        const t = stallThresholdMs(bot);
-        assert.ok(t >= 30 && t <= 55, `expected ~37ms observed gap, got ${t}`);
+        const realNow = Date.now;
+        let now = 1_000_000;
+        Date.now = () => now;
+        try {
+            startEventLoopStallGuard(bot);
+            bus.emit('keep_alive', { keepAliveId: 1 });
+            now += 37;
+            bus.emit('keep_alive', { keepAliveId: 2 });
+            assert.strictEqual(stallThresholdMs(bot), KEEP_ALIVE_INTERVAL_MS);
+        } finally {
+            Date.now = realNow;
+        }
     });
 });
 

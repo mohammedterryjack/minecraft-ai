@@ -1,14 +1,26 @@
 /**
- * Event-loop stall monitoring: threshold is the most recently observed gap between inbound
- * `keep_alive` packets from the server (minecraft-protocol), measured on `bot._client`.
- * Poll cadence follows the Nyquist sampling rule: sample at least twice per keep-alive period,
- * i.e. poll interval = (learned interval ms) / 2 (see `stallPollIntervalMsForThreshold`).
+ * Event-loop stall monitoring. The silence budget is the greater of two values: the maximum
+ * observed gap between inbound `keep_alive` packets on `bot._client`, and the server's
+ * keep-alive interval. A single short gap cannot reduce a maximum.
+ *
+ * ServerCommonPacketListenerImpl.keepConnectionAlive (vanilla, shown by Paper's patch of that
+ * method: "use vanilla's 15000L between keep alive packets"): when now - keepAliveTime >= 15000L,
+ * a pending keep-alive disconnects the client, otherwise the server sends ClientboundKeepAlivePacket.
+ * The client is kicked if it does not answer within 15 seconds (minecraft.wiki, Java Edition protocol, Keep Alive).
+ *
+ * Poll cadence follows the Nyquist sampling rule: sample at least twice per that budget,
+ * i.e. poll interval = budget / 2 (see `stallPollIntervalMsForThreshold`).
  *
  * Root cause of long stalls in production was unknown; this guard plus `withStallPhase` phase
- * stacks attribute stalls to labeled phases so the next step is diagnosis from real logs — not guessing.
+ * stacks attribute stalls to labeled phases so the next step is diagnosis from real logs.
  */
+
 import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { mainThreadWatchdogStarted, armMainThreadWatchdog, beatMainThreadWatchdog, publishMainThreadEvidence } from './main_thread_watchdog.js';
+
+// Vanilla ServerCommonPacketListenerImpl.keepConnectionAlive compares against 15000L, which is
+// both the gap before the next ClientboundKeepAlivePacket and the unanswered-keepalive kick.
+export const KEEP_ALIVE_INTERVAL_MS = 15000;
 
 /** @type {string[]} */
 let _phaseStack = [];
@@ -36,7 +48,8 @@ export function stallPollIntervalMsForThreshold(thresholdMs) {
 }
 
 /**
- * After at least two server keep_alive packets, holds the latest observed interval (ms).
+ * After at least two server keep_alive packets, the greater of the max observed gap and
+ * KEEP_ALIVE_INTERVAL_MS.
  * @param {import('mineflayer').Bot} bot
  */
 export function stallThresholdMs(bot) {
@@ -46,6 +59,12 @@ export function stallThresholdMs(bot) {
         throw new Error('[event_loop_guard] stall threshold not learned yet (need two inbound keep_alive packets from server)');
     }
     return t;
+}
+
+/** Silence that arms SIGKILL: the grounded keep-alive budget plus one Nyquist poll. */
+export function watchdogSilenceLimitMs(bot) {
+    const thresholdMs = stallThresholdMs(bot);
+    return thresholdMs + stallPollIntervalMsForThreshold(thresholdMs);
 }
 
 export function setStallPhase(phase) {
@@ -115,13 +134,11 @@ function _stallPollTick(bot) {
  * @param {import('mineflayer').Bot} bot
  */
 /**
- * fix65: `material` = this keep_alive gap fell outside every gap observed before it (a new min or max of the learned
- * spread). Only then is ARMED logged; inside the spread the threshold still tracks the latest gap, silently. Before, both
- * ARMED lines were logged on every keep_alive (37 lines in 5 minutes on the iMac).
+ * Called only when the grounded budget changes (a new maximum gap, or the first sample).
+ * A shorter gap does not reach here, so it cannot clear the poll or publish a smaller LIMIT.
  * @param {import('mineflayer').Bot} bot
- * @param {boolean} material
  */
-function _scheduleStallPoll(bot, material) {
+function _scheduleStallPoll(bot) {
     const thresholdMs = bot.__eventLoopStallThresholdMs;
     if (typeof thresholdMs !== 'number' || !Number.isFinite(thresholdMs) || thresholdMs <= 0) {
         throw new Error('[event_loop_guard] cannot schedule stall poll: invalid threshold on bot');
@@ -131,8 +148,8 @@ function _scheduleStallPoll(bot, material) {
         clearInterval(bot.__stallPollInterval);
         bot.__stallPollInterval = null;
     }
-    const spread = bot.__keepAliveGapSpread;
-    if (material) console.log(`[event-loop] stall guard ARMED: threshold tracks observed server keep_alive gap (currently ${thresholdMs}ms, outside the ${spread.n - 1} gap(s) seen before; spread now ${spread.min}-${spread.max}ms); poll every ${pollMs}ms (Nyquist: interval/2)`);
+    const maxGap = bot.__keepAliveGapMaxMs;
+    console.log(`[event-loop] stall guard ARMED: threshold is the max observed keep_alive gap, at least the server keep-alive interval (currently ${thresholdMs}ms, max gap ${maxGap}ms); poll every ${pollMs}ms (Nyquist: interval/2)`);
 
     if (!bot.__stallEventLoopHist) {
         bot.__stallEventLoopHist = monitorEventLoopDelay({ resolution: 20 });
@@ -140,12 +157,12 @@ function _scheduleStallPoll(bot, material) {
     }
 
     bot.__stallPollInterval = setInterval(() => _stallPollTick(bot), pollMs);
-    // fix64: blocked = the loop could not run for one full learned keep_alive gap; a healthy loop beats every pollMs, so
-    // silence beyond gap + pollMs means a whole gap passed with no turn
+    // fix64: blocked = the loop could not run for one full grounded keep-alive budget; a healthy loop beats every pollMs, so
+    // silence beyond budget + pollMs means a whole budget passed with no turn
     if (mainThreadWatchdogStarted()) {
         armMainThreadWatchdog(thresholdMs + pollMs);
         beatMainThreadWatchdog();
-        if (material) console.log(`[watchdog] ARMED: SIGKILL after ${thresholdMs + pollMs}ms without a main-loop heartbeat (keep_alive gap ${thresholdMs}ms + beat period ${pollMs}ms)`);
+        console.log(`[watchdog] ARMED: SIGKILL after ${thresholdMs + pollMs}ms without a main-loop heartbeat (max keep_alive gap ${maxGap}ms, protocol floor ${KEEP_ALIVE_INTERVAL_MS}ms, threshold ${thresholdMs}ms + beat period ${pollMs}ms)`);
     }
 }
 
@@ -187,13 +204,18 @@ export function startEventLoopStallGuard(bot) {
             throw new Error(`[event_loop_guard] invalid observed keep_alive gap ${intervalMs}ms`);
         }
         bot.__serverKeepAliveIntervalMs = intervalMs;
-        bot.__eventLoopStallThresholdMs = intervalMs;
-        const sp = bot.__keepAliveGapSpread;
-        const material = !sp || intervalMs < sp.min || intervalMs > sp.max;
-        bot.__keepAliveGapSpread = sp
-            ? { min: Math.min(sp.min, intervalMs), max: Math.max(sp.max, intervalMs), n: sp.n + 1 }
-            : { min: intervalMs, max: intervalMs, n: 1 };
-        _scheduleStallPoll(bot, material);
+        const prevMax = bot.__keepAliveGapMaxMs;
+        if (prevMax !== undefined && (typeof prevMax !== 'number' || !Number.isFinite(prevMax))) {
+            throw new Error(`[event_loop_guard] keep_alive gap max is ${prevMax}`);
+        }
+        const maxGap = prevMax === undefined ? intervalMs : Math.max(prevMax, intervalMs);
+        bot.__keepAliveGapMaxMs = maxGap;
+        // A short sample cannot reduce the max, and the protocol interval is the floor:
+        // the server kicks a client that is silent for KEEP_ALIVE_INTERVAL_MS.
+        const grounded = Math.max(maxGap, KEEP_ALIVE_INTERVAL_MS);
+        if (bot.__eventLoopStallThresholdMs === grounded) return;
+        bot.__eventLoopStallThresholdMs = grounded;
+        _scheduleStallPoll(bot);
     };
     bot.__stallGuardKeepAliveHandler = onKeepAlive;
     bot._client.on('keep_alive', onKeepAlive);

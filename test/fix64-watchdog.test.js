@@ -17,6 +17,7 @@ import { fileURLToPath } from 'node:url';
 import { rmSync } from 'node:fs';
 import { Vec3 } from 'vec3';
 import { Coder } from '../src/agent/coder.js';
+import { KEEP_ALIVE_INTERVAL_MS, stallPollIntervalMsForThreshold } from '../src/utils/event_loop_guard.js';
 
 const NAME = '__fix64_test__';
 after(() => { rmSync(`./bots/${NAME}`, { recursive: true, force: true }); rmSync(`./bots/${NAME}-watchdog_kill.json`, { force: true }); });
@@ -170,8 +171,10 @@ function runChild(mode, gapMs) {
     });
 }
 
+const FLOOR_LIMIT_MS = KEEP_ALIVE_INTERVAL_MS + stallPollIntervalMsForThreshold(KEEP_ALIVE_INTERVAL_MS);
+
 describe('fix64: off-main-thread watchdog', () => {
-    it('a child whose main thread spins forever is SIGKILLed by the worker, with phase/skill evidence on stderr', { timeout: 30000 }, async () => {
+    it('a child whose main thread spins forever is SIGKILLed by the worker, with phase/skill evidence on stderr', { timeout: FLOOR_LIMIT_MS * 2 }, async () => {
         const r = await runChild('spin', 200);
         assert.strictEqual(r.signal, 'SIGKILL', `child ended code=${r.code} signal=${r.signal}\n${r.err}`);
         assert.match(r.out, /\[watchdog\] ARMED: SIGKILL after \d+ms without a main-loop heartbeat/);
@@ -181,7 +184,7 @@ describe('fix64: off-main-thread watchdog', () => {
         assert.match(r.err, /stack="mineIron > collectBlock"/);
     });
 
-    it('a healthy child that keeps beating is never killed and exits normally', { timeout: 30000 }, async () => {
+    it('a healthy child that keeps beating is never killed and exits normally', { timeout: FLOOR_LIMIT_MS * 2 }, async () => {
         const r = await runChild('healthy', 200);
         assert.strictEqual(r.signal, null, r.err);
         assert.strictEqual(r.code, 0, r.err);
