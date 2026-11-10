@@ -411,8 +411,10 @@ describe('fix98: rest serve chains a bed from game data', () => {
 describe('fix98: prompt facts', () => {
     it('observe carries is_day, sleeping, sky light, and the rest statistic', () => {
         const pos = new Vec3(0, 64, 0);
+        const stoneStateId = 1;
+        const sections = Array.from({ length: 24 }, () => ({ data: { value: stoneStateId } }));
         const bot = {
-            entity: { position: pos },
+            entity: { position: pos, eyeHeight: 1.62 },
             time: { timeOfDay: 18000, isDay: false },
             isSleeping: true,
             restSince: 77,
@@ -423,7 +425,11 @@ describe('fix98: prompt facts', () => {
             heldItem: null,
             inventory: { items: () => [], emptySlotCount: () => 36, slots: Array(46).fill(null) },
             entities: {},
-            world: { getBiome: () => 1, getColumns: () => [] },
+            registry: { blocksByStateId: { [stoneStateId]: { name: 'stone', metadata: 0 } } },
+            world: {
+                getBiome: () => 1,
+                getColumns: () => [{ chunkX: 0, chunkZ: 0, column: { minY: -64, sections } }],
+            },
             findBlocks: () => [],
             blockAt: () => ({ skyLight: 0 }),
         };
