@@ -142,14 +142,15 @@ describe('fix96 (2): the food plan weighs observed edge success, entity loot and
 
     it('a smelt goal that succeeded is a learned edge: cooked_beef is planned as beef, then the smelt', () => {
         const v = mkV({ goalStats: { 'Smelt 1 beef into 1 cooked_beef::': { success: 1, fail: 0 }, 'Smelt 3 raw_iron into 3 iron_ingot::': { success: 5, fail: 0 } } });
-        assert.deepStrictEqual(v._learnedSmeltInputs('cooked_beef'), ['beef']);
-        assert.deepStrictEqual(v._learnedSmeltInputs('iron_ingot'), ['raw_iron']);
+        const idx = v._learnedSmeltIndex();
+        assert.deepStrictEqual([...idx.get('cooked_beef')], ['beef']);
+        assert.deepStrictEqual([...idx.get('iron_ingot')], ['raw_iron']);
         const pre = v._obtainPlanner({ inventory: {}, nearby_blocks: [] }).prerequisites('cooked_beef', 1, {});
         assert.strictEqual(pre.task, 'Smelt 1 beef into 1 cooked_beef');
         assert.deepStrictEqual(pre.steps.map(s => s.task), ['Obtain 1 beef']);
         const none = mkV({});
         assert.strictEqual(none._obtainPlanner({ inventory: {}, nearby_blocks: [] }).prerequisites('cooked_beef', 1, {}).how, 'obtain');
-        assert.throws(() => mkV({ goalStats: undefined })._learnedSmeltInputs('cooked_beef'), /goalStats required/);
+        assert.throws(() => mkV({ goalStats: undefined })._learnedSmeltIndex(), /goalStats required/);
     });
 
     it('the data\'s dropChance is not read as a chance: raw_iron is mined, not crafted from a raw_iron_block', () => {

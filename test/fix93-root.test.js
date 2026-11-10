@@ -485,6 +485,34 @@ describe('fix93 hunger serve', () => {
         assert.ok(v.progress.subgoals.some(s => s.task === 'Craft 1 bread' && s.parent === 'need:hunger'));
         assert.ok(!v.progress.subgoals.some(s => s !== hunger && s.task === 'need:hunger' && s.retry === true));
     });
+    it('a prerequisite retry that still lacks its need inserts no second anchor', async () => {
+        const v = mk({ consume: { n: 14, food: 46.2, hp: 0 } });
+        const mine = { task: 'Mine 1 iron_ore' };
+        v.progress.subgoals = [mine];
+        v.progress.goalStats = {};
+        v.progress.blockers = [];
+        v.progress.recipeEdges = {};
+        v.progress.decomposed = {};
+        v._producers = () => [];
+        v._curSub = { task: 'need:hunger', retry: true, prereq: true, depth: 0, chain: [] };
+        v._chainNeeds = Voyager.prototype._chainNeeds;
+        v._resolveChainedNeed = Voyager.prototype._resolveChainedNeed;
+        v._subgoalForNeed = Voyager.prototype._subgoalForNeed;
+        v._subgoalToObtainItem = Voyager.prototype._subgoalToObtainItem;
+        v._prereqChain = Voyager.prototype._prereqChain;
+        v._resolveGoal = Voyager.prototype._resolveGoal;
+        v._needKey = Voyager.prototype._needKey;
+        v._recordGoalOutcome = Voyager.prototype._recordGoalOutcome;
+        v._obtainPlanner = () => ({
+            cheapest: () => ({ item: 'bread', ties: [] }),
+            prerequisites: () => ({ task: 'Craft 1 bread', how: 'craft', plan: ['Craft 1 bread'], cycles: [], steps: [], ties: [] }),
+        });
+        await assert.rejects(
+            () => v._serveLearnedFood({ firstRise: { f: 18 } }, v.observe()),
+            /inserted 0 prerequisite retries/
+        );
+        assert.deepStrictEqual(v.progress.subgoals.map(s => s.task), ['Mine 1 iron_ore']);
+    });
     it('a backchain that drops a queued object is still reported loudly', async () => {
         const v = mk({ consume: { n: 14, food: 46.2, hp: 0 } });
         v._chainNeeds = () => { v.progress.subgoals = [{ task: 'Craft 1 bread' }]; return true; };

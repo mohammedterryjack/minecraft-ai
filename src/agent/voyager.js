@@ -3301,11 +3301,6 @@ Use only c; no other globals.`;
         }
         return byItem;
     }
-    _learnedSmeltInputs(item) {
-        const inputs = this._learnedSmeltIndex().get(item);
-        if (inputs === undefined) return [];
-        return [...inputs];
-    }
     // fix81: the goal key a subgoal chain is seeking: an item goal seeks the item, an ensure goal the block PLACED nearby
     _goalKey(goal) {
         if (goal.kind === 'ensure') return `placed ${goal.item}`;
@@ -6464,9 +6459,13 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
     }
 
     async step() {
-        // fix100: one event-loop turn before the step body. A post-run tail and the next serve otherwise
-        // stay in one microtask chain, so a heartbeat interval never runs between them.
-        await new Promise((resolve) => { setImmediate(resolve); });
+        // The stall heartbeat is a setInterval, so it runs in the timers phase. Node's event loop is
+        // timers, pending callbacks, poll (I/O), check (setImmediate), then close
+        // (https://nodejs.org/en/docs/guides/event-loop-timers-and-nexttick/). A setImmediate scheduled
+        // from a poll callback runs in that same iteration's check phase, after timers have already
+        // been considered, so it does not give a due heartbeat a turn. The joined post-run tail and
+        // hunger serve were the synchronous planner; the smelt index and the recipe and edge memos
+        // are what remove that block.
         const now = Date.now(); console.log(`[timing] ${new Date().toISOString().slice(11,19)}Z step start (gap since last step end ${this._stepEnd ? now - this._stepEnd : 0}ms)`);   // fix27
         try { return await this._step(); } finally { this._flushSkills(); this._stepEnd = Date.now(); console.log(`[timing] ${new Date().toISOString().slice(11,19)}Z step end (took ${this._stepEnd - now}ms)`); }
     }

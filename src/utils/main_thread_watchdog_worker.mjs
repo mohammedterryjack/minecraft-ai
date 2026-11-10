@@ -4,10 +4,17 @@
 // debugger is off while the bot is healthy.
 //
 // Kill clock: the armed limit is the vanilla kick bound (event_loop_guard.js KEEP_ALIVE_KICK_MS = 15000 × 2).
-// Once the main thread has processed a keep_alive, capture at last stamp + limit/2 and kill at last stamp + limit.
-// That is ServerCommonPacketListenerImpl.keepConnectionAlive: a pending keep-alive older than 15000L disconnects,
-// so the kick lands one or two intervals after the last keep-alive the client handled. A heartbeat does not move
-// that deadline. Before any keep-alive, the same limit is silence since the last beat (startup has no server timer yet).
+// Once the main thread has processed a keep_alive, kill at last stamp + limit. That is
+// ServerCommonPacketListenerImpl.keepConnectionAlive: a pending keep-alive older than 15000L disconnects, so the
+// kick lands one or two intervals after the last keep-alive the client handled. A heartbeat does not move that
+// deadline. Before any keep-alive, the same limit is silence since the last beat.
+//
+// The stack capture is not that clock. Vanilla sends a keep-alive every >=15000 ms, so the age passes limit/2 on
+// every healthy cycle. Capturing then, once per process, pauses a healthy thread and the kill later blames that
+// stack. Capture only when the heartbeat has been silent for limit/2 (the loop is actually not turning), and a
+// beat or a keep-alive clears it so the next incident can capture again. The capture is never awaited: a main
+// thread inside native code never delivers Debugger.paused, and waiting for it skipped the kill. If the deadline
+// wins, the record is "stack not captured".
 import { workerData } from 'node:worker_threads';
 import { writeSync, writeFileSync, renameSync } from 'node:fs';
 import { Session } from 'node:inspector';
@@ -33,8 +40,15 @@ const evidencePath = workerData.evidencePath;
 let evidence = { phases: [], skill: '(none published)', stack: '(none published)' };
 let code = null;
 let frames = null;
-let captureStarted = false;
+let epoch = 0;
+let inspectorBusy = false;
+let lastKa = 0n;
 let dead = false;
+
+function resetCapture() {
+    epoch++;
+    frames = null;
+}
 
 const session = new Session();
 session.connectToMainThread();
@@ -76,9 +90,8 @@ function frameText(list) {
     return list.map(f => `${f.functionName}@${f.url}:${f.lineNumber}`).join(' <- ');
 }
 
-async function captureStack() {
-    if (captureStarted) return;
-    captureStarted = true;
+async function captureStack(myEpoch) {
+    inspectorBusy = true;
     let enabled = false;
     try {
         await post('Debugger.enable');
@@ -88,8 +101,8 @@ async function captureStack() {
         });
         await post('Debugger.pause');
         const msg = await paused;
+        if (dead || myEpoch !== epoch) return;
         const callFrames = msg && msg.params ? msg.params.callFrames : undefined;
-        if (dead) return;
         if (!Array.isArray(callFrames) || callFrames.length === 0) {
             frames = 'stack not captured';
             writeSync(2, '[watchdog] LOUD: stack not captured\n');
@@ -103,32 +116,38 @@ async function captureStack() {
                 }
                 out.push({ functionName: f.functionName, url: f.url, lineNumber: f.location.lineNumber + 1, columnNumber: f.location.columnNumber });
             }
-            if (bad || out.length === 0) {
-                frames = 'stack not captured';
-                writeSync(2, '[watchdog] LOUD: stack not captured\n');
-            } else if (!dead) {
+            if (bad || out.length === 0 || dead || myEpoch !== epoch) {
+                if (myEpoch === epoch && !dead) {
+                    frames = 'stack not captured';
+                    writeSync(2, '[watchdog] LOUD: stack not captured\n');
+                }
+            } else {
                 frames = out;
                 writeSync(2, `[watchdog] captured stack: ${frameText(out)}\n`);
             }
         }
     } catch (e) {
-        if (!dead) {
+        if (!dead && myEpoch === epoch) {
             frames = 'stack not captured';
             const text = e && e.stack ? e.stack : String(e);
             writeSync(2, `[watchdog] LOUD: stack not captured: ${text}\n`);
         }
-    }
-    if (enabled) {
-        try { await post('Debugger.resume'); }
-        catch (e) {
-            const text = e && e.stack ? e.stack : String(e);
-            writeSync(2, `[watchdog] LOUD: Debugger.resume failed: ${text}\n`);
+    } finally {
+        // A kill that already won disconnects the session and parks this thread. Resuming then would
+        // wait on a dead session, and the parked thread would never get there.
+        if (enabled && !dead) {
+            try { await post('Debugger.resume'); }
+            catch (e) {
+                const text = e && e.stack ? e.stack : String(e);
+                writeSync(2, `[watchdog] LOUD: Debugger.resume failed: ${text}\n`);
+            }
+            try { await post('Debugger.disable'); }
+            catch (e) {
+                const text = e && e.stack ? e.stack : String(e);
+                writeSync(2, `[watchdog] LOUD: Debugger.disable failed: ${text}\n`);
+            }
         }
-        try { await post('Debugger.disable'); }
-        catch (e) {
-            const text = e && e.stack ? e.stack : String(e);
-            writeSync(2, `[watchdog] LOUD: Debugger.disable failed: ${text}\n`);
-        }
+        inspectorBusy = false;
     }
 }
 
@@ -172,7 +191,18 @@ function kill(reason, silentMs, limit, kaAgeMs, killClock) {
         }));
         renameSync(tmp, evidencePath);
     } finally {
-        process.kill(pid, 'SIGKILL');
+        let killErr = null;
+        try { process.kill(pid, 'SIGKILL'); }
+        catch (e) { killErr = e; }
+        // The capture is not awaited, so it may have paused the main thread and not resumed yet.
+        // Parking below blocks this thread, which would leave that pause in place. Disconnect is
+        // synchronous and drops the pause (the same session the clean process.exit path disconnects).
+        try { session.disconnect(); }
+        catch (e) {
+            const text = e && e.stack ? e.stack : String(e);
+            writeSync(2, `[watchdog] LOUD: inspector disconnect failed: ${text}\n`);
+        }
+        if (killErr) throw killErr;
     }
     // fix79: one kill, then nothing. Park on a cell no one else can notify.
     const parked = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
@@ -192,20 +222,23 @@ async function loop() {
         const limit = Atomics.load(ctl, LIMIT);
         const now = process.hrtime.bigint();
         const beat = Atomics.load(ctl, BEAT);
-        if (beat !== seen) { seen = beat; beatAt = now; }
+        if (beat !== seen) { seen = beat; beatAt = now; resetCapture(); }
         const limitNs = BigInt(limit) * NS;
         const halfNs = limitNs / 2n;
         const ka = Atomics.load(kaNs, 0);
+        if (ka !== lastKa) {
+            lastKa = ka;
+            if (ka !== 0n) resetCapture();
+        }
         const beatSilent = now - beatAt;
         const kaAge = ka === 0n ? null : now - ka;
-        // Re-read the stamp immediately: a keep-alive processed while this thread was asleep moved the deadline.
-        const captureDue = !captureStarted && ((ka !== 0n && now - ka >= halfNs) || beatSilent >= halfNs);
-        if (captureDue) {
-            const ka2 = Atomics.load(kaNs, 0);
-            const now2 = process.hrtime.bigint();
-            const still = (ka2 !== 0n && now2 - ka2 >= halfNs) || (now2 - beatAt >= halfNs);
-            if (still) await captureStack();
-            continue;
+        // Heartbeat silence, not keep-alive age. A healthy server's keep-alive is already older than limit/2
+        // when the next one arrives. Do not await: native code never delivers Debugger.paused.
+        if (!inspectorBusy && frames === null && beatSilent >= halfNs) {
+            captureStack(epoch).catch((e) => {
+                const text = e && e.stack ? e.stack : String(e);
+                writeSync(2, `[watchdog] LOUD: capture failed: ${text}\n`);
+            });
         }
         if (dead) return;
         const kaKill = kaAge !== null && kaAge >= limitNs;
@@ -221,16 +254,12 @@ async function loop() {
             return;
         }
         let waitNs = limitNs;
-        if (ka !== 0n && !captureStarted) {
-            const until = ka + halfNs - now;
+        if (frames === null && !inspectorBusy) {
+            const until = beatAt + halfNs - now;
             if (until < waitNs) waitNs = until;
         }
         if (ka !== 0n) {
             const until = ka + limitNs - now;
-            if (until < waitNs) waitNs = until;
-        }
-        if (!captureStarted) {
-            const until = beatAt + halfNs - now;
             if (until < waitNs) waitNs = until;
         }
         const untilBeatKill = beatAt + limitNs - now;

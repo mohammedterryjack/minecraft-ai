@@ -11,9 +11,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { performance } from 'node:perf_hooks';
+import { createServer, connect } from 'node:net';
 import { edibleNames } from '../src/agent/food_backchain.js';
 import { Coder } from '../src/agent/coder.js';
-import { KEEP_ALIVE_INTERVAL_MS, KEEP_ALIVE_KICK_MS } from '../src/utils/event_loop_guard.js';
+import { KEEP_ALIVE_INTERVAL_MS, KEEP_ALIVE_KICK_MS, watchdogBeatPeriodMs } from '../src/utils/event_loop_guard.js';
 
 const require = createRequire(import.meta.url);
 const VER = '1.20.4';
@@ -21,6 +22,9 @@ const registry = require('prismarine-registry')(VER);
 const { Recipe } = require('prismarine-recipe')(registry);
 
 const CHILD = fileURLToPath(new URL('./fixtures/fix100-keepalive-block-child.mjs', import.meta.url));
+const NATIVE_CHILD = fileURLToPath(new URL('./fixtures/fix100-native-block-child.mjs', import.meta.url));
+const HEALTHY_CHILD = fileURLToPath(new URL('./fixtures/fix100-healthy-then-block-child.mjs', import.meta.url));
+const DEAD_WORKER_CHILD = fileURLToPath(new URL('./fixtures/fix100-dead-worker-exit-child.mjs', import.meta.url));
 const START_AFTER_KEEPALIVE_MS = 13_000;
 const BLOCK_MS = 20_000;
 const INV = { oak_log: 23, diorite: 105, andesite: 60, raw_copper: 8, iron_helmet: 3, raw_iron: 85, torch: 80, oak_sapling: 18, granite: 64, coal: 15, stick: 1, cobbled_deepslate: 5, dark_oak_planks: 1, oak_button: 1, jukebox: 1, iron_sword: 1, music_disc_11: 1, honey_block: 1, cobblestone: 337, netherrack: 1, dirt: 261, birch_log: 6, oak_planks: 1 };
@@ -167,26 +171,37 @@ describe('fix100 craft reroute', () => {
     });
 });
 
-describe('fix100 step turn', () => {
-    it('a heartbeat interval gets a turn between a step tail and the next step', async () => {
-        const v = Object.create(Voyager.prototype);
+describe('fix100 event-loop phases', () => {
+    it('a setImmediate from an I/O callback does not run a due timer', async () => {
+        // timers run before poll. setImmediate is the check phase of the same iteration, so a due
+        // setInterval does not run between the socket callback and the setImmediate continuation.
         let beats = 0;
         const timer = setInterval(() => { beats++; }, 1);
-        const marks = [];
-        v._flushSkills = () => { marks.push({ where: 'tail', beats }); };
-        v._step = async () => { marks.push({ where: 'body', beats }); return 'served'; };
+        const srv = createServer();
         try {
-            await v.step();
-            const spun = performance.now();
-            while (performance.now() - spun < 5) { /* make the interval due without yielding */ }
-            await v.step();
+            await new Promise((resolve) => srv.listen(0, resolve));
+            const port = srv.address().port;
+            const seen = await new Promise((resolve, reject) => {
+                srv.on('connection', (socket) => {
+                    socket.on('data', async () => {
+                        const spun = performance.now();
+                        while (performance.now() - spun < 5) { /* the interval is due; this does not yield */ }
+                        const before = beats;
+                        await new Promise((r) => { setImmediate(r); });
+                        socket.destroy();
+                        c.destroy();
+                        srv.close();
+                        resolve(beats > before);
+                    });
+                });
+                const c = connect(port, '127.0.0.1', () => c.write('x'));
+                c.on('error', () => {});
+                srv.on('error', reject);
+            });
+            assert.strictEqual(seen, false);
         } finally {
             clearInterval(timer);
         }
-        const tail = marks.findIndex((m) => m.where === 'tail');
-        const next = marks.findIndex((m, i) => i > tail && m.where === 'body');
-        assert.ok(tail >= 0 && next > tail);
-        assert.ok(marks[next].beats > marks[tail].beats, `heartbeat did not run between tail (${marks[tail].beats}) and the next step (${marks[next].beats})`);
     });
 });
 
@@ -243,6 +258,53 @@ describe('fix100 watchdog', () => {
         assert.strictEqual(recorded.lastPopped, 'action:hunger-serve');
         assert.strictEqual(typeof recorded.lastPoppedAt, 'string');
         assert.strictEqual(existsSync(ev), true);
+        await rm(dir, { recursive: true, force: true });
+    });
+
+    it('a native block is killed at the keep-alive deadline with stack not captured', { timeout: KEEP_ALIVE_KICK_MS + KEEP_ALIVE_INTERVAL_MS }, async () => {
+        const dir = await mkdtemp(join(tmpdir(), 'fix100-native-'));
+        const ev = join(dir, 'watchdog_kill.json');
+        const child = spawn(process.execPath, [NATIVE_CHILD, ev], { stdio: ['ignore', 'pipe', 'pipe'] });
+        let stderr = '';
+        child.stderr.on('data', (d) => { stderr += d; });
+        const ended = await new Promise((resolve) => child.on('exit', (code, signal) => resolve({ code, signal })));
+        assert.strictEqual(ended.signal, 'SIGKILL', stderr);
+        assert.match(stderr, /stack not captured/);
+        assert.doesNotMatch(stderr, /native block ended/);
+        const recorded = JSON.parse(readFileSync(ev, 'utf8'));
+        assert.strictEqual(recorded.killClock, 'keep-alive');
+        assert.strictEqual(recorded.callFrames, 'stack not captured');
+        assert.ok(recorded.kaAgeMs >= KEEP_ALIVE_KICK_MS, `ka age ${recorded.kaAgeMs}`);
+        assert.ok(recorded.kaAgeMs < KEEP_ALIVE_KICK_MS + KEEP_ALIVE_INTERVAL_MS, `ran the whole native block (${recorded.kaAgeMs}ms)`);
+        await rm(dir, { recursive: true, force: true });
+    });
+
+    it('healthy keep-alives older than half the limit do not spend the capture', { timeout: KEEP_ALIVE_KICK_MS * 3 }, async () => {
+        const dir = await mkdtemp(join(tmpdir(), 'fix100-healthy-'));
+        const ev = join(dir, 'watchdog_kill.json');
+        const child = spawn(process.execPath, [HEALTHY_CHILD, ev], { stdio: ['ignore', 'pipe', 'pipe'] });
+        let stderr = '';
+        child.stderr.on('data', (d) => { stderr += d; });
+        const ended = await new Promise((resolve) => child.on('exit', (code, signal) => resolve({ code, signal })));
+        assert.strictEqual(ended.signal, 'SIGKILL', stderr);
+        assert.match(stderr, /laterRealBlock/);
+        const recorded = JSON.parse(readFileSync(ev, 'utf8'));
+        assert.strictEqual(recorded.killClock, 'keep-alive');
+        assert.ok(Array.isArray(recorded.callFrames));
+        assert.strictEqual(recorded.callFrames[0].functionName, 'laterRealBlock');
+        await rm(dir, { recursive: true, force: true });
+    });
+
+    it('process.exit does not wait for a worker that has already exited', { timeout: watchdogBeatPeriodMs() }, async () => {
+        const dir = await mkdtemp(join(tmpdir(), 'fix100-dead-'));
+        const ev = join(dir, 'watchdog_kill.json');
+        const child = spawn(process.execPath, [DEAD_WORKER_CHILD, ev], { stdio: ['ignore', 'pipe', 'pipe'] });
+        let stderr = '';
+        child.stderr.on('data', (d) => { stderr += d; });
+        const ended = await new Promise((resolve) => child.on('exit', (code, signal) => resolve({ code, signal })));
+        assert.strictEqual(ended.signal, null, stderr);
+        assert.strictEqual(ended.code, 0, stderr);
+        assert.match(stderr, /LOUD: process.exit with the watchdog worker already exited/);
         await rm(dir, { recursive: true, force: true });
     });
 });

@@ -60,8 +60,14 @@ export function startMainThreadWatchdog(evidencePath) {
         workerData: { sab: ctl.buffer, kaSab: kaNs.buffer, ackSab: ack.buffer, callLenSab: callLen.buffer, callSab: callBytes.buffer, port: port2, pid: process.pid, evidencePath },
         transferList: [port2],
     });
+    let workerAlive = true;
     worker.on('error', (e) => { throw new Error(`[watchdog] LOUD FAIL: watchdog worker crashed: ${e && e.stack ? e.stack : e}`); });
     worker.on('exit', (code) => {
+        workerAlive = false;
+        // Wake a process.exit that is blocked in Atomics.wait. The exit event itself cannot run while the
+        // main thread is inside that wait, so a worker that dies earlier must be noticed before the wait.
+        Atomics.store(ack, 0, 1);
+        Atomics.notify(ack, 0);
         if (_shuttingDown) return;
         throw new Error(`[watchdog] LOUD FAIL: watchdog worker exited (code ${code}); the main thread is unguarded`);
     });
@@ -75,6 +81,11 @@ export function startMainThreadWatchdog(evidencePath) {
     process.exit = function (code) {
         _shuttingDown = true;
         const finish = () => origExit.call(process, code);
+        if (!workerAlive) {
+            writeSync(2, '[watchdog] LOUD: process.exit with the watchdog worker already exited; not waiting for an ack from a dead worker\n');
+            finish();
+            return;
+        }
         if (Atomics.load(ctl, READY) !== 1) { finish(); return; }
         try {
             port1.postMessage({ shutdown: true });
@@ -85,6 +96,7 @@ export function startMainThreadWatchdog(evidencePath) {
             return;
         }
         Atomics.wait(ack, 0, 0);
+        if (!workerAlive) writeSync(2, '[watchdog] LOUD: watchdog worker died before acknowledging shutdown; not hanging on its ack\n');
         finish();
     };
     console.log('[watchdog] main-thread watchdog worker started; the stall guard arms it at the keep-alive kick bound');
