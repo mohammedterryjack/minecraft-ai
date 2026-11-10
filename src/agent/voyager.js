@@ -106,9 +106,9 @@ export function extractFeedback(output) {
 // The section was attempt 1's execution output, the 789-call trace, the inventory-full fact and the behaviour log,
 // each repeating the same lines. collapseRepeats only merges consecutive identical lines, so 60 identical
 // collectLogs FAILs interleaved with other calls, and pathfinder lines that differ by coordinates, all stayed.
-// This builds the same facts once. A call's grouping key is its parent, name, argument words, the full outcome
-// (the return value or the throw), and the full error text. Every distinct key is one line with its count.
-// A line already printed verbatim is not pasted again. A longer line is not the same line. Nothing is sliced.
+// This builds the same facts once. Lines that differ only by numbers are one template: each numeric slot is an
+// exact run, an arithmetic range, or the value list, so every value can be read back. A line already printed
+// verbatim is not pasted again. A longer line is not the same line. Nothing is sliced.
 export function codeRetryFeedback({ cut, output, trace, critique, invFull, behaviorLog }) {
     if (typeof critique !== 'string') throw new Error('[fix97] code retry feedback needs the critic text');
     if (typeof output !== 'string') throw new Error('[fix97] code retry feedback needs the execution output');
@@ -1475,8 +1475,10 @@ Use only c; no other globals.`;
         registryItemNames.set(registry, names);
         return names;
     }
-    // Pair each number in the text with the registry item id nearest to it. name:count in the curriculum state is the
-    // same pair: the id and the number sit next to each other. Two items at the same distance is not a guess.
+    // Pair each number with the registry item id nearest to it. The curriculum state writes name:count, so the id
+    // stands immediately before the number. In a list the next id starts one separator after this number, the same
+    // distance as the colon, so the item before the number is the pair. Two items that both end before the number
+    // at that distance cannot occur: they would end at the same index.
     static textCountPairs(text, registry) {
         if (typeof text !== 'string' || text.length === 0) return [];
         const names = Voyager.registryNamesLongestFirst(registry);
@@ -1513,8 +1515,13 @@ Use only c; no other globals.`;
                 else if (dist === bestDist && !best.includes(item.name)) best.push(item.name);
             }
             if (best.length === 0) continue;
-            if (best.length !== 1) throw new Error(`[fix97] ${num.n} in ${JSON.stringify(text)} is equally near ${best.join(' and ')}`);
-            pairs.push({ item: best[0], n: num.n });
+            let item = best[0];
+            if (best.length !== 1) {
+                const preceding = items.filter(it => it.end <= num.start && best.includes(it.name) && (num.start - it.end) === bestDist);
+                if (preceding.length !== 1) throw new Error(`[fix97] ${num.n} in ${JSON.stringify(text)} is equally near ${best.join(' and ')}`);
+                item = preceding[0].name;
+            }
+            pairs.push({ item, n: num.n });
         }
         return pairs;
     }

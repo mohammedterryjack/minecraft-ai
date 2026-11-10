@@ -288,7 +288,116 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         assert.match(code55.evidence, /task records oak_log at 55/);
         assert.match(code55.evidence, /name:count/);
         assert.doesNotMatch(code55.evidence, /promptCounts/);
-        assert.throws(() => Voyager.textCountPairs('oak_log 55 oak_planks', registry), /equally near/);
+        assert.deepStrictEqual(Voyager.textCountPairs('oak_log 55 oak_planks', registry), [{ item: 'oak_log', n: 55 }]);
+    });
+
+    it('curriculum task text and the 21-entry texts do not throw or add records', () => {
+        const v = mkV({});
+        v.npGraph = { getFactsText: () => '' };
+        const state = {
+            inventory: { cobblestone: 8, oak_log: 55 }, position: '0, 64, 0', biome: 'plains', time: 'day (1000)',
+            health_value: 20, health_max: 20, food_value: 17, food_max: 20, inventory_slots: '2/36', empty_inventory_slots: 34,
+            equipment: { hand: 'empty', off_hand: 'empty', head: 'empty', torso: 'empty', legs: 'empty', feet: 'empty' },
+            threats: 'none', nearby_blocks: ['oak_log', 'stone'], nearby_entities: [], dimension: 'overworld',
+        };
+        const oakTask = 'Check inventory for oak_log and confirm count (currently 55) to ensure input is valid for crafting oak_planks';
+        const oakEvidence = 'failure only in non-library code checkOakLog (FAILED: Oak log count is less than 55 [food 0/20 health 10/20] | PRECONDITION violated: checkOakLog() does not satisfy its precondition c => c.pre.inv.oak_log >= 55)';
+        const tier = '{ wooden_pickaxe: 1, stone_pickaxe: 2, iron_pickaxe: 3, golden_pickaxe: 3, diamond_pickaxe: 4, netherite_pickaxe: 5 }';
+        const texts = [
+            'Mine 5 birch_log',
+            'Craft 1 stone_pickaxe',
+            'Smelt 3 iron_ingot',
+            'Build a 5x5 cobblestone floor next to the hut',
+            'Smelt 3 raw_iron into 3 iron_ingot',
+            'ensure crafting_table',
+            'Collect 1 stripped_birch_wood',
+            'Mine 8 iron_ore',
+            'Collect 4 oak_log',
+            'Get 2 stick',
+            'Kill 1 zombie',
+            'Harvest 4 wheat',
+            'Craft 1 iron_pickaxe using 3 iron_ingot and 2 stick',
+            'Mine 5 birch_log within 32 blocks',
+            oakTask,
+            oakEvidence,
+            tier,
+            v._codeState(state),
+            v._compactState(state),
+            v._stateText(state),
+            'c => Object.keys(c.post.inv).filter(k=>k.endsWith(\'_pickaxe\')||k.endsWith(\'_axe\')||k.endsWith(\'_sword\')).length === 3',
+            'c => c.args.length === 2 || (c.args.length === 3 && typeof c.args[2] === \'number\')',
+            'c => Number(c.ret) === 0 || (Number(c.ret) > 0 && Number(c.ret) <= 4 && c.post.alive)',
+            'c => Number(c.ret) >= 0 && Number(c.ret) <= (c.args[2]||4)',
+            'c => c.pre.alive && c.args[0] != null && c.args[1] != null && c.args[2] != null',
+            'c => c.dist(c.post.pos, {x: c.pre.pos.x + (c.args[0] % 3 - 1) * 40, y: c.pre.pos.y + Math.min(0, -8 - c.args[0] * 2), z: c.pre.pos.z}) <= 4',
+            'c => c.post.alive && c.dist(c.pre.pos, c.post.pos) < 0.5 && c.post.alive',
+            'c => c.dist(c.post.pos, {x: c.pre.pos.x, y: c.pre.pos.y, z: c.pre.pos.z}) <= 5',
+            'c => c.pre.alive && typeof c.args[1] === \'number\' && typeof c.args[2] === \'number\' && (c.pre.inv.raw_iron || 0) - c.args[1] < c.args[2]',
+            'c => { const startRaw = c.args[1], goal = c.args[2]; return true; }',
+            'c => c.ret !== true || (c.post.alive && c.post.dim === c.pre.dim && c.dist(c.pre.pos, c.post.pos) <= 64)',
+            'c => c.dist(c.post.pos, {x:-178,y:53,z:107}) <= 8 && Math.abs(c.post.pos.y - 53) <= 6',
+            'c => c.args[0] === -28 && c.args[1] === 73 && c.args[2] === 56 && c.pre.alive',
+            'c => c.pre.sky > 5',
+            'c => c.args[2] === 0',
+            'c => c.pre.sky > 4 && c.pre.inv.iron_hoe !== undefined',
+            'c => c.pre.inv.oak_log >= 55',
+        ];
+        const codeOf = (name, body) => `async function ${name}(bot) {\n  ${body}\n}`;
+        const base = [
+            { name: 'craftToolSet', code: codeOf('craftToolSet', 'return true;'), contract: { pre: 'c => true', post: texts[20] } },
+            { name: 'isSafeTarget', code: codeOf('isSafeTarget', 'return true;'), contract: { pre: texts[21], post: 'c => true' } },
+            { name: 'craftArmorSet', code: codeOf('craftArmorSet', 'return true;'), contract: { pre: 'c => true', post: texts[22] } },
+            { name: 'harvestCrop', code: codeOf('harvestCrop', 'return true;'), contract: { pre: 'c => true', post: texts[23] } },
+            { name: 'breakBlockAt', code: codeOf('breakBlockAt', 'return true;'), contract: { pre: texts[24], post: 'c => true' } },
+            { name: 'exploreForIronOre', code: codeOf('exploreForIronOre', 'return true;'), contract: { pre: 'c => true', post: texts[25] } },
+            { name: 'scanForIronOreBlocks', code: codeOf('scanForIronOreBlocks', 'return true;'), contract: { pre: 'c => true', post: texts[26] } },
+            { name: 'exploreForIronOreDeposit', code: codeOf('exploreForIronOreDeposit', 'return true;'), contract: { pre: 'c => true', post: texts[27] } },
+            { name: 'mineIronOreDeposit', code: codeOf('mineIronOreDeposit', 'return true;'), contract: { pre: texts[28], post: texts[29] } },
+            { name: 'ensureStorageChestNearby', code: codeOf('ensureStorageChestNearby', 'return true;'), contract: { pre: 'c => true', post: texts[30] } },
+            { name: 'equipBestPickaxeForIronOre', code: codeOf('equipBestPickaxeForIronOre', 'return true;'), contract: { pre: 'c => true', post: `c => { const tier = ${tier}; return tier.diamond_pickaxe === 4 && tier.netherite_pickaxe === 5; }` } },
+            { name: 'travelWestAvoidDeathHotspot', code: codeOf('travelWestAvoidDeathHotspot', 'return true;'), contract: { pre: 'c => true', post: texts[31] } },
+            { name: 'verifyBlockType', code: codeOf('verifyBlockType', 'return true;'), contract: { pre: texts[32], post: 'c => true' } },
+            { name: 'chopDownTrees', code: codeOf('chopDownTrees', 'return true;'), contract: { pre: texts[33], post: 'c => true' } },
+            { name: 'removeItem', code: codeOf('removeItem', 'return true;'), contract: { pre: texts[34], post: 'c => true' } },
+            { name: 'collectSurfaceDirt', code: codeOf('collectSurfaceDirt', 'return true;'), contract: { pre: texts[35], post: 'c => true' } },
+            {
+                name: 'checkOakLog',
+                code: codeOf('checkOakLog', 'const inventory = getInventoryCounts(bot);\n  if (inventory && inventory.oak_log >= 55) return true;\n  return false;'),
+                contract: { pre: texts[36], post: 'c => c.ret' },
+            },
+        ];
+        const wrong = [
+            'craftToolSet.post.3', 'isSafeTarget.pre.2', 'craftArmorSet.post.4', 'harvestCrop.post.2', 'breakBlockAt.pre.2',
+            'exploreForIronOre.post.4', 'scanForIronOreBlocks.post.0.5', 'exploreForIronOreDeposit.post.5',
+            'mineIronOreDeposit.pre.2', 'mineIronOreDeposit.post.2', 'ensureStorageChestNearby.post.64',
+            'equipBestPickaxeForIronOre.post.4', 'equipBestPickaxeForIronOre.post.5', 'travelWestAvoidDeathHotspot.post.6',
+            'verifyBlockType.pre.2', 'chopDownTrees.pre.5', 'removeItem.pre.2', 'collectSurfaceDirt.pre.4',
+        ];
+        const statePairs = Voyager.textCountPairs(v._codeState(state), registry);
+        assert.ok(statePairs.some(p => p.item === 'oak_log' && p.n === 55));
+        assert.ok(statePairs.some(p => p.item === 'cobblestone' && p.n === 8));
+        assert.ok(!statePairs.some(p => p.item === 'oak_log' && p.n === 8));
+        for (const text of texts) {
+            const pairs = Voyager.textCountPairs(text, registry);
+            assert.ok(Array.isArray(pairs), text);
+            for (const field of ['task', 'description', 'repairHistory']) {
+                const skills = base.map(s => {
+                    const copy = { ...s, contract: { ...s.contract } };
+                    if (field === 'repairHistory') copy.repairHistory = [{ evidence: text }];
+                    else copy[field] = text;
+                    return copy;
+                });
+                const manifest = buildContractManifest(skills);
+                for (const id of wrong) assert.ok(!manifest.records.some(r => r.id === id), `${field} ${JSON.stringify(text).slice(0, 80)} -> ${id}`);
+                const ids = manifest.records.map(r => r.id);
+                for (const id of ids) assert.ok(id === 'checkOakLog.code.55' || id === 'checkOakLog.pre.55', `${field} produced ${id} from ${JSON.stringify(text).slice(0, 120)}`);
+            }
+        }
+        const withState = base.map(s => ({ ...s, contract: { ...s.contract }, description: v._compactState(state), repairHistory: [{ evidence: oakEvidence }] }));
+        const oak = withState.find(s => s.name === 'checkOakLog');
+        oak.task = oakTask;
+        const manifest = buildContractManifest(withState);
+        assert.deepStrictEqual(manifest.records.map(r => r.id).sort(), ['checkOakLog.code.55', 'checkOakLog.pre.55']);
     });
 });
 
