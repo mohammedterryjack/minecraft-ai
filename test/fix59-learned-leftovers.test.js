@@ -214,19 +214,20 @@ describe('fix59 (3b): a dead update loop exits the process non-zero (no silent s
         const f = strip(readFileSync(new URL('../src/agent/fatal.js', import.meta.url), 'utf8'));
         assert.ok(!/catch/.test(f) && /process\.exit\(1\)/.test(f));
     });
-    it('uncaught error outside a task step is fatal; inside a step it fails and stops that step only', () => {
+    it('uncaughtException and unhandledRejection are fatal during a step and are not recorded as that step', () => {
         const calls = [];
         const mk = (running) => { const v = Object.create(Voyager.prototype); v.running = running; v.currentTask = 'Mine 1 iron_ore'; v.progress = { failed: [] }; v._saveProgress = () => calls.push('save');
             v.agent = { fatal: (w, e) => calls.push(`fatal:${w}:${e.message}`), bot: {}, actions: { stop: (src) => { calls.push(`stop:${src.kind}`); return Promise.resolve(); } } };
-            v.agent.requestInterrupt = (src) => { calls.push(`interrupt:${src.kind}`); v.agent.bot.interrupt_code = true; }; return v; };   // fix75: sources recorded
+            v.agent.requestInterrupt = (src) => { calls.push(`interrupt:${src.kind}`); v.agent.bot.interrupt_code = true; }; return v; };
         mk(false)._onProcessError('UNHANDLED REJECTION', new Error('stray'));
-        assert.deepStrictEqual(calls, ['fatal:UNHANDLED REJECTION outside a task step:stray']);
+        assert.deepStrictEqual(calls, ['fatal:UNHANDLED REJECTION:stray']);
         calls.length = 0;
-        const v = mk(true), realErr = console.error; console.error = () => {};
-        try { v._onProcessError('UNCAUGHT EXCEPTION', new Error('skill code')); } finally { console.error = realErr; }
-        assert.deepStrictEqual(calls, ['save', 'interrupt:process-error', 'stop:process-error']);
-        assert.deepStrictEqual(v.progress.failed, ['Mine 1 iron_ore']);
-        assert.strictEqual(v.agent.bot.interrupt_code, true);
+        const v = mk(true);
+        v._onProcessError('UNCAUGHT EXCEPTION', new Error('skill code'));
+        assert.deepStrictEqual(calls, ['fatal:UNCAUGHT EXCEPTION:skill code']);
+        assert.deepStrictEqual(v.progress.failed, []);
+        assert.strictEqual(v._crash, undefined);
+        assert.strictEqual(v.agent.bot.interrupt_code, undefined);
     });
     it('the process guard has no empty catch and no optional-call on stop()', () => {
         const g = method('_onProcessError');

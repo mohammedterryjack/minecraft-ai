@@ -189,7 +189,9 @@ function kill(reason, silentMs, limit, kaAgeMs, killClock) {
         : Object.hasOwn(recorded, 'endedAt') ? `${recorded.label} (finished ${recorded.endedAt}; not running)`
         : `${recorded.label} (${recorded.source.length} chars, staged ${recorded.at}; source in ${evidencePath})`;
     const popped = Object.hasOwn(evidence, 'lastPopped') ? ` lastPopped="${evidence.lastPopped}" at ${evidence.at}` : '';
-    writeSync(2, `[watchdog] MAIN THREAD BLOCKED: ${reason}; `
+    // A keep-alive deadline while heartbeats are still arriving is a pipeline that stopped reading packets.
+    const headline = killClock === 'keep-alive' && silentMs < limit ? 'KEEP-ALIVE NOT PROCESSED' : 'MAIN THREAD BLOCKED';
+    writeSync(2, `[watchdog] ${headline}: ${reason}; `
         + `phase_stack="${phaseStr}"${popped} skill="${evidence.skill}" stack="${evidence.stack}" bot_api_call="${call.call}"${call.unread ? ` (+${call.unread} bytes not held by the slot)` : ''} code="${codeStr}" inspector="${shown}" at ${new Date().toISOString()}; SIGKILL pid ${pid} so the supervisor restarts it\n`);
     try {
         const tmp = `${evidencePath}.tmp-${pid}`;

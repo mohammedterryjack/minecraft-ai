@@ -259,7 +259,7 @@ describe('fix100 watchdog', () => {
         child.stderr.on('data', (d) => { stderr += d; });
         const ended = await new Promise((resolve) => child.on('exit', (code, signal) => resolve({ code, signal })));
         assert.strictEqual(ended.signal, 'SIGKILL', stderr);
-        assert.match(stderr, /MAIN THREAD BLOCKED/);
+        assert.match(stderr, /KEEP-ALIVE NOT PROCESSED/);
         assert.match(stderr, /limit 30000ms/);
         assert.match(stderr, /keep-alive/);
         assert.match(stderr, /blockedInHungerServe/);

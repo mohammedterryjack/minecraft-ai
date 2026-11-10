@@ -3489,18 +3489,14 @@ Use only c; no other globals.`;
         return `interrupted: ${what}${travelling ? ' while travelling' : ''}${under ? ` (underground: y=${Math.floor(p.y)}, surface y=${s})` : ''}`;
     }
 
-    // fix59: process-level uncaught error/rejection. Kept alive ONLY while a task step is running: the error is that step's
-    // (generated code), so the step is failed and stopped and the update loop keeps acting. Outside a step nothing owns the
-    // error and nothing will act on it, so it is fatal (agent.fatal: exit 1, launchd restarts) instead of a silent stall.
+    // fix103: uncaughtException and unhandledRejection are not the running step's failure. A throw from a packet
+    // listener runs inside protodef FullPacketParser._transform's this.push (serializer.js) before cb(), so the
+    // readable-stream pipeline stays writing and keep_alive is never processed again. Node: it is not safe to resume
+    // normal operation after uncaughtException (https://nodejs.org/api/process.html#warning-using-uncaughtexception-correctly).
+    // The same applies to an unhandled rejection during a step. agent.fatal exits 1 and launchd restarts. The error is
+    // not written onto the step and is not used in learning.
     _onProcessError(kind, err) {
-        if (!this.running) return this.agent.fatal(`${kind} outside a task step`, err);
-        const t = this.currentTask;
-        this._crash = { t: Date.now(), kind, message: err instanceof Error ? err.message : String(err) };   // fix65: attributed in _attribute
-        console.error(`[voyager] !!! ${kind} during task step "${t}" - counted as FAILED, step stopped, process kept alive: ${err instanceof Error ? err.stack : String(err)}`);
-        if (t) { this.progress.failed.push(t); this._saveProgress(); }
-        const src = { kind: 'process-error', by: kind };   // fix75: recorded like every other interrupt
-        this.agent.requestInterrupt(src);
-        this.agent.actions.stop(src);
+        return this.agent.fatal(kind, err);
     }
     // a real player spoke: they take priority
     notePlayerMessage() {

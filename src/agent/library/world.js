@@ -1183,6 +1183,13 @@ function indexReport(idx) {
 
 function scheduleIndex(bot, idx) {
     if (idx.pumping) return;
+    if (!idx.queue.length) {
+        if (idx.drain.length === 0) return;
+        const waiting = idx.drain.splice(0);
+        const report = indexReport(idx);
+        for (const w of waiting) w.resolve(report);
+        return;
+    }
     idx.pumping = true;
     const step = () => {
         if (!idx.queue.length) {
@@ -1193,13 +1200,18 @@ function scheduleIndex(bot, idx) {
             return;
         }
         const job = idx.queue.shift();
-        idx.pending.delete(`${job.cx},${job.cz}`);
+        const key = `${job.cx},${job.cz}`;
+        idx.pending.delete(key);
         try {
             buildColumn(idx, viewContext(bot), job.cx, job.cz);
         } catch (err) {
+            // Taken off pending before the build. Put it back and leave every other queued column pending.
+            // Clearing the queue left loaded in-view columns neither indexed nor pending (the reindexSectionAt invariant).
+            if (!idx.columns.has(key)) {
+                idx.pending.add(key);
+                idx.queue.unshift(job);
+            }
             idx.pumping = false;
-            idx.queue.length = 0;
-            idx.pending.clear();
             const waiting = idx.drain.splice(0);
             if (waiting.length === 0) throw err;
             for (const w of waiting) w.reject(err);
@@ -1296,19 +1308,29 @@ function dropOutsideView(idx, ctx) {
     idx.viewR = ctx.radius;
 }
 
+// A loaded column enters the square when the bot crosses a chunk border or the radius grows. There is no
+// load event: vanilla already sent the ring just past the view edge, and a scan's dropOutsideView drops a
+// column that stays loaded. Re-sync on every event that builds a view context. dropOutsideView returns
+// immediately when the stood chunk and the radius are unchanged.
+function syncView(bot, idx, ctx) {
+    dropOutsideView(idx, ctx);
+    enqueueView(idx, ctx);
+    scheduleIndex(bot, idx);
+}
+
 function onColumnLoad(bot, idx, corner) {
     const { cx, cz } = chunkCorner(corner, 'chunkColumnLoad');
     const ctx = viewContext(bot);
     dropColumn(idx, `${cx},${cz}`);
-    enqueueColumn(idx, ctx, cx, cz);
+    syncView(bot, idx, ctx);
     patchNeighborFaces(idx, ctx, cx, cz);
-    scheduleIndex(bot, idx);
 }
 
 function onColumnUnload(bot, idx, corner) {
     const { cx, cz } = chunkCorner(corner, 'chunkColumnUnload');
     const ctx = viewContext(bot);
     dropColumn(idx, `${cx},${cz}`);
+    syncView(bot, idx, ctx);
     patchNeighborFaces(idx, ctx, cx, cz);
 }
 
@@ -1341,6 +1363,7 @@ function onBlockUpdate(bot, idx, oldBlock, newBlock) {
         throw new Error('nearby blocks: blockUpdate has no position (prismarine-world worldsync.js _emitBlockUpdate).');
     }
     const ctx = viewContext(bot);
+    syncView(bot, idx, ctx);
     const done = new Set();
     reindexSectionAt(idx, ctx, pos.x, pos.y, pos.z, done);
     for (const [fx, fy, fz] of FACES) reindexSectionAt(idx, ctx, pos.x + fx, pos.y + fy, pos.z + fz, done);
@@ -1380,8 +1403,7 @@ export function indexPerceivedChunks(bot) {
     const idx = ensureIndex(bot);
     const ctx = viewContext(bot);
     if (!ctx.columns.has(standingKey(ctx))) return Promise.reject(missingStanding(ctx));
-    dropOutsideView(idx, ctx);
-    enqueueView(idx, ctx);
+    syncView(bot, idx, ctx);
     if (!idx.queue.length && !idx.pumping) return Promise.resolve(indexReport(idx));
     return new Promise((resolve, reject) => {
         idx.drain.push({ resolve, reject });
@@ -1400,6 +1422,21 @@ export function perceivedBuildStats(bot) {
     const idx = perceivedIndex.get(bot);
     if (!idx) throw new Error('perceivedBuildStats: the exposed index has not been built for this bot');
     return indexReport(idx);
+}
+
+export function perceivedViewColumns(bot) {
+    const idx = perceivedIndex.get(bot);
+    if (!idx) throw new Error('perceivedViewColumns: the exposed index has not been built for this bot');
+    const ctx = viewContext(bot);
+    const rows = [];
+    for (const key of ctx.columns.keys()) {
+        const parts = key.split(',');
+        const cx = Number(parts[0]);
+        const cz = Number(parts[1]);
+        if (!inView(ctx, cx, cz)) continue;
+        rows.push({ cx, cz, indexed: idx.columns.has(key), pending: idx.pending.has(key) });
+    }
+    return rows;
 }
 
 function componentFaces(sec, localIndex) {
@@ -1613,8 +1650,7 @@ function perceivedBlocks(bot) {
     const idx = ensureIndex(bot);
     dropOutsideView(idx, ctx);
     if (!idx.columns.has(standingKey(ctx))) buildColumn(idx, ctx, ctx.stoodX, ctx.stoodZ);
-    enqueueView(idx, ctx);
-    scheduleIndex(bot, idx);
+    syncView(bot, idx, ctx);
     const seen = confirmVisible(ctx, idx, null);
     perceivedStat.set(bot, {
         cellReads: 0, candidates: seen.candidates, raycasts: seen.raycasts, ddaRays: seen.ddaRays, ddaSteps: seen.ddaSteps,
