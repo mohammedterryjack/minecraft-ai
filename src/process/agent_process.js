@@ -1,10 +1,38 @@
 import { spawn } from 'child_process';
+import { mkdirSync } from 'fs';
+import path from 'path';
 import { fileURLToPath } from 'url';
 import { logoutAgent } from '../mindcraft/mindserver.js';
 import { logExitCause, writeProcessLoud } from './exit_log.js';
 import { parentExitForChild } from './backend_unavailable.js';
 
 const init_agent_path = fileURLToPath(new URL('./init_agent.js', import.meta.url));
+
+// Same directory as logs/mindcraft.log (run-native.sh, overlay/server.js).
+const LOGS_DIR = fileURLToPath(new URL('../../logs/', import.meta.url));
+export const HEAP_SNAPSHOT_DIR = path.join(LOGS_DIR, 'heap');
+
+// Node options must precede the script. mkdir throws; the child is not spawned without the directory.
+export function agentChildArgv(name, port, load_memory, init_message, count_id, diagnosticDir) {
+    if (typeof diagnosticDir !== 'string' || diagnosticDir.length === 0) {
+        throw new Error('agentChildArgv: diagnosticDir required');
+    }
+    mkdirSync(diagnosticDir, { recursive: true });
+    const args = [
+        '--heapsnapshot-signal=SIGUSR2',
+        `--diagnostic-dir=${diagnosticDir}`,
+        init_agent_path,
+        name,
+    ];
+    args.push('-n', name);
+    args.push('-c', count_id);
+    if (load_memory)
+        args.push('-l', load_memory);
+    if (init_message)
+        args.push('-m', init_message);
+    args.push('-p', port);
+    return args;
+}
 
 export class AgentProcess {
     constructor(name, port) {
@@ -16,14 +44,7 @@ export class AgentProcess {
         this.count_id = count_id;
         this.running = true;
 
-        let args = [init_agent_path, this.name];
-        args.push('-n', this.name);
-        args.push('-c', count_id);
-        if (load_memory)
-            args.push('-l', load_memory);
-        if (init_message)
-            args.push('-m', init_message);
-        args.push('-p', this.port);
+        const args = agentChildArgv(this.name, this.port, load_memory, init_message, count_id, HEAP_SNAPSHOT_DIR);
 
         const agentProcess = spawn(process.execPath, args, {
             stdio: 'inherit',
