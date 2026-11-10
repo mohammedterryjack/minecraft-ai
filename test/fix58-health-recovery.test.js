@@ -8,6 +8,7 @@ import { describe, it, before } from 'node:test';
 import assert from 'node:assert';
 import { readFileSync } from 'fs';
 import { VitalsModel } from '../src/agent/vitals_model.js';
+import { RestThreat, emptyRestStore } from '../src/agent/rest_threat.js';
 
 // Real vitals from icefox2000 (bots/icefox2000/critic_cases.jsonl + violated_contracts.jsonl), contiguous segments only, [hp, food].
 const REAL = {
@@ -104,6 +105,7 @@ describe('fix58: wiring into voyager', () => {
     const mk = (vit, hp, food) => {
         const v = Object.create(Voyager.prototype);
         v.vitals = new VitalsModel(vit);
+        v.restThreat = new RestThreat(emptyRestStore());
         v.agent = { bot: { health: hp, food, game: {} } };
         return v;
     };
@@ -137,7 +139,7 @@ describe('fix58: wiring into voyager', () => {
         v._hutBuilt = () => false; v._cursorLimited = () => false; v._logPromptBreakdown = () => {}; v._saveProgress = () => {};
         let prompt = null;
         v._askLocal = async (sys, user) => { prompt = user; return '{"reasoning":"r","task":"eatFood","context":""}'; };
-        const state = { position: '0, 32, 0', biome: 'plains', time: 'day (1)', health_value: 17, health_max: 20, food_value: 17, food_max: 20, inventory_slots: '1/36', empty_inventory_slots: 35, threats: 'none', inventory: {}, nearby_blocks: [], equipment: { hand: 'empty' } };
+        const state = { position: '0, 32, 0', biome: 'plains', time: 'day (1)', health_value: 17, health_max: 20, food_value: 17, food_max: 20, inventory_slots: '1/36', empty_inventory_slots: 35, threats: 'none', inventory: {}, nearby_blocks: [], equipment: { hand: 'empty' }, is_day: true, sleeping: false, sky_light: 15, time_since_rest: 1 };
         const r = await v.proposeTask(state);
         assert.strictEqual(r.task, 'eatFood');
         assert.match(prompt, /health_recovery \(learned from own vitals\): hp 17\.3\/20, food 17; .*not recovering at food 17/);

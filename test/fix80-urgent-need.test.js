@@ -89,7 +89,12 @@ function mkV({ vitals, food = 10, health = 20, skillsList, proposeTask, decompos
         if (e) return { kind: 'skill', skill: e };
         return { kind: 'open' };
     };
-    v.observe = () => ({ inventory: {}, equipment: { hand: 'empty' }, nearby_blocks: [], position: '0,64,0', biome: 'plains', time: 'day 0', health_value: 20, health_max: 20, food_value: 20, food_max: 20, inventory_slots: '0/36', empty_inventory_slots: 36, threats: 'none' });
+    v.observe = () => ({
+        inventory: {}, equipment: { hand: 'empty' }, nearby_blocks: [], position: '0,64,0', biome: 'plains',
+        time: 'day 0', health_value: 20, health_max: 20, food_value: 20, food_max: 20,
+        inventory_slots: '0/36', empty_inventory_slots: 36, threats: 'none',
+        is_day: true, sleeping: false, sky_light: 15, time_since_rest: 1,
+    });
     return v;
 }
 

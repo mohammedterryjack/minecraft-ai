@@ -65,8 +65,8 @@ describe('fix96 (1): the curriculum prompt holds only what is relevant, lossless
 
     it('the state key a failure repeats is named "the current state" when it is the current one (lossless), and kept otherwise', () => {
         const v = mkV({});
-        const key = v._goalStateKey({ inventory: { dirt: 2 }, nearby_blocks: ['stone'] });
-        const other = v._goalStateKey({ inventory: { dirt: 3 }, nearby_blocks: ['stone'] });
+        const key = v._goalStateKey({ inventory: { dirt: 2 }, nearby_blocks: ['stone'], is_day: true });
+        const other = v._goalStateKey({ inventory: { dirt: 3 }, nearby_blocks: ['stone'], is_day: true });
         const text = `Collect 1 apple (stale: backed off: failed in this state (x; state ${key}; posterior success 0.25))`;
         assert.strictEqual(v._withCurrentState(text, key), 'Collect 1 apple (stale: backed off: failed in this state (x; the current state; posterior success 0.25))');
         assert.strictEqual(v._withCurrentState(`y; state ${other}; z`, key), `y; state ${other}; z`);
@@ -74,7 +74,7 @@ describe('fix96 (1): the curriculum prompt holds only what is relevant, lossless
     });
 
     it('failed_in_this_state names the current state once, not once per row', () => {
-        const state = { inventory: { dirt: 2 }, nearby_blocks: ['stone'] };
+        const state = { inventory: { dirt: 2 }, nearby_blocks: ['stone'], is_day: true };
         const v = mkV({});
         const key = v._goalStateKey(state);
         v.progress.goalFailStates = [

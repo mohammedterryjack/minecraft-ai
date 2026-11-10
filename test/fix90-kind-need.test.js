@@ -83,7 +83,7 @@ function mkV(skills) {
         currentWindow: null,
     };
     v.agent = { name: 'icefox2000', bot, openChat() {} };
-    v.observe = () => ({ inventory: {}, nearby_blocks: [], food_value: 17, empty_inventory_slots: 36 });
+    v.observe = () => ({ inventory: {}, nearby_blocks: [], food_value: 17, empty_inventory_slots: 36, is_day: true });
     return v;
 }
 
@@ -218,7 +218,7 @@ describe('fix90: curriculum replay of eatFood chains the need onto the hunger se
 
 describe('fix90: the curriculum does not re-propose a goal that just failed in this state', () => {
     const eq = { hand: 'empty', off_hand: 'empty', head: 'empty', torso: 'empty', legs: 'empty', feet: 'empty' };
-    const stateKey = 'inv:;near:';
+    const stateKey = 'inv:;near:;is_day:true';
     const failReason = 'FAILED: hungry but no food could be consumed';
 
     function curriculum(v) {
@@ -243,6 +243,7 @@ describe('fix90: the curriculum does not re-propose a goal that just failed in t
             health_value: 20, health_max: 20, food_value: 20, food_max: 20,
             inventory_slots: '0/36', empty_inventory_slots: 36, threats: 'none',
             inventory: {}, nearby_blocks: [], equipment: eq,
+            is_day: true, sleeping: false, sky_light: 15, time_since_rest: 1,
         };
         await v.proposeTask(state);
         assert.match(user, /failed_in_this_state/);
@@ -254,7 +255,7 @@ describe('fix90: the curriculum does not re-propose a goal that just failed in t
     it('the same-state posterior backs the goal off, and still retries at that rate', () => {
         const v = mkV([eatSkill(SHORT)]);
         v.progress.goalFailStates = [{ task: 'eatFood', ok: false, reason: failReason, state: stateKey }];
-        const state = { inventory: {}, nearby_blocks: [] };
+        const state = { inventory: {}, nearby_blocks: [], is_day: true };
         Math.random = () => 0.999;
         const why = v._rejectTask('eatFood', true, state);
         assert.strictEqual(typeof why, 'string');
@@ -266,9 +267,9 @@ describe('fix90: the curriculum does not re-propose a goal that just failed in t
     it('a failure recorded in a different state does not back the goal off here', () => {
         const v = mkV([eatSkill(SHORT)]);
         v.progress.goalStats = { 'eatFood::replay failed': { success: 0, fail: 3 } };
-        v.progress.goalFailStates = [{ task: 'eatFood', ok: false, reason: failReason, state: 'inv:bread:1;near:' }];
+        v.progress.goalFailStates = [{ task: 'eatFood', ok: false, reason: failReason, state: 'inv:bread:1;near:;is_day:true' }];
         Math.random = () => 0.999;
-        assert.strictEqual(v._rejectTask('eatFood', true, { inventory: {}, nearby_blocks: [] }), null);
+        assert.strictEqual(v._rejectTask('eatFood', true, { inventory: {}, nearby_blocks: [], is_day: true }), null);
     });
 
     it('a planner step feeds the rejection back and pursues the next proposal', async () => {
@@ -276,7 +277,7 @@ describe('fix90: the curriculum does not re-propose a goal that just failed in t
         v.progress.goalFailStates = [{ task: 'eatFood', ok: false, reason: failReason, state: stateKey }];
         for (const m of ['_checkHomeGround', '_watchWindows', '_watchDimension', '_oneshot', '_requeueDeferred', '_prefetchPlan']) v[m] = () => {};
         for (const m of ['_queueApiLintRepairs', '_gateTrial', '_backfillContracts', '_refactor', '_prune', '_generalise', '_split', '_retention', '_idlePractice', '_serveUrgent']) v[m] = async () => false;
-        v.observe = () => ({ inventory: {}, nearby_blocks: [], equipment: eq });
+        v.observe = () => ({ inventory: {}, nearby_blocks: [], equipment: eq, is_day: true });
         v._subgoalTask = () => null;
         v._takePlan = async () => ({ task: 'eatFood', reasoning: 'hungry' });
         const notes = [];

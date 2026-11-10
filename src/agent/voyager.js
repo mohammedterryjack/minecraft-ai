@@ -13,6 +13,7 @@ import { RepairMemory } from './repair_memory.js';
 import { IdlePractice } from './idle_practice.js';
 import { VitalsModel } from './vitals_model.js';   // fix58
 import { checkNeedSource, needInterruptSource, isUnblamedInterruptKind, sampleBeta, pickUrgentCandidate } from './urgent_need.js';   // fix80
+import { RestThreat, emptyRestStore, installProtocolFacts, restFacts, bedItemNames, findBedBlock } from './rest_threat.js';   // fix98
 import { peekPreconditionUnmet, clearPreconditionUnmet, checkNeed, reachNeedForBlocks } from './precondition.js';   // fix76; fix81: structured needs (markPreconditionUnmet is called by seeded code)
 import { SlotEffects } from './slot_effects.js';   // fix59
 import { obtainPlanner } from './recipe_plan.js';   // fix81
@@ -543,6 +544,11 @@ export class Voyager {
         if (!this.progress.vitals) this.progress.vitals = { regen: {}, runs: {}, foodSamples: { drop: { n: 0, sum: 0 }, rise: { n: 0, sum: 0 } } };
         if (!this.progress.vitals.foodSamples) this.progress.vitals.foodSamples = { drop: { n: 0, sum: 0 }, rise: { n: 0, sum: 0 } };
         this.vitals = new VitalsModel(this.progress.vitals);
+        // fix98: learned rest floor and entityHurt damage. Older progress files have no store; it starts empty.
+        // A missing statistics packet is not filled in here.
+        if (!Object.hasOwn(this.progress, 'restThreat')) this.progress.restThreat = emptyRestStore();
+        this.restThreat = new RestThreat(this.progress.restThreat);
+        this._urgentRng = Math.random;
         // fix59: learned per-skill inventory-slot effect (replaces the fix39 free-space name regex/list)
         if (!this.progress.slots) this.progress.slots = { runs: {} };
         this.slotEffects = new SlotEffects(this.progress.slots);
@@ -1225,7 +1231,7 @@ export class Voyager {
     static CONTRACT_SPEC = `A contract is two JavaScript arrow functions over one argument c, each returning true when satisfied:
   c.args  = the call's arguments after bot (numbers/strings; objects are null)
   c.ret   = the call's return value (primitive, or null for objects)
-  c.pre / c.post = bot state before / after the call: { pos:{x,y,z}, hp (0-${skills.VITALS_MAX.health}), food (0-${skills.VITALS_MAX.food}), sky (sky light 0-15 at head height; 0 = underground or enclosed), alive (bool), dim (dimension string), inv:{item:count}, free (empty inventory slots), eq:{heldItem,offHand,helmet,chestplate,leggings,boots} }
+  c.pre / c.post = bot state before / after the call: { pos:{x,y,z}, hp (0-${skills.VITALS_MAX.health}), food (0-${skills.VITALS_MAX.food}), sky (sky light 0-15 at head height; 0 = underground or enclosed), alive (bool), dim (dimension string), inv:{item:count}, free (empty inventory slots), eq:{heldItem,offHand,helmet,chestplate,leggings,boots}, isDay (boolean, bot.time.isDay), sleeping (boolean), rest (minecraft:time_since_rest from the statistics packet), hurtBy (entityHurt source name, or null) }
   pos is a plain {x,y,z}. It is not a Vec3 and has no methods. Distance is c.dist(a, b), never c.post.pos.dist(...).
   eq.heldItem is the item's name (a string) or null, the same shape as a skill that returns that name. It is not an item object and has no .type.
   c.delta = inventory change {item: +n/-n}
@@ -1287,7 +1293,7 @@ Use only c; no other globals.`;
         if (param === null) return null;
         const pos = { x: 0, y: 64, z: 0 };
         const eq = { heldItem: 'iron_axe', offHand: null, helmet: null, chestplate: null, leggings: null, boots: null };
-        const state = { pos, hp: skills.VITALS_MAX.health, food: skills.VITALS_MAX.food, oxygen: skills.VITALS_MAX.health, sky: 15, alive: true, dim: 'overworld', inv: {}, free: 0, eq };
+        const state = { pos, hp: skills.VITALS_MAX.health, food: skills.VITALS_MAX.food, oxygen: skills.VITALS_MAX.health, sky: 15, alive: true, dim: 'overworld', inv: {}, free: 0, eq, isDay: true, sleeping: false, rest: 0, hurtBy: null };
         const args = counts && Array.isArray(counts.samples) ? counts.samples : [];
         const list = counts && counts.params && counts.params.length ? counts.params.join(', ') : 'none';
         const sample = { args, ret: true, pre: state, post: state, delta: {}, dist: (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z), game: { item: () => true, block: () => true, drops: () => [], harvestTools: () => null } };
@@ -2537,7 +2543,11 @@ Use only c; no other globals.`;
     }
     // fix58: every traced skill run with pre/post snapshots teaches that skill's observed food/hp change
     _learnVitalsEffects(trace) {
-        for (const r of trace) { if (r.intr || !r.s0 || !r.s1 || !r.s0.alive || !r.s1.alive) continue; this.vitals.noteRun(r.name, r.s0, r.s1); }
+        for (const r of trace) {
+            if (r.intr || !r.s0 || !r.s1 || !r.s0.alive || !r.s1.alive) continue;
+            this.vitals.noteRun(r.name, r.s0, r.s1);
+            this._ensureRestThreat().noteRun(r.name, r.s0, r.s1);
+        }
     }
     // fix59: same traced runs teach each skill's observed inventory-slot effect (post.free - pre.free)
     _learnSlotEffects(trace) {
@@ -2608,6 +2618,8 @@ Use only c; no other globals.`;
     // Threat seam (fix77): push { id:'threat', value: hitChance * learnedDamage, ... }. No fixed priority order.
     _urgentCandidates(st) {
         const candidates = [];
+        let rng = this._urgentRng;
+        if (typeof rng !== 'function') rng = Math.random;
         if (st.servable) {
             let s = 0, f = 0;
             if (st.best !== null && st.best.entry.stats) {
@@ -2616,7 +2628,7 @@ Use only c; no other globals.`;
                 if (typeof s !== 'number') throw new Error(`[fix80] raiser stats.success/fail must be numbers`);
                 if (typeof f !== 'number') throw new Error(`[fix80] raiser stats.success/fail must be numbers`);
             }
-            const draw = sampleBeta(s + 1, f + 1);
+            const draw = sampleBeta(s + 1, f + 1, rng);
             // fix89: a need that has failed is worth its Thompson draw times its learned posterior success
             // (the same (s+1)/(n+2) a goal's backoff uses). Fresh needs (no failures) keep multiplier 1.
             const needPosterior = this._goalBackoffMultiplier('need:hunger');
@@ -2633,14 +2645,44 @@ Use only c; no other globals.`;
         }
         if (taskName !== null && taskName !== undefined) {
             const { s, f } = this._goalOutcomes(taskName);
-            const draw = sampleBeta(s + 1, f + 1);
+            const draw = sampleBeta(s + 1, f + 1, rng);
             const stake = this._taskHpStake(taskName);
             candidates.push({ id: 'task', kind: 'task', value: draw * stake, draw, stake, taskName });
         } else {
             candidates.push({ id: 'task', kind: 'task', value: 0, draw: 0, stake: 0, taskName: null });
         }
-        // fix77: ThreatModel candidates append here, same value units (expected HP loss).
+        // fix98: rest and threat share this slot. Higher value wins. A zero threat is not a candidate.
+        const model = this._ensureRestThreat();
+        const draw = sampleBeta(1, 1, rng);
+        const rest = model.restCandidate(this.agent.bot, this._goalBackoffMultiplier('need:rest'), draw);
+        if (rest !== null) candidates.push(rest);
+        const threat = model.threatCandidate(this._goalBackoffMultiplier('need:threat'), draw);
+        if (threat !== null && threat.value > 0) candidates.push(threat);
         return candidates;
+    }
+    _ensureRestThreat() {
+        if (this.restThreat) return this.restThreat;
+        if (!this.progress) throw new Error('[fix98] restThreat model missing');
+        if (typeof this.progress !== 'object') throw new Error('[fix98] restThreat model missing');
+        if (!Object.hasOwn(this.progress, 'restThreat')) this.progress.restThreat = emptyRestStore();
+        this.restThreat = new RestThreat(this.progress.restThreat);
+        return this.restThreat;
+    }
+    _installRestFacts() {
+        const bot = this.agent && this.agent.bot;
+        if (!bot) return;
+        if (!bot._client) return;
+        const model = this._ensureRestThreat();
+        if (model.installed === true) return;
+        installProtocolFacts(bot, minecraftData(VERSION));
+        model.installed = true;
+    }
+    _playableNamed(name) {
+        const e = this.skills.find(s => s.name === name);
+        if (!e) return null;
+        if (e.demoted) return null;
+        if (e.mergedInto) return null;
+        return e;
     }
     // fix89: a need serve that already chained subgoals for what it lacks. Those subgoals ARE the serve;
     //        replaying the raiser again would starve them. True while any of that chain is still queued.
@@ -2672,6 +2714,8 @@ Use only c; no other globals.`;
             // Clear the need label when the serve finishes (success, fail, or throw) so the next step can serve again.
             // Leaving need:hunger stuck would skip every later _serveUrgent (re-entry check) — a livelock.
             if (this.currentTask === 'need:hunger') this.currentTask = null;
+            else if (this.currentTask === 'need:rest') this.currentTask = null;
+            else if (this.currentTask === 'need:threat') this.currentTask = null;
         }
     }
     async _serveUrgentBody() {
@@ -2687,9 +2731,10 @@ Use only c; no other globals.`;
         if (typeof bot.health !== 'number') throw new Error(`[fix80] _serveUrgent: bot.health must be a number, got ${JSON.stringify(bot.health)}`);
 
         const st = this._hungerServeState();
-        if (!st.servable) return false;
         const candidates = this._urgentCandidates(st);
         const winner = pickUrgentCandidate(candidates);
+        if (winner.id === 'rest') return await this._serveRest(winner);
+        if (winner.id === 'threat') return await this._serveThreat(winner);
         if (winner.id !== 'hunger') return false;
         if (!(winner.value > 0)) return false;   // no HP-harm evidence → leave the step to the task/curriculum
         // fix89: the backchain from the last failed serve is the work that obtains the missing input
@@ -2788,6 +2833,106 @@ Use only c; no other globals.`;
             return false;
         }
         throw new Error(`[fix91] _pursueProposedTask returned ${JSON.stringify(acted)} for "${task}"; expected true or false`);
+    }
+    // fix98: replay a learned raiser. A missing input is chained. A failure is recorded on the need, not swallowed.
+    async _replayNeedRaiser(label, before, entry) {
+        const route = { name: entry.name, call: `await ${entry.name}(bot);` };
+        const rp = await this._replay(label, before, route);
+        if (rp === null) throw new Error(`[fix98] _replay returned nothing for ${label}`);
+        if (rp === undefined) throw new Error(`[fix98] _replay returned nothing for ${label}`);
+        if (rp.ok) {
+            console.log(`[urgent-need] ${label} served via learned raiser ${entry.name}`);
+            this._afterSuccess();
+            return true;
+        }
+        if (Array.isArray(rp.needs) && rp.needs.length > 0) {
+            if (this._chainNeeds(label, rp.needs, this.observe())) {
+                console.log(`[urgent-need] ${entry.name} lacked an input; backchained`);
+                return true;
+            }
+        }
+        if (typeof rp.reason === 'string' && rp.reason.length > 0) {
+            this._noteGoalState(label, false, rp.reason, before);
+            this._recordGoalOutcome(label, false, rp.reason);
+            console.log(`[urgent-need] ${label} raiser failed: ${rp.reason}`);
+            return true;
+        }
+        if (typeof rp.unmetPrecondition === 'string' && rp.unmetPrecondition.length > 0) {
+            console.log(`[urgent-need] ${label} unmet precondition: ${rp.unmetPrecondition}`);
+            return true;
+        }
+        throw new Error(`[fix98] ${label} raiser failed without a reason: ${JSON.stringify(rp)}`);
+    }
+    async _serveRest(winner) {
+        if (this._needServePending('need:rest')) {
+            console.log('[urgent-need] rest backchain still queued; leaving the step to that work');
+            return false;
+        }
+        const before = this.observe();
+        const label = 'need:rest';
+        this.currentTask = label;
+        this._curSub = null;
+        const bot = this.agent.bot;
+        const raiser = this._ensureRestThreat().bestRestRaiser(name => this._playableNamed(name));
+        if (raiser !== null) return await this._replayNeedRaiser(label, before, raiser.entry);
+        const bed = findBedBlock(bot);
+        if (bed !== null) {
+            if (typeof bot.sleep !== 'function') throw new Error('[fix98] bot.sleep was not delivered');
+            try {
+                await bot.sleep(bed);
+            } catch (e) {
+                const message = e instanceof Error ? e.message : String(e);
+                const err = new Error(`[fix98] bot.sleep rejected: ${message}`);
+                err.cause = e;
+                throw err;
+            }
+            console.log(`[urgent-need] rested via bot.sleep (${winner.by})`);
+            this._afterSuccess();
+            return true;
+        }
+        const names = bedItemNames(bot);
+        const inv = before.inventory;
+        if (!inv) throw new Error('[fix98] rest serve needs observe().inventory');
+        if (typeof inv !== 'object') throw new Error('[fix98] rest serve needs observe().inventory');
+        let held = null;
+        for (const n of names) {
+            if (Object.hasOwn(inv, n) && typeof inv[n] === 'number' && inv[n] > 0) { held = n; break; }
+        }
+        const need = held !== null
+            ? { item: held, count: 1, reason: 'proximity', source: 'game data' }
+            : { item: this._obtainPlanner(before).cheapest(names, 1, inv, true).item, count: 1, reason: 'ingredients', source: 'game data' };
+        const chained = this._chainNeeds(label, [need], before);
+        if (chained !== true) throw new Error(`[fix98] no recipe chain for a bed (${need.item})`);
+        console.log(`[urgent-need] rest queued a bed from game data (${need.item}, ${need.reason})`);
+        return true;
+    }
+    async _serveThreat(winner) {
+        if (this._needServePending('need:threat')) {
+            console.log('[urgent-need] threat backchain still queued; leaving the step to that work');
+            return false;
+        }
+        const before = this.observe();
+        const label = 'need:threat';
+        this.currentTask = label;
+        this._curSub = null;
+        const raiser = this._ensureRestThreat().bestThreatRaiser(name => this._playableNamed(name));
+        if (raiser !== null) return await this._replayNeedRaiser(label, before, raiser.entry);
+        const note = `LEARNED threat (pre-empts decompose/subgoal queues; they are deferred, not dropped): ${winner.by}. Propose ONE task that reduces further health loss using what the bot has.`;
+        let proposal = await this.proposeTask({ ...before, note });
+        if (proposal === null) throw new Error('[fix98] proposeTask returned nothing for a threat');
+        if (proposal === undefined) throw new Error('[fix98] proposeTask returned nothing for a threat');
+        if (typeof proposal !== 'object') throw new Error('[fix98] proposeTask returned nothing for a threat');
+        if (typeof proposal.task !== 'string') throw new Error('[fix98] threat proposal has no task');
+        if (proposal.task.trim().length === 0) throw new Error('[fix98] threat proposal has no task');
+        const accepted = await this._acceptPlannerTask(proposal, before);
+        if (accepted === null) {
+            console.log('[urgent-need] threat proposal rejected by the learned posterior; leaving the step');
+            return false;
+        }
+        const acted = await this._pursueProposedTask(accepted.task, accepted.proposal, before);
+        if (acted === true) return true;
+        if (acted === false) return false;
+        throw new Error(`[fix98] _pursueProposedTask returned ${JSON.stringify(acted)} for a threat`);
     }
     // fix93: built-in raiser. An edible already held is eaten and the deficit closes on measured food.
     // Otherwise the cheapest game-data plan is queued ahead of the raiser. The open-goal retry of
@@ -3367,6 +3512,26 @@ Use only c; no other globals.`;
         if (prev) this.vitals.observeSample(prev, { h, f }, skills.getVitalsMax(bot).health);   // fix58: learn food level -> hp regen
         const hit = prev && h < prev.h ? { t: now, dmg: +(prev.h - h).toFixed(1), near: (() => { const e = bot.nearestEntity(x => x !== bot.entity && x.type !== 'object' && x.position.distanceTo(p) < 8); return e ? `${e.name || e.username} ${e.position.distanceTo(p).toFixed(0)}m` : 'no entity within 8m'; })(), onGround: bot.entity.onGround, inLava: !!bot.entity.isInLava, inWater: !!bot.entity.isInWater } : null;
         this._samples.push({ t: now, y: p.y, h, f, o, hit }); if (this._samples.length > 30) this._samples.shift();
+        this._installRestFacts();
+        this._threatDuringStep(h);
+    }
+    // fix98: a sourced entityHurt whose learned damage exceeds the running task's HP stake cuts the step.
+    // Hunger stays boundary-only. The nearest-entity note above is death detail, not this attacker.
+    _threatDuringStep(hp) {
+        const model = this.restThreat;
+        if (!model || model.installed !== true) return;
+        model.onSample(this.agent.bot, hp);
+        if (this.running !== true) return;
+        if (this.agent.bot.interrupt_code === true) return;
+        const task = this.currentTask;
+        if (typeof task !== 'string' || task.length === 0) return;
+        if (task === 'need:threat' || task === 'need:rest') return;
+        let rng = this._urgentRng;
+        if (typeof rng !== 'function') rng = Math.random;
+        const threat = model.threatCandidate(this._goalBackoffMultiplier('need:threat'), sampleBeta(1, 1, rng));
+        if (threat === null) return;
+        if (!(threat.value > this._taskHpStake(task))) return;
+        this.agent.requestInterrupt({ kind: 'threat', by: threat.by });
     }
     // fix51: _deathDetail now accepts optional beforeInv to compute items dropped on death
     _deathDetail(d, beforeInv = null) {
@@ -3588,6 +3753,8 @@ Use only c; no other globals.`;
             threats: this._threats(),
             recent_deaths: (this.agent.recentDeaths || []).join('; ') || 'none',
             death_hotspots: this._deathHotspots(),
+            // fix98: day, sleep, sky light, and the rest statistic. Missing facts throw.
+            ...restFacts(bot),
         };
     }
     // fix51: get inventory+equipment combined view (same as satisfaction check uses for __have)
@@ -3691,7 +3858,13 @@ Use only c; no other globals.`;
         const invSummary = items.length ? items.map(([k, v]) => `${k}:${v}`).join(',') : 'empty';
         const eq = s.equipment;
         const held = eq.hand !== 'empty' ? eq.hand : '';
-        return `pos:(${s.position}) biome:${s.biome} time:${(s.time || '').split(' ')[0]} hp:${s.health_value}/${s.health_max} food:${s.food_value}/${s.food_max} inv:${s.inventory_slots},${s.empty_inventory_slots}empty${held ? ` held:${held}` : ''} threats:${s.threats || 'none'} items:[${invSummary}]`;
+        if (typeof s.time !== 'string') throw new Error('[fix98] compact state time must be the full time sentence');
+        if (s.time.length === 0) throw new Error('[fix98] compact state time must be the full time sentence');
+        if (typeof s.is_day !== 'boolean') throw new Error('[fix98] compact state is_day required');
+        if (typeof s.sleeping !== 'boolean') throw new Error('[fix98] compact state sleeping required');
+        if (typeof s.sky_light !== 'number') throw new Error('[fix98] compact state sky_light required');
+        if (typeof s.time_since_rest !== 'number') throw new Error('[fix98] compact state minecraft:time_since_rest required');
+        return `pos:(${s.position}) biome:${s.biome} time:${s.time} is_day:${s.is_day} sleeping:${s.sleeping} sky_light:${s.sky_light} time_since_rest:${s.time_since_rest} hp:${s.health_value}/${s.health_max} food:${s.food_value}/${s.food_max} inv:${s.inventory_slots},${s.empty_inventory_slots}empty${held ? ` held:${held}` : ''} threats:${s.threats || 'none'} items:[${invSummary}]`;
     }
     _stateText(s) {
         // fix34: present inventory facts prominently as exact counts (not just JSON blob)
@@ -6552,15 +6725,16 @@ Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
         if (!Array.isArray(this.progress.goalFailStates)) throw new Error(`[fix90] progress.goalFailStates must be an array, got ${JSON.stringify(this.progress.goalFailStates)}`);
         return this.progress.goalFailStates;
     }
-    // The state a "would this goal fail again" question is about: inventory counts and nearby blocks.
-    // Time, position and the food number are not part of it (hunger ticking is not a new state).
+    // The state a "would this goal fail again" question is about: inventory counts, nearby blocks, and
+    // whether it is day. The raw tick and the food number are not part of it (hunger ticking is not a new state).
     _goalStateKey(state) {
         if (!state || typeof state !== 'object') throw new Error('[fix90] goal state required');
         if (!state.inventory || typeof state.inventory !== 'object') throw new Error('[fix90] goal state.inventory required');
         if (!Array.isArray(state.nearby_blocks)) throw new Error('[fix90] goal state.nearby_blocks required');
+        if (typeof state.is_day !== 'boolean') throw new Error('[fix98] goal state is_day required');
         const inv = Object.keys(state.inventory).sort().map(k => `${k}:${state.inventory[k]}`).join(',');
         const near = [...state.nearby_blocks].sort().join(',');
-        return `inv:${inv};near:${near}`;
+        return `inv:${inv};near:${near};is_day:${state.is_day}`;
     }
     _noteGoalState(task, ok, reason, state) {
         if (typeof task !== 'string' || task.length === 0) throw new Error(`[fix90] goal state outcome needs a task, got ${JSON.stringify(task)}`);
@@ -6683,7 +6857,7 @@ Rules:
 - Propose ONE concrete, verifiable task achievable in a few minutes with the current inventory and surroundings (e.g. "Mine 5 birch_log", "Craft 1 stone_pickaxe", "Smelt 3 iron_ingot", "Build a 5x5 cobblestone floor next to the hut").
 - Do not repeat completed tasks unless needed for progress; avoid tasks that failed recently unless prerequisites are now met.
 - Do not propose a task listed under failed_in_this_state. It already failed for the reason given and the state has not changed.
-- The bot must survive: dying loses its inventory. Nothing keeps it alive automatically (no eating, fleeing, fighting or sheltering reflexes), so survival is your job too: read time, health, food, threats and inventory space in the state and decide.
+- The bot must survive: dying loses its inventory. Survival is your job. A learned rest need and a threat interrupt can pre-empt a step when the evidence says so. Read the full time sentence, is_day, sleeping, sky_light, time_since_rest, health, food, threats and inventory space in the state and decide.
 - A task is either an item goal ("<verb> N <item>", "Smelt N <raw> into N <out>", "ensure <block>"), the bare name of a known skill that takes no arguments besides bot (it is verified by that skill's learned postcondition), or a short free-text task.
 Reply ONLY with JSON: {"reasoning": "ONE short sentence", "task": "...", "context": "short hint how to do it"}`;
         const bot = this.agent.bot;   // fix29: current vitals as plain facts, read now (an overlapped plan's state may be minutes old)

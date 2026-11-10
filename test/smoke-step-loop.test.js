@@ -54,7 +54,7 @@ const TEST_BOT_NAME = '__smoke_test_bot__';
 const TEST_BOT_DIR = `./bots/${TEST_BOT_NAME}`;
 
 function createMockBot() {
-    const mockPosition = { x: 100, y: 64, z: 200, floored: () => ({ x: 100, y: 64, z: 200 }), distanceTo: () => 10 };
+    const mockPosition = { x: 100, y: 64, z: 200, floored: () => ({ x: 100, y: 64, z: 200, offset: () => ({ x: 100, y: 65, z: 200 }) }), distanceTo: () => 10 };
     // mineflayer sets the player's eyeHeight from this constant (lib/plugins/entities.js). GoalLookAtBlock measures reach from it.
     const require = createRequire(import.meta.url);
     const entitiesSrc = readFileSync(require.resolve('mineflayer/lib/plugins/entities.js'), 'utf8');
@@ -131,7 +131,9 @@ function createMockBot() {
         health: 18,
         food: 15,
         game,
-        time: { timeOfDay: 6000 },
+        time: { timeOfDay: 6000, isDay: true },
+        isSleeping: false,
+        restSince: 1,
         registry: mockRegistry,
         version: '1.20.4',
         heldItem: { name: 'stone_pickaxe' },
@@ -147,7 +149,7 @@ function createMockBot() {
         },
         findBlock: () => null,
         findBlocks: () => [],
-        blockAt: () => null,
+        blockAt: () => ({ name: 'air', skyLight: 15 }),
         nearestEntity: () => null,
         on: () => {},
         once: () => {},
@@ -271,6 +273,10 @@ function createMockState() {
         distance_to_town: 50,
         biome: 'forest',
         time: 'day (6000)',
+        is_day: true,
+        sleeping: false,
+        sky_light: 15,
+        time_since_rest: 1,
         health: '18/20',
         food: '15/20',
         food_value: 15,
