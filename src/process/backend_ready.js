@@ -5,20 +5,20 @@
 // https://nodejs.org/api/fs.html#caveats — a directory watch is not a poll. Re-read from
 // the saved offset on every event. Arm does not start at EOF: a refusal during startup
 // can land after the server has already written Done, and skipping that line waits forever.
-// The current run is the minecraft server process. Vanilla
-// log4j2.xml (server jar, and the same appender wiki.vg documents) is a
-// RollingRandomAccessFile: fileName logs/latest.log, filePattern
-// logs/%d{yyyy-MM-dd}-%i.log.gz, with TimeBasedTriggeringPolicy and
-// OnStartupTriggeringPolicy. TimeBasedTriggeringPolicy rolls when the smallest unit
-// in that %d pattern changes (Apache Log4j, Rolling file appenders: daily, at midnight
-// of the server timezone, on the next log event). The JVM keeps running, so the
-// "Starting minecraft server" line is in the gzip and latest.log is the tail of the
-// same run. OnStartupTriggeringPolicy rolls because a new JVM started; that process
-// has a new pid and its start line is in the new latest.log. The running server is
-// launchd job com.mo.minecraftserver (launchctl print gui/<uid>/com.mo.minecraftserver,
-// launchctl(1): print service-target). Its pid is the run. A latest.log with no start
-// line is that process's post-rollover tail. A job that is not running is not a run.
-// Rotated .gz files are not read.
+// The current run is the bytes of latest.log. Vanilla log4j2.xml (server jar, and the
+// same appender wiki.vg documents) is a RollingRandomAccessFile: fileName logs/latest.log,
+// filePattern logs/%d{yyyy-MM-dd}-%i.log.gz, with TimeBasedTriggeringPolicy and
+// OnStartupTriggeringPolicy. TimeBasedTriggeringPolicy rolls when the smallest unit in
+// that %d pattern changes (Apache Log4j, Rolling file appenders:
+// https://logging.apache.org/log4j/2.x/manual/appenders/rolling-file.html — daily, at
+// midnight of the server timezone, on the next log event). The JVM keeps running, so
+// the "Starting minecraft server" line moves into the gzip and latest.log has none:
+// the current run starts at offset 0. OnStartupTriggeringPolicy rolls because a new
+// JVM started, and that JVM's start line is in the new latest.log. A new inode (the
+// roll replaced the file) or a shrunk file resets the offset to 0. Rotated .gz files
+// are not read. The launchd job's pid is not the run: the job's script exits 0 when
+// the screen session already exists, and the pid launchd reports is the screen
+// process.
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -27,68 +27,12 @@ export const DONE_RE = /\]: Done \(\d+(?:\.\d+)?s\)!/;
 export const STOPPING_MARK = 'Stopping server';
 // The first line of a server run, e.g. [12:04:00] [Server thread/INFO]: Starting minecraft server version 1.21.4
 export const START_MARK = 'Starting minecraft server';
-// launchd job that runs ~/bin/start-minecraftserver-screen.sh (settings.js).
-export const MINECRAFT_SERVER_JOB = 'com.mo.minecraftserver';
-export const LAUNCHCTL = 'launchctl';
 
-export function launchdTarget(uid) {
-    if (!Number.isInteger(uid) || uid < 0) throw new Error('[fix99] uid required to address the launchd gui domain');
-    return `gui/${uid}/${MINECRAFT_SERVER_JOB}`;
-}
-
-// Top-level `launchctl print` keys are one tab. Nested dictionaries are indented further and are not the job.
-function launchdField(text, name) {
-    const prefix = `\t${name} = `;
-    const lines = text.split('\n').filter((line) => line.startsWith(prefix));
-    if (lines.length !== 1) throw new Error(`[fix99] launchctl print has ${lines.length} ${name} lines for ${MINECRAFT_SERVER_JOB}`);
-    return lines[0].slice(prefix.length);
-}
-
-export function readLaunchdPrint(text) {
-    if (typeof text !== 'string' || text.length === 0) throw new Error('[fix99] launchctl print returned no job description');
-    const state = launchdField(text, 'state');
-    if (state !== 'running') {
-        throw new Error(`[fix99] ${MINECRAFT_SERVER_JOB} is ${state}; the minecraft server process is not running`);
-    }
-    const pidText = launchdField(text, 'pid');
-    if (!/^[0-9]+$/.test(pidText)) throw new Error(`[fix99] ${MINECRAFT_SERVER_JOB} pid is not an integer: ${JSON.stringify(pidText)}`);
-    const pid = Number(pidText);
-    if (!Number.isInteger(pid) || pid <= 0) throw new Error(`[fix99] ${MINECRAFT_SERVER_JOB} pid is not a live process: ${pidText}`);
-    return { pid };
-}
-
-export function queryMinecraftServer(execFile) {
-    if (typeof execFile !== 'function') throw new Error('[fix99] execFile required');
-    const uid = process.getuid();
-    if (!Number.isInteger(uid)) throw new Error(`[fix99] process.getuid() returned ${uid}; the launchd gui domain cannot be named`);
-    const target = launchdTarget(uid);
-    let text;
-    try {
-        text = execFile(LAUNCHCTL, ['print', target], { encoding: 'utf8' });
-    } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        throw new Error(`[fix99] launchctl print ${target} failed: ${msg}`);
-    }
-    if (typeof text !== 'string') throw new Error(`[fix99] launchctl print ${target} returned ${typeof text}, not text`);
-    return readLaunchdPrint(text);
-}
-
-export function requireRunningServer(server) {
-    if (server === undefined || server === null || typeof server !== 'object') {
-        throw new Error('[fix99] the minecraft server process is not running; cannot locate the current server run');
-    }
-    if (!Number.isInteger(server.pid) || server.pid <= 0) {
-        throw new Error(`[fix99] the minecraft server process is not running (pid ${server.pid}); cannot locate the current server run`);
-    }
-    return server;
-}
-
-// Byte offset of this process's run inside latest.log. A start line in this file is a
-// run boundary (the JVM that logged it). No start line means TimeBasedTriggeringPolicy
-// already rolled that line into the dated gzip; the bytes here are still pid's run.
-export function offsetOfCurrentRun(buf, server) {
+// Byte offset of the current run inside latest.log. A start line is a run boundary.
+// No start line means TimeBasedTriggeringPolicy already rolled that line into the dated
+// gzip while the JVM kept running, so the current run is the whole file.
+export function offsetOfCurrentRun(buf) {
     if (!Buffer.isBuffer(buf)) throw new Error('[fix94] latest.log bytes required');
-    requireRunningServer(server);
     const text = buf.toString('utf8');
     const at = text.lastIndexOf(START_MARK);
     if (at < 0) return 0;
@@ -125,11 +69,10 @@ export function configuredLink(settings) {
     throw new Error('[fix94] settings.port required');
 }
 
-export function armBackendReady({ logDir, server }) {
+export function armBackendReady({ logDir }) {
     if (typeof logDir !== 'string' || logDir.length === 0) {
         throw new Error('[fix94] backend_log_dir is required; no backend readiness source configured');
     }
-    const running = requireRunningServer(server);
     const logPath = path.join(logDir, 'latest.log');
     let ino = null;
     let offset = 0;
@@ -179,7 +122,7 @@ export function armBackendReady({ logDir, server }) {
         fs.closeSync(fd0);
     }
     ino = initial.ino;
-    offset = offsetOfCurrentRun(whole, running);
+    offset = offsetOfCurrentRun(whole);
 
     function finish(line) {
         if (settled) return;
@@ -199,6 +142,8 @@ export function armBackendReady({ logDir, server }) {
         if (settled) return;
         const st = stat();
         if (!st) return;
+        // Log4j's roll replaces latest.log (new inode) or the file shrinks under the saved offset.
+        // Either one is a new file boundary: read from the start.
         if (ino === null || st.ino !== ino || st.size < offset) {
             ino = st.ino;
             offset = 0;

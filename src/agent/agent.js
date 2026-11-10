@@ -21,11 +21,10 @@ import { log, validateNameFormat } from './connection_handler.js';
 import { startEventLoopStallGuard } from '../utils/event_loop_guard.js';
 import { startMainThreadWatchdog, watchdogEvidencePath } from '../utils/main_thread_watchdog.js';
 import { inspect } from 'node:util';
-import { execFileSync } from 'node:child_process';
 import { fatalExit, runUpdateLoop } from './fatal.js';   // fix59
 import { logExitCause, writeProcessLoud } from '../process/exit_log.js';
 import { applyDisconnect, latchBackendStopping, resumeWhenBackendReady } from '../process/backend_unavailable.js';
-import { armBackendReady, requireBackendLogDir, configuredLink, queryMinecraftServer } from '../process/backend_ready.js';
+import { armBackendReady, requireBackendLogDir, configuredLink } from '../process/backend_ready.js';
 
 export class Agent {
     async start(load_mem=false, init_message=null, count_id=0) {
@@ -121,10 +120,9 @@ export class Agent {
         initModes(this);
 
         this.bot.on('login', () => {
-            this._minecraftServer = queryMinecraftServer(execFileSync);
-            this._backendWatch = armBackendReady({ logDir: this._backendLogDir, server: this._minecraftServer });
+            this._backendWatch = armBackendReady({ logDir: this._backendLogDir });
             console.log(this.name, 'logged in!');
-            startMainThreadWatchdog(watchdogEvidencePath(`./bots/${this.name}`));   // fix64: off-thread; the guard below arms it with the learned keep_alive gap
+            startMainThreadWatchdog(watchdogEvidencePath(`./bots/${this.name}`));   // fix64: off-thread; the guard below arms it at the keep-alive kick bound
             startEventLoopStallGuard(this.bot);
             serverProxy.login();
             
@@ -574,7 +572,6 @@ export class Agent {
             logDir: this._backendLogDir,
             latch: this._disconnectLatch,
             watch: this._backendWatch,
-            server: this._minecraftServer,
             exitFn: (code) => process.exit(code),
             log: (msg) => {
                 logExitCause(msg);

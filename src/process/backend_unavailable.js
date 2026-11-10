@@ -86,14 +86,14 @@ export function authorizeBackendResume(latch) {
 }
 
 // The Done line has been written. Exit 75 so launchd's SuccessfulExit false respawns once.
-export function resumeWhenBackendReady({ logDir, latch, exitFn, watch, log, server }) {
+export function resumeWhenBackendReady({ logDir, latch, exitFn, watch, log }) {
     if (typeof logDir !== 'string' || logDir.length === 0) {
         throw new Error('[fix94] backend_log_dir is required; no backend readiness source configured');
     }
     if (typeof exitFn !== 'function') throw new Error('[fix94] exit function required');
     if (typeof log !== 'function') throw new Error('[fix94] log function required');
     let handle = watch;
-    if (handle === undefined || handle === null) handle = armBackendReady({ logDir, server });
+    if (handle === undefined || handle === null) handle = armBackendReady({ logDir });
     if (!handle || typeof handle.ready !== 'object' || typeof handle.ready.then !== 'function') {
         throw new Error('[fix94] backend watch has no ready promise');
     }

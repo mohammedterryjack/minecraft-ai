@@ -3,9 +3,9 @@
  * Context: bot.__psnStackStr (set in skill_graph instrumentSrc __wrap).
  *
  * Root cause of live spam (`[bot-api] blockAt 0ms ctx=(no PSN trace)` on every call):
- * logging was unconditional. Log only when duration exceeds the learned
- * bot.__eventLoopStallThresholdMs (same keep_alive-derived threshold as the event-loop guard).
- * No new constants; no log until that threshold is learned.
+ * logging was unconditional. Log only when duration exceeds
+ * bot.__eventLoopStallThresholdMs, the keep-alive kick bound the stall guard sets at start.
+ * No log until that bound is set.
  */
 import { mainThreadWatchdogStarted, noteMainThreadCall } from './main_thread_watchdog.js';
 
@@ -42,7 +42,7 @@ export function wrapBotForApiTiming(bot) {
                     const ms = Date.now() - t0;
                     const thr = tr.__eventLoopStallThresholdMs;
                     if (thr === undefined || thr === null) {
-                        // Not learned yet (need two inbound keep_alive packets); nothing to compare.
+                        // The stall guard has not set the keep-alive kick bound yet; nothing to compare.
                         return;
                     }
                     if (typeof thr !== 'number' || !Number.isFinite(thr) || thr <= 0) {

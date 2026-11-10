@@ -8,7 +8,7 @@
  *    b) candidate outcomes were read before death/stall/timeout attribution, so a cut candidate was skipped as `intr`;
  *    c) a hang killed the process before any outcome was written. A trial journal + the watchdog's evidence file now count
  *       it on the next start.
- * 3) ARMED is logged only when the grounded keep_alive budget rises (a new maximum). A shorter gap stays silent.
+ * 3) ARMED is the keep-alive kick bound. A keep_alive gap does not log again and does not replace it.
  */
 import { describe, it, after } from 'node:test';
 import assert from 'node:assert';
@@ -22,7 +22,7 @@ import * as world from '../src/agent/library/world.js';
 import { Coder } from '../src/agent/coder.js';
 import { Voyager } from '../src/agent/voyager.js';
 import { instrumentSrc } from '../src/agent/skill_graph.js';
-import { startEventLoopStallGuard, stopEventLoopStallGuard } from '../src/utils/event_loop_guard.js';
+import { startEventLoopStallGuard, stopEventLoopStallGuard, watchdogSilenceLimitMs } from '../src/utils/event_loop_guard.js';
 import { watchdogEvidencePath } from '../src/utils/main_thread_watchdog.js';
 
 const NAME = '__fix65_test__';
@@ -192,7 +192,7 @@ describe('fix65: trial candidates are retired by the learner', () => {
         assert.ok(!existsSync(`${v.dir}/trials_inflight.json`));
     });
 
-    it('end to end: the real watchdog SIGKILLs a spinning child and the next learner counts it from the file the worker wrote', { timeout: 30000 }, async () => {
+    it('end to end: the real watchdog SIGKILLs a spinning child and the next learner counts it from the file the worker wrote', { timeout: watchdogSilenceLimitMs() * 2 }, async () => {
         const ev = watchdogEvidencePath(BOT_DIR);
         rmSync(ev, { force: true });
         const v = liveVoyager();
@@ -225,8 +225,8 @@ describe('fix65: trial candidates are retired by the learner', () => {
     });
 });
 
-describe('fix65: ARMED is logged only when the grounded keep_alive budget rises', () => {
-    it('a new maximum logs; a shorter gap does not log and does not replace the threshold', () => {
+describe('fix65: ARMED is the keep-alive kick bound', () => {
+    it('the guard arms once at 30000ms, and keep_alive gaps do not log again or replace it', () => {
         const realNow = Date.now, realLog = console.log;
         const lines = [];
         let now = 1_000_000;
@@ -242,7 +242,7 @@ describe('fix65: ARMED is logged only when the grounded keep_alive budget rises'
             Date.now = realNow; console.log = realLog;
         }
         const armed = lines.filter(l => l.includes('stall guard ARMED'));
-        assert.deepStrictEqual(armed.map(l => Number(l.match(/currently (\d+)ms/)[1])), [15030, 15034, 15178]);
-        assert.strictEqual(bot.__eventLoopStallThresholdMs, 15178);
+        assert.deepStrictEqual(armed.map(l => Number(l.match(/currently (\d+)ms/)[1])), [30000]);
+        assert.strictEqual(bot.__eventLoopStallThresholdMs, null);
     });
 });

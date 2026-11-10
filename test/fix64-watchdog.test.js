@@ -7,7 +7,7 @@
  *    injected into each loop (`if (bot.interrupt_code) return`) can never fire there, because the flag is set from an event
  *    handler. Staging now starts every iteration of an async loop with one event-loop turn.
  * 2) The #44 stall guard and the exit-on-disconnect handlers are main-loop callbacks, so a blocked loop silenced them.
- *    A worker-thread watchdog (Atomics heartbeat, limit = learned keep_alive gap + beat period) SIGKILLs a blocked process
+ *    A worker-thread watchdog (Atomics heartbeat, limit = keep-alive kick bound) SIGKILLs a blocked process
  *    after writing the last phase/skill evidence from the worker.
  */
 import { describe, it, after } from 'node:test';
@@ -17,7 +17,7 @@ import { fileURLToPath } from 'node:url';
 import { rmSync } from 'node:fs';
 import { Vec3 } from 'vec3';
 import { Coder } from '../src/agent/coder.js';
-import { KEEP_ALIVE_INTERVAL_MS, stallPollIntervalMsForThreshold } from '../src/utils/event_loop_guard.js';
+import { watchdogSilenceLimitMs, watchdogBeatPeriodMs } from '../src/utils/event_loop_guard.js';
 
 const NAME = '__fix64_test__';
 after(() => { rmSync(`./bots/${NAME}`, { recursive: true, force: true }); rmSync(`./bots/${NAME}-watchdog_kill.json`, { force: true }); });
@@ -171,7 +171,7 @@ function runChild(mode, gapMs) {
     });
 }
 
-const FLOOR_LIMIT_MS = KEEP_ALIVE_INTERVAL_MS + stallPollIntervalMsForThreshold(KEEP_ALIVE_INTERVAL_MS);
+const FLOOR_LIMIT_MS = watchdogSilenceLimitMs();
 
 describe('fix64: off-main-thread watchdog', () => {
     it('a child whose main thread spins forever is SIGKILLed by the worker, with phase/skill evidence on stderr', { timeout: FLOOR_LIMIT_MS * 2 }, async () => {

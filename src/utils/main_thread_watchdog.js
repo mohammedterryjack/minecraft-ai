@@ -8,9 +8,8 @@
  *
  * This watchdog lives in a worker thread, which has its own isolate and is not scheduled by the main loop. The worker
  * never uses its own event loop either: it sleeps in Atomics.wait on a SharedArrayBuffer, which the main thread bumps
- * once per stall-guard poll (Nyquist half of the learned keep_alive gap). The silence limit is published by the guard
- * once it has learned the gap: limit = grounded keep-alive budget + beat period. The budget is the max observed
- * gap and at least the server keep-alive interval (event_loop_guard.js). On a miss the worker writes the last published evidence (phase stack, running skill, PSN call stack)
+ * once per stall-guard poll (the beat period: Nyquist half of the vanilla 15000 ms keep-alive interval). The silence
+ * limit is the keep-alive kick bound, 15000 ms × 2 (event_loop_guard.js). On a miss the worker writes the last published evidence (phase stack, running skill, PSN call stack)
  * straight to fd 2 with fs.writeSync, then SIGKILLs the process (SIGKILL cannot be caught by any JS handler), the parent
  * process sees the child exit and exits non-zero, and launchd restarts it.
  *
@@ -37,7 +36,7 @@ export function watchdogEvidencePath(botDir) {
 }
 
 /**
- * Start the worker once per process. Arming waits for the learned keep_alive gap (armMainThreadWatchdog).
+ * Start the worker once per process. The stall guard arms it at the keep-alive kick bound (armMainThreadWatchdog).
  * @param {string} evidencePath file the worker writes (synchronously, before SIGKILL) for the next process to read
  */
 export function startMainThreadWatchdog(evidencePath) {
@@ -53,7 +52,7 @@ export function startMainThreadWatchdog(evidencePath) {
     worker.unref();
     port1.unref();
     _wd = { ctl, port: port1, worker, callLen, callBytes, encoder: new TextEncoder() };
-    console.log('[watchdog] main-thread watchdog worker started; it arms once the stall guard learns the server keep_alive gap');
+    console.log('[watchdog] main-thread watchdog worker started; the stall guard arms it at the keep-alive kick bound');
     return _wd;
 }
 

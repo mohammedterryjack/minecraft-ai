@@ -588,7 +588,7 @@ export class Coder {
     /**
      * @param {string} code
      * @param {number} preludeLines
-     * @param {number} warnDistMs numeric literal threshold (derived from observed keep_alive gap ms on the live bot)
+     * @param {number} warnDistMs numeric literal threshold (the keep-alive kick bound the stall guard sets)
      */
     _largeWorldScanLint(code, preludeLines, warnDistMs) {
         if (typeof warnDistMs !== 'number' || !Number.isFinite(warnDistMs) || warnDistMs <= 0) {
@@ -619,7 +619,7 @@ export class Coder {
                             const n = this._getNumericLiteral(p.value);
                             if (n !== null && n >= warnDist) {
                                 reportLine = p.value.loc.start.line;
-                                detail = `bot.${callee.property.name} option ${kn}=${n} (>= observed keep_alive gap ${warnDist}ms as stall-risk distance)`;
+                                detail = `bot.${callee.property.name} option ${kn}=${n} (>= keep-alive kick bound ${warnDist}ms as stall-risk distance)`;
                             }
                         }
                     }
@@ -627,7 +627,7 @@ export class Coder {
                         const n = this._getNumericLiteral(node.arguments[1]);
                         if (n !== null && n >= warnDist) {
                             reportLine = node.arguments[1].loc.start.line;
-                            detail = `bot.nearestEntity second arg maxDistance=${n} (>= observed keep_alive gap ${warnDist}ms as stall-risk distance)`;
+                            detail = `bot.nearestEntity second arg maxDistance=${n} (>= keep-alive kick bound ${warnDist}ms as stall-risk distance)`;
                         }
                     }
                 }
@@ -635,7 +635,7 @@ export class Coder {
                     const n = this._getNumericLiteral(node.arguments[2]);
                     if (n !== null && n >= warnDist) {
                         reportLine = node.arguments[2].loc.start.line;
-                        detail = `getNearestBlock distance=${n} (>= observed keep_alive gap ${warnDist}ms as stall-risk distance)`;
+                        detail = `getNearestBlock distance=${n} (>= keep-alive kick bound ${warnDist}ms as stall-risk distance)`;
                     }
                 }
                 if (reportLine !== null && reportLine > preludeLines) {
@@ -906,22 +906,22 @@ export class Coder {
         }
 
         const bot = this.agent.bot;
-        const learnedMs =
+        const stallMs =
             bot &&
             typeof bot.__eventLoopStallThresholdMs === 'number' &&
             Number.isFinite(bot.__eventLoopStallThresholdMs) &&
             bot.__eventLoopStallThresholdMs > 0
                 ? bot.__eventLoopStallThresholdMs
                 : null;
-        if (learnedMs === null) {
+        if (stallMs === null) {
             warnings.push(
-                'WARNING: large-radius scan stall-risk check is OFF until the event-loop guard learns the server keep_alive interval (two inbound keep_alive packets on bot._client).\n'
+                'WARNING: large-radius scan stall-risk check is OFF until the event-loop guard sets the keep-alive kick bound.\n'
             );
         }
-        const largeScanWarnings = learnedMs === null ? [] : this._largeWorldScanLint(code, preludeLines, learnedMs);
+        const largeScanWarnings = stallMs === null ? [] : this._largeWorldScanLint(code, preludeLines, stallMs);
         if (largeScanWarnings.length > 0) {
-            const wd = learnedMs;
-            let w = `WARNING: Large-radius block/world scan (numeric distance >= ${wd} — same ms as the observed server keep_alive gap used for stall detection) may block the event loop.\n`;
+            const wd = stallMs;
+            let w = `WARNING: Large-radius block/world scan (numeric distance >= ${wd} — the keep-alive kick bound used for stall detection) may block the event loop.\n`;
             w += 'Prefer smaller maxDistance, chunk-aware iteration, or yield with await between batches.\n';
             for (const x of largeScanWarnings) {
                 w += `  Line ${x.line}: ${x.detail}\n`;
