@@ -68,7 +68,7 @@ export class Ollama {
                 if (apiResponse) {
                     res = apiResponse['message']['content'];
                 } else {
-                    res = 'No response data.';
+                    throw new Error(`[ollama] ${model}: response has no body`);
                 }
             } catch (err) {
                 if (err.code === 'OLLAMA_LEARNED_BOUND') throw err;   // fix60: a hang beyond the learned bound fails loud, never a canned reply
@@ -105,9 +105,8 @@ export class Ollama {
             break;
         }
 
-        if (finalRes == null) {
-            console.warn("Could not get a valid response after max attempts.");
-            finalRes = 'I thought too hard, sorry, try again.';
+        if (finalRes === null) {
+            throw new Error(`[ollama] ${model}: no complete response after ${maxAttempts} attempts`);
         }
         return finalRes;
     }

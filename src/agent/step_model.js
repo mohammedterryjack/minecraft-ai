@@ -1,4 +1,5 @@
 import { selectAPI, createModel } from '../models/_model_map.js';
+import { cloneModelSpec } from '../models/failover.js';
 
 // The step model must answer with one JSON object. This is the only statement of that
 // requirement; each api maps it, and an api with no mapping throws.
@@ -37,6 +38,24 @@ function copyParams(params) {
     return { ...params };
 }
 
+function rejectNonOllamaKeepAlive(selected) {
+    if (selected.api !== 'ollama' && selected.params !== undefined && Object.hasOwn(selected.params, 'keep_alive')) {
+        throw new Error(`[voyager] keep_alive is only sent for api ollama, not ${selected.api}`);
+    }
+}
+
+function applyJson(selected, label) {
+    const jsonParams = jsonModeParams(selected.api, JSON_OBJECT);
+    const merged = selected.params === undefined ? {} : { ...selected.params };
+    for (const [key, value] of Object.entries(jsonParams)) {
+        if (Object.hasOwn(merged, key) && JSON.stringify(merged[key]) !== JSON.stringify(value)) {
+            throw new Error(`[voyager] ${label}.params.${key} conflicts with JSON mode ${JSON.stringify(value)}`);
+        }
+        merged[key] = value;
+    }
+    selected.params = merged;
+}
+
 // Build the voyager step model from profile.model through selectAPI/createModel.
 // Generation options are whatever profile.model.params already names. Nothing here
 // supplies a model, url, context size, or prediction cap.
@@ -62,17 +81,16 @@ export function createStepModel(profileModel) {
         url: profileModel.url,
         params: copyParams(profileModel.params),
     });
-    if (selected.api !== 'ollama' && selected.params !== undefined && Object.hasOwn(selected.params, 'keep_alive')) {
-        throw new Error(`[voyager] keep_alive is only sent for api ollama, not ${selected.api}`);
+    rejectNonOllamaKeepAlive(selected);
+    applyJson(selected, 'profile.model');
+    if (Object.hasOwn(profileModel, 'failover')) {
+        // The failover is a second model spec. JSON mode is mapped for its own api
+        // (ollama chat `format: "json"`, https://github.com/ollama/ollama/blob/main/docs/api.md)
+        // on a copy, so the profile object is unchanged.
+        const failover = selectAPI(cloneModelSpec(profileModel.failover, 'profile.model.failover'));
+        rejectNonOllamaKeepAlive(failover);
+        applyJson(failover, 'profile.model.failover');
+        selected.failover = failover;
     }
-    const jsonParams = jsonModeParams(selected.api, JSON_OBJECT);
-    const merged = selected.params === undefined ? {} : { ...selected.params };
-    for (const [key, value] of Object.entries(jsonParams)) {
-        if (Object.hasOwn(merged, key) && JSON.stringify(merged[key]) !== JSON.stringify(value)) {
-            throw new Error(`[voyager] profile.model.params.${key} conflicts with JSON mode ${JSON.stringify(value)}`);
-        }
-        merged[key] = value;
-    }
-    selected.params = merged;
     return createModel(selected);
 }

@@ -1,6 +1,7 @@
 import { GoogleGenAI } from '@google/genai';
 import { strictFormat } from '../utils/text.js';
 import { getKey } from '../utils/keys.js';
+import { errorWithCause } from './failover.js';
 
 
 export class Gemini {
@@ -83,7 +84,6 @@ export class Gemini {
             parts: [{ text: 'SYSTEM: Vision response' }, imagePart]
         })
 
-        let res = null;
         try {
             console.log('Awaiting Google API vision response...');
             const result = await this.genAI.models.generateContent({
@@ -95,17 +95,13 @@ export class Gemini {
                 },
                 systemInstruction: systemMessage
             });
-            res = await result.text;
+            const res = await result.text;
             console.log('Received.');
+            return res;
         } catch (err) {
-            console.log(err);
-            if (err.message.includes("Image input modality is not enabled for models/")) {
-                res = "Vision is only supported by certain models.";
-            } else {
-                res = "An unexpected error occurred, please try again.";
-            }
+            const detail = err instanceof Error ? err.message : String(err);
+            throw errorWithCause(err, `[google] vision request failed: ${detail}`);
         }
-        return res;
     }
 
     async embed(text) {

@@ -22,6 +22,7 @@ const { GPT } = await import('../src/models/gpt.js');
 const { Ollama } = await import('../src/models/ollama.js');
 const { CodeModel } = await import('../src/models/code_model.js');
 const { Prompter } = await import('../src/models/prompter.js');
+const { FailoverModel } = await import('../src/models/failover.js');
 const { setSettings } = await import('../src/agent/settings.js');
 
 function step(model) {
@@ -95,6 +96,13 @@ after(() => {
     }
 });
 
+const failover = {
+    api: 'ollama',
+    model: 'qwen2.5-coder:7b',
+    url: 'http://192.168.1.215:11434',
+    params: { keep_alive: -1 },
+};
+
 const dell = {
     api: 'openai',
     model: 'Qwen3.8-Flash-Next-UD-IQ4_XS',
@@ -102,6 +110,7 @@ const dell = {
     params: {
         chat_template_kwargs: { enable_thinking: false },
     },
+    failover,
 };
 
 function assertNoCap(obj) {
@@ -113,21 +122,30 @@ function assertNoCap(obj) {
 }
 
 describe('fix106: voyager step model comes from profile.model', () => {
-    it('openai profile.model is the openai wrapper, with url, model, and JSON mode', () => {
+    it('openai profile.model is the openai client, with a declared ollama failover and JSON mode on both', () => {
         const mo = JSON.parse(readFileSync(new URL('../profiles/mo_bot.json', import.meta.url), 'utf8'));
         assert.deepEqual(mo.model, dell);
         const before = structuredClone(mo.model);
         const model = step(mo.model);
-        assert.equal(model instanceof GPT, true);
-        assert.equal(model instanceof Ollama, false);
-        assert.equal(model.model_name, dell.model);
-        assert.equal(model.url, dell.url);
-        assert.deepEqual(model.params.response_format, { type: 'json_object' });
-        assert.deepEqual(model.params.chat_template_kwargs, { enable_thinking: false });
+        assert.equal(model instanceof FailoverModel, true);
+        assert.equal(model.primary instanceof GPT, true);
+        assert.equal(model.primary instanceof Ollama, false);
+        assert.equal(model.failover instanceof Ollama, true);
+        assert.equal(model.primary.model_name, dell.model);
+        assert.equal(model.primary.url, dell.url);
+        assert.deepEqual(model.primary.params.response_format, { type: 'json_object' });
+        assert.deepEqual(model.primary.params.chat_template_kwargs, { enable_thinking: false });
+        assert.equal(model.failover.model_name, failover.model);
+        assert.equal(model.failover.url, failover.url);
+        assert.equal(model.failover.params.format, 'json');
+        assert.equal(model.failover.params.keep_alive, -1);
+        assert.equal(Object.hasOwn(model.failover.params, 'num_ctx'), false);
+        assert.equal(Object.hasOwn(model.failover.params, 'num_predict'), false);
         assert.deepEqual(mo.model.params, { chat_template_kwargs: { enable_thinking: false } });
-        assertNoCap(model.params);
-        assert.equal(Object.hasOwn(model.params, 'keep_alive'), false);
-        assert.equal(Object.hasOwn(model.params, 'format'), false);
+        assert.deepEqual(mo.model.failover.params, { keep_alive: -1 });
+        assertNoCap(model.primary.params);
+        assert.equal(Object.hasOwn(model.primary.params, 'keep_alive'), false);
+        assert.equal(Object.hasOwn(model.primary.params, 'format'), false);
         assert.deepEqual(mo.model, before);
     });
 
