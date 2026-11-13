@@ -10,7 +10,6 @@ import { promises as fs } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { selectAPI, createModel } from './_model_map.js';
-import { Ollama } from './ollama.js';
 import { writeCodePromptDump } from './code_prompt_dump.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -68,10 +67,13 @@ export class Prompter {
             let code_model_profile = selectAPI(this.profile.code_model);
             let freeFallback = null;
             if (code_model_profile.api === 'cursor') {
-                // fix33: default fallback is a coder-class model, not the chat model
-                const freeConfig = this.profile.code_model_free || { api: 'ollama', model: 'qwen2.5-coder:7b', url: 'http://192.168.1.215:11434', params: { keep_alive: -1, options: { num_ctx: 8192 } } };
-                try { freeFallback = new Ollama(freeConfig.model, freeConfig.url, freeConfig.params); console.log(`[prompter] configured FREE fallback coder: ${freeFallback.model_name} at ${freeFallback.url}`); }
-                catch (e) { console.warn(`[prompter] failed to configure free fallback coder: ${e.message}`); }
+                // fix106: the free coder is profile.code_model_free. Missing config throws; there is no substitute model.
+                const freeConfig = this.profile.code_model_free;
+                if (freeConfig === undefined || freeConfig === null || typeof freeConfig !== 'object' || Array.isArray(freeConfig)) {
+                    throw new Error(`[prompter] profile.code_model_free is missing or malformed (${JSON.stringify(freeConfig)})`);
+                }
+                freeFallback = createModel(selectAPI(freeConfig));
+                console.log(`[prompter] configured FREE fallback coder: ${freeFallback.model_name} at ${freeFallback.url}`);
             }
             this.code_model = new CodeModel(createModel(code_model_profile), 60 * 60 * 1000, 'code-model', freeFallback);
         }

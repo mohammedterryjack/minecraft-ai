@@ -1,14 +1,15 @@
 {
     "name": "icefox2000",
     "model": {
-        "api": "ollama",
-        "model": "qwen3:4b-instruct-2507-q4_K_M",
-        "url": "http://192.168.1.215:11434",
+        "api": "openai",
+        "model": "Qwen3.8-Flash-Next-UD-IQ4_XS",
+        "url": "http://192.168.1.148:8090/v1",
         "params": {
-            "keep_alive": -1,
-            "options": {
-                "num_ctx": 8192
-            }
+            "chat_template_kwargs": {
+                "enable_thinking": false
+            },
+            "max_tokens": 512,
+            "num_ctx": 8192
         }
     },
     "embedding": {
