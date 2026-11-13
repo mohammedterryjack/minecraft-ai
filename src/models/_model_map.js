@@ -1,6 +1,7 @@
 import { promises as fs } from 'fs';
 import path from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
+import { cloneModelSpec, FailoverModel } from './failover.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -10,7 +11,7 @@ const __dirname = path.dirname(__filename);
 const apiMap = await (async () => {
     const map = {};
     const files = (await fs.readdir(__dirname))
-        .filter(f => f.endsWith('.js') && f !== '_model_map.js' && f !== 'prompter.js');
+        .filter(f => f.endsWith('.js') && f !== '_model_map.js' && f !== 'prompter.js' && f !== 'failover.js');
     for (const file of files) {
         try {
             const moduleUrl = pathToFileURL(path.join(__dirname, file)).href;
@@ -85,5 +86,10 @@ export function createModel(profile) {
         throw new Error('Unknown api:', profile.api);
     }
     const model = new apiMap[profile.api](profile.model, profile.url, profile.params);
-    return model;
+    // Chat (prompter), the voyager step model, and code_model are all built here.
+    // A declared profile failover is wrapped once. A spec with no failover key
+    // is the raw client: nothing is implied.
+    if (!Object.hasOwn(profile, 'failover')) return model;
+    const failoverProfile = selectAPI(cloneModelSpec(profile.failover, 'failover'));
+    return new FailoverModel(model, createModel(failoverProfile));
 }

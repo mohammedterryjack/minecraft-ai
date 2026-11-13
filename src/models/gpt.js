@@ -1,6 +1,7 @@
 import OpenAIApi from 'openai';
 import { getKey, hasKey } from '../utils/keys.js';
 import { strictFormat } from '../utils/text.js';
+import { errorWithCause } from './failover.js';
 
 // A string third argument is the chat stop sequence. Voyager's step model passes an
 // inference-meta object in that position (the same call Ollama reads for timing). That
@@ -10,6 +11,14 @@ function stopSequence(third) {
     if (typeof third === 'string') return third;
     if (third !== null && typeof third === 'object') return undefined;
     throw new Error(`[openai] stop sequence must be a string, got ${third === null ? 'null' : typeof third}`);
+}
+
+// Our own 'Context length exceeded' throw, or the API's context_length_exceeded code.
+// This retries with a shorter turn list. It does not invent a text reply.
+function isContextLength(err) {
+    if (err instanceof Error && err.message === 'Context length exceeded') return true;
+    if (err !== null && typeof err === 'object' && err.code === 'context_length_exceeded') return true;
+    return false;
 }
 
 export class GPT {
@@ -90,16 +99,16 @@ export class GPT {
             }
         }
         catch (err) {
-            if ((err.message == 'Context length exceeded' || err.code == 'context_length_exceeded') && turns.length > 1) {
+            if (isContextLength(err) && turns.length > 1) {
                 console.log('Context length exceeded, trying again with shorter context.');
                 return await this.sendRequest(turns.slice(1), systemMessage, stop_seq);
-            } else if (err.message.includes('image_url')) {
-                console.log(err);
-                res = 'Vision is only supported by certain models.';
-            } else {
-                console.log(err);
-                res = 'My brain disconnected, try again.';
             }
+            // OpenAI Node SDK connection failures are APIConnectionError /
+            // APIConnectionTimeoutError (https://github.com/openai/openai-node#handling-errors).
+            // The original error is the cause. A text substitute was parsed as the
+            // model reply ("local model reply is not valid JSON").
+            const detail = err instanceof Error ? err.message : String(err);
+            throw errorWithCause(err, `[openai] ${model} request failed: ${detail}`);
         }
         return res;
     }

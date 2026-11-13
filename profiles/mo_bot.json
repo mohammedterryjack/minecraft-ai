@@ -8,6 +8,14 @@
             "chat_template_kwargs": {
                 "enable_thinking": false
             }
+        },
+        "failover": {
+            "api": "ollama",
+            "model": "qwen2.5-coder:7b",
+            "url": "http://192.168.1.215:11434",
+            "params": {
+                "keep_alive": -1
+            }
         }
     },
     "embedding": {
@@ -22,6 +30,14 @@
         "params": {
             "chat_template_kwargs": {
                 "enable_thinking": false
+            }
+        },
+        "failover": {
+            "api": "ollama",
+            "model": "qwen2.5-coder:7b",
+            "url": "http://192.168.1.215:11434",
+            "params": {
+                "keep_alive": -1
             }
         }
     },
