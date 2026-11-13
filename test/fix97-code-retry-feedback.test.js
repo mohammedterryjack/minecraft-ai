@@ -24,9 +24,10 @@ import { codeRetryFeedback } from '../src/agent/voyager.js';
 import { CODE_PROMPT_DUMP, writeCodePromptDump } from '../src/models/code_prompt_dump.js';
 import { CODE_RETRY_78, observedChatWork } from './fixtures/code_retry_observation.js';
 
-const profile = JSON.parse(readFileSync(new URL('../profiles/mo_bot.json', import.meta.url), 'utf8'));
-const NUM_CTX = profile.code_model.params.options.num_ctx;
-const KEY = `${profile.code_model.model} /api/chat`;
+// The overflow was counted on qwen2.5-coder:7b against num_ctx 8192 (CODE_RETRY_78).
+// mo_bot.json code_model is the Dell openai server and no longer names that context.
+const NUM_CTX = CODE_RETRY_78.contextTokens;
+const KEY = 'qwen2.5-coder:7b /api/chat';
 
 // Same path as the live bound: workOf reads prompt_eval_count, recordCall stores chars/that as cpt,
 // callBound estimates ceil(chars / cpt). The cpt is CODE_RETRY_78, the one live count. No local tokenizer.
@@ -60,7 +61,6 @@ describe('fix97 code-retry feedback is compact by construction', () => {
         const sections = [CODE_RETRY_78.systemChars, CODE_RETRY_78.skillsChars, CODE_RETRY_78.preludeChars, CODE_RETRY_78.stateChars, CODE_RETRY_78.historyChars, CODE_RETRY_78.retryChars, CODE_RETRY_78.framingChars];
         assert.strictEqual(sections.reduce((sum, n) => sum + n, 0), CODE_RETRY_78.totalChars);
         assert.strictEqual(CODE_RETRY_78.totalChars - CODE_RETRY_78.userChars, CODE_RETRY_78.systemMessageChars);
-        assert.strictEqual(NUM_CTX, CODE_RETRY_78.contextTokens);
         const cpt = learnLiveDensity();
         const sameShape = cd.requestShape('/api/chat', { messages: [{ role: 'user', content: 'x'.repeat(CODE_RETRY_78.totalChars) }], options: { num_ctx: NUM_CTX } });
         assert.strictEqual(cd.callBound(KEY, sameShape).pTok, CODE_RETRY_78.promptTokens);

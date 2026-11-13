@@ -20,6 +20,7 @@ if (process.env.OPENAI_API_KEY === undefined || process.env.OPENAI_API_KEY.lengt
 const { Voyager } = await import('../src/agent/voyager.js');
 const { GPT } = await import('../src/models/gpt.js');
 const { Ollama } = await import('../src/models/ollama.js');
+const { CodeModel } = await import('../src/models/code_model.js');
 const { Prompter } = await import('../src/models/prompter.js');
 const { setSettings } = await import('../src/agent/settings.js');
 
@@ -100,10 +101,16 @@ const dell = {
     url: 'http://192.168.1.148:8090/v1',
     params: {
         chat_template_kwargs: { enable_thinking: false },
-        max_tokens: 512,
-        num_ctx: 8192,
     },
 };
+
+function assertNoCap(obj) {
+    assert.equal(Object.hasOwn(obj, 'max_tokens'), false);
+    assert.equal(Object.hasOwn(obj, 'max_completion_tokens'), false);
+    assert.equal(Object.hasOwn(obj, 'num_ctx'), false);
+    assert.equal(Object.hasOwn(obj, 'num_predict'), false);
+    assert.equal(Object.hasOwn(obj, 'n_predict'), false);
+}
 
 describe('fix106: voyager step model comes from profile.model', () => {
     it('openai profile.model is the openai wrapper, with url, model, and JSON mode', () => {
@@ -117,8 +124,8 @@ describe('fix106: voyager step model comes from profile.model', () => {
         assert.equal(model.url, dell.url);
         assert.deepEqual(model.params.response_format, { type: 'json_object' });
         assert.deepEqual(model.params.chat_template_kwargs, { enable_thinking: false });
-        assert.equal(model.params.max_tokens, 512);
-        assert.equal(model.params.num_ctx, 8192);
+        assert.deepEqual(mo.model.params, { chat_template_kwargs: { enable_thinking: false } });
+        assertNoCap(model.params);
         assert.equal(Object.hasOwn(model.params, 'keep_alive'), false);
         assert.equal(Object.hasOwn(model.params, 'format'), false);
         assert.deepEqual(mo.model, before);
@@ -164,8 +171,7 @@ describe('fix106: voyager step model comes from profile.model', () => {
             assert.equal(body.model, dell.model);
             assert.deepEqual(body.response_format, { type: 'json_object' });
             assert.deepEqual(body.chat_template_kwargs, { enable_thinking: false });
-            assert.equal(body.max_tokens, 512);
-            assert.equal(body.num_ctx, 8192);
+            assertNoCap(body);
             assert.equal(Object.hasOwn(body, 'keep_alive'), false);
             assert.equal(Object.hasOwn(body, 'format'), false);
             assert.equal(Object.hasOwn(body, 'stop'), false);
@@ -226,6 +232,70 @@ describe('fix106: voyager step model comes from profile.model', () => {
         assert.equal(src.includes('192.168.'), false);
         assert.equal(src.includes('qwen3:4b'), false);
         assert.equal(src.includes('createStepModel'), true);
+        const factory = readFileSync(new URL('../src/agent/step_model.js', import.meta.url), 'utf8');
+        assert.equal(factory.includes('max_tokens'), false);
+        assert.equal(factory.includes('num_ctx'), false);
+        assert.equal(factory.includes('num_predict'), false);
+    });
+});
+
+describe('fix106: code model is the Dell openai server and is not JSON mode', () => {
+    const NAME = 'fix106-code-model';
+    after(() => rmSync(`./bots/${NAME}`, { recursive: true, force: true }));
+
+    it('mo_bot code_model matches model; embedding and code_model_free stay on .215', () => {
+        const mo = JSON.parse(readFileSync(new URL('../profiles/mo_bot.json', import.meta.url), 'utf8'));
+        assert.deepEqual(mo.code_model, mo.model);
+        assert.deepEqual(mo.code_model, dell);
+        assert.equal(mo.embedding.url, 'http://192.168.1.215:11434');
+        assert.equal(mo.embedding.model, 'nomic-embed-text');
+        assert.equal(mo.code_model_free.url, 'http://192.168.1.215:11434');
+        assert.equal(mo.code_model_free.model, 'qwen2.5-coder:7b');
+    });
+
+    it('prompter builds api openai through the factory, and the request has no JSON mode or generation cap', async () => {
+        const { server, seen, port } = await listen();
+        const { default: agentSettings } = await import('../src/agent/settings.js');
+        const saved = { ...agentSettings };
+        setSettings({ base_profile: 'assistant' });
+        try {
+            const profile = {
+                name: NAME,
+                model: { api: 'ollama', model: 'chat-test', url: 'http://127.0.0.1:9', params: { keep_alive: -1 } },
+                code_model: {
+                    api: 'openai',
+                    model: dell.model,
+                    url: `http://127.0.0.1:${port}/v1`,
+                    params: { chat_template_kwargs: { enable_thinking: false } },
+                },
+                embedding: { api: 'ollama', model: 'nomic-embed-text', url: 'http://127.0.0.1:9', params: { keep_alive: -1 } },
+            };
+            const prompter = new Prompter({ name: NAME }, profile);
+            const coder = prompter.code_model;
+            assert.equal(coder instanceof CodeModel, true);
+            assert.equal(coder.primary instanceof GPT, true);
+            assert.equal(coder.primary instanceof Ollama, false);
+            assert.equal(coder.primary.model_name, dell.model);
+            assert.equal(coder.primary.url, `http://127.0.0.1:${port}/v1`);
+            assert.deepEqual(coder.primary.params, { chat_template_kwargs: { enable_thinking: false } });
+            assert.equal(Object.hasOwn(coder.primary.params, 'response_format'), false);
+            assert.equal(Object.hasOwn(coder.primary.params, 'format'), false);
+            assertNoCap(coder.primary.params);
+            const reply = await coder.sendRequest([{ role: 'user', content: 'write a codeblock' }], 'system');
+            assert.equal(reply, '{}');
+            assert.equal(seen.length, 1);
+            assert.equal(seen[0].url, '/v1/chat/completions');
+            const body = seen[0].body;
+            assert.equal(body.model, dell.model);
+            assert.deepEqual(body.chat_template_kwargs, { enable_thinking: false });
+            assert.equal(Object.hasOwn(body, 'response_format'), false);
+            assert.equal(Object.hasOwn(body, 'format'), false);
+            assert.equal(Object.hasOwn(body, 'keep_alive'), false);
+            assertNoCap(body);
+        } finally {
+            setSettings(saved);
+            await close(server);
+        }
     });
 });
 
