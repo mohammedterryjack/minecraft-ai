@@ -2,6 +2,16 @@ import OpenAIApi from 'openai';
 import { getKey, hasKey } from '../utils/keys.js';
 import { strictFormat } from '../utils/text.js';
 
+// A string third argument is the chat stop sequence. Voyager's step model passes an
+// inference-meta object in that position (the same call Ollama reads for timing). That
+// object is not a stop sequence and must not be written into the request.
+function stopSequence(third) {
+    if (third === undefined) return '***';
+    if (typeof third === 'string') return third;
+    if (third !== null && typeof third === 'object') return undefined;
+    throw new Error(`[openai] stop sequence must be a string, got ${third === null ? 'null' : typeof third}`);
+}
+
 export class GPT {
     static prefix = 'openai';
     constructor(model_name, url, params) {
@@ -22,11 +32,14 @@ export class GPT {
     }
 
     async sendRequest(turns, systemMessage, stop_seq='***') {
+        const stop = stopSequence(stop_seq);
         let messages = strictFormat(turns);
-        messages = messages.map(message => {
-            message.content += stop_seq;
-            return message;
-        });
+        if (stop !== undefined) {
+            messages = messages.map(message => {
+                message.content += stop;
+                return message;
+            });
+        }
         let model = this.model_name || "gpt-5.4-mini";
 
         let res = null;
@@ -41,7 +54,7 @@ export class GPT {
                 const pack = {
                     model: model,
                     messages,
-                    stop: stop_seq,
+                    ...(stop === undefined ? {} : { stop }),
                     ...(this.params || {})
                 };
                 if (model.includes('o1') || model.includes('o3') || model.includes('5')) {
@@ -56,10 +69,12 @@ export class GPT {
             // otherwise, use responses
             else {
                 let messages = strictFormat(turns);
-                messages = messages.map(message => {
-                    message.content += stop_seq;
-                    return message;
-                });
+                if (stop !== undefined) {
+                    messages = messages.map(message => {
+                        message.content += stop;
+                        return message;
+                    });
+                }
                 const response = await this.openai.responses.create({
                     model: model,
                     instructions: systemMessage,
@@ -68,8 +83,10 @@ export class GPT {
                 });
                 console.log('Received.');
                 res = response.output_text;
-                let stop_seq_index = res.indexOf(stop_seq);
-                res = stop_seq_index !== -1 ? res.slice(0, stop_seq_index) : res;
+                if (stop !== undefined) {
+                    let stop_seq_index = res.indexOf(stop);
+                    res = stop_seq_index !== -1 ? res.slice(0, stop_seq_index) : res;
+                }
             }
         }
         catch (err) {

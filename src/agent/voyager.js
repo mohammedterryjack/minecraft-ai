@@ -26,7 +26,8 @@ import { makeCompartment } from './library/lockdown.js';
 import { getAllItems, getAllBlocks, getItemCraftingRecipes, isHostile, isDatapackHostile } from '../utils/mcdata.js';
 import { cosineSimilarity } from '../utils/math.js';
 import minecraftData from 'minecraft-data';
-import { Ollama, CONTEXT_FULL } from '../models/ollama.js';
+import { CONTEXT_FULL } from '../models/ollama.js';
+import { createStepModel } from './step_model.js';
 import { setCallDurationStore } from '../models/call_durations.js';
 import { setMovementStore, learnedKinds, recordStep, recordCut, stepBound, noteUnbounded } from '../utils/movement_model.js';
 import { signatureOf, depsOf, missingCalls, installViolations, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf, thrownIn, declaredNames, skillSourceViolations, splitGeneratedCode, oneFunctionFeedback, entryCallFeedback, markerCallsMissing, markerGateNames, collapseRepeats, parsesAsScript, pastedLibrarySkills, groupVaryingLines, structuredTrace, flatCopy } from './skill_graph.js';
@@ -61,7 +62,6 @@ export const CONTRACT_EVAL = 'pending its first recorded call';
 // fix70: the API-lint failure in the repair evidence the code model sees. One definition for the startup re-lint and the
 // repair-time re-lint, so both evidences are the same text. fix96: the whole lint text (it was cut at 600 chars).
 const apiLintEvidence = (name, lint) => `${name} does not lint against the current built-in API, so it cannot run: ${String(lint).replace(/\s+/g, ' ')}`;
-const LOCAL = { model: 'qwen3:4b-instruct-2507-q4_K_M', url: 'http://192.168.1.215:11434', params: { format: 'json', options: { num_ctx: 8192, num_predict: 512 } } };   // fix38: raised from 150 to 512 - short JSON replies still need room for reasoning; truncation fails loudly (fix31)
 export const CALLS = { local: 0, code: 0, replay: 0 };
 
 // fix68b: PSN parent is __syncParent inside instrumentSrc (no AsyncLocalStorage — CVE-2025-59466)
@@ -81,7 +81,7 @@ const HUT = { get x() { return HOME.x; }, get y() { return HOME.y + 1; }, get z(
 // fix27: fixed milestone ordering removed; the curriculum learns what to do next
 
 // tolerant JSON: strip fences, fix stray backslashes / trailing commas, then fall back to field regexes
-// fix31: local (Ollama format=json) replies must be complete JSON with the required keys - no salvage, fail loudly
+// fix31: step-model JSON-mode replies must be complete JSON with the required keys - no salvage, fail loudly
 export function parseLocalJSON(text, keys) {
     let o; try { o = JSON.parse(String(text)); } catch (e) { throw new Error('local model reply is not valid JSON: ' + String(text).slice(0, 200)); }
     const miss = keys.filter(k => !(k in o)); if (miss.length) throw new Error(`local model reply lacks ${miss.join(', ')}: ` + String(text).slice(0, 200));
@@ -3890,12 +3890,18 @@ Use only c; no other globals.`;
         if (npFacts) lines.push('', npFacts);
         return lines.join('\n');
     }
+    // fix106: curriculum and critic use profile.model, through the same factory as the prompter.
     _local() {
-        if (!this.__local) this.__local = new Ollama(LOCAL.model, LOCAL.url, { ...LOCAL.params, keep_alive: this.agent.prompter.profile.model?.params?.keep_alive });
+        if (!this.__local) {
+            const prompter = this.agent.prompter;
+            if (prompter === undefined || prompter === null) throw new Error('[voyager] agent.prompter is missing');
+            const profile = prompter.profile;
+            if (profile === undefined || profile === null) throw new Error('[voyager] prompter.profile is missing');
+            this.__local = createStepModel(profile.model);
+        }
         return this.__local;
     }
-    // small local model (Mac Studio Ollama) for curriculum + critic judgment; unloads after 5 min idle
-    // fix31: one local request in flight at a time (solo decode speed; Ollama keeps a prefix-cache slot per prompt type)
+    // fix31: one step-model request in flight at a time (solo decode speed; the server keeps a prefix-cache slot per prompt type)
     _ensureInferCover() {
         if (!this._inferCover) {
             this._inferCover = createInferenceCover({
