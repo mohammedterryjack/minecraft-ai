@@ -1,3 +1,4 @@
+import fs from 'fs';
 import minecraftData from 'minecraft-data';
 import settings from '../agent/settings.js';
 import rootSettings from '../../settings.js';
@@ -75,42 +76,68 @@ export function initBot(username) {
 
     const bot = createBot(options);
 
-    // Throttle position packets to avoid kicks on Paper/Spigot servers
-    // Paper enforces stricter packet rate limits than vanilla, causing ECONNRESET
-    // when mineflayer sends position updates faster than 50ms apart
-    let lastPositionUpdate = 0;
-    let pendingPositionPacket = null;
-    const POSITION_THROTTLE_MS = 50;
+    // fix108: movement wire guard. mineflayer physics already paces packets at the vanilla
+    // 20/s and already drops non-finite position/position_look (physics.js sendPacketPosition/
+    // sendPacketPositionAndLook). We keep an equivalent loud safety net here for any packet
+    // written outside physics (library/skill code writing bot._client.write directly).
+    // 'flying' is intentionally NOT coord-checked: on 1.20.4 mineflayer's flying keep-alive
+    // carries only {onGround,flags}, no x/y/z (physics.js:198).
     const originalWrite = bot._client.write.bind(bot._client);
+    const MOVE_DEBUG = process.env.MCDATA_MOVE_DEBUG;
+    const moveLog = [];
+    function logMove(name, data) {
+        if (!MOVE_DEBUG) return;
+        moveLog.push({ t: Date.now(), name, x: data && data.x, y: data && data.y, z: data && data.z, yaw: data && data.yaw, pitch: data && data.pitch });
+        if (moveLog.length > 6000) moveLog.shift();
+    }
+    bot._client._mcdataMoveLog = moveLog;
+    function dumpMove(tag, extra) {
+        if (!MOVE_DEBUG) return;
+        try { fs.writeFileSync(MOVE_DEBUG, JSON.stringify({ when: new Date().toISOString(), tag, extra, moves: moveLog })); } catch (e) { console.error('[mcdata] move dump failed', e.message); }
+    }
     bot._client.write = function(name, data) {
-        // ViaProxy->26.x workaround: never send NaN coords (server kicks "invalid move"); reset to last good state
-        if ((name === "position" || name === "position_look") && data && (isNaN(data.x) || isNaN(data.y) || isNaN(data.z) || data.x === null)) {
+        if ((name === "position" || name === "position_look") && data &&
+            !(Number.isFinite(data.x) && Number.isFinite(data.y) && Number.isFinite(data.z))) {
+            console.error(`[mcdata] REJECT ${name} with non-finite position x=${data.x} y=${data.y} z=${data.z}; restored last good position`);
             const e = bot.entity; if (e) { if (bot._lastGoodPos) e.position = bot._lastGoodPos.clone(); e.velocity.x = 0; e.velocity.y = 0; e.velocity.z = 0; }
             return;
         }
-        if ((name === "position" || name === "position_look") && data && bot.entity) bot._lastGoodPos = bot.entity.position.clone();
-        if (name === 'position' || name === 'position_look' || name === 'look') {
-            const now = Date.now();
-            if (now - lastPositionUpdate < POSITION_THROTTLE_MS) {
-                // Queue this packet so the last position update is never lost
-                if (!pendingPositionPacket) {
-                    pendingPositionPacket = setTimeout(() => {
-                        pendingPositionPacket = null;
-                        lastPositionUpdate = Date.now();
-                        originalWrite(name, data);
-                    }, POSITION_THROTTLE_MS - (now - lastPositionUpdate));
-                }
-                return;
-            }
-            lastPositionUpdate = now;
-            if (pendingPositionPacket) {
-                clearTimeout(pendingPositionPacket);
-                pendingPositionPacket = null;
-            }
+        // Vanilla ServerGamePacketListenerImpl.handleMovePlayer rejects non-finite yaw/pitch
+        // with multiplayer.disconnect.invalid_player_movement; mineflayer physics guards
+        // position (physics.js:104,130) but NOT rotation. Mirror mineflayer's own salvage
+        // pattern (drop the corrupt component, keep the packet valid, log loudly): substitute
+        // the last finite rotation so position sync continues and the server never sees NaN.
+        if ((name === "look" || name === "position_look") && data &&
+            !(Number.isFinite(data.yaw) && Number.isFinite(data.pitch))) {
+            const rot = bot._mcLastGoodRot || { yaw: 0, pitch: 0 };
+            const ee = bot.entity || {};
+            console.error(`[mcdata] REPAIR ${name} non-finite rotation yaw=${data.yaw} pitch=${data.pitch} (entity.yaw=${ee.yaw} entity.pitch=${ee.pitch}) -> substituting last good yaw=${rot.yaw} pitch=${rot.pitch}`, new Error('look-caller').stack);
+            data.yaw = rot.yaw; data.pitch = rot.pitch;
         }
-        return originalWrite(name, data);
+        if ((name === "look" || name === "position_look") && data && Number.isFinite(data.yaw) && Number.isFinite(data.pitch)) {
+            bot._mcLastGoodRot = { yaw: data.yaw, pitch: data.pitch };
+        }
+        if ((name === "position" || name === "position_look") && data && bot.entity) bot._lastGoodPos = bot.entity.position.clone();
+        // fix108: write every packet through; a failed write is loud. Do NOT synthesize extra
+        // packets here. The removed uncommitted 'tick_end' pair was fatal: serverbound Tick End
+        // only exists from 1.21.3 on (minecraft-data defines packet_tick_end starting at 1.21.3),
+        // so on the configured 1.20.4 protocol the name is unmapped and protodef emitted it as
+        // packet id 0x00 — reserved on 1.20.3/1.20.4 for Accept Teleportation (VarInt teleportId).
+        // ViaProxy's ViaBackwards v26_3to26_2 EntityPacketRewriter26_3 crashed on that empty body
+        // ("ERROR IN Protocol26_3To26_2 IN REMAP OF ACCEPT_TELEPORTATION (0x00)",
+        // IndexOutOfBoundsException) and kicked the bot ~1s after every login.
+        logMove(name, data);
+        if (name === 'position' || name === 'position_look' || name === 'look' || name === 'flying') {
+            try {
+                return originalWrite(name, data);
+            } catch (err) {
+                console.error(`[mcdata] write(${name}) failed: ${err && err.message ? err.message : err}`);
+                throw err;
+            }
+        } else {
+            return originalWrite(name, data);
+        }
     };
-
     // Suppress PartialReadError for non-critical packets
     // Paper servers sometimes send packets that node-minecraft-protocol
     // can't fully parse (scoreboard, resource_pack, custom_payload, etc.)
@@ -129,6 +156,72 @@ export function initBot(username) {
     };
 
     bot.loadPlugin(pathfinder);
+    // fix109: enforce the vanilla invariant "rotation is always finite" on bot.entity.
+    // Root cause of the kick loop: a replayed skill calls bot.lookAt() on a Vec3 built with
+    // Vec3.add(Vec3) (Vec3.add takes x,y,z numbers, so the result is NaN); mineflayer's
+    // bot.look then does `bot.entity.yaw += yawChange` (physics.js:347) and the physics loop
+    // does `lastSentYaw += clamp(-max, NaN, max)` (physics.js:169) — both permanently poison
+    // rotation, every move packet then carries NaN yaw/pitch, and
+    // ServerGamePacketListenerImpl.handleMovePlayer kicks with
+    // multiplayer.disconnect.invalid_player_movement ("Invalid move player packet received").
+    // Reject non-finite rotation writes at the entity, loudly, keeping the last finite value.
+    bot.on('spawn', () => {
+        const e = bot.entity; if (!e || e.__mcdataRotGuard) return;
+        e.__mcdataRotGuard = true;
+        let _yaw = e.yaw, _pitch = e.pitch;
+        Object.defineProperty(e, 'yaw', {
+            configurable: true,
+            get: () => _yaw,
+            set: (v) => {
+                if (!Number.isFinite(v)) { console.error(`[mcdata] BLOCKED entity.yaw write of ${v} (kept ${_yaw})`, new Error('yaw-setter').stack); return; }
+                _yaw = v;
+            }
+        });
+        Object.defineProperty(e, 'pitch', {
+            configurable: true,
+            get: () => _pitch,
+            set: (v) => {
+                if (!Number.isFinite(v)) { console.error(`[mcdata] BLOCKED entity.pitch write of ${v} (kept ${_pitch})`, new Error('pitch-setter').stack); return; }
+                _pitch = v;
+            }
+        });
+    });
+    // Reject non-finite inputs at the API boundary too, so bot.look()/lookAt() cannot hang:
+    // a NaN look can never converge, and physics' lookingTask promise stayed pending forever,
+    // wedging generated code until mindcraft's "Code execution refused stop after 10 seconds"
+    // killed the process (action_manager.js:46).
+    const _origLook = bot.look;
+    bot.look = function (yaw, pitch, ...rest) {
+        if (!Number.isFinite(yaw) || !Number.isFinite(pitch)) {
+            console.error(`[mcdata] bot.look() called with non-finite yaw=${yaw} pitch=${pitch}; ignored, keeping current rotation`, new Error('look-caller').stack);
+            return Promise.resolve();
+        }
+        return _origLook.call(this, yaw, pitch, ...rest);
+    };
+    const _origLookAt = bot.lookAt;
+    bot.lookAt = function (position, ...rest) {
+        if (!position || !Number.isFinite(position.x) || !Number.isFinite(position.y) || !Number.isFinite(position.z)) {
+            console.error(`[mcdata] bot.lookAt() called with non-finite position ${position}; ignored, keeping current rotation`, new Error('look-caller').stack);
+            return Promise.resolve();
+        }
+        return _origLookAt.call(this, position, ...rest);
+    };
+    if (MOVE_DEBUG) {
+        bot.once('kicked', (reason) => dumpMove('kicked', reason));
+        bot.once('error', (e) => dumpMove('error', String(e && e.message)));
+        bot.once('end', (r) => dumpMove('end', String(r)));
+        bot.once('spawn', () => {
+            // record incoming server teleports (physics.js sets entity rotation/position from them)
+            bot._client.on('position', (p) => {
+                moveLog.push({ t: Date.now(), dir: 'in', name: 'position', x: p.x, y: p.y, z: p.z, yaw: p.yaw, pitch: p.pitch, teleportId: p.teleportId, flags: p.flags });
+                if (!(Number.isFinite(p.x) && Number.isFinite(p.y) && Number.isFinite(p.z) && Number.isFinite(p.yaw) && Number.isFinite(p.pitch))) {
+                    console.error(`[mcdata] INBOUND position packet has non-finite field x=${p.x} y=${p.y} z=${p.z} yaw=${p.yaw} pitch=${p.pitch} teleportId=${p.teleportId}`);
+                } else {
+                    console.log(`[mcdata] inbound server teleport x=${p.x} y=${p.y} z=${p.z} yaw=${p.yaw} pitch=${p.pitch}`);
+                }
+            });
+        });
+    }
     bot.loadPlugin(pvp);
     bot.loadPlugin(collectblock);
     // fix70: mineflayer-auto-eat is not loaded. fix18 (a0009a1) made eating a learned skill and called autoEat.disable(), but
