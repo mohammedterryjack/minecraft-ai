@@ -5,6 +5,7 @@ import rootSettings from '../../settings.js';
 import { createBot } from 'mineflayer';
 import prismarine_items from 'prismarine-item';
 import { pathfinder } from 'mineflayer-pathfinder';
+import { installCachedBestHarvestTool } from './harvest_tool_cache.js';
 import { plugin as pvp } from 'mineflayer-pvp';
 import { plugin as collectblock } from 'mineflayer-collectblock';
 import plugin from 'mineflayer-armor-manager';
@@ -156,6 +157,12 @@ export function initBot(username) {
     };
 
     bot.loadPlugin(pathfinder);
+    // fix114: wrap the pathfinder's bestHarvestTool default in a per-(block name,
+    // inventory, effects) cache. The default nbt-decodes every tool per inventory
+    // item per A* node (mineflayer-pathfinder index.js:46); the world-exhaust
+    // reachability searches (world.js pathToBlock) made that half the CPU and the
+    // top allocator (965 MB -> 2.19 GB RSS in 6 h live). Same answers, computed once.
+    installCachedBestHarvestTool(bot);
     // fix109: enforce the vanilla invariant "rotation is always finite" on bot.entity.
     // Root cause of the kick loop: a replayed skill calls bot.lookAt() on a Vec3 built with
     // Vec3.add(Vec3) (Vec3.add takes x,y,z numbers, so the result is NaN); mineflayer's
