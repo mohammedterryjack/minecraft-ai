@@ -890,8 +890,9 @@ function stateAt(index, x, y, z, view) {
 // ChunkOcclusionDataBuilder / ChunkOcclusionData (yarn 1.20.4, net.minecraft.client.render.chunk) is that graph.
 // observe() BFS-es sections from the eye, steps through a connected face pair, and only away from the eye,
 // inside the loaded view square (https://minecraft.wiki/w/Render_distance). A buried cave section is never a
-// candidate. The graph is built when the chunk loads, one column per turn, and rebuilt for a section on
-// blockUpdate. mineflayer forwards chunkColumnLoad, chunkColumnUnload, and blockUpdate from the world
+// candidate. The graph is built when the chunk loads, one column per turn; a blockUpdate marks its sections dirty and one
+// flush per turn rebuilds each dirty section once (fix112), with queries flushing first so scans stay fresh.
+// mineflayer forwards chunkColumnLoad, chunkColumnUnload, and blockUpdate from the world
 // (mineflayer lib/plugins/blocks.js forwardedEvents; prismarine-world worldsync.js).
 function viewContext(bot) {
     const eye = eyeOf(bot);
@@ -1367,6 +1368,17 @@ function reindexSectionAt(idx, ctx, x, y, z, done) {
     built.sections[si] = indexSection(idx, ctx, cx, cz, si, column);
 }
 
+// fix112: a blockUpdate event reindexes up to 7 16³ sections (4096 cell reads plus a visibility graph each).
+// mineflayer emits one blockUpdate per block it receives — blocks.js updateBlockState calls prismarine-world
+// worldsync.js setBlockStateId, which calls _emitBlockUpdate (node_modules/prismarine-world/src/worldsync.js),
+// and the multi_block_change handler loops updateBlockState over every record (node_modules/mineflayer/lib/
+// plugins/blocks.js). One chunk stream or one server "force-sending blocks" burst is thousands of events;
+// reindexing per event blocked the main thread past the 30 s keep-alive watchdog (kill stacks 2026-11-15
+// T10:31:10Z: update_light -> updateBlockState -> _emitBlockUpdate -> onBlockUpdate -> reindexSectionAt ->
+// indexSection -> faceOpen -> stateAt) and allocated a section's worth of typed arrays per event. Events now
+// only validate the position, keep the fix103 pending invariant, and mark the block dirty; one flush per turn
+// reindexes each touched section once. A query flushes before reading (flushDirtySections), so no scan ever
+// sees a stale section.
 function onBlockUpdate(bot, idx, oldBlock, newBlock) {
     const pos = (newBlock && newBlock.position) || (oldBlock && oldBlock.position);
     if (!pos || !Number.isFinite(pos.x) || !Number.isFinite(pos.y) || !Number.isFinite(pos.z)) {
@@ -1374,9 +1386,27 @@ function onBlockUpdate(bot, idx, oldBlock, newBlock) {
     }
     const ctx = viewContext(bot);
     syncView(bot, idx, ctx);
+    idx.dirty.set(`${pos.x},${pos.y},${pos.z}`, pos);
+    if (!idx.flushScheduled) {
+        idx.flushScheduled = true;
+        setImmediate(() => {
+            idx.flushScheduled = false;
+            if (idx.dirty.size) flushDirtySections(bot, idx);
+        });
+    }
+}
+
+// Reindexes every dirty position's own section and the sections its six faces touch, once each (the done set),
+// then clears the dirty marks. Positions that arrive during the flush are taken by the next one.
+function flushDirtySections(bot, idx) {
+    const positions = [...idx.dirty.values()];
+    idx.dirty.clear();
+    const ctx = viewContext(bot);
     const done = new Set();
-    reindexSectionAt(idx, ctx, pos.x, pos.y, pos.z, done);
-    for (const [fx, fy, fz] of FACES) reindexSectionAt(idx, ctx, pos.x + fx, pos.y + fy, pos.z + fz, done);
+    for (const pos of positions) {
+        reindexSectionAt(idx, ctx, pos.x, pos.y, pos.z, done);
+        for (const [fx, fy, fz] of FACES) reindexSectionAt(idx, ctx, pos.x + fx, pos.y + fy, pos.z + fz, done);
+    }
     // Visibility was confirmed from the last eye cell through these sections. A cell change there can open or
     // close a ray. A change outside that set cannot: the walk never entered it.
     if (idx.reachedKeys) {
@@ -1392,6 +1422,7 @@ function ensureIndex(bot) {
     }
     idx = {
         columns: new Map(), queue: [], pending: new Set(), drain: [], pumping: false,
+        dirty: new Map(), flushScheduled: false,
         cellReads: 0, sectionsBuilt: 0, sectionsSkipped: 0, builds: 0, buildMs: 0, open: new Map(),
         visGen: 0, vis: null, reachedKeys: new Set(),
     };
@@ -1658,6 +1689,7 @@ function perceivedBlocks(bot) {
     const ctx = viewContext(bot);
     if (!ctx.columns.has(standingKey(ctx))) throw missingStanding(ctx);
     const idx = ensureIndex(bot);
+    if (idx.dirty.size) flushDirtySections(bot, idx);
     dropOutsideView(idx, ctx);
     if (!idx.columns.has(standingKey(ctx))) buildColumn(idx, ctx, ctx.stoodX, ctx.stoodZ);
     syncView(bot, idx, ctx);
@@ -1675,6 +1707,7 @@ export async function perceivedPosition(bot, name) {
     const ctx = viewContext(bot);
     const idx = perceivedIndex.get(bot);
     if (!idx || !idx.columns.has(standingKey(ctx))) throw missingStanding(ctx);
+    if (idx.dirty.size) flushDirtySections(bot, idx);
     const seen = confirmVisible(ctx, idx, name);
     return seen.position;
 }
