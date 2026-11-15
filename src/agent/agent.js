@@ -184,7 +184,14 @@ export class Agent {
             "Set the difficulty to",
             "Teleported ",
             "Set the weather to",
-            "Gamerule "
+            "Gamerule ",
+            // fix118: 26.x reworded command feedback and it arrives attributed to the op player,
+            // so the 1.20 strings above never match ("Set minecraft:overworld to time marker
+            // minecraft:night]", "Gave 1 [Cherry Leaves] to S4ku24_Moonglich]"). The bot was
+            // answering these like chat (live: 17:5x, replied !stay(600) twice to a time marker).
+            "Set minecraft:",
+            "Gave ",
+            "Took ",
         ];
         
         const respondFunc = async (username, message) => {
