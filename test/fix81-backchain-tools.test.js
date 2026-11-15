@@ -374,8 +374,11 @@ describe('fix81: _backchain chains on the missing item, not only the goal item',
     it('a single named need is planned through the learned graph, produced, and the goal route retried', async () => {
         const v = mkV({ inv: {}, nearby: [] });
         delete v._backchain;
+        // fix111: plan steps name library skills (_chain only ever pushes this.skills names); _planStepCall
+        // fails loud on a name the library does not have, so the simulated plan's producer is in the library.
+        v.skills.push({ name: 'craftSticks', task: 'Craft 3 sticks', deps: [], effects: ['stick'], consumes: {}, code: 'async function craftSticks(bot) { return true; }', stats: { success: 1, fail: 0, tasks: [] } });
         const asked = [];
-        v._chain = (item, want, inv, depth, plan) => { asked.push([item, want]); plan.push({ name: 'craftSticks', item: 'stick' }); return true; };
+        v._chain = (item, want, inv, depth, plan) => { asked.push([item, want]); plan.push({ name: 'craftSticks', item: 'stick', need: 3 }); return true; };
         const runs = [];
         v._replay = async (task, before, r) => { runs.push(`${task} via ${r.name}`); return { ok: true, name: r.name }; };
         const rp = await v._backchain('Craft 1 stone_pickaxe', { inventory: { stick: 1 } }, [{ item: 'stick', count: 2, reason: 'ingredients', source: 'reported' }]);
