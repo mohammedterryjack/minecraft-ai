@@ -6971,6 +6971,23 @@ Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
         if (bad) return bad;
         const g = this._resolveGoal(task);
         if (g.kind === 'invalid') return g.why;
+        // fix120: an item goal the inventory cannot physically hold is rejected before an attempt
+        // is spent. Minecraft's pickup rule: a dropped item stays on the ground unless some slot
+        // is empty or holds a non-full stack of that item (minecraft.wiki/w/Inventory); with 0-1
+        // empty slots the "Obtain 1 rotten_flesh / spider_eye / tropical_fish" and
+        // "Obtain 4 glass_bottle" tasks (15 Nov, 343 items held) could not complete and burned
+        // 4 attempts each ("INVENTORY FULL DETECTED" at the end of every attempt). Same
+        // registry math as the fix92 capacity layer (roomFor counts partial stacks + empty
+        // slots). The reason text flows into the fix90 re-proposal loop, which names the
+        // space-freeing skills (tossClutter / depositToChest are in the curriculum's known
+        // skills, fix39). Goals parsed before a bot exists (constructor-time poly-merge, fix52)
+        // and goal items with no item entry in the registry (block-only names) have no capacity
+        // to consult.
+        const capBot = this.agent?.bot;
+        if (g.kind === 'item' && capBot?.inventory?.slots && capBot.registry?.itemsByName?.[g.item]) {
+            const room = roomFor(capBot.registry, stackableCounts(capBot), g.item);
+            if (room < g.count) return `inventory cannot hold ${g.count} ${g.item} (room for ${room}); free space first: propose tossClutter or depositToChest`;
+        }
         if (!fromPlanner) return null;
         if (state !== undefined && state !== null) return this._goalStateBackedOff(task, state);
         return this._goalBackedOff(task);
@@ -8527,7 +8544,18 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
                 this._lastCutKind = null;
             } else {
             const trace = lastTrace;
-            if (!Array.isArray(trace)) throw new Error(`[fix86] __psnTrace missing when recording failure of "${task}"`);
+            // fix120: lastTrace is null exactly when no generated attempt reached execution
+            // (every attempt was refused before running at lint/staging, voyager.js:8413). The cut
+            // being recorded then came from an earlier replay attempt, and that attempt attributed
+            // its own journal trace on the replay path already — there is no generated call to
+            // blame here. The fix86 throw fired on this legitimate no-execution path (live:
+            // "Obtain 4 glass_bottle" after the 21:00 GMT drown, 16639) AND skipped the
+            // _lastCutKind reset below, leaking a stale cut kind into the next task's failure
+            // attribution. An executed attempt that loses its trace still throws (8455).
+            if (!Array.isArray(trace)) {
+                console.log(`[fix120] "${task}": no generated attempt executed (cut: ${anyCut}); nothing to attribute, not blaming`);
+                this._lastCutKind = null;
+            } else {
             const failingCalls = trace.filter(t => t.fail && !t.intr);
             // Only record backoff if there's a failing skill to attribute
             if (failingCalls.length > 0) {
@@ -8542,6 +8570,7 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
                 gs.rate = rate;
             }
             this._lastCutKind = null;  // reset for next run
+            }
             }
         }
         this._saveProgress();

@@ -6,6 +6,7 @@ import { createBot } from 'mineflayer';
 import prismarine_items from 'prismarine-item';
 import { pathfinder } from 'mineflayer-pathfinder';
 import { installCachedBestHarvestTool } from './harvest_tool_cache.js';
+import { installInterruptibleWaitForTicks } from './interruptible_wait.js';
 import { plugin as pvp } from 'mineflayer-pvp';
 import { plugin as collectblock } from 'mineflayer-collectblock';
 import plugin from 'mineflayer-armor-manager';
@@ -165,6 +166,9 @@ export function initBot(username) {
     // mineflayer defers plugin init to the spawn event (plugin_loader.js), and the
     // pathfinder default is assigned there (index.js:46) — install on spawn after it.
     bot.once('spawn', () => installCachedBestHarvestTool(bot));
+    // fix120: bot.waitForTicks must end when an interrupt arrives, or the 10 s refused-stop
+    // escalation kills the process for an uninterruptible tick wait (see interruptible_wait.js).
+    installInterruptibleWaitForTicks(bot);
     // fix109: enforce the vanilla invariant "rotation is always finite" on bot.entity.
     // Root cause of the kick loop: a replayed skill calls bot.lookAt() on a Vec3 built with
     // Vec3.add(Vec3) (Vec3.add takes x,y,z numbers, so the result is NaN); mineflayer's

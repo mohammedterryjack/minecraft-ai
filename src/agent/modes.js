@@ -4,6 +4,17 @@ import * as mc from '../utils/mcdata.js';
 import settings from './settings.js'
 import convoManager from './conversation.js';
 
+// fix120: when to fight for air. bot.oxygenLevel is the air supply in breath units, max 20
+// (mineflayer breath.js: Math.round(air / 15)); the game spends it over 300 ticks (~15 s) and
+// deals drowning damage at 0 (minecraft.wiki/w/Drowning#Air_supplies). It is undefined until the
+// first air-supply metadata packet (never submerged), which is not an emergency. Half supply
+// leaves ~7.5 s: the latest point a jump-swim climb out of water reliably fits.
+export const AIR_SUPPLY_MAX = 20;
+export const AIR_EMERGENCY = AIR_SUPPLY_MAX / 2;
+export function drowningEmergency(bot) {
+    return typeof bot.oxygenLevel === 'number' && bot.oxygenLevel <= AIR_EMERGENCY;
+}
+
 async function say(agent, message) {
     agent.bot.modes.behavior_log += message + '\n';
     if (agent.shut_up || !settings.narrate_behavior) return;
@@ -37,8 +48,31 @@ const modes_list = [
             // fire are judged only on loaded cells; the damage branch below needs no block and always runs
             const cellsKnown = !!block && !!blockAbove;
             if (cellsKnown && blockAbove.name === 'water') {
+                // fix120: emergency surfacing. The old assist below only helped when no path was
+                // running, so a pathfinder route across open water stayed submerged and drowned the
+                // bot (live 15 Nov 2026: death at -174,51,106 during a replayed goToNearestBlock,
+                // oxygen 4 -> -1; self_preservation's interrupt could not unwind the raw tick wait
+                // until fix120 made waitForTicks interruptible). bot.oxygenLevel is the air supply
+                // in breath units, max 20 (mineflayer breath.js: metadata air / 15); Minecraft
+                // spends it over 300 ticks (~15 s) and deals drowning damage at 0
+                // (minecraft.wiki/w/Drowning#Air_supplies). Half air is the last point where a
+                // jump-swim climb fits comfortably, and this now interrupts whatever holds the bot.
+                if (drowningEmergency(bot)) {
+                    execute(this, agent, async () => {
+                        bot.pathfinder.setGoal(null);
+                        // !bot.interrupt_code bounds the loop: with an interrupt set the wrapped
+                        // waitForTicks resolves at once, so without it this would spin.
+                        while (bot.health > 0 && !bot.interrupt_code) {
+                            const head = bot.blockAt(bot.entity.position.offset(0, 1, 0));
+                            if (!head || head.name !== 'water') break;
+                            bot.setControlState('jump', true);
+                            await bot.waitForTicks(5);
+                        }
+                        bot.setControlState('jump', false);
+                    });
+                }
                 // does not call execute so does not interrupt other actions
-                if (!bot.pathfinder.goal) {
+                else if (!bot.pathfinder.goal) {
                     bot.setControlState('jump', true);
                 }
             }
