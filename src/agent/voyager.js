@@ -1285,7 +1285,29 @@ Use only c; no other globals.`;
             },
         };
     }
-    _contractCtx(fields) { return { ...fields, dist: (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z), game: this._contractGame() }; }
+    _contractCtx(fields) {
+        // fix116: c.pre.inv / c.post.inv / c.delta are item COUNTS. A plain object reads
+        // undefined for an item nobody holds, and comparisons against undefined are
+        // silently false (1 > undefined === false): the learned craftRecipe post
+        // `c.ret === false || c.ret === null || (c.args[0] !== null && c.post.inv[c.args[0]] > c.pre.inv[c.args[0]])`
+        // reported POSTCONDITION violated on a craft that visibly gained the item
+        // (live 2026-11-15: craftRecipe("iron_leggings",1) -> true, delta +1 iron_leggings,
+        // pre.inv had no iron_leggings key -> 1 > undefined -> false). The count of an
+        // unheld item is 0; make every count total. 'in', Object.hasOwn and Object.keys
+        // keep their meaning — only the missing-key read defaults to 0.
+        const totalCounts = (o) => new Proxy(o || {}, {
+            get: (t, k) => (k in t ? t[k] : typeof k === 'string' ? 0 : undefined),
+        });
+        const state = (st) => (st && typeof st === 'object' ? { ...st, inv: totalCounts(st.inv) } : st);
+        return {
+            ...fields,
+            pre: state(fields.pre),
+            post: state(fields.post),
+            delta: totalCounts(fields.delta),
+            dist: (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z),
+            game: this._contractGame(),
+        };
+    }
     _compileContract(src) { const f = makeCompartment(this._getContractEndowments()).evaluate(`(${src})`); if (typeof f !== 'function') throw new Error('not a function'); return f; }
     // fix86: a learned contract is checked against the real snapshot shape (plain pos, string heldItem, c.dist).
     //        c.post.pos.dist and c.post.eq.heldItem.type are not on that shape, so they cannot be learned.

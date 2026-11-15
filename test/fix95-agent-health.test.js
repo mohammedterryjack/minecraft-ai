@@ -143,7 +143,7 @@ describe('fix95 D: a learned pre that returns a non-boolean is a bad contract, n
         const v = contractRig("c => c.pre.inv['raw_copper'] && c.pre.alive", "c => c.post.inv['raw_copper'] === 0", rec);
         const r = v._postVerifiesRun(v.skills[0]);
         assert.strictEqual(r.ok, false);
-        assert.match(r.why, /returned undefined, not a boolean/);
+        assert.match(r.why, /returned 0, not a boolean/); // fix116: an unheld count reads 0 (total), and 0 is still not a boolean
         const verdict = v._practiceRunChanged(v.skills[0], {}, {});
         assert.strictEqual(verdict.ok, null);
         assert.strictEqual(v._repairQueue.length, 1);
