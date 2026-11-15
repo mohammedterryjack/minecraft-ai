@@ -612,7 +612,31 @@ function lookGoal(bot, position) {
         throw new Error('reachability: bot.entity.eyeHeight is missing.');
     }
     if (!bot.world) throw new Error('reachability: bot.world is missing. GoalLookAtBlock raycasts through the world.');
-    const goal = new pf.goals.GoalLookAtBlock(new Vec3(position.x, position.y, position.z), bot.world, { entityHeight: eyeHeight, reach: gameReach(bot) });
+    const pos = new Vec3(position.x, position.y, position.z);
+    const reach = gameReach(bot);
+    // fix110: GoalLookAtBlock.isEnd is true only where world.raycast returns the target block exactly
+    // (mineflayer-pathfinder lib/goals.js GoalLookAtBlock.isEnd: `rayPos && rayPos.x === this.pos.x && ...`).
+    // prismarine-world raycast intersects each candidate block with its own collision shapes
+    // (`iter.intersect(block.shapes, position)`, prismarine-world src/world.js raycast), and minecraft-data
+    // blockstates give shapeless blocks boundingBox 'empty' (torch, redstone_torch, fire;
+    // https://minecraft.wiki/w/Torch). Such a target has no surface for any ray to hit, so
+    // GoalLookAtBlock.isEnd is false for every node: A* can neither succeed nor exhaust (the goal is not
+    // the issue for the open set - it keeps expanding while isEnd never holds), and this search runs with
+    // no thinkTimeout on purpose (see openSearch). Measured live 20:21Z: the "Craft 1 torch" need probed
+    // perceived torch (-19,75,58), a torch with shapes.length 0; the search was still 'partial' at
+    // 4400 s with 1.4M nodes visited and the open heap growing, and the voyager step that awaited it
+    // never ended. The relation every caller asks is "can the bot get within interaction reach of this
+    // position"; for a target that can present no face, that is exactly GoalNear (goals.js:
+    // "Get within a distance of x, y, z", isEnd = node.distanceTo <= range) - always satisfiable where the
+    // position is walkable, so the search ends in success or noPath.
+    let target = null;
+    let targetRead = false;
+    if (typeof bot.blockAt === 'function') { target = bot.blockAt(pos); targetRead = true; }
+    else if (typeof bot.world.getBlock === 'function') { target = bot.world.getBlock(pos); targetRead = true; }
+    const raycastable = !targetRead || (target !== null && target !== undefined && Array.isArray(target.shapes) && target.shapes.length > 0);
+    const goal = raycastable
+        ? new pf.goals.GoalLookAtBlock(pos, bot.world, { entityHeight: eyeHeight, reach })
+        : new pf.goals.GoalNear(pos.x, pos.y, pos.z, reach);
     return { movements, goal };
 }
 
