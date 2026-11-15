@@ -162,7 +162,9 @@ export function initBot(username) {
     // item per A* node (mineflayer-pathfinder index.js:46); the world-exhaust
     // reachability searches (world.js pathToBlock) made that half the CPU and the
     // top allocator (965 MB -> 2.19 GB RSS in 6 h live). Same answers, computed once.
-    installCachedBestHarvestTool(bot);
+    // mineflayer defers plugin init to the spawn event (plugin_loader.js), and the
+    // pathfinder default is assigned there (index.js:46) — install on spawn after it.
+    bot.once('spawn', () => installCachedBestHarvestTool(bot));
     // fix109: enforce the vanilla invariant "rotation is always finite" on bot.entity.
     // Root cause of the kick loop: a replayed skill calls bot.lookAt() on a Vec3 built with
     // Vec3.add(Vec3) (Vec3.add takes x,y,z numbers, so the result is NaN); mineflayer's
