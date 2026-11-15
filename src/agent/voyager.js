@@ -1429,6 +1429,17 @@ Use only c; no other globals.`;
             }
         }
         const readsArgs = Voyager.contractReadsArgs(ct.pre) || Voyager.contractReadsArgs(ct.post);
+        // fix119: a post that reads nothing the run produces verifies nothing (live: tossDeepslate30
+        //        learned post "c => true" — every successful toss was then unverifiable for the fix56
+        //        open-goal check, 4 attempts burned per "Toss N" task). Same judgment as
+        //        _postVerifiesRun check 1, made at learn time so such a post is never stored.
+        {
+            const { root, param } = this._parseContract(ct.post);
+            if (param === null) return 'post takes no parameter, so it reads nothing from the run';
+            const postReads = new Set();
+            this._walkAst(root.body, node => { if (node.type !== 'MemberExpression') return; const p = this._contractPath(node, param); if (p && p.length) postReads.add(p[0]); });
+            if (!['ret', 'delta', 'post'].some(k => postReads.has(k))) return `post reads only [${[...postReads].join(', ')}]; it verifies nothing the call does — state an observable effect (c.ret, c.delta, c.post.*)`;
+        }
         const recorded = Voyager.recordedCalls(skill);
         // No recorded call: the shape and arity checks above are the whole judgment. Evaluating now would need an argument value.
         if (readsArgs && recorded.length === 0) {
@@ -6291,6 +6302,12 @@ Use only c; no other globals.`;
         for (const s of filtered) {
             const met = this._practicePostAlreadyMet(s, obs);
             if (met.met) { excluded.push(`${s.name}: ${met.reason}`); continue; }
+            // fix119: a practice run whose learned pre does not hold is NO VERDICT by fix87's own
+            // rule ("pre did not hold, so this run is not evidence"), yet it was re-picked every
+            // idle window (live: tossAllTorches with no torches, every window 18:17-19:45). Pre is
+            // state-dependent, so a false pre is a skip for now, not a mark on the skill.
+            const pre = this._practicePreHolds(s, obs);
+            if (pre.holds === false) { excluded.push(`${s.name}: ${pre.reason}`); continue; }
             const successes = s.stats.success;
             const failures = s.stats.fail;
             const n = successes + failures;
@@ -6336,6 +6353,32 @@ Use only c; no other globals.`;
         const held = this._compileContract(skill.contract.post)(this._contractCtx({ args: [], ret: true, pre: snap, post: snap, delta: {} }));
         if (held !== true && held !== false) throw new Error(`[fix93] ${skill.name} post returned ${JSON.stringify(held)}, not a boolean`);
         return { met: held === true, evaluable: true, reason: held === true ? 'postcondition already holds in the current world' : 'post does not hold' };
+    }
+    // fix119: does the skill's learned PRE hold in the current world? Mirrors _practicePostAlreadyMet:
+    // a run with pre false is NO VERDICT (fix87), so selection must not pick it while pre is false.
+    // {holds: true|false|null}; null means not evaluable now (reads c.args, or a field the
+    // observation lacks) and is NOT a skip — only a definite false skips.
+    _practicePreHolds(skill, obs) {
+        if (!skill.contract || typeof skill.contract.pre !== 'string') return { holds: null, reason: 'no pre-contract' };
+        if (!skill.contract.pre.includes('=>')) return { holds: null, reason: 'pre is not an arrow predicate' };
+        if (Voyager.contractReadsArgs(skill.contract.pre)) return { holds: null, reason: 'pre reads c.args' };
+        const fields = this._extractPostFields(skill.contract.pre);   // reads pre.* and post.* alike
+        const world = practiceWorld(obs);
+        if ((fields.pos || fields.dist) && !world.pos) return { holds: null, reason: 'pre reads position; observation has none' };
+        if (fields.hp && typeof world.hp !== 'number') return { holds: null, reason: 'pre reads hp; observation has none' };
+        if (fields.food && typeof world.food !== 'number') return { holds: null, reason: 'pre reads food; observation has none' };
+        // fix116: counts are total — getInventoryCounts reports every held item, so a missing key
+        // means 0, not "unknown". Only a missing inventory map is not evaluable.
+        if (fields.inv.length && !world.inv) return { holds: null, reason: 'observation has no inventory' };
+        for (const slot of fields.eq) {
+            if (!world.eq || !Object.hasOwn(world.eq, slot)) return { holds: null, reason: `pre reads eq.${slot}; observation has none` };
+        }
+        if (skill.contract.pre.includes('.alive') && typeof world.alive !== 'boolean') return { holds: null, reason: 'pre reads alive; observation has none' };
+        if (skill.contract.pre.includes('.dim') && typeof world.dim !== 'string') return { holds: null, reason: 'pre reads dim; observation has none' };
+        const snap = { pos: world.pos, hp: world.hp, food: world.food, alive: world.alive, dim: world.dim, inv: world.inv, eq: world.eq, free: world.free };
+        const held = this._compileContract(skill.contract.pre)(this._contractCtx({ args: [], ret: true, pre: snap, post: snap, delta: {} }));
+        if (held !== true && held !== false) throw new Error(`[fix119] ${skill.name} pre returned ${JSON.stringify(held)}, not a boolean`);
+        return { holds: held, reason: held ? 'pre holds' : 'pre does not hold in the current world' };
     }
     // fix42: get items needed by pending/failed tasks (from learned needs/produces, not hard-coded)
     // fix25: prefer smeltGoal so "Smelt X into Y" prioritizes Y (product), ingredients come from consumes
