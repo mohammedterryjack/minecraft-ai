@@ -362,6 +362,8 @@ export class Agent {
 
             let command_name = containsCommand(res);
 
+            let command_only_reply = false;
+
             if (command_name) { // contains query or command
                 res = truncCommandMessage(res); // everything after the command is ignored
                 this.history.add(this.name, res);
@@ -385,6 +387,9 @@ export class Agent {
                     if (pre_message.length > 0)
                         chat_message = `${pre_message}  ${chat_message}`;
                     this.routeResponse(source, chat_message);
+                    // fix117: remember when the model gave a command-only reply (no text
+                    // for the player); the command's own result is spoken after execution
+                    command_only_reply = pre_message.length === 0;
                 }
                 else {
                     // no command at all
@@ -412,6 +417,10 @@ export class Agent {
                 }
 
                 console.log('Agent executed:', command_name, 'and got:', execute_res);
+                // fix117: on a command-only reply the player only heard "*used X*",
+                // which answers nothing; say what the command actually did.
+                if (command_only_reply && execute_res)
+                    this.routeResponse(source, String(execute_res));
                 used_command = true;
 
                 if (execute_res)
@@ -464,6 +473,9 @@ export class Agent {
         // newlines are interpreted as separate chats, which triggers spam filters. replace them with spaces
         message = message.replaceAll('\n', ' ');
 
+        // fix117: outgoing chat was never logged, so a "bot did not reply" report could
+        // not be told apart from a silent send failure; log every outgoing message.
+        console.log(`${this.name} says in-game: ${message}`);
         if (settings.only_chat_with.length > 0) {
             for (let username of settings.only_chat_with) {
                 this.bot.whisper(username, message);
