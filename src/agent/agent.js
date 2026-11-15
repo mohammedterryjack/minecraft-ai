@@ -269,6 +269,9 @@ export class Agent {
     requestInterrupt(source) {
         this.actions.noteInterrupt(source);
         this.bot.interrupt_code = true;
+        // fix120: tell waits that poll no flag (bot.waitForTicks, see utils/interruptible_wait.js)
+        // that the interrupt has arrived; the wrapped tick wait resolves on this event.
+        this.bot.emit('interrupt_code_set');
         this.bot.stopDigging();
         this.bot.collectBlock.cancelTask();
         this.bot.pathfinder.stop();
