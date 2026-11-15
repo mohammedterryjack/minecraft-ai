@@ -642,7 +642,12 @@ export class Coder {
                     // Check if there's a null check between assign and access
                     let hasNullCheck = false;
                     for (let j = assignLine; j < lineNum; j++) {
-                        if (codeLines[j].includes(`!${varName}`) || codeLines[j].includes(`${varName} === null`) || codeLines[j].includes(`${varName} == null`)) {
+                        // fix113: a truthy short-circuit is a guard too. `if (existing && existing.name === t)`
+                        // and `const n = existing ? existing.name : 'air'` never dereference null; before this
+                        // they were reported as "Accessing properties ... on null" and fed back to the coder.
+                        if (codeLines[j].includes(`!${varName}`) || codeLines[j].includes(`${varName} === null`) || codeLines[j].includes(`${varName} == null`)
+                            || codeLines[j].includes(`${varName} &&`) || codeLines[j].includes(`${varName} ?`)
+                            || codeLines[j].includes(`${varName}?.`)) {
                             hasNullCheck = true;
                             break;
                         }

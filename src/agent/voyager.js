@@ -3987,8 +3987,24 @@ Use only c; no other globals.`;
         if (kill && has('killMob')) return { name: 'killMob', call: `await killMob(bot, ${JSON.stringify(kill[2].toLowerCase())}, ${kill[1]});`, check: 'output' };
         const harv = task.match(/^harvest\s+(\d+)\s+([a-z_]+)/i);
         if (harv && has('harvestCrop')) return { name: 'harvestCrop', call: `await harvestCrop(bot, ${JSON.stringify(harv[2].toLowerCase())}, ${harv[1]});`, check: 'output' };
-        if (goal && ['mine', 'collect', 'gather', 'chop'].includes(goal.verb) && /(_ore|^stone|^cobblestone|^deepslate)$/.test(goal.item) && has('mineOre'))
-            return { name: 'mineOre', call: `await mineOre(bot, ${JSON.stringify(goal.item)}, ${goal.count});` };
+        // fix113: a mine goal names either an ore BLOCK ("Mine 10 iron_ore") or the product it drops
+        // ("Mine 10 raw_iron"). mineOre takes the block to mine (it forwards to mineBlocks by block name),
+        // so map the product through game data: minecraft-data blockLoot lists each block's drops
+        // (blockLoot['iron_ore'].drops contains { item: 'raw_iron' }), so the ore blocks for product X are
+        // the blocks whose drops name X; the shortest is the plain ore before its deepslate variant. The
+        // stone/cobblestone/deepslate names are directly minable. Before this, "Mine 10 raw_iron" routed to
+        // nothing and the backchain plan was abandoned (live 2026-11-15).
+        if (goal && ['mine', 'collect', 'gather', 'chop'].includes(goal.verb) && has('mineOre')) {
+            let oreBlock = /(_ore|^stone|^cobblestone|^deepslate)$/.test(goal.item) ? goal.item : null;
+            if (!oreBlock) {
+                const blockLoot = minecraftData(VERSION).blockLoot || {};
+                const candidates = Object.keys(blockLoot)
+                    .filter(bn => bn.endsWith('_ore') && (blockLoot[bn].drops || []).some(d => d.item === goal.item))
+                    .sort((a, b) => a.length - b.length || (a < b ? -1 : 1));
+                oreBlock = candidates.length ? candidates[0] : null;
+            }
+            if (oreBlock) return { name: 'mineOre', call: `await mineOre(bot, ${JSON.stringify(oreBlock)}, ${goal.count});` };
+        }
         if (goal && ['mine', 'collect', 'gather', 'chop'].includes(goal.verb) && goal.item.endsWith('_log') && has('collectLogs'))
             return { name: 'collectLogs', call: `await collectLogs(bot, ${goal.count}, ${JSON.stringify(goal.item)});` };
         if (goal && ['get', 'obtain'].includes(goal.verb) && has('obtainItem') && this._routeProducesFit('obtainItem', [goal.item]))
