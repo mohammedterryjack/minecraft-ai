@@ -18,8 +18,11 @@
 // emits 'interrupt_code_set'; this wrapper listens for that event while a wait is outstanding.
 export function installInterruptibleWaitForTicks(bot) {
     if (bot.__interruptibleWaitInstalled) return;
+    // waitForTicks is a PROTOTYPE method in mineflayer (lib/bot.js: Bot.prototype.waitForTicks),
+    // so it is never an own property right after createBot; check the lookup, then wrap as an
+    // own property that calls the prototype original via `orig.call(this, ticks)`.
+    if (typeof bot.waitForTicks !== 'function') throw new Error('[fix120] bot.waitForTicks is not callable at install time');
     const orig = bot.waitForTicks;
-    if (typeof orig !== 'function') throw new Error('[fix120] bot.waitForTicks is not a function at install time');
     bot.waitForTicks = function (ticks) {
         if (bot.interrupt_code) return Promise.resolve();
         return new Promise((resolve, reject) => {

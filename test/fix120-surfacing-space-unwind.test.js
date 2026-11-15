@@ -77,13 +77,28 @@ describe('fix120 B: waitForTicks ends when the interrupt arrives', () => {
         const wrapped = bot.waitForTicks;
         installInterruptibleWaitForTicks(bot);
         assert.strictEqual(bot.waitForTicks, wrapped);
-        assert.throws(() => installInterruptibleWaitForTicks(new EventEmitter()), /not a function at install time/);
+        assert.throws(() => installInterruptibleWaitForTicks(new EventEmitter()), /not callable at install time/);
+    });
+    it('wraps a PROTOTYPE waitForTicks (mineflayer shape: Bot.prototype.waitForTicks)', async () => {
+        class FakeBot extends EventEmitter {
+            constructor() { super(); this.interrupt_code = false; }
+            waitForTicks(t) { return new Promise(() => { }); }
+        }
+        const bot = new FakeBot();
+        installInterruptibleWaitForTicks(bot);
+        assert.notStrictEqual(bot.waitForTicks, FakeBot.prototype.waitForTicks); // own wrapper
+        const done = bot.waitForTicks(10000);
+        let resolved = false;
+        done.then(() => { resolved = true; });
+        await new Promise((r) => setTimeout(() => { bot.interrupt_code = true; bot.emit('interrupt_code_set'); r(); }, 10));
+        await done;
+        assert.ok(resolved);
     });
     it('requestInterrupt emits interrupt_code_set; mcdata installs the wrapper', () => {
         const agent_src = readFileSync('src/agent/agent.js', 'utf8');
         const mcdata_src = readFileSync('src/utils/mcdata.js', 'utf8');
         assert.match(agent_src, /this\.bot\.emit\('interrupt_code_set'\);/);
-        assert.match(mcdata_src, /installInterruptibleWaitForTicks\(bot\);/);
+        assert.match(mcdata_src, /bot\.once\('inject_allowed', \(\) => installInterruptibleWaitForTicks\(bot\)\)/);
     });
 });
 
