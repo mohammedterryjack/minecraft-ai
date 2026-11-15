@@ -3366,6 +3366,31 @@ Use only c; no other globals.`;
         delete e.candidate;
         this._noteProposal(e, { task, kind: 'trial', evidence: dropped, desc: 'candidate dropped the reported need', outcome: 'rejected dropped need' });
     }
+    // fix111: a candidate whose code cannot lint poisons every bundle that stages it: the replay dies
+    // "lint failed before run" and codegen dies staging the same library, so every task reaching that skill
+    // fails its attempts forever (live: the joint-repair ensureCraftingTable candidate with an empty if block —
+    // its joint bundle was linted without it, see the jointSet fix). When a staged bundle that includes
+    // candidate overrides fails lint, re-lint each candidate in the bundle alone (same closure, incumbent for
+    // the others): the ones that fail on their own are rejected like fix87 rejects a dropped-need candidate —
+    // loud, not kept, fed back through the repair memory. The next attempt stages the incumbent.
+    async _rejectLintPoisonedCandidates(closure, over, label) {
+        const rejected = [];
+        for (const name of Object.keys(over)) {
+            if (!closure.has(name)) continue;
+            const entry = this.skills.find(s => s.name === name);
+            if (!entry || !entry.candidate || entry.candidate.code !== over[name]) continue;
+            const solo = this._libSrcSubset(closure, { [name]: entry.candidate.code }) + '\n\nawait Promise.resolve();';
+            const { lint } = await this._stageLintExec(solo, closure, `${label}:candidate-lint:${name}`);
+            if (!lint) continue;
+            const cand = entry.candidate;
+            console.error(`!!! [fix111] LOUD: candidate of ${name} fails lint on its own and is REJECTED (it poisoned every bundle that staged it): ${String(lint).split('\n').find(l => l.startsWith('Message:')) || String(lint).slice(0, 200)}`);
+            delete entry.candidate;
+            this._noteProposal(entry, { task: cand.task || label, kind: 'trial', evidence: String(lint), desc: 'candidate fails lint', outcome: 'rejected: fails lint' });
+            if (cand.refactor) this._rollbackRefactor(cand.refactor, `${name} candidate fails lint`);
+            rejected.push(name);
+        }
+        return rejected;
+    }
     _crashedInRun() { const c = this._crash; return c && c.t >= (this._runStart || Infinity) ? c : null; }
     // fix65: a run that kills the process (watchdog SIGKILL on a blocked main loop) never reaches _attribute, so its trial
     // outcome was lost: the 12:43Z hang in the collectBlock candidate left its record at 0/0. Before every run that carries
@@ -3994,6 +4019,7 @@ Use only c; no other globals.`;
         let best = null, bestScore = 0;
         for (const s of this.skills) {
             if (s.primitive || s.demoted || s.mergedInto || !s.task) continue;
+            if (requiredArgs(s).length) continue;   // fix111: a bare call cannot fill required parameters (the same fix86 guard _structuredReplay and _embedReplay apply)
             if (head(s.task) !== head(task) && !(nums(head(s.task)) === nums(head(task)) && ids(head(s.task)) === ids(head(task)))) continue;
             const nameHit = s.name.toLowerCase().split(/(?=[a-z])/).length && task.toLowerCase().replace(/[^a-z]/g, '').includes(s.name.toLowerCase().replace(/^(craft|mine|get|make)/, '')) ? 0.3 : 0;
             const sc = wordOverlapScore(task, s.task) + nameHit + 0.3 * rate(s.stats || newStats());
@@ -4198,7 +4224,13 @@ Use only c; no other globals.`;
         const call = '\n\nasync function __replay(bot) {\n    try { ' + r.call + ' } finally { bot.__psnOut = bot.output; }\n}\nawait __replay(bot);';
         const full = libPart + '\n\n' + instrumentSrc(tracedNames) + call;
         const { lint, staged } = await this._stageLintExecTraced(libPart + call, full, replayClosure, `voyager:replay:${r.name}`);
-        if (lint) { console.error(`[voyager] replay ${r.name}: lint failed before run: ${lint}`); return { ok: false, name: r.name, output: '', reason: `lint failed before run: ${lint}` }; }
+        if (lint) {
+            // fix111: a staged candidate that cannot lint would fail this replay forever; reject the culprits
+            // before reporting, so the next attempt stages the incumbent and the task can progress.
+            const rejected = await this._rejectLintPoisonedCandidates(replayClosure, over, `voyager:replay:${r.name}`);
+            if (rejected.length) console.error(`[voyager] replay ${r.name}: ${rejected.join(', ')} candidate(s) rejected for failing lint; this attempt failed, the next stages the incumbent`);
+            console.error(`[voyager] replay ${r.name}: lint failed before run: ${lint}`); return { ok: false, name: r.name, output: '', reason: `lint failed before run: ${lint}` };
+        }
         if (!staged) return { ok: false };
         // fix70: what this skill did to the inventory is measured over ITS run only (runBefore -> after). `before` is the
         //        task-start snapshot (goal gain is still measured from it); everything between it and this run (other replays,
@@ -4305,6 +4337,12 @@ Use only c; no other globals.`;
     /** Only skills in `names` (dependency-closure subset); same override rules as _libSrc */
     _libSrcSubset(names, over = {}) {
         const set = names instanceof Set ? names : new Set(names);
+        // fix111: overrides for names the set does not contain were silently dropped. The joint repair linted
+        // a bundle built exactly like that (its set filters BOTH repaired skills out), so the repaired code
+        // was never linted, went to the gate unchecked, and a candidate that cannot lint poisoned every bundle
+        // that later staged it. An override that can never land is a caller bug: fail loud.
+        const missing = Object.keys(over).filter(n => !set.has(n));
+        if (missing.length) throw new Error(`[fix111] LOUD: _libSrcSubset overrides for ${missing.join(', ')} are not in the staged name set`);
         return this.skills.filter(s => set.has(s.name)).map(s => over[s.name] ?? s.code).join('\n\n');
     }
     /** Install bot API timing proxy once for skill/staged execution. */
@@ -5661,6 +5699,30 @@ Use only c; no other globals.`;
         plan.push({ name: pick.s.name, item, need });
         return true;
     }
+    // fix111: a producer with required parameters cannot run as `await name(bot);` — _precheck throws fix86
+    // ("routed with no item; a subgoal cannot call a skill with an undefined item"), the step fails and the
+    // whole plan is abandoned: every backchain through a parameterised producer (live: craftItem, the producer
+    // of planks/sticks/tools) died at step 1/1 forever. The plan step already knows the item and the count, and
+    // the producer's own task text carries its verb; _structuredReplay turns "<verb> N <item>" into the
+    // parameterised call — the same builder the top-level router uses, so no per-skill argument lists live here.
+    _planStepCall(st) {
+        const entry = this.skills.find(s => s.name === st.name);
+        if (!entry) throw new Error(`[fix111] LOUD: backchain plan names unknown skill ${st.name}`);
+        const req = requiredArgs(entry);
+        if (!req.length) return `await ${entry.name}(bot);`;
+        const verb = String(entry.task || '').trim().split(/\s+/)[0];
+        if (!verb) {
+            console.error(`!!! [fix111] LOUD: backchain step ${entry.name} needs (${req.join(', ')}) and has no task text to derive the verb from; plan abandoned rather than calling it with no arguments`);
+            return null;
+        }
+        const t = `${verb} ${st.need} ${st.item}`;
+        const r = this._structuredReplay(t);
+        if (!r || r.name !== entry.name) {
+            console.error(`!!! [fix111] LOUD: backchain step ${entry.name} needs (${req.join(', ')}) but "${t}" routes to ${r ? r.name : 'nothing'}; plan abandoned rather than calling ${entry.name} with no arguments`);
+            return null;
+        }
+        return r.call;
+    }
     // fix81: with structured needs, the chain target is the missing item (a single named need), not only the goal item
     async _backchain(task, before, needs) {
         const goal = countGoal(task); if (!goal) return null;
@@ -5671,7 +5733,9 @@ Use only c; no other globals.`;
             if (!this._chain(target.item, have + target.count, before.inventory, 0, plan, []) || !plan.length) return null;
             console.log(`[backchain] plan for missing ${target.count} ${target.item} (${target.reason}) of "${task}": ${plan.map(x => `${x.name}(+${x.item})`).join(' -> ')}`);
             for (let i = 0; i < plan.length; i++) {
-                const st = plan[i], last = await this._replay(`obtain 1 ${st.item}`, this.observe(), { name: st.name, call: `await ${st.name}(bot);` });
+                const st = plan[i], call = this._planStepCall(st);   // fix111: fill the producer's required arguments from the plan step (was a bare call: fix86 threw on every parameterised producer)
+                if (call === null) { console.log(`[backchain] step ${i + 1}/${plan.length} ${st.name}: no argument-supplying call; plan abandoned`); return { ok: false }; }
+                const last = await this._replay(`obtain 1 ${st.item}`, this.observe(), { name: st.name, call });
                 if (last === null) { console.log(`[backchain] step ${i + 1}/${plan.length} ${st.name} not replayable; plan abandoned`); return { ok: false }; }
                 if (!last.ok) { console.log(`[backchain] step ${i + 1}/${plan.length} ${st.name} ${last.interrupted ? 'interrupted' : 'failed'}; plan abandoned`); return last; }
             }
@@ -5684,7 +5748,9 @@ Use only c; no other globals.`;
         let last = null;
         for (let i = 0; i < plan.length; i++) {
             const st = plan[i], t = i === plan.length - 1 ? task : `obtain 1 ${st.item}`;
-            last = await this._replay(t, i === plan.length - 1 ? before : this.observe(), { name: st.name, call: `await ${st.name}(bot);` });
+            const call = this._planStepCall(st);   // fix111: fill the producer's required arguments from the plan step
+            if (call === null) { console.log(`[backchain] step ${i + 1}/${plan.length} ${st.name}: no argument-supplying call; plan abandoned`); return { ok: false }; }
+            last = await this._replay(t, i === plan.length - 1 ? before : this.observe(), { name: st.name, call });
             if (!last?.ok) { console.log(`[backchain] step ${i + 1}/${plan.length} ${st.name} ${last?.interrupted ? 'interrupted' : 'failed'}; plan abandoned`); return last || { ok: false }; }
         }
         console.log(`[backchain] plan for "${task}" PASSED (${plan.length} skill(s), no model call)`);
@@ -7743,7 +7809,12 @@ IMPORTANT: All functions use bare names. Do NOT write skills.goToPosition - writ
             return false;
         }
         const strip = c => c.replace(/^\s*\/\/[^\n]*\n/gm, '').trim(), desc = (c, d) => ((c.match(/\/\/\s*DESCRIPTION:\s*(.+)/) || [])[1] || d).trim();
-        const jointSet = new Set(relevantSkills);
+        // fix111: relevantSkills filters BOTH repaired skills out (it builds the callable API list), and
+        // _libSrcSubset renders only the names in its set — the joint bundle used to contain NEITHER repaired
+        // function, so this lint passed while checking none of the new code (live: the 16:57Z
+        // ensureCraftingTable+craftRecipe repair stored a candidate with an empty if block that then failed
+        // lint in every replay/codegen bundle staging it). The linted bundle must hold the new functions.
+        const jointSet = new Set([e.name, pe.name, ...relevantSkills]);
         const jointBundle = this._libSrcSubset(jointSet, { [e.name]: strip(fns[e.name]), [pe.name]: strip(fns[pe.name]) }) + '\n\nawait Promise.resolve();';
         const { lint } = await this._stageLintExec(jointBundle, jointSet, `voyager:joint-repair:${e.name}+${pe.name}`);
         if (lint) { console.log(`[psn] joint repair FAILED lint: ${String(lint).slice(0, 300)}`); return false; }
@@ -8247,6 +8318,22 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
                 staged = st;
             }
             if (!lint && !staged) throw new Error('[psn] staging of traced generated code failed');
+            if (lint) {
+                // fix111: the staged library may carry a candidate that cannot lint — the same bundle dies
+                // whatever the model writes (live: the empty-if ensureCraftingTable candidate failed every
+                // attempt of every craft task). Reject lint-poisoned staged candidates before re-prompting.
+                const stagedOver = Object.fromEntries(Object.keys(over).filter(n => stageNameSet.has(n)).map(n => [n, over[n]]));
+                const rejected = await this._rejectLintPoisonedCandidates(stageNameSet, stagedOver, `voyager:writeCode:${task}`);
+                if (rejected.length) {
+                    // rebuild this attempt's bundle without the rejected candidates and re-lint the model code
+                    for (const k of Object.keys(over)) delete over[k];
+                    for (const s of this.skills) if (s.candidate) over[s.name] = s.candidate.code;   // survivors only
+                    const libSrc2 = this.skills.filter(s => stageNameSet.has(s.name) && s.name !== own && !codeDeclares.has(s.name)).map(s => over[s.name] ?? s.code).join('\n\n');
+                    const retry = await this._stageLintExecTraced(libSrc2 + (libSrc2 ? '\n\n' : '') + code, libSrc2 + (libSrc2 ? '\n\n' : '') + instrumentSrc(Voyager._tracedSkillNamesForInstrument(this, stageNameSet, over)) + '\n\n' + code, stageNameSet, `voyager:writeCode:${task}:att${i}:post-reject`);
+                    if (!retry.lint && retry.staged) { lint = null; staged = retry.staged; }
+                    else lint = retry.lint || lint;
+                }
+            }
             if (lint) { console.log('[voyager] lint failed: ' + String(lint)); feedback = 'Lint error:\n' + lint; lastCode = code; continue; }
 
             // fix70: this attempt's own window (see _replay): `before` is the task-start snapshot taken before the proposal, any
