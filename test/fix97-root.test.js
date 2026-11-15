@@ -187,28 +187,28 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
     it('an inventory comparison to an ungrounded literal is refused; a bare 55 is not one', () => {
         const v = mkV({});
         const skill = { name: 'checkOakLog', code: 'async function checkOakLog(bot) { return true; }', consumes: {}, effects: [] };
-        assert.match(v._validContract({ pre: 'c => c.pre.inv.oak_log < 55', post: 'c => true' }, skill), /pre uses 55/);
+        assert.match(v._validContract({ pre: 'c => c.pre.inv.oak_log < 55', post: 'c => c.ret !== false' }, skill), /pre uses 55/);
         const bare = { name: 'checkOakLog', code: 'async function checkOakLog(bot) { return 55; }', consumes: {}, effects: [] };
-        assert.strictEqual(v._validContract({ pre: 'c => true', post: 'c => true' }, bare), null);
+        assert.strictEqual(v._validContract({ pre: 'c => true', post: 'c => c.ret !== false' }, bare), null);
         const withArg = { name: 'checkOakLog', code: 'async function checkOakLog(bot, block) { return block === null; }', consumes: {}, effects: [] };
-        const ok = v._validContract({ pre: 'c => c.args.length >= 1 && c.args[0] === null', post: 'c => true' }, withArg);
+        const ok = v._validContract({ pre: 'c => c.args.length >= 1 && c.args[0] === null', post: 'c => c.ret !== false' }, withArg);
         assert.strictEqual(ok, null);
         assert.strictEqual(withArg.contractEval, Voyager.CONTRACT_EVAL);
         const bareParam = { name: 'checkOakLog', code: 'async function checkOakLog(bot, block) { return true; }', consumes: {}, effects: [] };
-        assert.strictEqual(v._validContract({ pre: 'c => c.args[0] === null', post: 'c => true' }, bareParam), null);
+        assert.strictEqual(v._validContract({ pre: 'c => c.args[0] === null', post: 'c => c.ret !== false' }, bareParam), null);
         assert.strictEqual(bareParam.contractEval, Voyager.CONTRACT_EVAL);
         const buried = { name: 'checkOakLog', code: 'async function checkOakLog(bot) { return 155; }', consumes: {}, effects: [], stats: { success: 5512, fail: 0 } };
-        const buriedReason = v._validContract({ pre: 'c => c.pre.inv.oak_log < 55', post: 'c => true' }, buried);
+        const buriedReason = v._validContract({ pre: 'c => c.pre.inv.oak_log < 55', post: 'c => c.ret !== false' }, buried);
         assert.match(buriedReason, /pre uses 55/);
         assert.doesNotMatch(buriedReason, /155|5512/);
         const goal = { ...skill, task: 'Collect 55 oak_log' };
-        assert.strictEqual(v._validContract({ pre: 'c => c.pre.inv.oak_log < 55', post: 'c => true' }, goal), null);
+        assert.strictEqual(v._validContract({ pre: 'c => c.pre.inv.oak_log < 55', post: 'c => c.ret !== false' }, goal), null);
     });
 
     it('the manifest lists a 55 contract and does not apply; this checkout has no checkOakLog', () => {
         const fixture = [
-            { name: 'checkOakLog', code: 'async function checkOakLog(bot) { return true; }', contract: { pre: 'c => c.pre.inv.oak_log < 55', post: 'c => true' } },
-            { name: 'ok', code: 'async function ok(bot) { return 2; }', contract: { pre: 'c => c.pre.free > 2', post: 'c => true' } },
+            { name: 'checkOakLog', code: 'async function checkOakLog(bot) { return true; }', contract: { pre: 'c => c.pre.inv.oak_log < 55', post: 'c => c.ret !== false' } },
+            { name: 'ok', code: 'async function ok(bot) { return 2; }', contract: { pre: 'c => c.pre.free > 2', post: 'c => c.ret !== false' } },
         ];
         const manifest = buildContractManifest(fixture);
         assert.strictEqual(manifest.apply, false);
@@ -276,13 +276,13 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         const sleep = {
             name: 'checkOakLog',
             code: 'async function checkOakLog(bot) { await sleep(bot, 55); const counts = getInventoryCounts(bot); return counts.oak_log < 55; }',
-            contract: { pre: 'c => c.pre.inv.oak_log < 55', post: 'c => true' },
+            contract: { pre: 'c => c.pre.inv.oak_log < 55', post: 'c => c.ret !== false' },
         };
         assert.ok(Voyager.copiedInventoryHits(sleep, registry).some(h => h.where === 'pre' && h.item === 'oak_log' && h.n === 55));
         const apple = {
             name: 'ensureInventorySpaceForApple',
             code: 'async function ensureInventorySpaceForApple(bot) { const emptySlots = bot.inventory.emptySlotCount(); return emptySlots < 10; }',
-            contract: { pre: 'c => c.pre.inv.pink_petals < 10', post: 'c => true' },
+            contract: { pre: 'c => c.pre.inv.pink_petals < 10', post: 'c => c.ret !== false' },
         };
         assert.ok(!Voyager.copiedInventoryHits(apple, registry).some(h => h.item === 'pink_petals'));
     });
@@ -290,28 +290,28 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
     it('c.args past the parameters after bot is rejected, and the error names that list', () => {
         const v = mkV({});
         const skill = { name: 'cookFood', code: 'async function cookFood(bot, count = 1) { return true; }', consumes: {}, effects: [] };
-        const reason = v._validContract({ pre: 'c => c.args[1] >= 1', post: 'c => true' }, skill);
+        const reason = v._validContract({ pre: 'c => c.args[1] >= 1', post: 'c => c.ret !== false' }, skill);
         assert.match(reason, /parameters after bot are \(count = 1\)/);
         assert.match(reason, /c\.args\[1\]/);
-        assert.strictEqual(v._validContract({ pre: 'c => c.args[0] >= 1 && c.args.length === 1', post: 'c => true' }, skill), null);
-        assert.match(v._validContract({ pre: 'c => c.args.length >= 2', post: 'c => true' }, skill), /arity 1/);
+        assert.strictEqual(v._validContract({ pre: 'c => c.args[0] >= 1 && c.args.length === 1', post: 'c => c.ret !== false' }, skill), null);
+        assert.match(v._validContract({ pre: 'c => c.args.length >= 2', post: 'c => c.ret !== false' }, skill), /arity 1/);
         const rest = { name: 'cookFood', code: 'async function cookFood(bot, count = 1, ...more) { return true; }', consumes: {}, effects: [] };
-        assert.strictEqual(v._validContract({ pre: 'c => c.args[3] >= 1', post: 'c => true' }, rest), null);
+        assert.strictEqual(v._validContract({ pre: 'c => c.args[3] >= 1', post: 'c => c.ret !== false' }, rest), null);
         const mid = { name: 'place', code: 'async function place(bot, a, b = 1, c = 2) { return true; }', consumes: {}, effects: [] };
-        assert.strictEqual(v._validContract({ pre: 'c => c.args.length === 2', post: 'c => true' }, mid), null);
-        assert.strictEqual(v._validContract({ pre: 'c => c.args.length === 1', post: 'c => true' }, mid), null);
-        assert.strictEqual(v._validContract({ pre: 'c => c.args.length === 3', post: 'c => true' }, mid), null);
-        assert.match(v._validContract({ pre: 'c => c.args.length === 4', post: 'c => true' }, mid), /parameters after bot are \(a, b = 1, c = 2\)/);
-        assert.match(v._validContract({ pre: 'c => c.args.length === 0', post: 'c => true' }, mid), /c\.args\.length compared to 0/);
+        assert.strictEqual(v._validContract({ pre: 'c => c.args.length === 2', post: 'c => c.ret !== false' }, mid), null);
+        assert.strictEqual(v._validContract({ pre: 'c => c.args.length === 1', post: 'c => c.ret !== false' }, mid), null);
+        assert.strictEqual(v._validContract({ pre: 'c => c.args.length === 3', post: 'c => c.ret !== false' }, mid), null);
+        assert.match(v._validContract({ pre: 'c => c.args.length === 4', post: 'c => c.ret !== false' }, mid), /parameters after bot are \(a, b = 1, c = 2\)/);
+        assert.match(v._validContract({ pre: 'c => c.args.length === 0', post: 'c => c.ret !== false' }, mid), /c\.args\.length compared to 0/);
         const midRest = { name: 'place', code: 'async function place(bot, a, b = 1, c = 2, ...more) { return more; }', consumes: {}, effects: [] };
-        assert.strictEqual(v._validContract({ pre: 'c => c.args.length === 4', post: 'c => true' }, midRest), null);
+        assert.strictEqual(v._validContract({ pre: 'c => c.args.length === 4', post: 'c => c.ret !== false' }, midRest), null);
         const derived = { name: 'cookFood', code: 'async function cookFood(bot, count = Number("1")) { return count >= 1; }', consumes: {}, effects: [] };
-        assert.strictEqual(v._validContract({ pre: 'c => c.args[0] >= 1', post: 'c => true' }, derived), null);
+        assert.strictEqual(v._validContract({ pre: 'c => c.args[0] >= 1', post: 'c => c.ret !== false' }, derived), null);
         assert.strictEqual(derived.contractEval, Voyager.CONTRACT_EVAL);
         const invented = { name: 'cookFood', code: 'async function cookFood(bot, count = Number("1")) { return true; }', consumes: {}, effects: [] };
-        assert.strictEqual(v._validContract({ pre: 'c => c.args[0] >= 1', post: 'c => true' }, invented), null);
+        assert.strictEqual(v._validContract({ pre: 'c => c.args[0] >= 1', post: 'c => c.ret !== false' }, invented), null);
         assert.strictEqual(invented.contractEval, Voyager.CONTRACT_EVAL);
-        assert.strictEqual(v._validContract({ pre: 'c => true', post: 'c => true' }, invented), null);
+        assert.strictEqual(v._validContract({ pre: 'c => true', post: 'c => c.ret !== false' }, invented), null);
         assert.strictEqual(Object.hasOwn(invented, 'contractEval'), false);
     });
 
@@ -322,7 +322,7 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
             code: 'async function craftItem(bot, itemName, target = 1) { if (!itemName) return false; return true; }',
             stats: { success: 1, fail: 0, streakFail: 0, tasks: [] },
         };
-        const typeofString = { pre: "c => c.pre.alive && typeof c.args[0] === 'string' && (c.args.length === 1 || (c.args.length === 2 && typeof c.args[1] === 'number' && c.args[1] >= 1))", post: 'c => true' };
+        const typeofString = { pre: "c => c.pre.alive && typeof c.args[0] === 'string' && (c.args.length === 1 || (c.args.length === 2 && typeof c.args[1] === 'number' && c.args[1] >= 1))", post: 'c => c.ret !== false' };
         assert.strictEqual(v._validContract(typeofString, craft), null);
         assert.strictEqual(craft.contractEval, Voyager.CONTRACT_EVAL);
         const recorded = { succeeded: true, violated: false };
@@ -336,7 +336,7 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         assert.deepStrictEqual(craft.stats.calls[0].types, ['string', 'number']);
         assert.strictEqual(v._validContract(typeofString, craft), null);
         assert.strictEqual(Object.hasOwn(craft, 'contractEval'), false);
-        assert.match(v._validContract({ pre: "c => typeof c.args[0] === 'number'", post: 'c => true' }, craft), /contradicts recorded call \("oak_planks", 1\)/);
+        assert.match(v._validContract({ pre: "c => typeof c.args[0] === 'number'", post: 'c => c.ret !== false' }, craft), /contradicts recorded call \("oak_planks", 1\)/);
         assert.strictEqual(Voyager.recordCallShape(craft, ['stick', 4], recorded), false);
         assert.strictEqual(craft.stats.calls.length, 1);
         assert.deepStrictEqual(craft.stats.calls[0].values, ['oak_planks', 1]);
@@ -663,15 +663,15 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         assert.throws(() => Voyager.parseContract('function ( {'), /contract does not parse/);
         const commented = 'async function checkOakLog(bot) {\n  // currently 55\n  log(bot, "currently 55");\n  return true;\n}';
         const skill = { name: 'checkOakLog', code: commented, consumes: {}, effects: [] };
-        assert.match(v._validContract({ pre: 'c => c.pre.inv.oak_log < 55', post: 'c => true' }, skill), /pre uses 55/);
-        assert.deepStrictEqual(Voyager.copiedInventoryHits({ ...skill, contract: { pre: 'c => true', post: 'c => true' } }, registry), []);
+        assert.match(v._validContract({ pre: 'c => c.pre.inv.oak_log < 55', post: 'c => c.ret !== false' }, skill), /pre uses 55/);
+        assert.deepStrictEqual(Voyager.copiedInventoryHits({ ...skill, contract: { pre: 'c => true', post: 'c => c.ret !== false' } }, registry), []);
         assert.match(Voyager.prototype._learnContracts.toString(), /String\(e\.code\)/);
         assert.doesNotMatch(Voyager.prototype._learnContracts.toString(), /sourceForContractPrompt/);
         const coded = { name: 'checkOakLog', code: 'async function checkOakLog(bot) { const n = 55; return n; }', consumes: {}, effects: [] };
-        assert.match(v._validContract({ pre: 'c => c.pre.inv.oak_log < 55', post: 'c => true' }, coded), /pre uses 55/);
-        assert.deepStrictEqual(Voyager.copiedInventoryHits({ ...coded, contract: { pre: 'c => true', post: 'c => true' } }, registry), []);
+        assert.match(v._validContract({ pre: 'c => c.pre.inv.oak_log < 55', post: 'c => c.ret !== false' }, coded), /pre uses 55/);
+        assert.deepStrictEqual(Voyager.copiedInventoryHits({ ...coded, contract: { pre: 'c => true', post: 'c => c.ret !== false' } }, registry), []);
         const copied = { name: 'checkOakLog', code: 'async function checkOakLog(bot) { const counts = getInventoryCounts(bot); return counts.oak_log >= 55; }', consumes: {}, effects: [], promptCounts: { oak_log: 55 } };
-        assert.match(v._validContract({ pre: 'c => c.pre.inv.oak_log >= 55', post: 'c => true' }, copied), /pre uses 55/);
+        assert.match(v._validContract({ pre: 'c => c.pre.inv.oak_log >= 55', post: 'c => c.ret !== false' }, copied), /pre uses 55/);
     });
 
     it('armour slots and a stack size are minecraft-data; the other review literals stay wrong', () => {
@@ -690,11 +690,11 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         const travel = 'async function travelWestAvoidDeathHotspot(bot) {\n  const destX = -178, destY = 53, destZ = 107;\n  if (d <= 4) return;\n  const step = Math.min(32, d);\n  await goToPosition(bot, destX, destY, destZ, 3);\n  await travelTo(bot, destX, destY, destZ, 8);\n}';
         const skills = [
             { name: 'craftToolSet', code: tool, contract: { pre: 'c => true', post: 'c => c.ret === 3' } },
-            { name: 'isSafeTarget', code: safe, contract: { pre: 'c => c.args.length >= 2 && c.args.length <= 3 && c.args.length === 2', post: 'c => true' } },
+            { name: 'isSafeTarget', code: safe, contract: { pre: 'c => c.args.length >= 2 && c.args.length <= 3 && c.args.length === 2', post: 'c => c.ret !== false' } },
             { name: 'equipBestArmor', code: armorCode, contract: { pre: 'c => true', post: 'c => c.ret <= 4' } },
             { name: 'craftArmorSet', code: setCode, contract: { pre: 'c => true', post: 'c => c.ret === 4' } },
             { name: 'harvestCrop', code: crop, contract: { pre: 'c => true', post: 'c => c.ret >= 2' } },
-            { name: 'breakBlockAt', code: brk, contract: { pre: 'c => c.args.length >= 2', post: 'c => true' } },
+            { name: 'breakBlockAt', code: brk, contract: { pre: 'c => c.args.length >= 2', post: 'c => c.ret !== false' } },
             { name: 'ensureStorageChestNearby', code: chestCode, contract: { pre: 'c => true', post: 'c => c.ret <= 64' } },
             { name: 'equipBestPickaxeForIronOre', code: pick, contract: { pre: 'c => true', post: 'c => c.ret === 4 || c.ret === 5' } },
             { name: 'travelWestAvoidDeathHotspot', code: travel, contract: { pre: 'c => true', post: 'c => Math.abs(c.post.pos.y - 53) <= 6' } },
@@ -702,7 +702,7 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
             { name: 'exploreForIronOre', code: 'async function exploreForIronOre(bot) {\n  return getNearestBlock(bot, "iron_ore", 32);\n}', contract: { pre: 'c => true', post: 'c => c.ret <= 4' } },
             { name: 'scanForIronOreBlocks', code: 'async function scanForIronOreBlocks(bot) {\n  return getNearestBlocks(bot, ["iron_ore", "deepslate_iron_ore"], 128, 20);\n}', contract: { pre: 'c => true', post: 'c => c.ret >= 0.5' } },
             { name: 'mineIronOreDeposit', code: 'async function mineIronOreDeposit(bot) {\n  const b = getNearestBlock(bot, "iron_ore", 32);\n  if (!b) return false;\n  await mineBlock(bot, b);\n  return true;\n}', contract: { pre: 'c => c.args.length >= 2', post: 'c => c.ret >= 2' } },
-            { name: 'checkOakLog', code: 'async function checkOakLog(bot) {\n  const counts = getInventoryCounts(bot);\n  return counts.oak_log >= 55;\n}', promptCounts: { oak_log: 55 }, contract: { pre: 'c => c.pre.inv.oak_log >= 55', post: 'c => true' } },
+            { name: 'checkOakLog', code: 'async function checkOakLog(bot) {\n  const counts = getInventoryCounts(bot);\n  return counts.oak_log >= 55;\n}', promptCounts: { oak_log: 55 }, contract: { pre: 'c => c.pre.inv.oak_log >= 55', post: 'c => c.ret !== false' } },
         ];
         const manifest = buildContractManifest(skills);
         assert.deepStrictEqual(manifest.records.map(r => r.id), [
@@ -716,13 +716,13 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         assert.match(byId['checkOakLog.pre.oak_log.55'], /not the parsed goal quantity of oak_log/);
         assert.strictEqual(manifest.checkOakLogPresent, true);
         const absent = [
-            { name: 'smeltIronIntoIngot', code: 'async function smeltIronIntoIngot(bot) { const c = getInventoryCounts(bot); return c.raw_iron < 1; }', promptCounts: { raw_iron: 1 }, contract: { pre: 'c => true', post: 'c => true' } },
-            { name: 'mineBlocks', code: 'async function mineBlocks(bot, blockName, count = 1) { return true; }', contract: { pre: 'c => c.args.length >= 2', post: 'c => true' } },
-            { name: 'craftItem', code: 'async function craftItem(bot, itemName, target = 1) { return true; }', contract: { pre: 'c => c.args.length >= 2', post: 'c => true' } },
-            { name: 'hasItemCount', code: 'async function hasItemCount(bot, name, count) { return true; }', contract: { pre: 'c => c.args.length >= 2', post: 'c => true' } },
-            { name: 'ensureIngredientsAndCraft', code: 'async function ensureIngredientsAndCraft(bot, itemName, count = 1) { return true; }', contract: { pre: 'c => c.args.length >= 2', post: 'c => true' } },
+            { name: 'smeltIronIntoIngot', code: 'async function smeltIronIntoIngot(bot) { const c = getInventoryCounts(bot); return c.raw_iron < 1; }', promptCounts: { raw_iron: 1 }, contract: { pre: 'c => true', post: 'c => c.ret !== false' } },
+            { name: 'mineBlocks', code: 'async function mineBlocks(bot, blockName, count = 1) { return true; }', contract: { pre: 'c => c.args.length >= 2', post: 'c => c.ret !== false' } },
+            { name: 'craftItem', code: 'async function craftItem(bot, itemName, target = 1) { return true; }', contract: { pre: 'c => c.args.length >= 2', post: 'c => c.ret !== false' } },
+            { name: 'hasItemCount', code: 'async function hasItemCount(bot, name, count) { return true; }', contract: { pre: 'c => c.args.length >= 2', post: 'c => c.ret !== false' } },
+            { name: 'ensureIngredientsAndCraft', code: 'async function ensureIngredientsAndCraft(bot, itemName, count = 1) { return true; }', contract: { pre: 'c => c.args.length >= 2', post: 'c => c.ret !== false' } },
             { name: 'craftArmorSet', code: 'async function craftArmorSet(bot, material = "iron") {\n  const counts = getInventoryCounts(bot);\n  if (counts.iron_ingot < 4) return false;\n  return true;\n}', promptCounts: { iron_ingot: 4 }, contract: { pre: 'c => true', post: 'c => c.ret === 4' } },
-            { name: 'isSafeTarget', code: 'function isSafeTarget(bot, x, z, maxRange = 48) { return true; }', contract: { pre: 'c => c.args.length >= 2 && c.args.length <= 3', post: 'c => true' } },
+            { name: 'isSafeTarget', code: 'function isSafeTarget(bot, x, z, maxRange = 48) { return true; }', contract: { pre: 'c => c.args.length >= 2 && c.args.length <= 3', post: 'c => c.ret !== false' } },
         ];
         const cleared = buildContractManifest(absent);
         for (const id of ['smeltIronIntoIngot.code.1', 'mineBlocks.pre.2', 'craftItem.pre.2', 'hasItemCount.pre.2', 'ensureIngredientsAndCraft.pre.2', 'craftArmorSet.post.4', 'isSafeTarget.pre.2', 'isSafeTarget.pre.3']) {
@@ -735,10 +735,10 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         const oakTask = 'Check inventory for oak_log and confirm count (currently 55) to ensure input is valid for crafting oak_planks';
         const skills = [
             { name: 'craftToolSet', code: fn('craftToolSet'), contract: { pre: 'c => true', post: 'c => Object.keys(c.post.inv).filter(k=>k.endsWith(\'_pickaxe\')||k.endsWith(\'_axe\')||k.endsWith(\'_sword\')).length === 3' } },
-            { name: 'isSafeTarget', code: fn('isSafeTarget'), contract: { pre: 'c => c.args.length === 2 || (c.args.length === 3 && typeof c.args[2] === \'number\')', post: 'c => true' } },
+            { name: 'isSafeTarget', code: fn('isSafeTarget'), contract: { pre: 'c => c.args.length === 2 || (c.args.length === 3 && typeof c.args[2] === \'number\')', post: 'c => c.ret !== false' } },
             { name: 'craftArmorSet', code: fn('craftArmorSet'), contract: { pre: 'c => true', post: 'c => Number(c.ret) === 0 || (Number(c.ret) > 0 && Number(c.ret) <= 4 && c.post.alive)' } },
             { name: 'harvestCrop', code: fn('harvestCrop'), contract: { pre: 'c => true', post: 'c => Number(c.ret) >= 0 && Number(c.ret) <= (c.args[2]||4)' } },
-            { name: 'breakBlockAt', code: fn('breakBlockAt'), contract: { pre: 'c => c.pre.alive && c.args[0] != null && c.args[1] != null && c.args[2] != null', post: 'c => true' } },
+            { name: 'breakBlockAt', code: fn('breakBlockAt'), contract: { pre: 'c => c.pre.alive && c.args[0] != null && c.args[1] != null && c.args[2] != null', post: 'c => c.ret !== false' } },
             { name: 'exploreForIronOre', code: fn('exploreForIronOre'), contract: { pre: 'c => true', post: 'c => c.dist(c.post.pos, {x: c.pre.pos.x + (c.args[0] % 3 - 1) * 40, y: c.pre.pos.y + Math.min(0, -8 - c.args[0] * 2), z: c.pre.pos.z}) <= 4' } },
             { name: 'scanForIronOreBlocks', code: fn('scanForIronOreBlocks'), contract: { pre: 'c => true', post: 'c => c.post.alive && c.dist(c.pre.pos, c.post.pos) < 0.5 && c.post.alive' } },
             { name: 'exploreForIronOreDeposit', code: fn('exploreForIronOreDeposit'), contract: { pre: 'c => true', post: 'c => c.dist(c.post.pos, {x: c.pre.pos.x, y: c.pre.pos.y, z: c.pre.pos.z}) <= 5' } },
@@ -746,10 +746,10 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
             { name: 'ensureStorageChestNearby', code: fn('ensureStorageChestNearby'), contract: { pre: 'c => true', post: 'c => c.ret !== true || (c.post.alive && c.post.dim === c.pre.dim && c.dist(c.pre.pos, c.post.pos) <= 64)' } },
             { name: 'equipBestPickaxeForIronOre', code: fn('equipBestPickaxeForIronOre'), contract: { pre: 'c => true', post: 'c => { const tier = { wooden_pickaxe: 1, stone_pickaxe: 2, iron_pickaxe: 3, golden_pickaxe: 3, diamond_pickaxe: 4, netherite_pickaxe: 5 }; return tier.diamond_pickaxe === 4 && tier.netherite_pickaxe === 5; }' } },
             { name: 'travelWestAvoidDeathHotspot', code: fn('travelWestAvoidDeathHotspot'), contract: { pre: 'c => true', post: 'c => c.dist(c.post.pos, {x:-178,y:53,z:107}) <= 8 && Math.abs(c.post.pos.y - 53) <= 6' } },
-            { name: 'verifyBlockType', code: fn('verifyBlockType'), contract: { pre: 'c => c.args[0] === -28 && c.args[1] === 73 && c.args[2] === 56 && c.pre.alive', post: 'c => true' } },
-            { name: 'chopDownTrees', code: fn('chopDownTrees'), contract: { pre: 'c => c.pre.sky > 5', post: 'c => true' } },
-            { name: 'removeItem', code: fn('removeItem'), contract: { pre: 'c => c.args[2] === 0', post: 'c => true' } },
-            { name: 'collectSurfaceDirt', code: fn('collectSurfaceDirt'), contract: { pre: 'c => c.pre.sky > 4 && c.pre.inv.iron_hoe !== undefined', post: 'c => true' } },
+            { name: 'verifyBlockType', code: fn('verifyBlockType'), contract: { pre: 'c => c.args[0] === -28 && c.args[1] === 73 && c.args[2] === 56 && c.pre.alive', post: 'c => c.ret !== false' } },
+            { name: 'chopDownTrees', code: fn('chopDownTrees'), contract: { pre: 'c => c.pre.sky > 5', post: 'c => c.ret !== false' } },
+            { name: 'removeItem', code: fn('removeItem'), contract: { pre: 'c => c.args[2] === 0', post: 'c => c.ret !== false' } },
+            { name: 'collectSurfaceDirt', code: fn('collectSurfaceDirt'), contract: { pre: 'c => c.pre.sky > 4 && c.pre.inv.iron_hoe !== undefined', post: 'c => c.ret !== false' } },
             {
                 name: 'checkOakLog',
                 task: oakTask,
@@ -768,14 +768,14 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
                 task: 'Craft 4 birch_planks',
                 code: fn('craftBirchPlanks', 'const counts = getInventoryCounts(bot);\n  return counts.birch_planks >= 4;'),
                 promptCounts: { birch_planks: 4 },
-                contract: { pre: 'c => c.pre.inv.birch_planks >= 4', post: 'c => true' },
+                contract: { pre: 'c => c.pre.inv.birch_planks >= 4', post: 'c => c.ret !== false' },
             },
             {
                 name: 'collectSevenDirt',
                 task: 'Collect 7 dirt',
                 code: fn('collectSevenDirt', 'const counts = getInventoryCounts(bot);\n  return counts.dirt >= 7;'),
                 promptCounts: { dirt: 7 },
-                contract: { pre: 'c => c.pre.inv.dirt >= 7', post: 'c => true' },
+                contract: { pre: 'c => c.pre.inv.dirt >= 7', post: 'c => c.ret !== false' },
             },
         ];
         const manifest = buildContractManifest(skills);
@@ -808,10 +808,10 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         const dirtDesc = 'Collect 32 dirt blocks within 32 blocks of the current position to ensure tilling surface is available for planting wheat_seeds';
         const skills = [
             { name: 'craftToolSet', code: fn('craftToolSet'), contract: { pre: 'c => true', post: 'c => Object.keys(c.post.inv).filter(k=>k.endsWith(\'_pickaxe\')||k.endsWith(\'_axe\')||k.endsWith(\'_sword\')).length === 3' } },
-            { name: 'isSafeTarget', code: fn('isSafeTarget'), contract: { pre: 'c => c.args.length === 2 || (c.args.length === 3 && typeof c.args[2] === \'number\')', post: 'c => true' } },
+            { name: 'isSafeTarget', code: fn('isSafeTarget'), contract: { pre: 'c => c.args.length === 2 || (c.args.length === 3 && typeof c.args[2] === \'number\')', post: 'c => c.ret !== false' } },
             { name: 'craftArmorSet', code: fn('craftArmorSet'), contract: { pre: 'c => true', post: 'c => Number(c.ret) === 0 || (Number(c.ret) > 0 && Number(c.ret) <= 4 && c.post.alive)' } },
             { name: 'harvestCrop', code: fn('harvestCrop'), contract: { pre: 'c => true', post: 'c => Number(c.ret) >= 0 && Number(c.ret) <= (c.args[2]||4)' } },
-            { name: 'breakBlockAt', code: fn('breakBlockAt'), contract: { pre: 'c => c.pre.alive && c.args[0] != null && c.args[1] != null && c.args[2] != null', post: 'c => true' } },
+            { name: 'breakBlockAt', code: fn('breakBlockAt'), contract: { pre: 'c => c.pre.alive && c.args[0] != null && c.args[1] != null && c.args[2] != null', post: 'c => c.ret !== false' } },
             { name: 'exploreForIronOre', code: fn('exploreForIronOre'), contract: { pre: 'c => true', post: 'c => c.dist(c.post.pos, {x: c.pre.pos.x + (c.args[0] % 3 - 1) * 40, y: c.pre.pos.y + Math.min(0, -8 - c.args[0] * 2), z: c.pre.pos.z}) <= 4' } },
             { name: 'scanForIronOreBlocks', code: fn('scanForIronOreBlocks'), contract: { pre: 'c => true', post: 'c => c.post.alive && c.dist(c.pre.pos, c.post.pos) < 0.5 && c.post.alive' } },
             { name: 'exploreForIronOreDeposit', code: fn('exploreForIronOreDeposit'), contract: { pre: 'c => true', post: 'c => c.dist(c.post.pos, {x: c.pre.pos.x, y: c.pre.pos.y, z: c.pre.pos.z}) <= 5' } },
@@ -819,10 +819,10 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
             { name: 'ensureStorageChestNearby', code: fn('ensureStorageChestNearby'), contract: { pre: 'c => true', post: 'c => c.ret !== true || (c.post.alive && c.post.dim === c.pre.dim && c.dist(c.pre.pos, c.post.pos) <= 64)' } },
             { name: 'equipBestPickaxeForIronOre', code: fn('equipBestPickaxeForIronOre'), contract: { pre: 'c => true', post: 'c => { const tier = { wooden_pickaxe: 1, stone_pickaxe: 2, iron_pickaxe: 3, golden_pickaxe: 3, diamond_pickaxe: 4, netherite_pickaxe: 5 }; return tier.diamond_pickaxe === 4 && tier.netherite_pickaxe === 5; }' } },
             { name: 'travelWestAvoidDeathHotspot', code: fn('travelWestAvoidDeathHotspot'), contract: { pre: 'c => true', post: 'c => c.dist(c.post.pos, {x:-178,y:53,z:107}) <= 8 && Math.abs(c.post.pos.y - 53) <= 6' } },
-            { name: 'verifyBlockType', code: fn('verifyBlockType'), contract: { pre: 'c => c.args[0] === -28 && c.args[1] === 73 && c.args[2] === 56 && c.pre.alive', post: 'c => true' } },
-            { name: 'chopDownTrees', code: fn('chopDownTrees'), contract: { pre: 'c => c.pre.sky > 5', post: 'c => true' } },
-            { name: 'removeItem', code: fn('removeItem'), contract: { pre: 'c => c.args[2] === 0', post: 'c => true' } },
-            { name: 'collectSurfaceDirt', code: fn('collectSurfaceDirt'), contract: { pre: 'c => c.pre.sky > 4 && c.pre.inv.iron_hoe !== undefined', post: 'c => true' } },
+            { name: 'verifyBlockType', code: fn('verifyBlockType'), contract: { pre: 'c => c.args[0] === -28 && c.args[1] === 73 && c.args[2] === 56 && c.pre.alive', post: 'c => c.ret !== false' } },
+            { name: 'chopDownTrees', code: fn('chopDownTrees'), contract: { pre: 'c => c.pre.sky > 5', post: 'c => c.ret !== false' } },
+            { name: 'removeItem', code: fn('removeItem'), contract: { pre: 'c => c.args[2] === 0', post: 'c => c.ret !== false' } },
+            { name: 'collectSurfaceDirt', code: fn('collectSurfaceDirt'), contract: { pre: 'c => c.pre.sky > 4 && c.pre.inv.iron_hoe !== undefined', post: 'c => c.ret !== false' } },
             {
                 name: 'checkOakLog',
                 task: oakTask,
@@ -853,13 +853,13 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
                 name: 'craftBirchPlanks',
                 task: 'Craft 4 birch_planks',
                 code: fn('craftBirchPlanks', 'const counts = getInventoryCounts(bot);\n  return counts.birch_planks >= 4;'),
-                contract: { pre: 'c => c.pre.inv.birch_planks >= 4', post: 'c => true' },
+                contract: { pre: 'c => c.pre.inv.birch_planks >= 4', post: 'c => c.ret !== false' },
             },
             {
                 name: 'collectSevenDirt',
                 task: 'Collect 7 dirt',
                 code: fn('collectSevenDirt', 'const counts = getInventoryCounts(bot);\n  return counts.dirt >= 7;'),
-                contract: { pre: 'c => c.pre.inv.dirt >= 7', post: 'c => true' },
+                contract: { pre: 'c => c.pre.inv.dirt >= 7', post: 'c => c.ret !== false' },
             },
         ];
         const manifest = buildContractManifest(skills);
@@ -926,10 +926,10 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         const codeOf = (name, body) => `async function ${name}(bot) {\n  ${body}\n}`;
         const base = [
             { name: 'craftToolSet', code: codeOf('craftToolSet', 'return true;'), contract: { pre: 'c => true', post: texts[20] } },
-            { name: 'isSafeTarget', code: codeOf('isSafeTarget', 'return true;'), contract: { pre: texts[21], post: 'c => true' } },
+            { name: 'isSafeTarget', code: codeOf('isSafeTarget', 'return true;'), contract: { pre: texts[21], post: 'c => c.ret !== false' } },
             { name: 'craftArmorSet', code: codeOf('craftArmorSet', 'return true;'), contract: { pre: 'c => true', post: texts[22] } },
             { name: 'harvestCrop', code: codeOf('harvestCrop', 'return true;'), contract: { pre: 'c => true', post: texts[23] } },
-            { name: 'breakBlockAt', code: codeOf('breakBlockAt', 'return true;'), contract: { pre: texts[24], post: 'c => true' } },
+            { name: 'breakBlockAt', code: codeOf('breakBlockAt', 'return true;'), contract: { pre: texts[24], post: 'c => c.ret !== false' } },
             { name: 'exploreForIronOre', code: codeOf('exploreForIronOre', 'return true;'), contract: { pre: 'c => true', post: texts[25] } },
             { name: 'scanForIronOreBlocks', code: codeOf('scanForIronOreBlocks', 'return true;'), contract: { pre: 'c => true', post: texts[26] } },
             { name: 'exploreForIronOreDeposit', code: codeOf('exploreForIronOreDeposit', 'return true;'), contract: { pre: 'c => true', post: texts[27] } },
@@ -937,10 +937,10 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
             { name: 'ensureStorageChestNearby', code: codeOf('ensureStorageChestNearby', 'return true;'), contract: { pre: 'c => true', post: texts[30] } },
             { name: 'equipBestPickaxeForIronOre', code: codeOf('equipBestPickaxeForIronOre', 'return true;'), contract: { pre: 'c => true', post: `c => { const tier = ${tier}; return tier.diamond_pickaxe === 4 && tier.netherite_pickaxe === 5; }` } },
             { name: 'travelWestAvoidDeathHotspot', code: codeOf('travelWestAvoidDeathHotspot', 'return true;'), contract: { pre: 'c => true', post: texts[31] } },
-            { name: 'verifyBlockType', code: codeOf('verifyBlockType', 'return true;'), contract: { pre: texts[32], post: 'c => true' } },
-            { name: 'chopDownTrees', code: codeOf('chopDownTrees', 'return true;'), contract: { pre: texts[33], post: 'c => true' } },
-            { name: 'removeItem', code: codeOf('removeItem', 'return true;'), contract: { pre: texts[34], post: 'c => true' } },
-            { name: 'collectSurfaceDirt', code: codeOf('collectSurfaceDirt', 'return true;'), contract: { pre: texts[35], post: 'c => true' } },
+            { name: 'verifyBlockType', code: codeOf('verifyBlockType', 'return true;'), contract: { pre: texts[32], post: 'c => c.ret !== false' } },
+            { name: 'chopDownTrees', code: codeOf('chopDownTrees', 'return true;'), contract: { pre: texts[33], post: 'c => c.ret !== false' } },
+            { name: 'removeItem', code: codeOf('removeItem', 'return true;'), contract: { pre: texts[34], post: 'c => c.ret !== false' } },
+            { name: 'collectSurfaceDirt', code: codeOf('collectSurfaceDirt', 'return true;'), contract: { pre: texts[35], post: 'c => c.ret !== false' } },
             {
                 name: 'checkOakLog',
                 code: codeOf('checkOakLog', 'const inventory = getInventoryCounts(bot);\n  if (inventory && inventory.oak_log >= 55) return true;\n  return false;'),
