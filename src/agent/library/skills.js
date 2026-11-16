@@ -1523,20 +1523,23 @@ export async function goToGoal(bot, goal) {
     bot.pathfinder.thinkTimeout = 10000; // fix44: reduced from 20s to 10s for faster failure feedback
     bot.pathfinder.tickTimeout = 40;
 
-    // fix124: while the bot's head is underwater no pathfinder movement can carry it —
-    // every movement generator refuses liquid nodes
-    // (node_modules/mineflayer-pathfinder/lib/movements.js:526,546,556,642), so navigation
-    // from a submerged position is structurally dead: the search either finds no path or a
-    // path whose first step physics cannot execute, and the learned watchdog kills the
-    // attempt at "no swim progress" (live: flooded shaft at (-175, 41, 104), PSN regenerating
-    // exitWater code forever). Float to the surface first (swimming is the game's own
-    // liquid movement), then pathfind from there.
+    // fix124: while the bot floats in water no pathfinder movement can carry it — every
+    // generator refuses liquid nodes and a horizontal step needs a floor block
+    // (node_modules/mineflayer-pathfinder/lib/movements.js:526,546,556 and getMoveForward's
+    // landing-block requirement), so navigation from a flooded shaft or water-filled corridor
+    // is structurally dead: attempts die at the learned watchdog "no swim progress"
+    // (live: (-175, 41, 104), PSN regenerating exitWater forever). Swim toward the goal
+    // column with the game's own liquid movement first, then pathfind on dry ground.
     if (bot.entity.isInWater) {
-        const swim = await swimToSurface(bot);
-        if (!swim.surfaced) {
+        const gpos = goal.pos ?? (Number.isFinite(goal.x) ? goal : null);
+        const swim = await swimTowards(bot, gpos ? gpos.x : null, gpos ? gpos.z : null);
+        if (!swim.reached) {
             const p = bot.entity.position;
-            log(bot, `FAILED: cannot swim out of the water at (${Math.floor(p.x)}, ${Math.floor(p.y)}, ${Math.floor(p.z)}): ${swim.interrupted ? 'interrupted' : 'the column is sealed above (no air)'}. Reach dry ground another way.`);
+            log(bot, `FAILED: could not swim ${gpos ? 'to dry ground near the target' : 'out of the water'} at (${Math.floor(p.x)}, ${Math.floor(p.y)}, ${Math.floor(p.z)}): ${swim.blocked ? 'two game seconds without entering a new cell (sealed or wall ahead)' : 'interrupted'}. Reach it another way.`);
             return false;
+        }
+        if (typeof goal.isEnd === 'function' && goal.isEnd(bot.entity.position)) {
+            return true;
         }
         if (swim.rose >= 1) {
             log(bot, `Swam ${Math.round(swim.rose)} blocks up to the water surface; pathfinding from there.`);
@@ -1770,51 +1773,89 @@ function startDoorInterval(bot) {
     return doorCheckInterval;
 }
 
-export async function swimToSurface(bot) {
+export async function swimTowards(bot, x = null, z = null) {
     /**
-     * Rise out of a water column by swimming: hold jump until the head clears the surface.
-     * Needed because mineflayer-pathfinder has no movement that operates in liquid —
-     * getMoveUp returns the moment the node block is liquid, getMoveDown/getMoveDropDown
-     * refuse liquid targets and parkour will not jump from water
-     * (node_modules/mineflayer-pathfinder/lib/movements.js:526,546,556,642) — so a bot
-     * submerged in a flooded pit or shaft has no path out that pathfinding can produce.
-     * Swimming is direct physics: holding jump pushes the entity up through water (the same
-     * control the drowning reflex uses, src/agent/modes.js:68). Once the head cell is air the
-     * bot floats at the surface and pathfinder movements exist again.
+     * Swim with direct controls (the game's own liquid movement) to a column, or straight up
+     * to the surface when no column is given. Needed because mineflayer-pathfinder has no
+     * movement that operates in liquid: every generator refuses liquid nodes — getMoveUp
+     * returns at once, getMoveDown/getMoveDropDown refuse liquid targets, and a horizontal
+     * step needs a safe floor block which water never provides
+     * (node_modules/mineflayer-pathfinder/lib/movements.js:526,546,556 and getMoveForward's
+     * landing-block requirement) — so a bot floating in a flooded shaft or water-filled
+     * corridor has no path that pathfinding can plan OR execute (live 16 Nov: bot stuck in
+     * the flooded mineshaft at (-175, 41, 104); every goToPosition died at the learned
+     * watchdog "no swim progress" while PSN regenerated exitWater code forever).
+     * Swimming here is lookAt(target) + forward + jump — the same controls the drowning
+     * reflex uses (src/agent/modes.js:68) — until the bot reaches dry ground, floats at the
+     * target column with its head free, or stops entering new cells (blocked).
      * @param {MinecraftBot} bot, reference to the minecraft bot.
-     * @returns {Promise<object>} {surfaced, rose, blocked?, interrupted?} — rose is the number
-     * of blocks gained. blocked means the column has no air above (zero rise over a full
-     * second of held jump); surfaced is true without swimming when the head is already free.
+     * @param {number} x, target column x, or null to rise in place.
+     * @param {number} z, target column z, or null to rise in place.
+     * @returns {Promise<object>} {reached, rose, blocked?, interrupted?} — rose is blocks of
+     * height gained. blocked means two game seconds passed with zero new cells entered.
+     * @example
+     * const swim = await skills.swimTowards(bot, 12, -4);
+     **/
+    const hasTarget = Number.isFinite(x) && Number.isFinite(z);
+    if (!bot.entity.isInWater) return { reached: true, rose: 0 };
+    const cellOf = (p) => `${Math.floor(p.x)},${Math.floor(p.y)},${Math.floor(p.z)}`;
+    const headFree = (p) => {
+        if (typeof bot.blockAt !== 'function') return false;
+        const head = bot.blockAt(p.offset(0, 1, 0));
+        return !head || head.name !== 'water';
+    };
+    const startY = bot.entity.position.y;
+    bot.setControlState('jump', true);
+    if (hasTarget) bot.setControlState('forward', true);
+    let lastCell = cellOf(bot.entity.position);
+    let stuckTicks = 0;
+    try {
+        while (!bot.interrupt_code) {
+            const p = bot.entity.position;
+            if (!bot.entity.isInWater) {
+                return { reached: true, rose: p.y - startY };
+            }
+            if (hasTarget) {
+                const dist = Math.hypot(x - p.x, z - p.z);
+                // arriving at the target column only counts once the head is clear of water
+                if (dist <= 1.5 && headFree(p)) return { reached: true, rose: p.y - startY };
+                await bot.lookAt(new Vec3(x, p.y, z));
+            } else {
+                // no column to aim for: done once the head cell is not water
+                if (headFree(p)) {
+                    return { reached: true, rose: p.y - startY };
+                }
+            }
+            // one game second of swimming, then judge progress by cells entered
+            await bot.waitForTicks(20);
+            const cell = cellOf(bot.entity.position);
+            if (cell === lastCell) {
+                stuckTicks += 20;
+                // two game seconds without entering a new cell: sealed column or wall ahead
+                if (stuckTicks >= 40) {
+                    return { reached: false, blocked: true, rose: bot.entity.position.y - startY };
+                }
+            } else {
+                stuckTicks = 0;
+                lastCell = cell;
+            }
+        }
+        return { reached: false, interrupted: true, rose: bot.entity.position.y - startY };
+    } finally {
+        bot.setControlState('jump', false);
+        bot.setControlState('forward', false);
+    }
+}
+
+export function swimToSurface(bot) {
+    /**
+     * Float straight up until the head clears the water (see swimTowards).
+     * @param {MinecraftBot} bot, reference to the minecraft bot.
+     * @returns {Promise<object>} {reached, rose, blocked?, interrupted?}
      * @example
      * const up = await skills.swimToSurface(bot);
      **/
-    const startY = bot.entity.position.y;
-    const headInWater = () => {
-        const head = bot.blockAt(bot.entity.position.offset(0, 1, 0));
-        return !!head && head.name === 'water';
-    };
-    if (!bot.entity.isInWater || !headInWater()) {
-        return { surfaced: true, rose: 0 };
-    }
-    bot.setControlState('jump', true);
-    let lastY = startY;
-    try {
-        while (!bot.interrupt_code) {
-            if (!headInWater()) {
-                return { surfaced: true, rose: bot.entity.position.y - startY };
-            }
-            // one game second of held jump; a free column always gains >1 block in that time
-            await bot.waitForTicks(20);
-            const y = bot.entity.position.y;
-            if (y - lastY < 1) {
-                return { surfaced: false, blocked: true, rose: y - startY };
-            }
-            lastY = y;
-        }
-        return { surfaced: false, interrupted: true, rose: bot.entity.position.y - startY };
-    } finally {
-        bot.setControlState('jump', false);
-    }
+    return swimTowards(bot);
 }
 
 export async function goToPosition(bot, x, y, z, min_distance=2) {
