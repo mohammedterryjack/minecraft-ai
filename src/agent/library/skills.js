@@ -3,7 +3,7 @@ import * as world from "./world.js";
 import pf from 'mineflayer-pathfinder';
 import Vec3 from 'vec3';
 import settings from "../../../settings.js";
-import { watchPathing } from "../../utils/movement_model.js";
+import { watchPathing, cellKey } from "../../utils/movement_model.js";
 import { findCarried } from "../../utils/carried.js";
 import { markPreconditionUnmet, markBlockOutOfRange } from "../precondition.js";
 import { emptySlotsToFit, stackableCounts } from "../slot_room.js";
@@ -1530,8 +1530,14 @@ export async function goToGoal(bot, goal) {
     // is structurally dead: attempts die at the learned watchdog "no swim progress"
     // (live: (-175, 41, 104), PSN regenerating exitWater forever). Swim toward the goal
     // column with the game's own liquid movement first, then pathfind on dry ground.
+    // fix124b2: a route that crosses water is traversed segment by segment — walk, and when
+    // a walk stalls with the bot in water (the route entered a pool mid-way; live 16 Nov:
+    // "Smelt 5 raw_iron" -> goToNearestBlock died "no swim progress" 2634 ms after the bot
+    // walked into the flooded shaft) swim the water leg and walk again. Landed cells detect
+    // oscillation: the walk from a shore re-entering the same water the swim returns from.
+    const gpos = goal.pos ?? (Number.isFinite(goal.x) ? goal : null);
+    const landedCells = new Set();
     if (bot.entity.isInWater) {
-        const gpos = goal.pos ?? (Number.isFinite(goal.x) ? goal : null);
         const swim = await swimTowards(bot, gpos ? gpos.x : null, gpos ? gpos.z : null);
         if (!swim.reached) {
             const p = bot.entity.position;
@@ -1544,6 +1550,7 @@ export async function goToGoal(bot, goal) {
         if (swim.rose >= 1) {
             log(bot, `Swam ${Math.round(swim.rose)} blocks up to the water surface; pathfinding from there.`);
         }
+        landedCells.add(cellKey(bot.entity.position));
     }
 
     const nonDestructiveMovements = _survivalMovements(bot);
@@ -1631,8 +1638,11 @@ export async function goToGoal(bot, goal) {
             });
         };
 
+        // fix124b2: walk/swim segment loop (see the swim gate above)
+        for (;;) {
         try {
             await gotoWithProgress(goal);
+            break;
         } catch (err) {
             // fix44: check for interrupt first
             if (bot.interrupt_code || /interrupted/i.test(String(err?.message))) {
@@ -1641,14 +1651,36 @@ export async function goToGoal(bot, goal) {
                 log(bot, `FAILED: navigation cancelled (interrupted).`);
                 return false;
             }
-            
+
+            // fix124b2: the walk stalled with the bot in water — pathfinder cannot move in
+            // liquid, so swim this leg toward the goal column and plan the walk again
+            if (progressTimedOut && bot.entity.isInWater) {
+                const verdict = describeStall(progressTimedOut);
+                progressTimedOut = null;
+                log(bot, `Walk stalled in the water (${verdict}); swimming the water leg.`);
+                const seg = await swimTowards(bot, gpos ? gpos.x : null, gpos ? gpos.z : null);
+                if (!seg.reached) {
+                    clearInterval(doorCheckInterval);
+                    const p = bot.entity.position;
+                    log(bot, `FAILED: could not swim the water leg at (${Math.floor(p.x)}, ${Math.floor(p.y)}, ${Math.floor(p.z)}): ${seg.blocked ? 'two game seconds without entering a new cell (sealed or wall ahead)' : 'interrupted'}. Reach it another way.`);
+                    return false;
+                }
+                const cell = cellKey(bot.entity.position);
+                if (landedCells.has(cell)) {
+                    clearInterval(doorCheckInterval);
+                    log(bot, `FAILED: swimming out of the water returned to (${cell}) — the same shore the walk entered the water from. This route cannot be crossed by alternating walking and swimming.`);
+                    return false;
+                }
+                landedCells.add(cell);
+                continue;
+            }
+
             // fix44: check for progress timeout (stall)
             if (progressTimedOut) {
                 clearInterval(doorCheckInterval);
                 log(bot, `FAILED: navigation stalled - ${describeStall(progressTimedOut)}.`);
                 return false;
             }
-            
             // long/complex path: hop via intermediate waypoints toward the goal, then retry
             if (!/Took to long|No path|Timeout/i.test(String(err?.message)) || goal.x == null) {
                 throw err;
@@ -1684,6 +1716,8 @@ export async function goToGoal(bot, goal) {
             progressTimedOut = null;
             
             await gotoWithProgress(goal);
+            break;
+        }
         }
         clearInterval(doorCheckInterval);
         return true;
