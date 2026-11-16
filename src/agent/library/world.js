@@ -684,8 +684,14 @@ function openSearch(bot, position) {
         throw new Error('reachability: bot.entity.position is missing. getPathFromTo starts there (mineflayer-pathfinder index.js:69).');
     }
     const { movements, goal } = lookGoal(bot, position);
-    // thinkTimeout (index.js:40, default 5000) is a machine-speed cap. The loaded columns bound the open set.
-    return bot.pathfinder.getPathFromTo(movements, bot.entity.position, goal, { timeout: Number.POSITIVE_INFINITY, tickTimeout: tick });
+    // fix132: thinkTimeout (index.js:40, default 5000) is the same total think budget every
+    // normal goto runs under (mindcraft's own pathfind_timeout is 4000 ms). The +Infinity this
+    // used to pass rested on "the loaded columns bound the open set" — measured false twice:
+    // fix110 saw a probe "still 'partial' at 4400 s with 1.4M nodes and the open heap growing",
+    // and live 16 Nov 18:36–18:55 GMT the hunger serve's reachability search hung 20 minutes at
+    // 80% CPU with RSS +1.4 GB. Exceeding the think budget fails loudly (pathToBlock throws);
+    // it is never silently treated as unreachable.
+    return bot.pathfinder.getPathFromTo(movements, bot.entity.position, goal, { timeout: bot.pathfinder.thinkTimeout, tickTimeout: tick });
 }
 
 function yieldResult(step) {
@@ -707,7 +713,7 @@ function returnedResult(step) {
 
 function rejectUnfinished(result) {
     if (result.status === 'timeout') {
-        throw new Error('reachability: the search stopped on thinkTimeout (mineflayer-pathfinder index.js:40, lib/astar.js:73). The loaded world bounds the search. A timer does not.');
+        throw new Error('reachability: the search exceeded the thinkTimeout budget (mineflayer-pathfinder index.js:40) that every normal goto runs under. fix132: without this budget the same search ran 4400 s (fix110) and 20 min at +1.4 GB RSS (16 Nov live) without ending; this step fails loudly and is retried from a moved position, and timeout is never reported as reachable or unreachable.');
     }
     throw new Error(`reachability: getPathFromTo returned ${result.status}. Expected success, noPath, or partial (mineflayer-pathfinder lib/astar.js compute).`);
 }
