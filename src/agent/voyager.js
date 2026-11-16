@@ -6404,6 +6404,26 @@ Use only c; no other globals.`;
         }
         return items;
     }
+    // fix128: publish the keep-floor used by skills.discard() (see there). Same evidence that
+    // gates idle practice ("would consume scarce") and the capacity plan's reserves: the max
+    // measured consume of each item across learned skills, raised to the quantity a pending or
+    // recently-failed goal still asks for. Recomputed per task start so it tracks new evidence.
+    _publishItemKeeps() {
+        const keeps = new Map();
+        const bump = (item, n) => {
+            if (item && Number.isInteger(n) && n > 0) keeps.set(item, Math.max(keeps.get(item) ?? 0, n));
+        };
+        for (const s of this.skills) {
+            for (const [item, amt] of Object.entries(verifiedConsumes(s))) bump(item, amt);
+        }
+        for (const task of [...(this.progress.failed || []).slice(-10), ...(this.progress.pending || []).slice(-5)]) {
+            const goal = smeltGoal(task) || countGoal(task);
+            if (goal?.item) bump(goal.item, goal.count ?? 1);
+            if (goal?.items) goal.items.forEach((it) => bump(it, 1));
+        }
+        if (this.agent?.bot) this.agent.bot.itemKeeps = keeps;
+        return keeps;
+    }
     // fix42: check if a practice skill should be skipped (postcondition already met or would consume scarce inputs)
     // Returns a skip reason string, or null if practice is allowed
     // fix49: effects/consumes/stats initialized at load time - read directly
@@ -8672,6 +8692,7 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             if (invalid !== null) throw new Error(`[fix91] queued subgoal "${task}" failed the task gate after it was taken: ${invalid}`);
         }
         console.log(`[voyager] new task: ${task} (${proposal.reasoning})`);
+        this._publishItemKeeps(); // fix128: keep-floor for discard() from current evidence + pending goals
         this.currentTask = task;
         await this._pursueProposedTask(task, proposal, before);
     }

@@ -1208,6 +1208,28 @@ export async function discard(bot, itemName, num=-1) {
      * @example
      * await skills.discard(bot, "oak_log");
      **/
+    // fix128: keep-floor. Generated free-up code emptied scarce items live:
+    // discard("raw_iron",5) (mindcraft.log 77413) and discard("raw_iron",7) (line 98185) took
+    // raw_iron to 0 while smeltFiveRawIron's measured consumeEvidence is 5. The keep-reserve
+    // machinery (slot_room.surplusFromConsumption/capacityPlan, fix84/fix92: "A stack can be
+    // emptied only when the rest of that kind still covers its reserve") only guarded the plan
+    // path; discard() is the primitive every generated free-up goes through, so the floor lives
+    // here too. bot.itemKeeps (Map item->count) is published per task by
+    // Voyager._publishItemKeeps() from verifiedConsumes evidence + pending-goal demand.
+    if (bot.itemKeeps instanceof Map && bot.itemKeeps.has(itemName)) {
+        let held = 0;
+        for (const it of bot.inventory.items()) if (it.name === itemName) held += it.count;
+        const keep = bot.itemKeeps.get(itemName);
+        const allowed = Math.max(0, held - keep);
+        if (allowed === 0) {
+            log(bot, `FAILED: keeping all ${held} ${itemName}: ${keep} reserved by consumption evidence or pending goals. Use putInChest instead of discarding reserved items.`);
+            return false;
+        }
+        if (num === -1 || num > allowed) {
+            log(bot, `Capping discard of ${itemName} to ${allowed} (held ${held}, keep ${keep} reserved by consumption evidence or pending goals).`);
+            num = allowed;
+        }
+    }
     let discarded = 0;
     while (true) {
         let item = bot.inventory.findInventoryItem(itemName);
