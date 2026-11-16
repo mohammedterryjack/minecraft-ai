@@ -1068,16 +1068,13 @@ export async function placeBlock(bot, blockType, x, y, z, placeOn='bottom', dont
         return false;
     }
 
-    const pos = bot.entity.position;
-    const pos_above = pos.plus(Vec3(0,1,0));
-    const dont_move_for = ['torch', 'redstone_torch', 'redstone', 'lever', 'button', 'rail', 'detector_rail', 
-        'powered_rail', 'activator_rail', 'tripwire_hook', 'tripwire', 'water_bucket', 'string'];
-    if (!dont_move_for.includes(item_name) && (pos.distanceTo(targetBlock.position) < 1.1 || pos_above.distanceTo(targetBlock.position) < 1.1)) {
-        // too close
-        let goal = new pf.goals.GoalNear(targetBlock.position.x, targetBlock.position.y, targetBlock.position.z, 2);
-        let inverted_goal = new pf.goals.GoalInvert(goal);
-        bot.pathfinder.setMovements(new pf.Movements(bot));
-        await bot.pathfinder.goto(inverted_goal);
+    if (world.cellOccupiedByBot(bot, target_dest)) {
+        // fix134: the target cell is inside the bot's own hitbox. The server rejects the
+        // placement outright (blocks cannot intersect entities) — and moving away first only
+        // places into the cell from a worse angle or digs it out. Fail loud with the fix:
+        // stand elsewhere, or place at another cell (getNearestFreeSpace never offers these).
+        log(bot, `FAILED: cannot place ${blockType} at ${target_dest}: the bot itself occupies that cell. Stand somewhere else or pick another cell (getNearestFreeSpace excludes occupied cells).`);
+        return false;
     }
     if (outOfReach(bot, targetBlock.position)) {
         // too far
