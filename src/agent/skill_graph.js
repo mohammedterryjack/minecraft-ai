@@ -479,6 +479,7 @@ const __argText = xs => '[' + xs.map(__valText).join(',') + ']';
 const __reported = new WeakSet();
 const __harness = (stackStr, fn) => { const was = bot.__psnStackStr; bot.__psnStackStr = stackStr + ' <- (psn trace)'; __inHarness = true; try { return fn(); } finally { __inHarness = false; bot.__psnStackStr = was; } };
 const __wrap = (n, f) => function (...a) {
+    if (a.length < f.length) throw new Error(n + ' expects ' + f.length + ' argument(s), the bot first; called with ' + a.length + ': ' + n + '(' + a.map(x => x === bot ? 'bot' : __valText(x)).join(', ') + '). Call it with every argument, the bot as the first.');
     if (__inHarness) return f.apply(this, a);
     if (__T.length >= __TRACE_RECORDS) { __T.untraced += 1; return f.apply(this, a); }
     const par = __syncParent;

@@ -1222,7 +1222,11 @@ export class Coder {
         for (const k of skillKeysExec) {
             const f = skills[k];
             if (typeof f === 'function') {
-                endowments[k] = k === 'log' ? f : (...a) => (a[0]?.interrupt_code ? Promise.resolve(false) : f(...a));
+                // fix125: short calls state their violation now, not as a TypeError deep inside the library
+                endowments[k] = k === 'log' ? f : (...a) => {
+                    if (a.length < f.length) throw new Error(k + ' expects ' + f.length + ' argument(s), the bot first; called with ' + a.length + ': ' + k + '(' + a.map(x => x && x.interrupt_code !== undefined ? 'bot' : String(x)).join(', ') + '). Call it with every argument, the bot as the first.');
+                    return a[0]?.interrupt_code ? Promise.resolve(false) : f(...a);
+                };
             }
         }
         for (const k of worldKeysExec) {
