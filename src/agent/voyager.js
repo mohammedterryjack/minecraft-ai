@@ -8655,6 +8655,20 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             // fix91: _nextSubgoal already dropped invalid heads. A taken subgoal that still fails the gate is a bug,
             // and asking the planner here used to end the step while the rest of the queue sat there.
             const invalid = this._rejectTask(task, false);
+            if (invalid !== null && /^inventory cannot hold /.test(invalid)) {
+                // fix126: a physical-capacity rejection is not that bug — the inventory filled between
+                // enqueue and take (live 16 Nov 12:26 GMT: "Obtain 1 cod" vs room for 0, repeated every
+                // step). fix120's reason already names the fix ("free space first"); act on it: put a
+                // space-maker task at the head and the taken subgoal right behind it.
+                const SPACE_TASK = 'Free up inventory space';
+                const q = Array.isArray(this.progress.subgoals) ? this.progress.subgoals : (this.progress.subgoals = []);
+                let at = q.findIndex((s) => s && s.task === SPACE_TASK);
+                if (at === -1) { q.unshift({ task: SPACE_TASK, depth: 0 }); at = 0; console.log(`[fix126] "${task}" needs inventory space (${invalid}); queued "${SPACE_TASK}" ahead of it`); }
+                else console.log(`[fix126] "${task}" still cannot fit and "${SPACE_TASK}" is already queued; re-queueing behind it`);
+                q.splice(at + 1, 0, this._curSub ?? { task, depth: 0 });
+                this._saveProgress();
+                return;
+            }
             if (invalid !== null) throw new Error(`[fix91] queued subgoal "${task}" failed the task gate after it was taken: ${invalid}`);
         }
         console.log(`[voyager] new task: ${task} (${proposal.reasoning})`);
