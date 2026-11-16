@@ -8,6 +8,7 @@
  * than every earlier completed call of the same method. The store is the recorded durations.
  */
 import { mainThreadWatchdogStarted, noteMainThreadCall } from './main_thread_watchdog.js';
+import { Vec3 } from 'vec3';
 
 // fix96: one argument as the kill evidence shows it: primitives as they are, a function as its name, an object by its
 // own primitive fields (a Vec3 is x,y,z; findBlocks options show maxDistance and count). Nothing is stringified deeply,
@@ -46,6 +47,21 @@ export function assertFindBlocksOptions(options, fnName) {
             throw new Error(`${fnName}: ${key} must be a finite number, got ${shown}. matching is a block id, an array of block ids, or a function; maxDistance and count are numbers`);
         }
     }
+}
+
+// fix123: bot.blockAt requires a Vec3 — mineflayer hands the point to prismarine-world, whose
+// WorldSync.getBlock calls pos.floored() (node_modules/prismarine-world/src/worldsync.js:101-102).
+// Code-model output passes plain {x,y,z} literals to it (live: the repaired craftRecipe's
+// bot.blockAt({x,y,z}) crashed with "pos.floored is not a function" 128 times). fix97 established
+// argument enforcement at this proxy; a position-like first arg (finite x/y/z, not already a Vec3)
+// is normalized here so the class cannot crash the process again. Anything else passes through.
+export function coercePositionArg(value) {
+    if (value !== null && typeof value === 'object' && !Array.isArray(value)
+        && typeof value.floored !== 'function'
+        && Number.isFinite(value.x) && Number.isFinite(value.y) && Number.isFinite(value.z)) {
+        return new Vec3(value.x, value.y, value.z);
+    }
+    return value;
 }
 
 // Completed call durations, per method. The owner (voyager progress.botApiDurations) attaches the store.
@@ -102,6 +118,7 @@ export function wrapBotForApiTiming(bot) {
             if (typeof raw !== 'function') return raw;
             return function timedBotApi(...args) {
                 if (prop === 'findBlocks' || prop === 'findBlock') assertFindBlocksOptions(args[0], String(prop));
+                if (prop === 'blockAt' && args.length > 0) args[0] = coercePositionArg(args[0]);
                 const t0 = Date.now();
                 const done = () => {
                     const ms = Date.now() - t0;
