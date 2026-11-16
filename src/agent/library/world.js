@@ -11,10 +11,34 @@ const { CHUNK_WIDTH, BLOCK_SECTION_VOLUME, SECTION_WIDTH, SECTION_HEIGHT } = req
 
 
 // fix42: getAllFreeSpaces returns all valid positions (for retry logic when placeBlock fails at one cell)
+// fix134: cells the bot's own hitbox occupies. A block cannot be placed where an entity
+// intersects the cell (server interact check; https://minecraft.wiki/w/Place) — the interact
+// packet is silently rejected and no block appears. The bot's torso cell is air over a solid
+// floor, so free-space searches offered it as the NEAREST free space and every placement there
+// died as "Server refused ... the block is still air" (furnace at (-7,19,39), live 16 Nov).
+export function occupiedCells(bot) {
+    const p = bot.entity.position;
+    const hw = bot.entity.width / 2;
+    const cells = new Set();
+    for (let x = Math.floor(p.x - hw); x <= Math.floor(p.x + hw); x++) {
+        for (let y = Math.floor(p.y); y <= Math.floor(p.y + bot.entity.height - Number.EPSILON); y++) {
+            for (let z = Math.floor(p.z - hw); z <= Math.floor(p.z + hw); z++) {
+                cells.add(`${x},${y},${z}`);
+            }
+        }
+    }
+    return cells;
+}
+
+export function cellOccupiedByBot(bot, pos) {
+    return occupiedCells(bot).has(`${Math.floor(pos.x)},${Math.floor(pos.y)},${Math.floor(pos.z)}`);
+}
+
 export function getAllFreeSpaces(bot, size=1, distance=8, maxCount=10) {
     /**
      * Get all empty spaces with solid blocks beneath them of the given size, sorted by distance.
-     * @param {Bot} bot - The bot to get the free spaces for.
+     * Cells the bot itself stands in are excluded (the server rejects placements inside an entity).
+     * @param {Bot} bot - The bot to get the nearest free space for.
      * @param {number} size - The (size x size) of the space to find, default 1.
      * @param {number} distance - The maximum distance to search, default 8.
      * @param {number} maxCount - Maximum number of positions to return, default 10.
@@ -25,11 +49,14 @@ export function getAllFreeSpaces(bot, size=1, distance=8, maxCount=10) {
         maxDistance: distance,
         count: 1000
     });
+    const occupied = occupiedCells(bot);
     const results = [];
     for (let i = 0; i < empty_pos.length && results.length < maxCount; i++) {
+        if (occupied.has(`${empty_pos[i].x},${empty_pos[i].y},${empty_pos[i].z}`)) continue;
         let empty = true;
         for (let x = 0; x < size; x++) {
             for (let z = 0; z < size; z++) {
+                if (occupied.has(`${empty_pos[i].x + x},${empty_pos[i].y},${empty_pos[i].z + z}`)) { empty = false; break; }
                 let top = bot.blockAt(empty_pos[i].offset(x, 0, z));
                 let bottom = bot.blockAt(empty_pos[i].offset(x, -1, z));
                 if (!top || top.name !== 'air' || !bottom || bottom.drops.length === 0 || !bottom.diggable) {
