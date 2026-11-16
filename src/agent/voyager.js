@@ -2503,6 +2503,11 @@ Use only c; no other globals.`;
         const msgs = [];
         for (const tool of [...tools].sort()) {
             for (const block of [...blocks].sort()) {
+                // fix122: a block is never in its own harvestTools, so the pair (tool === block) carries
+                // no harvest claim — it is the skill holding/equipping the block itself. Without this
+                // skip, selectCobblestone (post: heldItem === 'cobblestone', and 'cobblestone' is also
+                // a block name) failed contract validation on every backfill attempt, forever.
+                if (tool === block) continue;
                 const ht = registry.blocksByName[block].harvestTools;
                 if (!ht) { msgs.push(`post expects '${tool}' for block '${block}', whose harvestTools list none (it drops by hand)`); continue; }
                 const names = Object.keys(ht).map(id => {
