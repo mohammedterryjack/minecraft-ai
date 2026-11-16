@@ -490,13 +490,32 @@ export async function attackEntity(bot, entity, kill=true) {
         await bot.attack(entity);
     }
     else {
-        bot.pvp.attack(entity);
-        while (world.getNearbyEntities(bot, 24).includes(entity)) {
-            await new Promise(resolve => setTimeout(resolve, 1000));
+        // fix130: honest kill verification. The old loop waited on
+        // world.getNearbyEntities(bot, 24).includes(entity) with a silent 1 s sleep: zero logging
+        // (live mindcraft.log: zero "Successfully killed" and zero clues why killMob returned 0),
+        // no bound (only an interrupt ended it — one step burned 532 s), and a mob that walked out
+        // of the 24-block window counted as killed. mineflayer-pvp follows the target itself
+        // (GoalFollow, node_modules/mineflayer-pvp/lib/PVP.js:72; attackRange 3.5) and bot.attack
+        // is an instant swing with server-side range checks (mineflayer 4.39 entities.js:843), so
+        // death is verified the way the client knows it: the entity leaving bot.entities. The
+        // wait is bounded in game time (30 game seconds — pvp's melee rate kills anything it can
+        // reach far sooner; what remains signals unreachable target or hits not registering).
+        log(bot, `Attacking ${entity.name} at ${Math.round(entity.position.distanceTo(bot.entity.position))} blocks.`);
+        await bot.pvp.attack(entity);
+        const deadline_ticks = 600; // 30 game seconds
+        let waited_ticks = 0;
+        while (bot.entities[entity.id] !== undefined && waited_ticks < deadline_ticks) {
+            await bot.waitForTicks(5);
+            waited_ticks += 5;
             if (bot.interrupt_code) {
                 bot.pvp.stop();
                 return false;
             }
+        }
+        bot.pvp.stop();
+        if (bot.entities[entity.id] !== undefined) {
+            log(bot, `FAILED: ${entity.name} still alive after 30 game seconds (now ${Math.round(entity.position.distanceTo(bot.entity.position))} blocks away) — unreachable or hits not registering; it was not killed.`);
+            return false;
         }
         log(bot, `Successfully killed ${entity.name}.`);
         await pickupNearbyItems(bot);
