@@ -464,7 +464,11 @@ export async function attackNearest(bot, mobType, kill=true) {
     if (mob) {
         return await attackEntity(bot, mob, kill);
     }
-    log(bot, 'Could not find any ' + mobType + ' to attack. If it is not in view, await goToMob(bot, "' + mobType + '") to search its habitat first.');
+    // fix133: the trace annotator promotes FAILED-prefixed lines into the failure evidence the
+    // critic and PSN repair prompts see; the guidance above that prefix never reached the model
+    // (live 16 Nov 19:3x: attackNearest('spider') failed 4/4 attempts with a bare `-> false` and
+    // no hint survived, so the model re-emitted the same glance every attempt).
+    log(bot, `FAILED: Could not find any ${mobType} to attack. If it is not in view, await goToMob(bot, "${mobType}") to search its habitat first (https://minecraft.wiki/w/Mob_spawning).`);
     return false;
 }
 
