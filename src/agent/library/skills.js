@@ -438,6 +438,15 @@ export async function clearNearestFurnace(bot) {
 }
 
 
+// Mobs that only exist in water (https://minecraft.wiki/w/Mob_spawning#Mob_attributes —
+// aquatic mobs spawn in water and drown out of it). Used by attackNearest (underwater combat
+// needs self_preservation paused) and by goToMob (water is their only habitat probe).
+const AQUATIC_MOBS = ['drowned', 'cod', 'salmon', 'pufferfish', 'tropical_fish', 'squid', 'glow_squid', 'dolphin', 'guardian', 'elder_guardian', 'axolotl'];
+
+// How often goToMob re-scans the entity list while dwelling at a habitat probe. Entity
+// spawn packets arrive asynchronously, so the check is periodic, not a one-shot glance.
+const SCAN_POLL_MS = 250;
+
 export async function attackNearest(bot, mobType, kill=true) {
     /**
      * Attack mob of the given type.
@@ -449,13 +458,13 @@ export async function attackNearest(bot, mobType, kill=true) {
      * await skills.attackNearest(bot, "zombie", true);
      **/
     bot.modes.pause('cowardice');
-    if (mobType === 'drowned' || mobType === 'cod' || mobType === 'salmon' || mobType === 'tropical_fish' || mobType === 'squid')
+    if (AQUATIC_MOBS.includes(mobType))
         bot.modes.pause('self_preservation'); // so it can go underwater. TODO: have an drowning mode so we don't turn off all self_preservation
     const mob = world.getNearbyEntities(bot, 24).find(entity => entity.name === mobType);
     if (mob) {
         return await attackEntity(bot, mob, kill);
     }
-    log(bot, 'Could not find any '+mobType+' to attack.');
+    log(bot, 'Could not find any ' + mobType + ' to attack. If it is not in view, await goToMob(bot, "' + mobType + '") to search its habitat first.');
     return false;
 }
 
@@ -2012,16 +2021,89 @@ export async function goToNearestEntity(bot, entityType, min_distance=2, range=6
     if (!entity) {
         const seen = [...new Set(Object.values(bot.entities).filter(e => e !== bot.entity && e.position && e.position.distanceTo(bot.entity.position) <= range).map(e => e.type === 'player' ? `player:${e.username}` : e.name))];
         const isPlayer = Object.keys(bot.players || {}).includes(entityType);
+        const isMob = !!bot.registry?.entitiesMap?.[entityType];
         log(bot, `FAILED: no entity of type '${entityType}' within ${range} blocks.` +
             (isPlayer ? ` '${entityType}' is a player name: use !goToPlayer, or ask them for coordinates.` : '') +
             ` Entity types actually nearby: ${seen.length ? seen.join(', ') : 'none'}.` +
-            ` DO NOT retry this same search; it will fail again. Ask a player for coordinates or choose a different task.`);
+            (isMob
+                ? ` Mobs are not spread evenly (https://minecraft.wiki/w/Mob_spawning) — it may simply be off-screen, not absent: await goToMob(bot, '${entityType}') to probe its habitat instead of retrying this scan.`
+                : ` DO NOT retry this same search; it will fail again. Ask a player for coordinates or choose a different task.`));
         return false;
     }
     let distance = bot.entity.position.distanceTo(entity.position);
     log(bot, `Found ${entityType} ${distance} blocks away.`);
     await goToPosition(bot, entity.position.x, entity.position.y, entity.position.z, min_distance);
     return true;
+}
+
+export async function goToMob(bot, mobType, { maxProbes = 4, scanMs = 5000 } = {}) {
+    /**
+     * Travel to a mob of the given type, seeking out its spawn habitat when it is not in view.
+     * Mobs are not spread evenly: aquatic mobs live only in water and land mobs congregate in
+     * dark places (caves) and on open surface (https://minecraft.wiki/w/Mob_spawning), so a
+     * single visibility scan fails whenever the mob is off-screen (live 16 Nov: "Obtain 1
+     * salmon"/"Obtain 1 spider_eye" died in ~10 ms because nothing was in view). This probes
+     * each plausible habitat and keeps scanning while travelling and waiting there.
+     * @param {MinecraftBot} bot, reference to the minecraft bot.
+     * @param {string} mobType, the type of mob to seek.
+     * @param {number} maxProbes, how many habitat probes to try before failing. Defaults to 4.
+     * @param {number} scanMs, how long to scan at each probe. Defaults to 5000.
+     * @returns {Promise<boolean>} true if the mob was found and approached, false if no habitat produced one.
+     * @example
+     * await skills.goToMob(bot, "cod");
+     **/
+    const seen = () => Object.values(bot.entities || {})
+        .find((e) => e !== bot.entity && e.name === mobType && e.position && e.alive !== false);
+    const approach = async () => {
+        const e = seen();
+        if (!e) return false;
+        await goToPosition(bot, e.position.x, e.position.y, e.position.z, 2);
+        return true;
+    };
+    if (await approach()) return true;
+    const aquatic = AQUATIC_MOBS.includes(mobType);
+    const probes = aquatic ? ['water', 'away'] : ['cave', 'surface', 'away'];
+    const tried = [];
+    for (let p = 0; p < Math.min(maxProbes, 2 * probes.length); p++) {
+        if (bot.interrupt_code) return false;
+        const kind = probes[p % probes.length];
+        let target = null;
+        if (kind === 'water') {
+            const w = bot.findBlock({
+                matching: (b) => b && (b.name === 'water' || b.name === 'flowing_water' || b.name === 'ice' || b.name === 'frosted_ice'),
+                maxDistance: 96,
+            });
+            target = w && w.position;
+        } else if (kind === 'cave') {
+            const floor = bot.entity.position.y - 4;
+            const c = bot.findBlock({ matching: (b) => b && b.name === 'air' && b.position.y <= floor, maxDistance: 64 });
+            target = c && c.position;
+        } else if (kind === 'surface') {
+            const s = bot.findBlock({ matching: (b) => b && b.name === 'air' && b.position.y >= 64, maxDistance: 64 });
+            target = s && s.position;
+        }
+        if (kind !== 'away' && target) {
+            log(bot, `goToMob ${mobType}: not in view, probing habitat ${kind} at (${Math.floor(target.x)},${Math.floor(target.y)},${Math.floor(target.z)}).`);
+            await goToPosition(bot, target.x, target.y, target.z, 2);
+            tried.push(`${kind} (${Math.floor(target.x)},${Math.floor(target.y)},${Math.floor(target.z)})`);
+        } else {
+            log(bot, `goToMob ${mobType}: ${kind} habitat ${target ? '' : 'not found in range '}${kind === 'away' ? '- exploring to fresh ground.' : 'so exploring to fresh ground.'}`);
+            await moveAway(bot, 32);
+            tried.push(kind === 'away' ? 'away (fresh ground)' : `${kind} (not found)`);
+        }
+        const deadline = Date.now() + scanMs;
+        while (Date.now() < deadline) {
+            if (bot.interrupt_code) return false;
+            if (await approach()) {
+                log(bot, `goToMob ${mobType}: found after probing ${tried.join('; ')}.`);
+                return true;
+            }
+            await new Promise((r) => setTimeout(r, SCAN_POLL_MS));
+        }
+    }
+    const nearby = [...new Set(Object.values(bot.entities || {}).filter((e) => e !== bot.entity && e.position).map((e) => e.name))];
+    log(bot, `FAILED: no ${mobType} found after probing habitats: ${tried.join('; ')}. Entity types actually nearby: ${nearby.length ? nearby.join(', ') : 'none'}.`);
+    return false;
 }
 
 export async function goToPlayer(bot, username, distance=3) {
