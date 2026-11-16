@@ -2147,7 +2147,14 @@ export async function goToNearestEntity(bot, entityType, min_distance=2, range=6
     if (!entity) {
         const seen = [...new Set(Object.values(bot.entities).filter(e => e !== bot.entity && e.position && e.position.distanceTo(bot.entity.position) <= range).map(e => e.type === 'player' ? `player:${e.username}` : e.name))];
         const isPlayer = Object.keys(bot.players || {}).includes(entityType);
-        const isMob = !!bot.registry?.entitiesMap?.[entityType];
+        // fix131: the mob branch keyed on registry.entitiesMap — a field prismarine-registry
+        // does not have (the name-keyed map is entitiesByName), so isMob was always false and
+        // every mob search got the "DO NOT retry" non-mob message. Categories from the game's
+        // own entity classification (minecraft-data entities.json type field): the spawnable,
+        // wandering categories get the habitat guidance; 'other'/'projectile'/'living'/
+        // 'player' (minecart, item, armor_stand, arrows) do not.
+        const mobCategories = ['mob', 'animal', 'hostile', 'water_creature', 'ambient', 'passive'];
+        const isMob = mobCategories.includes(bot.registry?.entitiesByName?.[entityType]?.type);
         log(bot, `FAILED: no entity of type '${entityType}' within ${range} blocks.` +
             (isPlayer ? ` '${entityType}' is a player name: use !goToPlayer, or ask them for coordinates.` : '') +
             ` Entity types actually nearby: ${seen.length ? seen.join(', ') : 'none'}.` +
