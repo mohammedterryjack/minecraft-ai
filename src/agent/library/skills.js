@@ -1706,6 +1706,30 @@ export async function goToGoal(bot, goal) {
                 continue;
             }
 
+            // fix129: dry shaft — pathfinder 2.4.5 has no same-column jump-and-place movement
+            // (getMoveJumpUp needs a diagonal one-block ledge, lib/movements.js:331; getMoveUp is
+            // climbable-blocks only, :553), so with the goal above and the walk dead it cannot
+            // path out at all. Climb the column by jump-and-place (pillarUp) and re-plan from
+            // there, the same segment pattern as the swim leg above (live: shaft at -176,48,106).
+            const goalY = goal.y ?? gpos?.y ?? null;
+            if (!bot.entity.isInWater && goalY !== null && bot.entity.position.y < goalY - 1 &&
+                (progressTimedOut || /No path|Took to long|Timeout/i.test(String(err?.message)))) {
+                const verdict = progressTimedOut ? describeStall(progressTimedOut) : String(err?.message);
+                progressTimedOut = null;
+                log(bot, `Walk stalled (${verdict}) with the goal ${Math.ceil(goalY - bot.entity.position.y)} blocks above; pilaring up.`);
+                const climb = await pillarUp(bot, goalY - 1);
+                if (!climb.ok) {
+                    clearInterval(doorCheckInterval);
+                    const p = bot.entity.position;
+                    log(bot, `FAILED: cannot pillar up at (${Math.floor(p.x)}, ${Math.floor(p.y)}, ${Math.floor(p.z)}): ${climb.interrupted ? 'interrupted' : climb.reason}. Reach the goal another way.`);
+                    return false;
+                }
+                if (climb.climbed > 0) {
+                    log(bot, `Pillared ${climb.climbed} blocks up to y=${Math.floor(bot.entity.position.y)}; replanning from there.`);
+                }
+                continue;
+            }
+
             // fix44: check for progress timeout (stall)
             if (progressTimedOut) {
                 clearInterval(doorCheckInterval);
@@ -1921,6 +1945,67 @@ export function swimToSurface(bot) {
      * const up = await skills.swimToSurface(bot);
      **/
     return swimTowards(bot);
+}
+
+export async function pillarUp(bot, targetY) {
+    /**
+     * Climb the current column by repeatedly jumping and placing a block under the feet.
+     * mineflayer-pathfinder 2.4.5 has no same-column jump-and-place movement: upward moves are
+     * the diagonal jump-up onto a one-block ledge (getMoveJumpUp requires the diagonal
+     * destination block one above the node, node_modules/mineflayer-pathfinder/lib/movements.js:331)
+     * or getMoveUp for climbable blocks only (ladder/vine, lib/movements.js:553) — even with
+     * allow1by1towers (lib/Movements.js:31) a dry 1-wide shaft cannot be pathfound out of at all
+     * (live 16 Nov 2026: bot trapped in the shaft at (-176, 48, 106), stall at (-173, 33, 98)).
+     * This performs the standard player technique with the documented mineflayer controls —
+     * setControlState('jump') and placing against the block under the feet (skills.placeBlock with
+     * placeOn='bottom') — jumping until the hitbox clears the feet cell (the server refuses a block
+     * into an entity), placing into the vacated cell, landing on it, repeating until targetY.
+     * Every iteration gains exactly one block or the climb fails loudly (no placeable full block,
+     * placement refused for two game seconds, unbreakable block overhead, or interrupt).
+     * @param {MinecraftBot} bot, reference to the minecraft bot.
+     * @param {number} targetY, climb until the bot's feet reach this y.
+     * @returns {Promise<object>} {climbed, ok, reason?, interrupted?}
+     * @example
+     * const climb = await skills.pillarUp(bot, bot.entity.position.y + 4);
+     **/
+    let climbed = 0;
+    while (bot.entity.position.y < targetY) {
+        if (bot.interrupt_code) return { climbed, ok: false, interrupted: true };
+        const p = bot.entity.position;
+        const fx = Math.floor(p.x), fy = Math.floor(p.y), fz = Math.floor(p.z);
+        const ref = bot.blockAt(p.offset(0, -1, 0));
+        if (!ref || ref.name === 'air' || ref.name === 'water' || ref.name === 'lava') {
+            return { climbed, ok: false, reason: `no solid block under the feet to place against at (${fx}, ${fy - 1}, ${fz})` };
+        }
+        const above = bot.blockAt(p.offset(0, 2, 0));
+        if (above && above.name !== 'air' && above.name !== 'water') {
+            const cleared = await breakBlockAt(bot, fx, fy + 2, fz);
+            if (!cleared) return { climbed, ok: false, reason: `blocked above the head by ${above.name} at (${fx}, ${fy + 2}, ${fz}) and cannot break it` };
+        }
+        // registry data decides what can stand as a pillar: full-cube blocks only
+        const item = bot.inventory.items().find((it) => bot.registry.blocksByName[it.name]?.boundingBox === 'block');
+        if (!item) return { climbed, ok: false, reason: 'no placeable full block in inventory to pillar on' };
+        const baseY = p.y;
+        bot.setControlState('jump', true);
+        let placed = false;
+        // two game seconds per block — the same game-time bound swimTowards uses; placement is
+        // accepted only once the hitbox has cleared the target cell (a real jump peaks ~1.25 blocks)
+        for (let tick = 0; tick < 40 && !bot.interrupt_code; tick++) {
+            await bot.waitForTicks(1);
+            if (!placed && bot.entity.position.y - baseY >= 1.05) {
+                placed = await placeBlock(bot, item.name, fx, fy, fz, 'bottom');
+            } else if (placed && bot.entity.position.y <= baseY + 1.05) {
+                break; // landed on the new block
+            }
+        }
+        bot.setControlState('jump', false);
+        if (bot.interrupt_code) return { climbed, ok: false, interrupted: true };
+        if (bot.entity.position.y < baseY + 0.9) {
+            return { climbed, ok: false, reason: `placement under the feet was refused for two game seconds at (${fx}, ${fy}, ${fz}) — something occupies or blocks the column` };
+        }
+        climbed += 1;
+    }
+    return { climbed, ok: true };
 }
 
 export async function goToPosition(bot, x, y, z, min_distance=2) {
