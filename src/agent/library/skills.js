@@ -1551,6 +1551,21 @@ export async function goToGoal(bot, goal) {
             if (destructivePath.status === 'success') {
                 log(bot, `Found destructive path.`);
             }
+            else if (nonDestructivePath.status === 'noPath' && destructivePath.status === 'noPath') {
+                // fix121: 'noPath' is not "out of time" — it is astar's proof that the open heap exhausted:
+                // every node reachable with these movements was explored and none satisfies the goal
+                // (node_modules/mineflayer-pathfinder/lib/astar.js:121). goto() with the same movements
+                // re-runs that identical search and rejects with the identical verdict (lib/goto.js:22-26),
+                // burning up to thinkTimeout (10 s) of chunked compute in which the bot reaches no ground —
+                // the learned run watchdog reads that as STALLED (live: "Craft 1 furnace", bot in a shaft 7
+                // blocks under the crafting table, 15.8 s per attempt x4, then PSN blamed craftRecipe and its
+                // code-model repair crashed with pos.floored). 'timeout'/'partial' mean the search was cut
+                // off mid-way and more budget can still win, so only the exhausted verdict fails here.
+                const gpos = goal.pos ?? (Number.isFinite(goal.x) ? goal : null);
+                const bp = bot.entity.position;
+                log(bot, `FAILED: no path exists to ${gpos ? `(${Math.floor(gpos.x)}, ${Math.floor(gpos.y)}, ${Math.floor(gpos.z)})` : 'the goal'} from (${Math.floor(bp.x)}, ${Math.floor(bp.y)}, ${Math.floor(bp.z)}): both searches exhausted every reachable node (noPath). The goal is unreachable from here, not slow — reach it another way (e.g. place a new crafting table next to the bot) instead of retrying this walk.`);
+                return false;
+            }
             else {
                 log(bot, `Path not found, but attempting to navigate anyway using destructive movements.`);
             }
