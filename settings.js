@@ -1,4 +1,15 @@
 const settings = {
+    // fix135 NOTE (unresolved, investigation 16 Nov 2026 23:50 GMT): the server is 26.3
+    // (protocol 775) and this file said 1.20.4 — every packet is downgraded ~40 versions by
+    // ViaProxy/ViaVersion, and that translation is what loses block updates: server world
+    // files hold furnaces/cobble the client still reads as air ("Server refused to place
+    // furnace ... the block is still air"), Paper spams "Player icefox2000 standing on air"
+    // (256x), and navigation stalls on ghost geometry. Tried minecraft_version "26.1"
+    // (mineflayer 4.39.0 supported list, same wire protocol 775): login succeeds then the
+    // server kicks "multiplayer.disconnect.invalid_player_movement" 18x in 3 minutes —
+    // ViaProxy (target-version 26.2) still translates 26.1->26.3 and mangles position
+    // packets. Reverted to 1.20.4 (works with the known desync tax). Real fix needs Mo:
+    // ViaProxy target-version 26.3 (viaproxy.yml is Mo's process), then retest 26.1 here.
     "minecraft_version": "1.20.4", // or specific version like "1.21.6"
     "host": "127.0.0.1", // or "localhost", "your.ip.address.here"
     "port": 25568, // set to -1 to automatically scan for open ports
