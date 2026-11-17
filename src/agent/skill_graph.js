@@ -143,6 +143,44 @@ export function entryCallFeedback(own) {
     if (typeof own !== 'string' || !own) throw new Error('entryCallFeedback: own function name required');
     return `The reply must end with exactly one call of ${own} (\`await ${own}(bot);\`) so the function runs and the execution trace records the call. A definition alone runs nothing: the task fails with no execution trace. That call is cut before the skill is saved, so the saved function does not run itself whenever it is staged.`;
 }
+// fix138: the return contract of a learned skill. Callers of learned skills check the returned value — the seeded
+// primitives all return true/false (tossItem, depositToChest), and generated callers follow that pattern. The live
+// tossCobblestoneBatch stub tossed its cobblestone, returned undefined, and every generated caller failed it with
+// "returned false or undefined" forever; its own effect contract held, so blame never targeted it for repair.
+// Returns feedback text when the top-level function `own` has no `return <value>` reachable in its own body
+// (returns inside nested callbacks do not count), null otherwise. Unparseable source is not judged here (the lint chain judges parse errors).
+export function missingReturnFeedback(own, skillSource) {
+    if (typeof own !== 'string' || !own) throw new Error('missingReturnFeedback: own function name required');
+    if (typeof skillSource !== 'string' || !skillSource.trim()) throw new Error('missingReturnFeedback: source required');
+    let ast;
+    try { ast = acorn.parse(String(skillSource), { ecmaVersion: 'latest', sourceType: 'module', allowAwaitOutsideFunction: true }); }
+    catch { return null; }
+    let fn = null;
+    const findFn = n => {
+        if (!n || typeof n.type !== 'string' || fn) return;
+        if ((n.type === 'FunctionDeclaration' || n.type === 'AsyncFunctionDeclaration') && n.id && n.id.name === own) { fn = n; return; }
+        for (const v of Object.values(n)) {
+            if (Array.isArray(v)) v.forEach(findFn);
+            else if (v && typeof v === 'object' && typeof v.type === 'string') findFn(v);
+        }
+    };
+    findFn(ast);
+    if (!fn) return null;
+    const FN_TYPES = new Set(['FunctionDeclaration', 'FunctionExpression', 'ArrowFunctionExpression', 'AsyncFunctionDeclaration']);
+    let hasValueReturn = false;
+    const walk = n => {
+        if (!n || typeof n.type !== 'string' || hasValueReturn) return;
+        if (n.type === 'ReturnStatement' && n.argument) { hasValueReturn = true; return; }
+        if (n !== fn && FN_TYPES.has(n.type)) return; // nested functions' returns belong to them
+        for (const v of Object.values(n)) {
+            if (Array.isArray(v)) v.forEach(walk);
+            else if (v && typeof v === 'object' && typeof v.type === 'string') walk(v);
+        }
+    };
+    walk(fn);
+    if (hasValueReturn) return null;
+    return `${own} never returns a value. Callers check the result of learned skills (the seeded primitives return true on success and false on failure), so a skill that falls off the end or returns bare \`return;\` is indistinguishable from failure at every call site. Return true when the work succeeded and false when it did not, on every path.`;
+}
 // fix85: source text of each call of a reserved binding (whitespace-normalized). A repair must still contain each one.
 export function markerCallTexts(code, name) {
     if (typeof name !== 'string' || !name) throw new Error('markerCallTexts: binding name required');

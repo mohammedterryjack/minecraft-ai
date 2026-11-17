@@ -218,7 +218,14 @@ describe('fix97 contracts: a hallucinated number is refused, and the manifest is
         const disk = buildContractManifest(live);
         assert.strictEqual(disk.checkOakLogPresent, false);
         assert.strictEqual(disk.apply, false);
-        assert.deepStrictEqual(disk.records.map(r => r.id), []);
+        // fix138: the live index is written by the running bot, so an empty records list was a world snapshot that broke every
+        // time the bot legitimately learned a self-referential count (toss10Cobblestone.code.cobblestone.10, 17 Nov). The
+        // invariant this test owns is that the audited poison entries never come back and the manifest is self-consistent;
+        // the behavior of record selection is covered against the frozen fixture in the next test.
+        for (const r of disk.records) {
+            const skillName = Array.isArray(r.path) ? r.path[0] : null;
+            assert.ok(skillName && live.some(s => s.name === skillName), `record ${r.id} references no skill in the live index`);
+        }
         for (const id of ['checkOakLog.code.oak_log.55', 'checkOakLog.pre.oak_log.55', 'smeltIronIntoIngot.code.1', 'mineBlocks.pre.2', 'craftItem.pre.2', 'craftArmorSet.post.4']) {
             assert.ok(!disk.records.some(r => r.id === id), id);
         }

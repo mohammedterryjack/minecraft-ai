@@ -30,7 +30,7 @@ import { CONTEXT_FULL } from '../models/ollama.js';
 import { createStepModel } from './step_model.js';
 import { setCallDurationStore } from '../models/call_durations.js';
 import { setMovementStore, learnedKinds, recordStep, recordCut, stepBound, noteUnbounded } from '../utils/movement_model.js';
-import { signatureOf, depsOf, missingCalls, installViolations, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf, thrownIn, declaredNames, skillSourceViolations, splitGeneratedCode, oneFunctionFeedback, entryCallFeedback, markerCallsMissing, markerGateNames, collapseRepeats, parsesAsScript, pastedLibrarySkills, groupVaryingLines, structuredTrace, flatCopy } from './skill_graph.js';
+import { signatureOf, depsOf, missingCalls, installViolations, newStats, recordRun, rate, gateLog, instrumentSrc, annotateTrace, traceText, blame, blameAll, parentsOf, thrownIn, declaredNames, skillSourceViolations, splitGeneratedCode, oneFunctionFeedback, entryCallFeedback, missingReturnFeedback, markerCallsMissing, markerGateNames, collapseRepeats, parsesAsScript, pastedLibrarySkills, groupVaryingLines, structuredTrace, flatCopy } from './skill_graph.js';
 import { writeCodePromptDump } from '../models/code_prompt_dump.js';
 import { getBareAPI, collectBareApiUsedInSource, PRECONDITION_UNMET_BINDING } from './coder.js';   // fix40: unified bare-name API helper
 import { withStallPhase } from '../utils/event_loop_guard.js';
@@ -8428,6 +8428,8 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             }
             // fix85: the executed reply must call the new function. The saved skill source still has the call cut off.
             if (lint === null && !split.entry) lint = entryCallFeedback(own);
+            // fix138: the return contract — a learned skill must return true/false, callers check it (see skill_graph).
+            if (lint === null && scriptParse === true) lint = missingReturnFeedback(own, split.skillSource);
             if (lint === null) { const introduced = markerCallsMissing('', code, PRECONDITION_UNMET_BINDING); if (introduced) lint = introduced; }
             // fix88: the saved source is checked before it runs. A self-call or a cycle is lint feedback, and saveSkill rejects it again.
             if (lint === null) {
