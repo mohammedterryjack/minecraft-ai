@@ -1124,7 +1124,11 @@ export async function placeBlock(bot, blockType, x, y, z, placeOn='bottom', dont
 export async function equipToolForBlock(bot, block) {
     if (block === undefined || block === null) throw new Error('equipToolForBlock: block argument required');
     const reg = bot.registry;
-    const speedsUp = (b, id) => !!(reg.materials[b.material] && reg.materials[b.material][id]);
+    // minecraft-data 1.21.2+ encodes tier-restricted blocks as material 'incorrect_for_<tool>_tool'; the group's map lists the
+    // tools that are NOT speedy on that block (value = baseline 2), so membership means the opposite of a speedup.
+    // mineflayer special-cases the wooden case in lib/plugins/digging.js (digTime); do the same generally here.
+    const isIncorrectGroup = (mat) => typeof mat === 'string' && mat.split(';').some(seg => seg.startsWith('incorrect_for_'));
+    const speedsUp = (b, id) => !!(reg.materials[b.material] && reg.materials[b.material][id]) && !isIncorrectGroup(b.material);
     const works = id => block.harvestTools ? !!block.harvestTools[id] : speedsUp(block, id);
     const items = bot.inventory.items();
     const cands = items.filter(it => works(it.type));

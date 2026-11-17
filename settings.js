@@ -1,16 +1,26 @@
 const settings = {
-    // fix135 NOTE (unresolved, investigation 16 Nov 2026 23:50 GMT): the server is 26.3
-    // (protocol 775) and this file said 1.20.4 — every packet is downgraded ~40 versions by
-    // ViaProxy/ViaVersion, and that translation is what loses block updates: server world
-    // files hold furnaces/cobble the client still reads as air ("Server refused to place
-    // furnace ... the block is still air"), Paper spams "Player icefox2000 standing on air"
-    // (256x), and navigation stalls on ghost geometry. Tried minecraft_version "26.1"
-    // (mineflayer 4.39.0 supported list, same wire protocol 775): login succeeds then the
-    // server kicks "multiplayer.disconnect.invalid_player_movement" 18x in 3 minutes —
-    // ViaProxy (target-version 26.2) still translates 26.1->26.3 and mangles position
-    // packets. Reverted to 1.20.4 (works with the known desync tax). Real fix needs Mo:
-    // ViaProxy target-version 26.3 (viaproxy.yml is Mo's process), then retest 26.1 here.
-    "minecraft_version": "1.20.4", // or specific version like "1.21.6"
+    // fix135 (17 Nov 2026): Mo set ViaProxy target-version to 26.3 (proxy restarted 09:07 GMT).
+    // The bundled minecraft-data 3.119.0 ships pc data for 26.1 only (no 26.3 dir), and
+    // voyager's fix52 registry check LOUD FAILs on a version without data — so connect as
+    // 26.1 (protocol 775). ViaVersion now translates 775->776->777 along its own supported
+    // step path instead of the ~40-version 1.20.4->26.3 jump that lost block updates
+    // ("Server refused to place ... the block is still air", Paper "standing on air" 256x,
+    // ghost geometry — region files proved server-side placements the client read as air).
+    // Earlier 26.1 attempt kicked invalid_player_movement only because viaproxy.yml still
+    // had target-version 26.2 (wrong target = broken movement translation).
+    // Upgrade path to true pass-through: bump minecraft-data to a release with pc/26.3.
+    // fix136 (17 Nov 2026): native 26.1 unblocked. The invalid_player_movement kick had a
+    // documented root cause: since 1.21.2 vanilla allows ONE position packet per client tick,
+    // reset by tick_end; mineflayer never sends tick_end (PrismarineJS/mineflayer#4189;
+    // ViaVersion/ViaBackwards#1362 documents exactly our 26.3-server symptom and notes old
+    // clients only survive because ViaBackwards synthesizes tick_end for them). src/utils/
+    // tick_end.js now appends tick_end after every position packet, gated on the protocol
+    // defining packet_tick_end (fix108 guard: never on 1.20.4). 26.1 (protocol 775) through
+    // ViaProxy target-version 26.3 pays only the 775->777 same-family block remap instead of
+    // the lossy 1.20.4 cross-boundary (1.20.5 blockstate-flattening) remap that produced the
+    // ghost-block placements. Upgrade path unchanged: when minecraft-data ships pc/26.3, set
+    // "26.3" for pass-through.
+    "minecraft_version": "26.1",
     "host": "127.0.0.1", // or "localhost", "your.ip.address.here"
     "port": 25568, // set to -1 to automatically scan for open ports
     // fix94: vanilla backend log directory. Confirmed from the iMac launcher
