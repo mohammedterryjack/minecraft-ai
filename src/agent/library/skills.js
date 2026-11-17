@@ -2374,8 +2374,25 @@ export async function moveAway(bot, distance) {
         }
     }
 
-    await goToGoal(bot, inverted_goal);
+    // fix139: report the truth. The pathfinder's goto/goal-reached failure was swallowed and the
+    // function returned true unconditionally, so a bot with no traversable cell away (sealed shaft)
+    // "escaped" without moving. self_preservation's low-health branch then re-fired moveAway(bot, 20)
+    // on every damage tick (live 17 Nov 2026: "Mode self_preservation finished executing" x329 in a
+    // ~230 ms loop, food 14 health 6, bot starved in place) because nothing ever changed the world.
+    // Contract: true only if the bot ended at least 1 block from where it started.
+    let reached = false;
+    try {
+        reached = await goToGoal(bot, inverted_goal);
+    } catch (err) {
+        log(bot, `FAILED: move away errored: ${err?.message ?? err}`);
+        return false;
+    }
     let new_pos = bot.entity.position;
+    const moved = reached && new_pos.distanceTo(pos) >= 1.0;
+    if (!moved) {
+        log(bot, `FAILED: could not move away from ${pos.floored()} — still at (${Math.floor(new_pos.x)}, ${Math.floor(new_pos.y)}, ${Math.floor(new_pos.z)}): no traversable route away from here.`);
+        return false;
+    }
     log(bot, `Moved away from ${pos.floored()} to ${new_pos.floored()}.`);
     return true;
 }
