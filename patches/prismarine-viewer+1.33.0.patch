@@ -370,7 +370,7 @@ index baf11fe..0450019 100644
 -})
 +module.exports = { bindViewerPage }
 diff --git a/node_modules/prismarine-viewer/lib/mineflayer.js b/node_modules/prismarine-viewer/lib/mineflayer.js
-index 06634bf..f3fcd41 100644
+index 06634bf..106b05f 100644
 --- a/node_modules/prismarine-viewer/lib/mineflayer.js
 +++ b/node_modules/prismarine-viewer/lib/mineflayer.js
 @@ -1,5 +1,6 @@
@@ -380,7 +380,26 @@ index 06634bf..f3fcd41 100644
  
  module.exports = (bot, { viewDistance = 6, firstPerson = false, port = 3000, prefix = '' }) => {
    const express = require('express')
-@@ -15,6 +16,120 @@ module.exports = (bot, { viewDistance = 6, firstPerson = false, port = 3000, pre
+@@ -10,11 +11,139 @@ module.exports = (bot, { viewDistance = 6, firstPerson = false, port = 3000, pre
+   const io = require('socket.io')(http, { path: prefix + '/socket.io' })
+ 
+   const { setupRoutes } = require('./common')
++  // patched (fix140): serve mindcraft's viewer-dist/ (built bundles + generated 26.1 assets, see
++  // mindcraft scripts/viewer/build-viewer.sh) before prismarine-viewer's own public/, which only
++  // carries data up to 1.21.4. Registered first so express resolves viewer-dist wins on equal paths.
++  // Override dir: process.env.PV_VIEWER_DIST, default mindcraft root viewer-dist/. If absent the
++  // viewer falls back to upstream public/ only (then 26.1 fails loudly, as intended).
++  {
++    const fsx = require('fs')
++    const pathx = require('path')
++    const viewerDist = process.env.PV_VIEWER_DIST || pathx.resolve(__dirname, '../../../viewer-dist')
++    if (fsx.existsSync(viewerDist)) {
++      app.use(prefix + '/', express.static(viewerDist))
++      console.log('[viewer] serving static override from ' + viewerDist)
++    }
++  }
+   setupRoutes(app, prefix)
+ 
    const sockets = []
    const primitives = {}
  
@@ -501,7 +520,7 @@ index 06634bf..f3fcd41 100644
    bot.viewer = new EventEmitter()
  
    bot.viewer.erase = (id) => {
-@@ -46,7 +161,7 @@ module.exports = (bot, { viewDistance = 6, firstPerson = false, port = 3000, pre
+@@ -46,7 +175,7 @@ module.exports = (bot, { viewDistance = 6, firstPerson = false, port = 3000, pre
    }
  
    io.on('connection', (socket) => {
@@ -510,7 +529,7 @@ index 06634bf..f3fcd41 100644
      sockets.push(socket)
  
      const worldView = new WorldView(bot.world, viewDistance, bot.entity.position, socket)
-@@ -65,6 +180,7 @@ module.exports = (bot, { viewDistance = 6, firstPerson = false, port = 3000, pre
+@@ -65,6 +194,7 @@ module.exports = (bot, { viewDistance = 6, firstPerson = false, port = 3000, pre
        if (firstPerson) {
          packet.pitch = bot.entity.pitch
        }
@@ -22598,10 +22617,21 @@ index 72d715b..f2efde9 100644
    cb(textureCache[texture])
  }
 diff --git a/node_modules/prismarine-viewer/viewer/lib/version.js b/node_modules/prismarine-viewer/viewer/lib/version.js
-index 39e3ad8..f31fd1e 100644
+index 39e3ad8..3af0bdc 100644
 --- a/node_modules/prismarine-viewer/viewer/lib/version.js
 +++ b/node_modules/prismarine-viewer/viewer/lib/version.js
-@@ -23,6 +23,7 @@ function minor (version) {
+@@ -1,4 +1,9 @@
+-const supportedVersions = ['1.8.8', '1.9.4', '1.10.2', '1.11.2', '1.12.2', '1.13.2', '1.14.4', '1.15.2', '1.16.1', '1.16.4', '1.17.1', '1.18.1', '1.19', '1.20.1', '1.21.1', '1.21.4']
++// patched (fix140): '26.1' added — bot connects as native 26.1. minecraft-assets ships data/26.1,
++// so public-equivalent blocksStates/26.1.json + textures/26.1.png are generated (see mindcraft
++// scripts/viewer/build-viewer.sh). Any other new version must get the same treatment: add it here,
++// generate its assets, rebuild the bundles. getVersion returns null for unknown versions on purpose —
++// the viewer must fail loudly, never render a mismatched block id space.
++const supportedVersions = ['1.8.8', '1.9.4', '1.10.2', '1.11.2', '1.12.2', '1.13.2', '1.14.4', '1.15.2', '1.16.1', '1.16.4', '1.17.1', '1.18.1', '1.19', '1.20.1', '1.21.1', '1.21.4', '26.1']
+ 
+ const lastOfMajor = {}
+ for (const version of supportedVersions) {
+@@ -23,6 +28,7 @@ function minor (version) {
  }
  
  function getVersion (version) {
@@ -22837,3 +22867,43 @@ index 744224a..d2d8b82 100644
 +}
 +
  module.exports = { WorldRenderer }
+diff --git a/node_modules/prismarine-viewer/webpack.config.js b/node_modules/prismarine-viewer/webpack.config.js
+index d1577c9..71e8465 100644
+--- a/node_modules/prismarine-viewer/webpack.config.js
++++ b/node_modules/prismarine-viewer/webpack.config.js
+@@ -12,6 +12,17 @@ const allowedWorkerFiles = ['blocks', 'blockCollisionShapes', 'tints', 'blockSta
+ const indexConfig = {
+   entry: './lib/index.js',
+   mode: 'production',
++  // patched (fix140): three@0.128 declares sideEffects:false, which is a lie for the legacy
++  // examples/js scripts (OrbitControls attaches itself to global THREE via a plain IIFE).
++  // webpack 5.112 trusts the flag and tree-shakes that IIFE away, leaving THREE.OrbitControls
++  // undefined at runtime ("r.OrbitControls is not a constructor" -> blank view). The previous
++  // committed bundle was built with an older webpack that ignored the flag. Keep three modules
++  // side-effectful so the OrbitControls registration survives.
++  module: {
++    rules: [
++      { test: /[\\/]three[\\/]/, sideEffects: true }
++    ]
++  },
+   output: {
+     path: path.resolve(__dirname, './public'),
+     filename: './index.js'
+@@ -73,6 +84,17 @@ const workerConfig = {
+   ],
+   externals: [
+     function (req, cb) {
++      // patched (fix140): the mineflayer worker only ever meshes pc chunks (the client asks for
++      // getVersion(bot.version), supportedVersions are all pc). Bundling minecraft-data's
++      // bedrock per-version DATA only (394MB raw at mcdata 3.119.0 -> 158MB bundle, over
++      // GitHub's 100MB file limit). bedrock/common/* must stay: minecraft-data's index requires
++      // data/bedrock/common/versions.json unconditionally (excluding it crashed index init with
++      // "reading 'length'" before any viewer data loaded). A bedrock version at runtime fails
++      // loudly, as intended.
++      if (req.context.includes('minecraft-data') && /[\\/](bedrock)[\\/]/.test(req.context + req.request) && !req.request.includes('common/')) {
++        cb(null, [])
++        return
++      }
+       if (req.context.includes('minecraft-data') && req.request.endsWith('.json')) {
+         const fileName = req.request.split('/').pop().replace('.json', '')
+         if (!allowedWorkerFiles.includes(fileName)) {
