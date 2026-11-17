@@ -7,6 +7,7 @@ import prismarine_items from 'prismarine-item';
 import { pathfinder } from 'mineflayer-pathfinder';
 import { installCachedBestHarvestTool } from './harvest_tool_cache.js';
 import { installInterruptibleWaitForTicks } from './interruptible_wait.js';
+import { installTickEndAfterMove, protocolHasTickEnd } from './tick_end.js';
 import { plugin as pvp } from 'mineflayer-pvp';
 import { plugin as collectblock } from 'mineflayer-collectblock';
 import plugin from 'mineflayer-armor-manager';
@@ -140,6 +141,23 @@ export function initBot(username) {
             return originalWrite(name, data);
         }
     };
+    // fix136: on 1.21.2+ protocols (e.g. 26.1) append serverbound tick_end after each
+    // position packet — vanilla allows one position packet per client tick and mineflayer
+    // never sends tick_end (PrismarineJS/mineflayer#4189, ViaVersion/ViaBackwards#1362:
+    // second move in a tick => multiplayer.disconnect.invalid_player_movement). Outside
+    // 1.21.2 the packet does not exist, so the provider gates every send (fix108 guard:
+    // an unmapped write on 1.20.4 = id 0x00 Accept Teleportation = ViaBackwards crash).
+    let _tickEndAutoWarned = false;
+    installTickEndAfterMove(bot._client, () => {
+        if (!mc_version || mc_version === 'auto') {
+            if (!_tickEndAutoWarned) {
+                _tickEndAutoWarned = true;
+                console.warn('[mcdata] fix136: minecraft_version "auto" — tick_end sender disabled; pin the version (26.1+) for native >=1.21.2 servers');
+            }
+            return false;
+        }
+        return protocolHasTickEnd(minecraftData(mc_version).protocol);
+    });
     // Suppress PartialReadError for non-critical packets
     // Paper servers sometimes send packets that node-minecraft-protocol
     // can't fully parse (scoreboard, resource_pack, custom_payload, etc.)
