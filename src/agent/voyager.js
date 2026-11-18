@@ -171,7 +171,26 @@ export function validateTask(task) {
     const names = knownNames();
     const bad = (t.match(/\b[a-z]+(?:_[a-z]+)+\b/g) || []).filter(n => !names.has(n));
     if (bad.length) return `unknown item/block names: ${bad.join(', ')} (use exact Minecraft ids like oak_log, cobblestone, iron_ingot)`;
+    const comp = compoundGoal(t);
+    if (comp !== null) return `compound goal: the task counts a second item after "and" (count ${comp}); propose one task per counted item`;
     return null;
+}
+// fix146: a count goal names exactly ONE counted item phrase. A second "<count> <noun>" joined by
+// "and" ("Gather 5 flint and 5 steel blocks (craft from iron ingots)...") is a compound goal:
+// countGoal silently truncated at "and" and drove satisfaction, decomposition and the contract off
+// the first half only, so the task could never verify and repeated until exhausted (live: 11
+// failures of the portal-step subgoal of "approach hoglin", mindcraft.log 112452-119918).
+// validateTask rejects compound goals at intake (the decomposer must emit atomic subgoals) and
+// countGoal refuses to half-parse them.
+function compoundGoal(task) {
+    const t = goalSentence(task);
+    if (typeof t !== 'string') return null;
+    if (!/^\s*(mine|collect|gather|craft|smelt|obtain|get|chop|cook)\b/i.test(t)) return null;
+    const m = t.match(/\band\s+(\d+|[a-z]+)\s+[a-z_]/i);
+    if (!m) return null;
+    const n = /^\d+$/.test(m[1]) ? parseInt(m[1], 10) : parseNumberWord(m[1]);
+    if (n === null || !Number.isInteger(n) || n <= 0) return null;
+    return n;
 }
 // "Mine 5 birch_log" / "Craft 1 stone_pickaxe" -> {item, count}
 // real crafting recipes (from minecraft-data) for every item id named in a text, so the local models stop inventing them
@@ -252,6 +271,7 @@ function goalSentence(task) {
 }
 function countGoal(task) {
     task = goalSentence(task);
+    if (compoundGoal(task) !== null) return null; // fix146: never half-parse a compound goal
     // fix47: support both numeric ("5") and word ("five") counts
     const m = task.match(/^(mine|collect|gather|craft|smelt|obtain|get|chop|cook)\s+(\d+|[a-z]+)\s+([a-z_ ]+)/i);
     if (!m) return null;
@@ -6771,8 +6791,13 @@ Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
         const skillLines = this.skills.length === 0 ? '[]' : (await this.retrieveSkills(`${task}\n${String(reason)}`, settings.skill_topk)).map(s => `${signatureOf(s.code, s.name)}: ${s.description}`).join('\n');
         const user = `goal: ${task}\nwhy it failed: ${String(reason)}\ndeath_hotspots: ${this._deathHotspots()}\n${this._stateText(this.observe())}\nknown_skills: ${skillLines}`;
         let subs = [];
-        try { subs = (parseLocalJSON(await this._askLocal(system, user, this._inferMeta('curriculum-decompose', { system, user })), ['subgoals']).subgoals || []).map(t => String(t).trim()).filter(t => t && t !== task && !validateTask(t)).slice(0, 4); }
-        catch (e) {
+        try {
+            const raw = (parseLocalJSON(await this._askLocal(system, user, this._inferMeta('curriculum-decompose', { system, user })), ['subgoals']).subgoals || []).map(t => String(t).trim()).filter(t => t && t !== task);
+            // fix146: rejected subgoals are LOUD; before this, an invalid subgoal (e.g. the compound
+            // "Gather 5 flint and 5 steel blocks", which validateTask now rejects) vanished silently
+            for (const t of raw) { const w = validateTask(t); if (w) console.log(`[psn] LOUD: decompose subgoal rejected at intake: "${t}" (${w})`); }
+            subs = raw.filter(t => !validateTask(t)).slice(0, 4);
+        } catch (e) {
             if (e instanceof Error && e.code === CONTEXT_FULL) throw e;
             console.log(`[psn] decompose FAILED for "${task}": ${e.message}`);
             return false;
