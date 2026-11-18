@@ -70,6 +70,32 @@ export function markBlockOutOfRange(bot, blockNames, count) {
     return markPreconditionUnmet(bot, { need });
 }
 
+// fix141: mob categories from the game's own entity classification (minecraft-data entities.json `type` field).
+//        Verified against pc/26.1: cow/pig/sheep/chicken=animal, zombie/skeleton/spider=hostile,
+//        salmon/cod=water_creature, bat=ambient, squid/villager=passive; armor_stand=living, item=other,
+//        thrown egg/snowball=projectile. Single source for the fix131 hint in goToNearestEntity too.
+export const MOB_ENTITY_TYPES = ['mob', 'animal', 'hostile', 'water_creature', 'ambient', 'passive'];
+export function isMobEntityName(entitiesByName, name) {
+    if (!entitiesByName || typeof entitiesByName !== 'object') throw new Error('[fix141] isMobEntityName: entitiesByName required');
+    if (typeof name !== 'string' || name === '') throw new Error(`[fix141] isMobEntityName: entity name must be a non-empty string, got ${JSON.stringify(name)}`);
+    const ent = entitiesByName[name];
+    return !!ent && MOB_ENTITY_TYPES.includes(ent.type);
+}
+
+// fix141: a mob search that gave up. Mobs are not spread evenly (https://minecraft.wiki/w/Mob_spawning), so a
+//        miss is a LOCATION problem, not an inventory one: the need reason 'approach' chains the subgoal
+//        "approach <mob>" (voyager approachGoal), verified by the mob appearing in observe().nearby_entities.
+//        Mirrors markBlockOutOfRange (fix87): a name that is not an entity in the game data is a wrong question
+//        and fails loud (fix95); a valid non-mob entity (item minecart, armor_stand) reports its own failure.
+export function markEntityOutOfRange(bot, name) {
+    if (!bot || typeof bot !== 'object') throw new Error('[fix141] markEntityOutOfRange: bot required');
+    if (!bot.registry || !bot.registry.entitiesByName) throw new Error('[fix141] markEntityOutOfRange: bot.registry.entitiesByName required');
+    if (!bot.registry.entitiesByName[name]) throw new Error(`[fix141] LOUD: '${name}' is not an entity in the game data; there is no approach need to report`);
+    if (!isMobEntityName(bot.registry.entitiesByName, name)) return null;
+    console.error(`[fix141] LOUD: no ${name} found after searching; reporting an approach need`);
+    return markPreconditionUnmet(bot, { need: { item: name, count: 1, reason: 'approach' } });
+}
+
 export function clearPreconditionUnmet(bot) {
     if (!bot) throw new Error('[fix76] clearPreconditionUnmet: bot object required');
     if (typeof bot !== 'object') throw new Error('[fix76] clearPreconditionUnmet: bot object required');

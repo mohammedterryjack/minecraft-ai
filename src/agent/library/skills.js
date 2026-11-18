@@ -5,7 +5,7 @@ import Vec3 from 'vec3';
 import settings from "../../../settings.js";
 import { watchPathing, cellKey } from "../../utils/movement_model.js";
 import { findCarried } from "../../utils/carried.js";
-import { markPreconditionUnmet, markBlockOutOfRange } from "../precondition.js";
+import { markPreconditionUnmet, markBlockOutOfRange, markEntityOutOfRange, isMobEntityName } from "../precondition.js";
 import { emptySlotsToFit, stackableCounts } from "../slot_room.js";
 import { itemSourceBlocks } from "../../utils/item_sources.js";
 
@@ -2158,14 +2158,16 @@ export async function goToNearestEntity(bot, entityType, min_distance=2, range=6
         // own entity classification (minecraft-data entities.json type field): the spawnable,
         // wandering categories get the habitat guidance; 'other'/'projectile'/'living'/
         // 'player' (minecart, item, armor_stand, arrows) do not.
-        const mobCategories = ['mob', 'animal', 'hostile', 'water_creature', 'ambient', 'passive'];
-        const isMob = mobCategories.includes(bot.registry?.entitiesByName?.[entityType]?.type);
+        // fix141: the list lives in precondition.js (MOB_ENTITY_TYPES); a missed MOB search also
+        // stamps an approach need so the planner sends the bot to find one (see markEntityOutOfRange).
+        const isMob = bot.registry?.entitiesByName ? isMobEntityName(bot.registry.entitiesByName, entityType) : false;
         log(bot, `FAILED: no entity of type '${entityType}' within ${range} blocks.` +
             (isPlayer ? ` '${entityType}' is a player name: use !goToPlayer, or ask them for coordinates.` : '') +
             ` Entity types actually nearby: ${seen.length ? seen.join(', ') : 'none'}.` +
             (isMob
                 ? ` Mobs are not spread evenly (https://minecraft.wiki/w/Mob_spawning) — it may simply be off-screen, not absent: await goToMob(bot, '${entityType}') to probe its habitat instead of retrying this scan.`
                 : ` DO NOT retry this same search; it will fail again. Ask a player for coordinates or choose a different task.`));
+        if (isMob) markEntityOutOfRange(bot, entityType);
         return false;
     }
     let distance = bot.entity.position.distanceTo(entity.position);
@@ -2241,6 +2243,12 @@ export async function goToMob(bot, mobType, { maxProbes = 4, scanMs = 5000 } = {
     }
     const nearby = [...new Set(Object.values(bot.entities || {}).filter((e) => e !== bot.entity && e.position).map((e) => e.name))];
     log(bot, `FAILED: no ${mobType} found after probing habitats: ${tried.join('; ')}. Entity types actually nearby: ${nearby.length ? nearby.join(', ') : 'none'}.`);
+    // fix141: a full habitat probe that found nothing is a LOCATION problem (mobs spawn in patches,
+    // https://minecraft.wiki/w/Mob_spawning): stamp an approach need so the planner chains "approach
+    // <mob>" and retries it once the mob is observed nearby, instead of repairing the callee that
+    // merely reported the miss (live 17-18 Nov: huntAndEat > getFood > killMob -> 0 for hours while
+    // PSN patched equipBestTool/killMob, and the bot starved at food 17/20 health 7/20).
+    markEntityOutOfRange(bot, mobType);
     return false;
 }
 

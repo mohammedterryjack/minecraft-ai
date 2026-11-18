@@ -13,7 +13,7 @@ import { RepairMemory } from './repair_memory.js';
 import { IdlePractice } from './idle_practice.js';
 import { VitalsModel } from './vitals_model.js';   // fix58
 import { checkNeedSource, needInterruptSource, isUnblamedInterruptKind, sampleBeta, pickUrgentCandidate } from './urgent_need.js';   // fix80
-import { peekPreconditionUnmet, clearPreconditionUnmet, checkNeed, reachNeedForBlocks } from './precondition.js';   // fix76; fix81: structured needs (markPreconditionUnmet is called by seeded code)
+import { peekPreconditionUnmet, clearPreconditionUnmet, checkNeed, reachNeedForBlocks, isMobEntityName } from './precondition.js';   // fix76; fix81: structured needs (markPreconditionUnmet is called by seeded code); fix141: isMobEntityName for approach goals
 import { SlotEffects } from './slot_effects.js';   // fix59
 import { obtainPlanner } from './recipe_plan.js';   // fix81
 import { itemSourceBlocks } from '../utils/item_sources.js';
@@ -321,6 +321,21 @@ function reachGoal(task) {
     const item = m[1].toLowerCase();
     if (!minecraftData(VERSION).blocksByName[item]) return null;
     return { count: 1, item, items: [item], verb: 'reach' };
+}
+
+// fix141: "approach <mob>" - a mob the bot needs is not where it stands. Mobs are not spread evenly
+//        (https://minecraft.wiki/w/Mob_spawning: packs spawn in patches on suitable blocks), so a mob miss is a
+//        LOCATION problem, not an inventory one: the need reason 'approach' chains this task and it is verified by
+//        the mob appearing in observe().nearby_entities - like reach, it is FOUND, not placed, so its failure
+//        needs are not "obtain <mob>" (that would chain approach -> craft a cow).
+function approachGoal(task) {
+    task = goalSentence(task);
+    const m = task.match(/^approach\s+([a-z_]+)$/i);
+    if (!m) return null;
+    if (!VERSION) throw new Error('[fix141] LOUD FAIL: approachGoal called but VERSION is null - bot version must be set before parsing goals');
+    const item = m[1].toLowerCase();
+    if (!isMobEntityName(minecraftData(VERSION).entitiesByName, item)) return null;
+    return { count: 1, item, items: [item], verb: 'approach' };
 }
 
 // "Smelt 6 raw_iron into 6 iron_ingot" -> verify by output gained
@@ -1582,6 +1597,8 @@ Use only c; no other globals.`;
         if (placed) out.push({ item: placed.item, n: placed.count });
         const reached = reachGoal(task);
         if (reached) out.push({ item: reached.item, n: reached.count });
+        const approached = approachGoal(task);   // fix141
+        if (approached) out.push({ item: approached.item, n: approached.count });
         return out;
     }
     // 0 and 1 are absent and one. A stack size, a recipe result, or a recipe's use of the item is game data for that count.
@@ -4088,7 +4105,7 @@ Use only c; no other globals.`;
         const q = await this._embed(task);
         let best = null, bs = -1;
         const g = this._resolveGoal(task);
-        const goalItems = g.kind === 'item' ? (g.items || [g.item]) : g.kind === 'ensure' || g.kind === 'reach' ? [g.item] : [];
+        const goalItems = g.kind === 'item' ? (g.items || [g.item]) : g.kind === 'ensure' || g.kind === 'reach' || g.kind === 'approach' ? [g.item] : [];
         const IMPORTANT_PRIMITIVES = new Set(['tossClutter', 'tossItem', 'depositToChest']);
         for (const s of this.skills) {
             // fix41: allow important primitives (inventory freeing skills) even if s.primitive is true
@@ -4149,7 +4166,7 @@ Use only c; no other globals.`;
                 if (need === null) throw new Error(`[fix87] LOUD: ${c.item} is not a block in the game data`);
                 return { ok: false, why: `no ${c.item} within 64 blocks`, need };
             }
-            if (c.pre === 'mob') return Object.values(bot.entities).some(e => e.name === c.mob && e.position.distanceTo(bot.entity.position) <= 48) ? { ok: true } : { ok: false, why: `no ${c.mob} within 48 blocks` };
+            if (c.pre === 'mob') return Object.values(bot.entities).some(e => e.name === c.mob && e.position.distanceTo(bot.entity.position) <= 48) ? { ok: true } : { ok: false, why: `no ${c.mob} within 48 blocks`, need: { item: c.mob, count: c.count || 1, reason: 'approach' } };   // fix141: a mob miss is a LOCATION need (mobs spawn in patches), not an inventory need
             if (c.pre === 'input') return (inv[c.input] || 0) > 0 ? { ok: true } : { ok: false, why: `no ${c.input} in inventory` };
         } catch (e) {
             if (e instanceof Error && e.message.startsWith('[fix87]')) throw e;
@@ -4247,7 +4264,7 @@ Use only c; no other globals.`;
         if (forced?.dedicatedTrial && !trial) throw new Error(`[fix79] dedicated trial of ${r.name} on "${task}" would run the incumbent: candidate does not fit the goal`);
         // fix79: route evidence for an item goal verified by gain on a bare-call route
         // fix86: ensure and reach goals are the same kind of bare route (ensureFurnaceWithinSixteen on a collect path)
-        const routeItems = g.kind === 'item' ? goal.items : (g.kind === 'ensure' || g.kind === 'reach' ? [g.item] : []);
+        const routeItems = g.kind === 'item' ? goal.items : (g.kind === 'ensure' || g.kind === 'reach' || g.kind === 'approach' ? [g.item] : []);
         const bareRoute = routeItems.length > 0 && !r.free && !r.at && !this._contract(r);
         if (bareRoute && !entry) throw new Error(`[fix79] item goal "${task}" routed to ${r.name}, which is not in the skill library`);
         const routeFit = bareRoute ? this._routeFit(entry, routeItems) : null;
@@ -4312,6 +4329,7 @@ Use only c; no other globals.`;
         else if (g.kind === 'item') ok = gainedFor(goal, before, after) >= goal.count;
         else if (g.kind === 'ensure') { ok = this._ensureHolds(g, after); console.log(`[psn] fix55 ensure goal ${g.item}: placed nearby -> ${ok}`); }
         else if (g.kind === 'reach') { ok = this._reachHolds(g, after); console.log(`[psn] fix83 reach goal ${g.item}: observed nearby -> ${ok}`); }
+        else if (g.kind === 'approach') { ok = this._approachHolds(g, after); console.log(`[psn] fix141 approach goal ${g.item}: observed nearby -> ${ok}`); }
         else if (g.kind === 'skill') {
             // a different skill run on a skill goal cannot show that the named skill succeeded
             if (r.name !== g.skill.name) { ok = false; console.log(`[psn] LOUD: skill goal "${task}" was run by ${r.name}, not ${g.skill.name}; NOT satisfied`); }
@@ -4535,6 +4553,8 @@ Use only c; no other globals.`;
         if (ensure) return { kind: 'ensure', ...ensure };
         const reach = reachGoal(t);   // fix83
         if (reach) return { kind: 'reach', ...reach };
+        const approach = approachGoal(t);   // fix141
+        if (approach) return { kind: 'approach', ...approach };
         const count = countGoal(t);
         if (count) return { kind: 'item', ...count };
         if (!isBareIdentifier(t)) return { kind: 'open' };
@@ -4569,6 +4589,12 @@ Use only c; no other globals.`;
         if (goal.verb !== 'reach') throw new Error(`[fix83] _reachHolds called for a non-reach goal (${goal.verb})`);
         if (!Array.isArray(state.nearby_blocks)) throw new Error('[fix83] state.nearby_blocks (array) required for reach goals');
         return state.nearby_blocks.includes(goal.item);
+    }
+    // fix141: an "approach" goal holds when the mob is observed nearby (exact entity name in observe().nearby_entities)
+    _approachHolds(goal, state) {
+        if (goal.verb !== 'approach') throw new Error(`[fix141] _approachHolds called for a non-approach goal (${goal.verb})`);
+        if (!Array.isArray(state.nearby_entities)) throw new Error('[fix141] state.nearby_entities (array) required for approach goals');
+        return state.nearby_entities.includes(goal.item);
     }
     // fix86: a run that made a block appear in nearby_blocks is evidence that skill can bring that block into range
     _noteBroughtNear(entry, before, after) {
@@ -4825,12 +4851,14 @@ Use only c; no other globals.`;
     _goalKey(goal) {
         if (goal.kind === 'ensure') return `placed ${goal.item}`;
         if (goal.kind === 'reach') return `reach ${goal.item}`;   // fix83
+        if (goal.kind === 'approach') return `approach ${goal.item}`;   // fix141
         if (goal.kind === 'skill') return `skill ${goal.skill.name}`;   // fix84
         return goal.item;
     }
     _needKey(need) {
         if (need.reason === 'proximity') return `placed ${need.item}`;
         if (need.reason === 'reach') return `reach ${need.item}`;   // fix83
+        if (need.reason === 'approach') return `approach ${need.item}`;   // fix141
         if (need.reason === 'slot') return 'slot';   // fix84: any full-inventory need is the same missing slot
         return need.item;
     }
@@ -5081,6 +5109,8 @@ Use only c; no other globals.`;
         }
         // fix83: nothing in the game data says where a block is: a reach goal that fails is decomposed / written by the model
         if (goal.kind === 'reach') return null;
+        // fix141: same for mobs: nothing in the game data says where a mob pack is; the approach route probes habitats
+        if (goal.kind === 'approach') return null;
         // smelt goals ("Smelt N <raw> into N <out>") are furnace work the crafting recipes do not describe.
         // fix90: a skill/open goal (and a smelt goal) can still lack an item of a kind. Item goals keep the recipe plan below.
         if (goal.kind !== 'item' || Object.hasOwn(goal, 'input')) {
@@ -5200,9 +5230,15 @@ Use only c; no other globals.`;
         const resolved = [];
         for (const n of needs) {
             const picked = this._resolveChainedNeed(n, inv, state, goal, task);
+            // fix141: a failed "approach <mob>" whose search re-stamped the same approach need must not chain
+            //        itself (fix81 would throw the cycle); the miss is recorded and the task just fails.
+            if (goal.kind === 'approach' && n.reason === 'approach' && !Object.hasOwn(picked, 'anyOf') && picked.item === goal.item) {
+                console.error(`!!! [fix141] LOUD: "${task}" is already the approach for ${picked.item}; the miss is recorded, not re-chained`);
+                continue;
+            }
             // fix84: a slot need names the drop that will not fit. That item IS the collect goal, and expanding it
             //        into the goal's own prerequisites would ask for the same item again instead of a free slot.
-            if (goal.kind === 'item' && picked.item === goal.item && n.reason !== 'proximity' && n.reason !== 'reach' && n.reason !== 'slot') {
+            if (goal.kind === 'item' && picked.item === goal.item && n.reason !== 'proximity' && n.reason !== 'reach' && n.reason !== 'approach' && n.reason !== 'slot') {
                 // the goal's own item could not be made: what it lacks is its own game-data prerequisites
                 const own = this._failureNeeds(task, null, null, state);
                 if (own === null) { console.log(`[backchain] "${task}": ${picked.item} reported missing, but the game data shows nothing it lacks`); continue; }
@@ -5218,7 +5254,7 @@ Use only c; no other globals.`;
             this._recordGoalOutcome(task, false, `prerequisite still missing: ${desc}`);
             return true;
         }
-        const keyed = goal.kind === 'item' || goal.kind === 'ensure' || goal.kind === 'reach' || goal.kind === 'skill';
+        const keyed = goal.kind === 'item' || goal.kind === 'ensure' || goal.kind === 'reach' || goal.kind === 'approach' || goal.kind === 'skill';
         const below = keyed ? [...chain, this._goalKey(goal)] : chain;
         const subs = [];
         for (const n of resolved) {
@@ -5273,7 +5309,7 @@ Use only c; no other globals.`;
         //        of any one member (cheapest plans that many of one item; members are not summed). A single item still
         //        stores held + shortfall, except proximity / reach / slot.
         this.progress.blockers = this.progress.blockers.filter(b => b.task !== task);
-        const shortfallOnly = new Set(['proximity', 'reach', 'slot']);
+        const shortfallOnly = new Set(['proximity', 'reach', 'approach', 'slot']);
         for (const n of resolved) {
             const sel = n.selector;
             let count = n.count;
@@ -5397,6 +5433,7 @@ Use only c; no other globals.`;
     _subgoalForNeed(n, state, task, below) {
         if (n.reason === 'proximity') return { task: `ensure ${n.item}`, need: n, edge: null };
         if (n.reason === 'reach') return { task: `reach ${n.item}`, need: n, edge: null };
+        if (n.reason === 'approach') return { task: `approach ${n.item}`, need: n, edge: null };   // fix141
         if (n.reason === 'slot') return this._slotAction(task, n, below, state);
         const learned = this._subgoalToObtainItem(n.item, n.count, state.inventory, new Set());
         if (learned !== null) return { task: learned, need: n, edge: null };
@@ -5660,6 +5697,12 @@ Use only c; no other globals.`;
         // fix83: "reach <block>" holds when the block is observed nearby (the same observation an ensure goal reads)
         if (goal.kind === 'reach') {
             if (this._reachHolds(goal, state)) return { satisfied: true, reason: `${goal.item} is within reach (observed nearby)` };
+            return { satisfied: false, reason: `${goal.item} not observed nearby (need to find it)`, goal };
+        }
+
+        // fix141: "approach <mob>" holds when the mob is observed nearby (observe().nearby_entities)
+        if (goal.kind === 'approach') {
+            if (this._approachHolds(goal, state)) return { satisfied: true, reason: `${goal.item} is nearby (observed entities)` };
             return { satisfied: false, reason: `${goal.item} not observed nearby (need to find it)`, goal };
         }
 
@@ -7517,7 +7560,7 @@ Reply ONLY with JSON: {"reasoning": "ONE short sentence", "success": true|false,
         //        the failure (ensureFurnaceWithinSixteen on collectOakLog). A throw is still that skill's failure.
         if (bs.length) {
             const blamedGoal = this._resolveGoal(task);
-            const blamedItems = blamedGoal.kind === 'item' ? (blamedGoal.items || [blamedGoal.item]) : blamedGoal.kind === 'ensure' || blamedGoal.kind === 'reach' ? [blamedGoal.item] : [];
+            const blamedItems = blamedGoal.kind === 'item' ? (blamedGoal.items || [blamedGoal.item]) : blamedGoal.kind === 'ensure' || blamedGoal.kind === 'reach' || blamedGoal.kind === 'approach' ? [blamedGoal.item] : [];
             if (blamedItems.length) {
                 bs = bs.filter(b => {
                     const e = this.skills.find(s => s.name === b.target);
@@ -8486,7 +8529,8 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             const goal = countGoal(task);
             const gained = goal ? gainedFor(goal, before, after) : 0;
             const reachG = this._resolveGoal(task);   // fix83: a reach goal is verified by observation, never by the critic alone
-            const reached = reachG.kind === 'reach' ? this._reachHolds(reachG, after) : null;
+            const reached = reachG.kind === 'reach' ? this._reachHolds(reachG, after)
+                : reachG.kind === 'approach' ? this._approachHolds(reachG, after) : null;   // fix141: same for approach (mob observed nearby)
             const verdict = cut ? { success: false, critique: `the attempt was ${cut}; it did not finish`, reasoning: 'cut off (critic skipped)' }   // fix23: a cut-off run is already a failure
                 : reached === true ? { success: true, critique: '', reasoning: `${reachG.item} observed nearby` }
                 : reached === false ? await this.critique(task, before, after, output, false)
