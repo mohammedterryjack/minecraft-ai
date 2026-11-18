@@ -9063,7 +9063,7 @@ Voyager.SEEDED_PRIMITIVES = [
         return false;
     }
     log(bot, \`Picked up \${pickedUp} items.\`);
-    return true;
+    return pickedUp > 0; // fix143: true iff items were picked up (see library/skills.js pickupNearbyItems)
 }`,
         deps: [],
     },
