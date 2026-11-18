@@ -317,7 +317,7 @@ describe('fix93 hunger backchain', () => {
         // fix96: entity loot is a source, not an opaque obtain: 1 beef from one cow (expected 2 per kill) is cheaper than
         //        3 wheat collected and crafted into bread
         assert.strictEqual(missing.item, 'beef');
-        assert.strictEqual(missing.task, 'Obtain 1 beef');
+        assert.strictEqual(missing.task, 'Kill 1 cow');   // fix142: mob-dropped food is obtained by killing the dropper
         const breadOnly = planFoodAcquisition({
             edibles: ['bread'], inventory: {},
             cheapest: (items, count, inv) => p.cheapest(items, count, inv, false),

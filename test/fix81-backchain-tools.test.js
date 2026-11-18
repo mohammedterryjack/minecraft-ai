@@ -321,7 +321,7 @@ describe('fix81: obtainPlanner (game data only)', () => {
     });
     it('a learned producer makes a raw resource known (iron_ingot by smelting, not from a block nobody has seen)', () => {
         const pre = planner([], item => item === 'iron_ingot').prerequisites('iron_ingot', 3, {});
-        assert.strictEqual(pre.task, 'Obtain 3 iron_ingot');
+        assert.strictEqual(pre.task, 'Kill 3 husk');   // fix142: entity-obtain tasks name the dropper (kill routes to killMob)
         assert.deepStrictEqual(pre.steps, []);
     });
     it('recipe cycles in the game data are reported and excluded (iron_ingot -> iron_block -> iron_ingot)', () => {

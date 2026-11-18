@@ -135,7 +135,7 @@ describe('fix96 (2): the food plan weighs observed edge success, entity loot and
     it('an item only a mob drops is an obtain from the named entities, not an opaque obtain', () => {
         const v = mkV({});
         const beef = v._obtainPlanner({ inventory: {}, nearby_blocks: [] }).prerequisites('beef', 1, {});
-        assert.strictEqual(beef.task, 'Obtain 1 beef');
+        assert.strictEqual(beef.task, 'Kill 1 cow');   // fix142: entity-obtain renders as Kill <dropper>
         assert.deepStrictEqual(beef.from, ['cow', 'mooshroom']);
         assert.strictEqual(beef.cost[0], 0, 'not opaque');
     });
@@ -147,13 +147,13 @@ describe('fix96 (2): the food plan weighs observed edge success, entity loot and
         assert.deepStrictEqual([...idx.get('iron_ingot')], ['raw_iron']);
         const pre = v._obtainPlanner({ inventory: {}, nearby_blocks: [] }).prerequisites('cooked_beef', 1, {});
         assert.strictEqual(pre.task, 'Smelt 1 beef into 1 cooked_beef');
-        assert.ok(pre.plan.includes('Obtain 1 beef'), pre.plan.join(' | '));
+        assert.ok(pre.plan.includes('Kill 1 cow'), pre.plan.join(' | '));
         assert.ok(pre.plan.some(s => s.includes('furnace')), pre.plan.join(' | '));
-        assert.ok(pre.steps.some(s => s.task === 'Obtain 1 beef'), JSON.stringify(pre.steps));
+        assert.ok(pre.steps.some(s => s.task === 'Kill 1 cow'), JSON.stringify(pre.steps));
         const none = mkV({});
         const cooked = none._obtainPlanner({ inventory: {}, nearby_blocks: [] }).prerequisites('cooked_beef', 1, {});
         assert.strictEqual(cooked.how, 'smelt');
-        assert.ok(cooked.plan.includes('Obtain 1 beef'), cooked.plan.join(' | '));
+        assert.ok(cooked.plan.includes('Kill 1 cow'), cooked.plan.join(' | '));
         assert.throws(() => mkV({ goalStats: undefined })._learnedSmeltIndex(), /goalStats required/);
     });
 

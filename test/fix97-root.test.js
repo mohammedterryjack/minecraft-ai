@@ -74,7 +74,7 @@ describe('fix97 food: an unreachable craft is not queued', () => {
         const v = mkV({});
         const pre = v._obtainPlanner({ inventory: {}, nearby_blocks: [] }).prerequisites('cooked_mutton', 1, {});
         assert.strictEqual(pre.how, 'smelt');
-        assert.ok(pre.plan.includes('Obtain 1 mutton'), pre.plan.join(' | '));
+        assert.ok(pre.plan.includes('Kill 1 sheep'), pre.plan.join(' | '));
         assert.ok(pre.plan.some(s => s.includes('furnace')), pre.plan.join(' | '));
         assert.strictEqual(typeof pre.fuel, 'string');
         assert.ok(pre.plan.some(s => s.includes(pre.fuel)), `${pre.fuel}: ${pre.plan.join(' | ')}`);
