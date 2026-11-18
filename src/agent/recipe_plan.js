@@ -23,7 +23,12 @@ import { furnaceInputsOf, fuelItemNames } from './furnace_recipes.js';
 // "Collect 1 apple" (oak_leaves nearby, 86 of 86 runs failed) the cheapest food every time. The data's dropChance is not
 // used (see meanDrop); what a source really yields is learned from the runs.
 // fix96: entity loot (registry.entityLoot) is a source of an item no recipe or block yields (beef from a cow): that option
-// is "obtain" from the named entities, not opaque. Learned smelt edges (smeltInputs(item): the inputs of "Smelt N <in>
+// is "obtain" from the named entities, not opaque.
+// fix142 (live icefox2000, 18 Nov): an entity-obtain rendered as "Obtain N <item>" routes to the generic obtainItem skill,
+// which tried craftRecipe(chicken) ("No recipe for chicken" — mobs drop items on death, they are not crafted; the obtain
+// verb never reached killMob/goToMob). The task for an entity-obtain is now "Kill N <dropper>" (highest expected yield,
+// name order on ties — deterministic), which routes to killMob and, through its fix141 mob contract, chains "approach <mob>"
+// when none is near. Opaque obtains (no recipe, block, entity, or furnace source) keep "Obtain N <item>". Learned smelt edges (smeltInputs(item): the inputs of "Smelt N <in>
 // into N <item>" goals that succeeded) plan the input, then the smelt.
 // fix97: furnace recipes come from minecraft-data (PC recipes.json has no furnace type; the package's bedrock furnace
 // tables name the same items). A smelt plans its input, a furnace, and a fuel. The fuel is the cheapest of the Java
@@ -102,6 +107,9 @@ export function obtainPlanner({ registry, recipesOf, known, proven, edgeSuccess,
                 if (y !== null) out.push({ entity: e.entity, yield: y });
             }
         }
+        // fix142: deterministic order (expected yield descending, entity name ascending): the first entry is the dropper
+        // the Kill task names.
+        out.sort((a, b) => (b.yield !== a.yield ? b.yield - a.yield : (a.entity < b.entity ? -1 : a.entity > b.entity ? 1 : 0)));
         return out;
     };
     const success = (item, verb) => {
@@ -266,7 +274,7 @@ export function obtainPlanner({ registry, recipesOf, known, proven, edgeSuccess,
                 const sub = plan(ing.item, want, sim, onPath, ctx, false);
                 if (!sub) { ok = false; break; }
                 if (sub.feasible !== true) feasible = false;
-                if (short > 0) missing.push({ item: ing.item, count: short, how: sub.how, input: sub.input });
+                if (short > 0) missing.push({ item: ing.item, count: short, how: sub.how, input: sub.input, from: sub.from });
                 sim = sub.inv; cost = add(cost, sub.cost); steps.push(...sub.steps);
             }
             if (!ok) continue;
@@ -301,7 +309,7 @@ export function obtainPlanner({ registry, recipesOf, known, proven, edgeSuccess,
             if (ctx.feasible === true && (sub.feasible !== true || furnace.feasible !== true || fuel.feasible !== true)) continue;
             const units = expected(rem, 1, item, 'smelt') - rem;   // the input's own units are in sub.cost; this adds the edge's failures
             const missing = [];
-            if (rem - Math.min(has(inv, input), rem) > 0) missing.push({ item: input, count: rem - Math.min(has(inv, input), rem), how: sub.how, input: sub.input });
+            if (rem - Math.min(has(inv, input), rem) > 0) missing.push({ item: input, count: rem - Math.min(has(inv, input), rem), how: sub.how, input: sub.input, from: sub.from });
             if (furnace.steps.length) missing.push({ item: 'furnace', count: 1, how: furnace.how, input: furnace.input });
             if (fuel.steps.length) {
                 const got = fuel.steps[fuel.steps.length - 1];
@@ -342,9 +350,9 @@ export function obtainPlanner({ registry, recipesOf, known, proven, edgeSuccess,
         } else {
             const mobs = entitySources(item);
             if (mobs.length) {
-                const best = Math.max(...mobs.map(m => m.yield));
+                const best = mobs[0].yield;   // fix142: entitySources is ranked (yield desc, name asc)
                 const units = expected(rem, best, item, 'obtain');
-                opts.push({ cost: [0, isKnown ? 0 : units, units, 1], inv, steps: [{ verb: 'obtain', item, count: rem }], how: 'obtain', from: mobs.map(m => m.entity), missing: [], ingredients: [], feasible: true });
+                opts.push({ cost: [0, isKnown ? 0 : units, units, 1], inv, steps: [{ verb: 'obtain', item, count: rem, from: mobs.map(m => m.entity) }], how: 'obtain', from: mobs.map(m => m.entity), missing: [], ingredients: [], feasible: true });
             } else if (recipes(item).length === 0 && furnaceInputsOf(item).length === 0) {
                 // No crafting recipe, block, mob drop, or furnace recipe (egg, milk_bucket). A cycle that
                 // emptied `crafts` still has recipes, so it is not this option. Unknown obtains are not
@@ -358,14 +366,18 @@ export function obtainPlanner({ registry, recipesOf, known, proven, edgeSuccess,
         return pick(opts, ctx, item);
     }
 
-    const taskFor = (how, item, count, input) => {
+    const taskFor = (how, item, count, input, from) => {
         if (how === 'smelt') {
             if (typeof input !== 'string' || input.length === 0) throw new Error(`[fix96] taskFor: a smelt of ${item} needs its input`);
             return `Smelt ${count} ${input} into ${count} ${item}`;
         }
         if (how === 'craft') return `Craft ${count} ${item}`;
         if (how === 'collect') return `Collect ${count} ${item}`;
-        if (how === 'obtain') return `Obtain ${count} ${item}`;
+        if (how === 'obtain') {
+            // fix142: a mob-dropped item is obtained by killing its dropper (routes to killMob, fix141 chains approach)
+            if (Array.isArray(from) && from.length) return `Kill ${count} ${from[0]}`;
+            return `Obtain ${count} ${item}`;
+        }
         throw new Error(`[fix81] taskFor: no task for how=${JSON.stringify(how)} (${count} ${item})`);
     };
     return {
@@ -386,12 +398,12 @@ export function obtainPlanner({ registry, recipesOf, known, proven, edgeSuccess,
             if (!Array.isArray(best.ingredients)) throw new Error(`[fix92] plan for ${item} has no direct ingredient list`);
             return {
                 how: best.how,
-                task: taskFor(best.how, item, count, best.input),
+                task: taskFor(best.how, item, count, best.input, best.from),
                 tool: Object.hasOwn(best, 'tool') ? best.tool : null,
                 from: Object.hasOwn(best, 'from') ? best.from : [],
                 ingredients: best.ingredients,
-                steps: best.missing.map(m => ({ item: m.item, count: m.count, task: taskFor(m.how, m.item, m.count, m.input) })),
-                plan: best.steps.map(s => taskFor(s.verb, s.item, s.count, s.input)),
+                steps: best.missing.map(m => ({ item: m.item, count: m.count, task: taskFor(m.how, m.item, m.count, m.input, m.from) })),
+                plan: best.steps.map(s => taskFor(s.verb, s.item, s.count, s.input, s.from)),
                 cycles: [...ctx.cycles],
                 ties: [...ctx.ties],
                 cost: best.cost,
