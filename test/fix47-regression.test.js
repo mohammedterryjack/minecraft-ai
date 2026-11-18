@@ -692,9 +692,12 @@ describe('fix47: prefix migration and shadow removal', () => {
             name: 'testLeftover',
             // This shouldn't happen normally, but test the detection
             // fix50: migration now THROWS on leftover patterns (fail loud, no soft paths)
+            // fix144: the leftover must be an EXECUTABLE namespace reference (a comment
+            // "skills.log" or a property access bot.skills.something cannot execute and is
+            // not flagged — see test/fix144-barename-scan-token-aware.test.js)
             code: `async function testLeftover(bot) {
-    // This is a comment mentioning skills.log
-    const x = bot.skills.something; // Different pattern
+    const helper = typeof skills.someUnknownHelper === 'function' ? skills.someUnknownHelper : null; // non-call prefixed ref migration cannot strip
+    return helper !== null;
 }`
         }];
         

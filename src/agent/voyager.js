@@ -619,7 +619,33 @@ export class Voyager {
     // fix42: MUST NOT create self-recursion by rewriting skills.NAME/world.NAME to NAME inside function NAME
     _migrateToBarenames() {
         // fix50: shared regex and field extractor for ALL code fields that can feed composer/repair prompts
-        const LEFTOVER_RE = /\b(?:skills|world)\.\w+/;
+        const LEFTOVER_RE = /\b(?:skills|world)\.\w+/; // fix50: rewrite trigger (call sites get stripped)
+    // fix144: the THROW scan must only flag references that EXECUTE. A raw-text regex also matched
+    // comments and string contents — a seeded template comment mentioning "library/skills.js" could
+    // never be stripped (rewriteCode only removes the call shape `skills.foo(`), so init threw on
+    // every launch (774-crash loop, 18 Nov 2026). acorn.tokenizer skips comments and hides string
+    // interiors, and does not require syntactic completeness, so prompt fragments scan too. A field
+    // that does not tokenize is a real syntax error and fails loud with its path (no soft path).
+    const prefixedRefs = (value, path) => {
+        const hits = [];
+        let t0 = null, t1 = null, t2 = null;
+        try {
+            for (const tk of acorn.tokenizer(value, { ecmaVersion: 'latest' })) {
+                // after each shift: t2 = previous token, t1 = one before, t0 = two before.
+                // pattern: name(skills|world) '.' name, NOT preceded by '.' (a property access like
+                // bot.world.getBlocks is legitimate mineflayer usage, not the skills/world namespace)
+                if (t2 && t1 && t2.type.label === '.' && t1.type.label === 'name'
+                    && (t1.value === 'skills' || t1.value === 'world') && tk.type.label === 'name'
+                    && !(t0 && t0.type.label === '.')) {
+                    hits.push(`${t1.value}.${tk.value}`);
+                }
+                t0 = t1; t1 = t2; t2 = tk;
+            }
+        } catch (err) {
+            throw new Error(`[fix144] cannot scan ${path} for prefixed references: ${err.message}`);
+        }
+        return hits;
+    };
         // fix50: extract ALL code strings from a skill entry (code, candidate.code, prev.code, handwritten_original.code, variants[*].code, repairHistory[*] code)
         const extractCodeFields = (s) => {
             const fields = [];
@@ -642,7 +668,19 @@ export class Voyager {
             }
             return fields;
         };
-        const hasLeftovers = () => this.skills.some(s => extractCodeFields(s).some(f => LEFTOVER_RE.test(f.value)));
+        // fix42: derive seeded names from SEEDED_PRIMITIVES source of truth (not a hard-coded list)
+        // fix144: hoisted above hasLeftovers — the scan skips seeded self-refs because seed reheal
+        // (via _needsReheal below) replaces those entries' code wholesale; everything else fails loud.
+        const seededNames = new Set(Voyager.SEEDED_PRIMITIVES.map(p => p.name));
+        const leftoverRefs = (value, path, fnName) =>
+            prefixedRefs(value, path).filter(r =>
+                !(seededNames.has(fnName) && (r === `skills.${fnName}` || r === `world.${fnName}`)));
+        const fnNameOf = (code) => {
+            const m = code?.match(/(?:async\s+)?function\s+([A-Za-z_]\w*)\s*\(/);
+            return m ? m[1] : null;
+        };
+        const hasLeftovers = () => this.skills.some(s =>
+            extractCodeFields(s).some(f => leftoverRefs(f.value, `${s.name}.${f.path}`, fnNameOf(s.code)).length > 0)); // fix144: token-aware — comments/strings cannot execute
         if (this.progress.migratedToBarenames && !hasLeftovers()) return;  // fully migrated
         if (this.progress.migratedToBarenames) {
             console.log('[fix41] migratedToBarenames was true but leftovers remain - rerunning migration');
@@ -651,8 +689,6 @@ export class Voyager {
         const skillFnNames = Object.keys(skills).filter(k => typeof skills[k] === 'function' && k !== 'log');
         const worldFnNames = Object.keys(world).filter(k => typeof world[k] === 'function');
         const allNames = new Set([...skillFnNames, ...worldFnNames]);
-        // fix42: derive seeded names from SEEDED_PRIMITIVES source of truth (not a hard-coded list)
-        const seededNames = new Set(Voyager.SEEDED_PRIMITIVES.map(p => p.name));
         const needsReheal = new Set();
         // fix42: rewrite helper - detects self-call and marks seeded for reheal instead of creating recursion
         const rewriteCode = (code, skillFnName) => {
@@ -686,11 +722,14 @@ export class Voyager {
                 if (code !== before) changes++;
             }
             // catch-all for ANY remaining patterns (unknown helpers)
+            // fix144: the catch-all must honor the fix42 self-call guard — stripping skills.NAME(
+            // inside function NAME creates the infinite recursion fix42 exists to prevent (repro:
+            // killMob containing skills.killMob( became bare killMob( despite "SELF-CALL BLOCKED").
             let before = code;
-            code = code.replace(/\bskills\.(\w+)\s*\(/g, '$1(');
+            code = code.replace(/\bskills\.(\w+)\s*\(/g, (m, n) => (n === skillFnName ? m : `${n}(`));
             if (code !== before) changes++;
             before = code;
-            code = code.replace(/\bworld\.(\w+)\s*\(/g, '$1(');
+            code = code.replace(/\bworld\.(\w+)\s*\(/g, (m, n) => (n === skillFnName ? m : `${n}(`));
             if (code !== before) changes++;
             // fix47: remove shadow patterns like "const log = skills.log" / "const foo = world.bar"
             before = code;
@@ -796,11 +835,12 @@ export class Voyager {
             }
         }
         // fix50: post-migration scan - THROW if any prefixed patterns remain (fail loud, no soft paths)
+        // fix144: via the token-aware scan so comments/strings cannot crash init (see prefixedRefs)
         const leftovers = [];
         for (const s of this.skills) {
             for (const f of extractCodeFields(s)) {
-                const matches = f.value.match(/\b(?:skills|world)\.[A-Za-z_]\w*/g);
-                if (matches) leftovers.push(`${s.name}.${f.path}: ${matches.join(', ')}`);
+                const refs = leftoverRefs(f.value, `${s.name}.${f.path}`, fnNameOf(s.code));
+                if (refs.length) leftovers.push(`${s.name}.${f.path}: ${refs.join(', ')}`);
             }
         }
         if (leftovers.length > 0) {
@@ -9063,7 +9103,7 @@ Voyager.SEEDED_PRIMITIVES = [
         return false;
     }
     log(bot, \`Picked up \${pickedUp} items.\`);
-    return pickedUp > 0; // fix143: true iff items were picked up (see library/skills.js pickupNearbyItems)
+    return pickedUp > 0; // fix143: true iff items were picked up
 }`,
         deps: [],
     },
