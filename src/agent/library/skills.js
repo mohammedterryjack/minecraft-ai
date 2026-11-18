@@ -869,7 +869,11 @@ export async function pickupNearbyItems(bot) {
         return false;
     }
     log(bot, `Picked up ${pickedUp} items.`);
-    return true;
+    // fix143: the docstring says true iff items were picked up. Returning true when the loop never ran
+    // (nothing nearby — collectBlock/the game already collected the drops) is a vacuous claim: it violated
+    // the learned postcondition ret===true ⇒ inventory gained (live: mineOre > mineBlocks > pickupNearbyItems,
+    // ~27 violations per run window, each queuing a repair of a skill that cannot fix a lie).
+    return pickedUp > 0;
 }
 
 
