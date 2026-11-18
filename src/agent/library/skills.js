@@ -1247,15 +1247,21 @@ export async function discard(bot, itemName, num=-1) {
     if (bot.itemKeeps instanceof Map && bot.itemKeeps.has(itemName)) {
         let held = 0;
         for (const it of bot.inventory.items()) if (it.name === itemName) held += it.count;
-        const keep = bot.itemKeeps.get(itemName);
-        const allowed = Math.max(0, held - keep);
-        if (allowed === 0) {
-            log(bot, `FAILED: keeping all ${held} ${itemName}: ${keep} reserved by consumption evidence or pending goals. Use putInChest instead of discarding reserved items.`);
-            return false;
-        }
-        if (num === -1 || num > allowed) {
-            log(bot, `Capping discard of ${itemName} to ${allowed} (held ${held}, keep ${keep} reserved by consumption evidence or pending goals).`);
-            num = allowed;
+        // fix145: a keep reserve can only protect items that exist. With held=0 the floor
+        // failed every free-up attempt with a lie ("keeping all 0 cobblestone: 218 reserved",
+        // mindcraft.log 124110-124112) and PSN repair patched on the false reservation
+        // premise forever. Fall through to the honest "nothing to discard" path below.
+        if (held > 0) {
+            const keep = bot.itemKeeps.get(itemName);
+            const allowed = Math.max(0, held - keep);
+            if (allowed === 0) {
+                log(bot, `FAILED: keeping all ${held} ${itemName}: ${keep} reserved by consumption evidence or pending goals. Use putInChest instead of discarding reserved items.`);
+                return false;
+            }
+            if (num === -1 || num > allowed) {
+                log(bot, `Capping discard of ${itemName} to ${allowed} (held ${held}, keep ${keep} reserved by consumption evidence or pending goals).`);
+                num = allowed;
+            }
         }
     }
     let discarded = 0;
