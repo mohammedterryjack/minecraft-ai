@@ -83,11 +83,18 @@ export function noteBotApiDuration(name, ms) {
     if (!_durations) throw new Error('[bot-api] duration store is not attached; a call is compared with recorded durations of the same method');
     if (typeof name !== 'string' || name.length === 0) throw new Error('[bot-api] method name required');
     if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) throw new Error(`[bot-api] duration of ${name} is ${ms}`);
-    const prev = _durations[name];
+    // fix148: _durations is a plain JSON-persisted object, so _durations[name] returns INHERITED members for
+    // method names like valueOf/toString/constructor (live 20 Nov: any Number()/String() coercion on the bot proxy
+    // calls bot.valueOf(); the proxy wrapped Object.prototype.valueOf, prev became that function, and this check
+    // threw on EVERY such call — 535x, failing replays whose action had already succeeded). Read via
+    // Object.hasOwn and write as an own data property (defineProperty, so even a method literally named
+    // __proto__ cannot reassign the store's prototype).
+    const has = Object.hasOwn(_durations, name);
+    const prev = has ? _durations[name] : undefined;
     let bound = null;
     let earlier = 0;
     let rec;
-    if (prev === undefined) {
+    if (!has) {
         rec = { n: 0, max: 0 };
     } else {
         if (prev === null || typeof prev !== 'object' || Array.isArray(prev) || !Number.isInteger(prev.n) || typeof prev.max !== 'number' || !Number.isFinite(prev.max)) {
@@ -101,7 +108,7 @@ export function noteBotApiDuration(name, ms) {
     }
     rec.n += 1;
     if (ms > rec.max) rec.max = ms;
-    _durations[name] = rec;
+    Object.defineProperty(_durations, name, { value: rec, writable: true, enumerable: true, configurable: true });
     if (bound === null || ms <= bound) return null;
     return { max: bound, n: earlier };
 }
