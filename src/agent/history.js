@@ -86,7 +86,9 @@ export class History {
                 turns: this.turns,
                 self_prompting_state: this.agent.self_prompter.state,
                 self_prompt: this.agent.self_prompter.isStopped() ? null : this.agent.self_prompter.prompt,
-                taskStart: this.agent.task.taskStartTime,
+                // fix147: agent.task is null until the first task starts (cleanKill on a boot-time disconnect hit
+                // this unguarded and save() rethrew, turning every socket close before a task into exit code 1).
+                taskStart: this.agent.task ? this.agent.task.taskStartTime : null,
                 last_sender: this.agent.last_sender
             };
             writeAtomic(this.memory_fp, JSON.stringify(data, null, 2));

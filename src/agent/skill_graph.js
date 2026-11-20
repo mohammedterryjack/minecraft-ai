@@ -1,8 +1,19 @@
 // Stage 1 (PSN-style skill network + Skill-V-style regression gate) helpers.
 import * as acorn from 'acorn';
 
+// fix147: memoised per skill name keyed by the exact code version. Replay routing (_lexicalReplay/_embedReplay/
+// _polyMerge) calls signatureOf for every skill on every routing pass; with ~930 skills / ~1 MB of code that acorn
+// parse dominated the main thread (watchdog stacks 20 Nov: requiredArgs -> signatureOf -> acorn parse; _polyMerge
+// = one full parse of the library PER skill, >30 s sync block -> ping timeout crash loop). Signature parsing is
+// pure over (code, name), so cache the result and recompute only when the code string changes (rewriteCode).
+// Parse failures are never cached — they stay loud on every call.
+const sigCache = new Map();
+const sigStats = { hits: 0, parses: 0 };
+export function signatureOfStats() { return { ...sigStats }; }
 /** Function declaration / async function expression assigned to `name` — AST only (no name regex on user code). */
 export function signatureOf(code, name) {
+    const cached = sigCache.get(name);
+    if (cached && cached.code === code) { sigStats.hits++; return cached.sig; }
     let ast;
     try {
         ast = acorn.parse(String(code), { ecmaVersion: 'latest', sourceType: 'module', allowAwaitOutsideFunction: true });
@@ -39,7 +50,12 @@ export function signatureOf(code, name) {
         }
     };
     walk(ast);
-    if (found) return `${name}(${paramsFrom(found)})`;
+    if (found) {
+        const sig = `${name}(${paramsFrom(found)})`;
+        sigStats.parses++;
+        sigCache.set(name, { code, sig });
+        return sig;
+    }
     throw new Error(`[skill_graph] signatureOf: no function declaration or assignment for "${name}" in skill source`);
 }
 function stripComments(code) { return String(code).replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, ''); }
