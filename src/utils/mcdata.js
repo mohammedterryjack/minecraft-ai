@@ -7,6 +7,7 @@ import prismarine_items from 'prismarine-item';
 import { pathfinder } from 'mineflayer-pathfinder';
 import { installCachedBestHarvestTool } from './harvest_tool_cache.js';
 import { installInterruptibleWaitForTicks } from './interruptible_wait.js';
+import { installPlaceOccupancyGuard } from './place_occupancy_guard.js';
 import { installTickEndAfterMove, protocolHasTickEnd } from './tick_end.js';
 import { plugin as pvp } from 'mineflayer-pvp';
 import { plugin as collectblock } from 'mineflayer-collectblock';
@@ -189,6 +190,11 @@ export function initBot(username) {
     // It is assigned by mineflayer's physics plugin (physics.js:456) during plugin injection, so
     // wrap it at inject_allowed — after the plugin, before gameplay.
     bot.once('inject_allowed', () => installInterruptibleWaitForTicks(bot));
+    // fix149: refuse placements whose destination cell is inside the bot's own hitbox at the
+    // mineflayer entry point (bot.placeBlock / bot._placeBlockWithOptions), with the reason —
+    // learned and repaired skills call mineflayer directly and were eating the server's silent
+    // rejection as "Server refused ... the block is still air" (see place_occupancy_guard.js).
+    bot.once('inject_allowed', () => installPlaceOccupancyGuard(bot));
     // fix109: enforce the vanilla invariant "rotation is always finite" on bot.entity.
     // Root cause of the kick loop: a replayed skill calls bot.lookAt() on a Vec3 built with
     // Vec3.add(Vec3) (Vec3.add takes x,y,z numbers, so the result is NaN); mineflayer's
