@@ -925,7 +925,21 @@ export async function breakBlockAt(bot, x, y, z) {
                 log(bot, `No harvest tool for ${block.name}: breaking by hand, no drops.`);
             }
         }
-        await bot.dig(block, true);
+        // fix157: mineflayer's bot.dig rejects with a bare Error('Digging aborted') whenever
+        // bot.stopDigging() fires (digging.js:165-189) — a mode pre-empted the task, a new dig
+        // request or a pathfinder takeover. breakBlock promises a boolean; letting that exception
+        // escape reached the code model as "Error: Digging aborted" with no cause (same shape as
+        // the navigation cancellation path logging "navigation cancelled (interrupted)").
+        try {
+            await bot.dig(block, true);
+        } catch (digErr) {
+            if (!/aborted/i.test(digErr?.message ?? '')) throw digErr;
+            const why = bot.interrupt_code
+                ? 'cancelled (interrupted by a mode or new command)'
+                : 'cancelled (another dig or pathfinder action took over)';
+            log(bot, `FAILED: dig of ${block.name} at ${block.position.x}, ${block.position.y}, ${block.position.z} ${why}.`);
+            return false;
+        }
         log(bot, `Broke ${block.name} at x:${x.toFixed(1)}, y:${y.toFixed(1)}, z:${z.toFixed(1)}.`);
     }
     else {
