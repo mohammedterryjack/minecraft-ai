@@ -6156,6 +6156,13 @@ Use only c; no other globals.`;
         if (!Array.isArray(trace)) return null;
         const rec = trace.find(t => t.name === name && t.err !== undefined);
         if (!rec || typeof rec.errTop !== 'string') return null;
+        // fix152: the library flagged this rejection as caused by the caller's own argument (world.js callerFault marker).
+        // The top frame is in the library because that is where a loud argument check must live; the fault is the caller's,
+        // so it stays the skill's failure: stats, streak, gate and PSN repair act on it like any other.
+        if (rec.errCallerFault === true) {
+            console.log(`!!! [blame] ${name} passed an argument the library rejected ("${rec.err}"); counted against ${name}, not the library`);
+            return null;
+        }
         const w = thrownIn(rec.errTop);
         if (w.staged) return null;
         const key = `${w.fn} ${w.loc}`;

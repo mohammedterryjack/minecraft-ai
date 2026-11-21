@@ -9,6 +9,17 @@ const require = createRequire(import.meta.url);
 // A chunk is 16 blocks on a side (prismarine-chunk; https://minecraft.wiki/w/Chunk).
 const { CHUNK_WIDTH, BLOCK_SECTION_VOLUME, SECTION_WIDTH, SECTION_HEIGHT } = require('prismarine-chunk/src/pc/common/constants.js');
 
+// fix152: a loud rejection of the CALLER's argument (bad name, bad type, bad number) is the caller's fault even though the
+//        throw site lives in the library. fix70's blame reads the error's top frame, so every such rejection escaped to
+//        progress.libraryFaults and the calling skill kept clean stats, was never demoted and never reached PSN repair —
+//        findSafeBlock("concrete") faulted 3312 times this way. The marker rides on the error; skill_graph's trace
+//        captures it (rec.errCallerFault) and voyager._libraryFault defers to it.
+export function callerFault(msg) {
+    const e = new Error(msg);
+    e.callerFault = true;
+    return e;
+}
+
 
 // fix42: getAllFreeSpaces returns all valid positions (for retry logic when placeBlock fails at one cell)
 // fix134: cells the bot's own hitbox occupies. A block cannot be placed where an entity
@@ -97,7 +108,7 @@ export const UNLOADED = 'unloaded (unknown, not air)';
 // far offset or an absolute position near the world origin was then read in the wrong frame.
 function _requireVec3(fn, arg, what, args) {
     if (args.length !== 2 || !(arg instanceof Vec3)) {
-        throw new Error(`${fn}(bot, ${what}) takes exactly one Vec3 after bot, e.g. ${fn}(bot, new Vec3(0, -1, 0)); got ${args.length - 1} argument(s): ${[...args].slice(1).map(a => JSON.stringify(a)).join(', ')}`);
+        throw callerFault(`${fn}(bot, ${what}) takes exactly one Vec3 after bot, e.g. ${fn}(bot, new Vec3(0, -1, 0)); got ${args.length - 1} argument(s): ${[...args].slice(1).map(a => JSON.stringify(a)).join(', ')}`);
     }
 }
 
@@ -199,7 +210,7 @@ function shownScanArg(v) {
 function requireScanNumber(fn, name, value) {
     if (typeof value !== 'number' || !Number.isFinite(value)) {
         const hint = 'distance and count are numbers. Block names go in block_types (getNearestBlocks) or the predicate (getNearestBlocksWhere), not in the distance. bot.findBlocks({ matching, maxDistance, count }): matching is a block id, an array of block ids, or a function; maxDistance and count are finite numbers.';
-        throw new Error(`${fn}: ${name} must be a finite number, got ${shownScanArg(value)}. ${hint}`);
+        throw callerFault(`${fn}: ${name} must be a finite number, got ${shownScanArg(value)}. ${hint}`);
     }
 }
 
@@ -228,11 +239,11 @@ export function getNearestBlocks(bot, block_types, distance, count) {
             // fix95: a name that is not a block (an item such as wheat_seeds) matched nothing, so the search returned
             //        nothing without any I/O and code that retried it spun the event loop until the watchdog killed the
             //        process. It is a wrong question, not an empty world: fail loudly and name the blocks that yield it.
-            if (typeof block_type !== 'string' || block_type.length === 0) throw new Error(`getNearestBlocks: a block name is a non-empty string, got ${typeof block_type === 'function' ? 'a function (use getNearestBlocksWhere for a predicate)' : JSON.stringify(block_type)}`);
+            if (typeof block_type !== 'string' || block_type.length === 0) throw callerFault(`getNearestBlocks: a block name is a non-empty string, got ${typeof block_type === 'function' ? 'a function (use getNearestBlocksWhere for a predicate)' : JSON.stringify(block_type)}`);
             const id = mc.getBlockId(block_type);
             if (id === null) {
                 const sources = itemSourceBlocks(bot.registry, block_type);
-                throw new Error(`getNearestBlocks: ${JSON.stringify(block_type)} is not a block in the game data; ` +
+                throw callerFault(`getNearestBlocks: ${JSON.stringify(block_type)} is not a block in the game data; ` +
                     (sources.length ? `the blocks that drop it are ${sources.join(', ')}; search for those` : 'no block drops it; obtain it another way (craft, smelt, or a mob drop)'));
             }
             block_ids.push(id);
