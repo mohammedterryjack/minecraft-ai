@@ -911,9 +911,18 @@ export async function breakBlockAt(bot, x, y, z) {
         if (bot.game.gameMode !== 'creative') {
             await equipToolForBlock(bot, block);   // fix62: cheapest tool that works (mineflayer-tool equipForBlock sorts by dig time = top tier)
             const itemId = bot.heldItem ? bot.heldItem.type : null
-            if (!block.canHarvest(itemId)) {
-                log(bot, `Don't have right tools to break ${block.name}.`);
+            // fix150: canHarvest predicts DROPS, not breakability (prismarine-block canHarvest is
+            // false only when the block lists harvestTools the held item lacks). The game still
+            // breaks any diggable block by hand — stone digTime 7.5s, cobblestone 10s — just with
+            // no drop; bedrock is the genuinely undiggable case (diggable=false). mineflayer gates
+            // digging solely on block.diggable + reach (lib/plugins/digging.js canDigBlock); this
+            // gate refusing hand-digs kept the bot entombed in its own hole.
+            if (!block.diggable) {
+                log(bot, `Cannot break ${block.name}: block is not diggable.`);
                 return false;
+            }
+            if (!block.canHarvest(itemId)) {
+                log(bot, `No harvest tool for ${block.name}: breaking by hand, no drops.`);
             }
         }
         await bot.dig(block, true);
@@ -2068,9 +2077,13 @@ export async function goToPosition(bot, x, y, z, min_distance=2) {
     const checkDigProgress = () => {
         if (bot.targetDigBlock) {
             const targetBlock = bot.targetDigBlock;
-            const itemId = bot.heldItem ? bot.heldItem.type : null;
-            if (!targetBlock.canHarvest(itemId)) {
-                log(bot, `Pathfinding stopped: Cannot break ${targetBlock.name} with current tools.`);
+            // fix150: abort only when mineflayer itself could not dig the block: canDigBlock is
+            // block.diggable && within 5.1 reach (lib/plugins/digging.js). The old canHarvest
+            // check treated "no drop without a pickaxe" as "cannot break" and killed every
+            // hand-dig escape path ("Pathfinding stopped: Cannot break cobblestone with current
+            // tools", 15x live while entombed at Y=47).
+            if (!bot.canDigBlock(targetBlock)) {
+                log(bot, `Pathfinding stopped: ${targetBlock.name} is not diggable from here.`);
                 bot.pathfinder.stop();
                 bot.stopDigging();
             }
