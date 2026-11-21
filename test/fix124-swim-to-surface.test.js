@@ -11,6 +11,7 @@
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
+import { Vec3 } from 'vec3';
 import * as skills from '../src/agent/library/skills.js';
 
 // Mock: a vertical water column. `surfaceY` = highest y whose cell is still water.
@@ -51,22 +52,38 @@ function mkBot({ startY, surfaceY, blocked = false }) {
 // floor(x) < bankX; the bank at bankX is dry (solid floor, air above). The entity
 // advances 2 blocks per second toward the lookAt target while forward is held, and never
 // crosses into the wall when wallX is set.
-function mkSwimmer({ startX, startZ = 104, bankX, wallX = null }) {
+function mkSwimmer({ startX, startZ = 104, bankX, wallX = null, wallName = 'bedrock', wallDiggable = false }) {
     const held = {};
+    let wallPresent = wallX !== null;
+    const wallCell = wallX === null ? null : Math.floor(wallX);
     const bot = {
         interrupt_code: false,
-        entity: { position: { x: startX, y: 41, z: startZ } },
+        entity: { position: new Vec3(startX, 41, startZ) },
         setControlState(name, value) { held[name] = value; },
         _held: held,
         _look: null,
+        _dug: [],
         async lookAt(v) { bot._look = v; },
+        blockAt(pos) {
+            if (wallPresent && Math.floor(pos.x) === wallCell) {
+                return { name: wallName, diggable: wallDiggable };
+            }
+            // the corridor is water-filled (head not free) until the bank
+            if (Math.floor(pos.x) < bankX) return { name: 'water', diggable: false };
+            return null;
+        },
+        async dig(b) {
+            if (!b.diggable) throw new Error(`cannot dig ${b.name}`);
+            bot._dug.push(b.name);
+            wallPresent = false; // fix151: the wall opens, water corridor continues
+        },
         async waitForTicks(n) {
             for (let t = 0; t < n; t++) {
                 if (held.forward) {
                     const p = bot.entity.position;
                     const dir = Math.sign(bot._look.x - p.x) || 0;
                     const next = p.x + dir * 2 / 20;
-                    if (wallX === null || (dir > 0 ? next < wallX : next > wallX)) p.x = next;
+                    if (wallX === null || !wallPresent || (dir > 0 ? next < wallX : next > wallX)) p.x = next;
                 }
                 // dry once reached, and dry stays dry (banks do not re-flood when the bot bobs)
                 if (Math.floor(bot.entity.position.x) >= bankX) bot.entity.isInWater = false;
@@ -88,13 +105,22 @@ describe('fix124: swimTowards', () => {
         assert.notStrictEqual(bot._held.jump, true, 'jump released');
     });
 
-    it('a wall between bot and bank fails loudly as blocked', async () => {
-        const bot = mkSwimmer({ startX: -175, bankX: -168, wallX: -172 });
+    it('an undiggable wall between bot and bank fails loudly as blocked', async () => {
+        const bot = mkSwimmer({ startX: -175, bankX: -168, wallX: -172, wallName: 'bedrock', wallDiggable: false });
         const res = await skills.swimTowards(bot, -168, 104);
         assert.strictEqual(res.reached, false);
         assert.strictEqual(res.blocked, true);
+        assert.deepStrictEqual(bot._dug, [], 'bedrock is never dug (diggable=false, fix150 rule)');
         assert.notStrictEqual(bot._held.forward, true, 'forward released on failure');
         assert.notStrictEqual(bot._held.jump, true, 'jump released on failure');
+    });
+
+    it('fix151: a diggable wall is dug and the swim continues to the bank', async () => {
+        const bot = mkSwimmer({ startX: -175, bankX: -168, wallX: -172, wallName: 'cobblestone', wallDiggable: true });
+        const res = await skills.swimTowards(bot, -168, 104);
+        assert.strictEqual(res.reached, true, `dug through, got ${JSON.stringify(res)}`);
+        assert.deepStrictEqual(bot._dug, ['cobblestone']);
+        assert.notStrictEqual(bot._held.forward, true, 'forward released');
     });
 });
 
