@@ -173,9 +173,19 @@ export function nestedBotMemberError(bot, node, assigned, nodes) {
             // bot.recipes is already reported by the direct bot.member check. Only a missing member of a real object
             // (bot.inventory.hasItem) is new.
             if (i === 0) return null;
+            // fix155: an Array.prototype method read off a reached plain object is always the
+            // array-vs-map confusion (bot.entities.filter — mineflayer docs api.md: bot.entities is
+            // a map of entityId to entity). Say that and give the correct form; the generic
+            // "closest members" suggestion below is garbage here (it offers the map's data keys).
+            if (i === parts.length - 1 && typeof key === 'string' && !Array.isArray(obj) &&
+                Object.prototype.hasOwnProperty.call(Array.prototype, key) &&
+                typeof Array.prototype[key] === 'function') {
+                const owner = parts.slice(0, i).join('.');
+                return `bot.${owner}.${key} does not exist: bot.${owner} is a plain object map (id -> value), not an array (mineflayer docs api.md: bot.entities is a map of entityId to entity). Use Object.values(bot.${owner}).${key}(...) — or the bare skills getNearbyEntities(bot, distance) / bot.nearestEntity(predicate).`;
+            }
             const isCall = i === parts.length - 1 && nodes.some(c => c.type === 'CallExpression' && c.callee === node);
             const closest = nearestBotMember(obj, key, isCall).map(k => `bot.${[...parts.slice(0, i), k].join('.')}`);
-            return `bot.${parts.slice(0, i + 1).join('.')} does not exist (closest real members: ${closest.join(', ')})`;
+            return `bot.${parts.slice(0, i + 1).join('.')} does not exist${closest.length ? ` (closest real members: ${closest.join(', ')})` : ''}`;
         }
         if (i < parts.length - 1) obj = memberValue(obj, key);
     }
@@ -185,8 +195,12 @@ export function nearestBotMember(bot, name, isCall) {
     const words = s => s.split(/(?=[A-Z])/).map(w => w.toLowerCase());
     const want = new Set(words(name));
     const lev = (a, b) => { let prev = Array.from({ length: b.length + 1 }, (_, j) => j); for (let i = 1; i <= a.length; i++) { const cur = [i]; for (let j = 1; j <= b.length; j++) cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)); prev = cur; } return prev[b.length]; };
-    const scored = [...botMembers(bot)].map(([k, fn]) => ({ k, kind: fn === isCall ? 0 : 1, shared: -(() => { const w = new Set(words(k)); const n = [...w].filter(x => want.has(x)).length; return n / new Set([...w, ...want]).size; })(), d: lev(name.toLowerCase(), k.toLowerCase()) }));
-    if (!scored.length) throw new Error('nearestBotMember: the live bot exposes no members');
+    // fix155: keys of a data map (bot.entities keys are entity ids like "12") are not members;
+    // suggesting bot.entities.12 as a "real member" misleads the coder. Filter to valid JS
+    // identifiers, and return none instead of throwing when nothing is left (the gate must never
+    // crash — a throwing gate gives the coder no feedback at all and fails the whole step).
+    const scored = [...botMembers(bot)].filter(([k]) => /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(k)).map(([k, fn]) => ({ k, kind: fn === isCall ? 0 : 1, shared: -(() => { const w = new Set(words(k)); const n = [...w].filter(x => want.has(x)).length; return n / new Set([...w, ...want]).size; })(), d: lev(name.toLowerCase(), k.toLowerCase()) }));
+    if (!scored.length) return [];
     scored.sort((a, b) => a.kind - b.kind || a.shared - b.shared || a.d - b.d);
     return scored.slice(0, 3).map(x => x.k);
 }

@@ -123,12 +123,15 @@ test('fix49: null-safe blockAt in breakBlockAt primitive', async (t) => {
 
     await t.test('repair system prompt should warn about null blockAt/findBlock', async () => {
         const fs = await import('fs');
+        const { API_SHAPE_NOTES } = await import('../src/agent/prompt_cut.js'); // fix155: notes shared from prompt_cut
         const voyagerCode = fs.readFileSync('./src/agent/voyager.js', 'utf8');
         // The repair system prompt should explicitly warn about null-checking
-        assert.ok(voyagerCode.includes('findBlock/findBlocks/nearestEntity') && 
-            voyagerCode.includes('can be null'),
+        assert.ok(voyagerCode.includes('${API_SHAPE_NOTES}'),
+            'repair prompts must interpolate the shared API_SHAPE_NOTES');
+        assert.ok(API_SHAPE_NOTES.includes('findBlock/findBlocks/nearestEntity') &&
+            API_SHAPE_NOTES.includes('can be null'),
             'repair system prompt should warn that findBlock/blockAt can return null');
-        assert.ok(voyagerCode.includes('null-check'),
+        assert.ok(API_SHAPE_NOTES.includes('null-check'),
             'repair prompt should mention null-checking');
     });
 

@@ -4,6 +4,13 @@
 
 const REDUNDANT = ['$SELF_PROMPT', '$MEMORY', '$STATS', '$INVENTORY', '$CODE_DOCS', '$EXAMPLES'];
 
+// fix155: the "shape notes" were hand-copied inline three times in voyager.js (repair,
+// joint-repair, compose prompts), and none of them stated the thing the coder keeps getting wrong:
+// `bot.entities` is an object map keyed by entity id (mineflayer docs api.md), not an array —
+// generated code calls .filter on it and the lint gate "closest real member" advice made it worse.
+// One constant, all three prompts, plus the map-vs-array and no-bot.leveldb notes.
+export const API_SHAPE_NOTES = `findBlock/findBlocks/nearestEntity/bot.entities/blockAt results can be null or empty: always null-check them before reading .position/.x or calling methods on them. bot.findBlocks(options): matching is a block id, an array of block ids, or a function; maxDistance and count are finite numbers. bot.findBlock(options) returns one block and does not take count; pass matching and maxDistance. getNearestBlocks(bot, block_types, distance, count): block_types is a block name or an array of names (null lists every block id); distance and count are finite numbers and are required. A list of names is not a distance. getNearbyBlockTypes(bot) lists blocks the bot can see (loaded, inside the server view distance, a face open to air or another non-occluding block, confirmed by bot.world.raycast). It does not take a radius. bot.entities is a map of entityId to entity, NOT an array (mineflayer docs api.md): bot.entities.filter/map/find is not a function — iterate Object.values(bot.entities), or call the bare skills getNearbyEntities(bot, distance) / getNearestEntityWhere(...). The bot object has only real mineflayer properties: there is no bot.leveldb, bot.db or bot.memory.`;
+
 export function voyagerCodingInstructions(coding, name) {
     if (typeof coding !== 'string' || coding.length === 0) throw new Error('[fix93] profile.coding required');
     for (const marker of REDUNDANT) {
