@@ -9080,7 +9080,8 @@ Voyager.SEEDED_PRIMITIVES = [
     if (bot.game.gameMode !== 'creative') {
         await equipToolForBlock(bot, block);
         const itemId = bot.heldItem ? bot.heldItem.type : null;
-        if (!block.canHarvest(itemId)) { log(bot, \`FAILED: Don't have right tools to break \${block.name}. Need one of: \${Object.keys(block.harvestTools || {}).map(id => bot.registry.items[id].name).join(', ') || 'any tool'}\`); return false; }
+        if (!block.diggable) { log(bot, \`FAILED: breakBlockAt: \${block.name} is not diggable (e.g. bedrock)\`); return false; }
+        if (!block.canHarvest(itemId)) { log(bot, \`No harvest tool for \${block.name}: breaking by hand, it will not drop.\`); }
     }
     await bot.dig(block, true);
     log(bot, \`Broke \${block.name} at \${x.toFixed(1)}, \${y.toFixed(1)}, \${z.toFixed(1)}.\`);
