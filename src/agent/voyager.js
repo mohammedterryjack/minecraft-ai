@@ -9090,7 +9090,17 @@ Voyager.SEEDED_PRIMITIVES = [
         if (!block.diggable) { log(bot, \`FAILED: breakBlockAt: \${block.name} is not diggable (e.g. bedrock)\`); return false; }
         if (!block.canHarvest(itemId)) { log(bot, \`No harvest tool for \${block.name}: breaking by hand, it will not drop.\`); }
     }
-    await bot.dig(block, true);
+    // fix157: bot.dig rejects with a bare Error('Digging aborted') when bot.stopDigging() fires
+    // (a mode pre-empted, a new dig request, pathfinder takeover). breakBlockAt promises a boolean;
+    // convert to FAILED + false like the navigation cancellation path.
+    try {
+        await bot.dig(block, true);
+    } catch (digErr) {
+        if (!/aborted/i.test(digErr?.message ?? '')) throw digErr;
+        const why = bot.interrupt_code ? 'interrupted by a mode or new command' : 'another dig or pathfinder action took over';
+        log(bot, \`FAILED: breakBlockAt dig of \${block.name} at \${x}, \${y}, \${z} cancelled: \${why}.\`);
+        return false;
+    }
     log(bot, \`Broke \${block.name} at \${x.toFixed(1)}, \${y.toFixed(1)}, \${z.toFixed(1)}.\`);
     return true;
 }`,
