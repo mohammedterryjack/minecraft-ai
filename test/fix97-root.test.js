@@ -18,6 +18,7 @@ import { readFileSync, existsSync, rmSync } from 'node:fs';
 import { edibleNames, planFoodAcquisition } from '../src/agent/food_backchain.js';
 import { applyContractResets, applyCallRecordMigrations, buildContractManifest } from '../scripts/fix97_contract_manifest.js';
 import { nestedBotMemberError, getBareAPI, Coder } from '../src/agent/coder.js';
+import { API_SHAPE_NOTES } from '../src/agent/prompt_cut.js';   // fix155
 import { getNearestBlocks, getNearestBlocksWhere, getNearbyBlockTypes, getNearbyBlocks, nearbyBlockRadius, perceivedStats, perceivedBuildStats, indexPerceivedChunks, pathToBlock } from '../src/agent/library/world.js';
 import { buildServerTerrain, makeServerChunk, serverHeight } from './server_terrain.js';
 import { gunzipSync } from 'node:zlib';
@@ -1380,8 +1381,10 @@ describe('fix97 findBlocks refuses a non-numeric maxDistance or count', () => {
         assert.strictEqual(nearbyBlockRadius(gameBot), 9 * CHUNK_WIDTH);
         assert.throws(() => client.emit('update_view_distance', { viewDistance: 9.5 }), /varint/);
         assert.strictEqual(gameBot.game.serverViewDistance, 9);
-        assert.match(Voyager.prototype._pursueProposedTask.toString(), /maxDistance and count are finite numbers/);
-        assert.match(Voyager.prototype._pursueProposedTask.toString(), /findBlock\(options\) returns one block and does not take count/);
+        // fix155: the shape notes are one shared constant in prompt_cut.js, interpolated here.
+        assert.match(Voyager.prototype._pursueProposedTask.toString(), /\$\{API_SHAPE_NOTES\}/);
+        assert.match(API_SHAPE_NOTES, /maxDistance and count are finite numbers/);
+        assert.match(API_SHAPE_NOTES, /findBlock\(options\) returns one block and does not take count/);
         const raw = new EventEmitter();
         raw._client = new EventEmitter();
         raw.registry = registry;

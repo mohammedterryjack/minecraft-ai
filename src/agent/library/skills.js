@@ -2080,20 +2080,31 @@ export async function pillarUp(bot, targetY) {
         const baseY = p.y;
         bot.setControlState('jump', true);
         let placed = false;
-        // two game seconds per block — the same game-time bound swimTowards uses; placement is
-        // accepted only once the hitbox has cleared the target cell (a real jump peaks ~1.25 blocks)
+        let prevY = p.y;
+        // fix154: place at the jump APEX, not at a rising height threshold. The server refuses a
+        // block whose cell intersects the player's hitbox (minecraft.wiki/w/Place) and checks ITS
+        // view of the player position. ViaProxy's 26.1->26.3 input translation lags the server-side
+        // position by a tick or two (the server log's "standing on air - force-sending blocks below"
+        // spam), so placing mid-rise (old >=1.05 threshold, ~0.18 blocks/tick upward velocity at that
+        // height) leaves the lagged hitbox back inside the feet cell and the server refuses. At the
+        // apex vertical velocity is ~0 (jump peaks 1.25 blocks, minecraft.wiki/w/Jump), so even a
+        // lagged server position is still above the vacated cell. Apex is detected as
+        // "no longer rising" (y <= previous tick's y) with the cell cleared (>=1.0), not a guessed
+        // height. Two game seconds per block, the same game-time bound swimTowards uses.
         for (let tick = 0; tick < 40 && !bot.interrupt_code; tick++) {
             await bot.waitForTicks(1);
-            if (!placed && bot.entity.position.y - baseY >= 1.05) {
+            const y = bot.entity.position.y;
+            if (!placed && y - baseY >= 1.0 && y <= prevY) {
                 placed = await placeBlock(bot, item.name, fx, fy, fz, 'bottom');
-            } else if (placed && bot.entity.position.y <= baseY + 1.05) {
+            } else if (placed && y <= baseY + 1.05) {
                 break; // landed on the new block
             }
+            prevY = y;
         }
         bot.setControlState('jump', false);
         if (bot.interrupt_code) return { climbed, ok: false, interrupted: true };
         if (bot.entity.position.y < baseY + 0.9) {
-            return { climbed, ok: false, reason: `placement under the feet was refused for two game seconds at (${fx}, ${fy}, ${fz}) — something occupies or blocks the column` };
+            return { climbed, ok: false, reason: `placement under the feet was refused repeatedly at (${fx}, ${fy}, ${fz}) during two game seconds of jumps — see the placeBlock FAILED lines above for who refused (client hitbox guard vs server)` };
         }
         climbed += 1;
     }
