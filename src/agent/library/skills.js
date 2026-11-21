@@ -1905,6 +1905,47 @@ function startDoorInterval(bot) {
     return doorCheckInterval;
 }
 
+// fix151: a swim that stops entering cells is stopped by a block — the wall between the bot and
+// the target column, or a solid cap over the column. Break the first diggable one (any diggable
+// block opens by hand — fix150; mineflayer gates digging on block.diggable, lib/plugins/digging.js
+// canDigBlock). Candidates: forward at feet and head level toward the target (including the two
+// axis-aligned neighbours of a diagonal heading, because lookAt + forward jams on corner walls),
+// then the cap above the head and the shaft above it, bottom first.
+async function digOutTowards(bot, target, triedCells) {
+    const p = bot.entity.position;
+    const feet = { x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z) };
+    const cands = [];
+    if (target) {
+        const sx = Math.sign(target.x - p.x), sz = Math.sign(target.z - p.z);
+        for (const [dx, dz] of [[sx, sz], [sx, 0], [0, sz]]) {
+            if (!dx && !dz) continue;
+            cands.push([feet.x + dx, feet.y, feet.z + dz]);
+            cands.push([feet.x + dx, feet.y + 1, feet.z + dz]);
+        }
+    }
+    for (const dy of [1, 2, 3]) cands.push([feet.x, feet.y + dy, feet.z]);
+    for (const [cx, cy, cz] of cands) {
+        const key = `${cx},${cy},${cz}`;
+        if (triedCells.has(key)) continue;
+        triedCells.add(key);
+        const b = bot.blockAt(new Vec3(cx, cy, cz));
+        if (!b || b.name === 'air' || b.name === 'water' || b.name === 'lava') continue;
+        if (!b.diggable) {
+            log(bot, `Swim blocked by undiggable ${b.name} at ${key}.`);
+            continue;
+        }
+        log(bot, `Swim blocked: digging ${b.name} at ${key} to open a way out.`);
+        try {
+            await bot.dig(b, true);
+        } catch (err) {
+            log(bot, `Swim blocked: dig of ${b.name} at ${key} failed: ${err.message ?? err}`);
+            return false;
+        }
+        return true;
+    }
+    return false;
+}
+
 export async function swimTowards(bot, x = null, z = null) {
     /**
      * Swim with direct controls (the game's own liquid movement) to a column, or straight up
@@ -1941,6 +1982,7 @@ export async function swimTowards(bot, x = null, z = null) {
     if (hasTarget) bot.setControlState('forward', true);
     let lastCell = cellOf(bot.entity.position);
     let stuckTicks = 0;
+    const triedCells = new Set(); // fix151: each walled cell is dug at most once per swim
     try {
         while (!bot.interrupt_code) {
             const p = bot.entity.position;
@@ -1963,8 +2005,15 @@ export async function swimTowards(bot, x = null, z = null) {
             const cell = cellOf(bot.entity.position);
             if (cell === lastCell) {
                 stuckTicks += 20;
-                // two game seconds without entering a new cell: sealed column or wall ahead
+                // two game seconds without entering a new cell: dig what is ahead (fix151) —
+                // a sealed pool or capped column only opens by removing a block, and any
+                // diggable block opens by hand (fix150: canHarvest is drops, not breakability;
+                // mineflayer gates digging on block.diggable, lib/plugins/digging.js canDigBlock).
                 if (stuckTicks >= 40) {
+                    if (await digOutTowards(bot, hasTarget ? { x, z } : null, triedCells)) {
+                        stuckTicks = 0;
+                        continue;
+                    }
                     return { reached: false, blocked: true, rose: bot.entity.position.y - startY };
                 }
             } else {
