@@ -1146,7 +1146,22 @@ export async function equipToolForBlock(bot, block) {
     const items = bot.inventory.items();
     const cands = items.filter(it => works(it.type));
     if (!cands.length) {
-        if (block.harvestTools) { log(bot, `FAILED: no inventory tool can harvest ${block.name}`); return null; }
+        if (block.harvestTools) {
+            // fix156: a bare "cannot harvest" is a dead end — in one window it appeared 17x while the
+            // bot, holding oak logs, never considered crafting the pickaxe the block needs. Name the
+            // registry-required tools ordered slowest-dig first (cheapest tier, same registry data as
+            // the mining-speed table above) and point at the entry point that gathers its own
+            // ingredients, so the critic and any chained generated code get an actionable repair
+            // (precedent: the shelter error recommending !gatherUntil).
+            const speedOf = (id) => { const m = reg.materials[block.material]; return (m && m[id]) || 1; };
+            const tools = Object.keys(block.harvestTools)
+                .map((id) => reg.items[id])
+                .filter(Boolean)
+                .sort((a, b) => speedOf(a.id) - speedOf(b.id))
+                .map((it) => it.name);
+            log(bot, `FAILED: no inventory tool can harvest ${block.name}; the registry requires one of: ${tools.join(', ')} — craft one with craftItem(bot, "${tools[0]}"), it gathers its own ingredients`);
+            return null;
+        }
         if (bot.heldItem && reg.items[bot.heldItem.type].maxDurability) await bot.unequip('hand');
         return null;
     }

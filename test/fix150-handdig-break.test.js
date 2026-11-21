@@ -18,6 +18,10 @@ import { breakBlockAt } from '../src/agent/library/skills.js';
 const here = dirname(fileURLToPath(import.meta.url));
 
 function makeBot() {
+    // fix156: the refusal branch of equipToolForBlock reads bot.registry to name the required
+    // tools, so this mock carries a minimal cobblestone-shaped registry (ids match cobble below)
+    const picks = { 257: { id: 257, name: 'wooden_pickaxe' }, 258: { id: 258, name: 'golden_pickaxe' }, 270: { id: 270, name: 'stone_pickaxe' }, 274: { id: 274, name: 'iron_pickaxe' }, 278: { id: 278, name: 'diamond_pickaxe' }, 282: { id: 282, name: 'netherite_pickaxe' }, 286: { id: 286, name: 'netherite_pickaxe' } };
+    const speeds = { 257: 2, 258: 3, 270: 4, 274: 6, 278: 8, 282: 9, 286: 9 };
     return {
         output: '',
         food: 20,
@@ -27,7 +31,7 @@ function makeBot() {
         entity: { position: new Vec3(-174.5, 47, 109.5), eyeHeight: 1.62 },
         inventory: { items: () => [] }, // no tools at all: the entombed state
         heldItem: null,
-        registry: null,
+        registry: { items: picks, materials: { 'mineable/pickaxe': speeds }, blocksArray: [] },
         unequip: async () => {},
         equip: async () => {},
         dug: [],
