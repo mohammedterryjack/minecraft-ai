@@ -7451,6 +7451,17 @@ current_health: ${Math.round(bot.health)}/${vmax.health}\ncurrent_food: ${bot.fo
     }
 
     // ---------- critic ----------
+    // fix162 (learning-investigation-20261121): when observation or inventory delta already says the goal
+    // failed, that IS the verdict — the critic stays only as critique-text author and eval-set record.
+    // Before this, both ground-truth-false branches returned the critic's own success flag, and the critic
+    // overrode ground truth in 30 of 1401 labeled cases (measured from critic_cases.jsonl; e.g. "Smelt 13
+    // raw_iron", "Mine 10 stone", "reach iron_block" saved as skills without the goal holding). Voyager
+    // checks task completion against game state, not model opinion (arXiv:2305.16414 §3.3).
+    async _groundFalse(task, before, after, output, why) {
+        const c = await this.critique(task, before, after, output, false);
+        return { ...c, success: false, reasoning: `ground truth: ${why}; critic said ${c.success}: ${c.reasoning || ''}` };
+    }
+
     async critique(task, before, after, output, label) {
         // fix37 (D): detect inventory-full as a cause of failure (stated as fact, not rule)
         const invFullFact = this._detectInventoryFullFailure(task, before, after, output);
@@ -8636,10 +8647,11 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
                 : reachG.kind === 'approach' ? this._approachHolds(reachG, after) : null;   // fix141: same for approach (mob observed nearby)
             const verdict = cut ? { success: false, critique: `the attempt was ${cut}; it did not finish`, reasoning: 'cut off (critic skipped)' }   // fix23: a cut-off run is already a failure
                 : reached === true ? { success: true, critique: '', reasoning: `${reachG.item} observed nearby` }
-                : reached === false ? await this.critique(task, before, after, output, false)
+                : reached === false ? await this._groundFalse(task, before, after, output, `${reachG.item} was not observed nearby (fix162: observation decides reach goals)`)
                 : (goal && gained >= goal.count)
                 ? { success: true, critique: '', reasoning: `inventory +${gained} ${goal.item}` }
-                : await this.critique(task, before, after, output, goal ? false : undefined);   // count goal not met by inventory -> ground truth false
+                : goal ? await this._groundFalse(task, before, after, output, `inventory did not gain ${goal.count} ${goal.item} (fix162: inventory delta decides count goals)`)
+                : await this.critique(task, before, after, output, undefined);   // no ground truth available: critic is the only judge (its false-positive rate: 2.14% measured)
             if (goal && gained >= goal.count) console.log(`[voyager] verified from inventory (+${gained} ${goal.item}), critic skipped`);
             console.log(`[voyager] attempt ${i} critic: success=${verdict.success} ${verdict.critique || ''}`);
             // fix86: _attribute nulls bot.__psnTrace. The success workflow and the post-loop failure record read the snapshot.
