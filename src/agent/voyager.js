@@ -3380,7 +3380,18 @@ Use only c; no other globals.`;
     _saveProgress() { writeAtomic(this.progressFile, JSON.stringify(this.progress, null, 2)); }
     // fix32: debounced (one write per burst); flushed at the end of every step
     _saveSkills() { this._skillsDirty = true; if (!this._saveTimer) this._saveTimer = setTimeout(() => this._flushSkills(), 1000); }
-    _flushSkills() { clearTimeout(this._saveTimer); this._saveTimer = null; if (!this._skillsDirty) return; this._skillsDirty = false; writeAtomic(this.indexFile, JSON.stringify(this.skills, null, 2)); }
+    _flushSkills() {
+        clearTimeout(this._saveTimer); this._saveTimer = null; if (!this._skillsDirty) return; this._skillsDirty = false;
+        // fix164 (learning-investigation-20261121): write-side embedding freshness invariant — an embedding
+        // may only persist while it matches its entry's current description/code (_embHash, fix35). Split,
+        // repair, restore and migration mutate description/code without re-embedding, and every cosine
+        // consumer read the stale vector: the fix161 dup gate aliased retreatToRandomNearbyLocation onto
+        // navigateToHoglinAvoidingPillagers through exactly such a stale embedding (fresh cosine 0.65).
+        // Null is the state every consumer already skips, and retrieveSkills' lazy re-embed (fix35) is the
+        // single repair path — so dropping here cannot break a reader, only cost one re-embed.
+        for (const s of this.skills) if (s.embedding && s._embHash !== this._embHash(s)) { s.embedding = null; delete s._embHash; }
+        writeAtomic(this.indexFile, JSON.stringify(this.skills, null, 2));
+    }
     // fix14: highest solid (non-leaf, non-log) block in a loaded column; null if the column is not loaded
     _surfaceY(x, z) {
         const bot = this.agent.bot, V = bot.entity.position.constructor; x = Math.floor(x); z = Math.floor(z);
