@@ -129,7 +129,10 @@ describe('fix66: goToGoal uses the learned verdict on the physics tick', () => {
     it('unlearned: does not cut, ends when the pathfinder ends', async () => {
         mm.setMovementStore({});
         const bot = mkBot(); let finish;
-        bot.pathfinder.goto = () => new Promise(r => { finish = r; });
+        // fix168: goToGoal now verifies the goal when the walk ends (goto() resolving with the
+        // bot nowhere near GoalNear is the false success that buried the y=40 retry loop), so
+        // this test's goto() puts the bot at the goal when it finishes.
+        bot.pathfinder.goto = () => new Promise(r => { finish = () => { bot.entity.position.set(50.4, 64, 0.2); r(); }; });
         const p = goToGoal(bot, new (await import('mineflayer-pathfinder')).default.goals.GoalNear(50, 64, 0, 1));
         await new Promise(r => setImmediate(r)); await new Promise(r => setImmediate(r));
         tick(bot, 50, 20 * 60);

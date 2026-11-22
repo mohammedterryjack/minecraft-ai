@@ -184,6 +184,19 @@ export function nestedBotMemberError(bot, node, assigned, nodes) {
                 return `bot.${owner}.${key} does not exist: bot.${owner} is a plain object map (id -> value), not an array (mineflayer docs api.md: bot.entities is a map of entityId to entity). Use Object.values(bot.${owner}).${key}(...) — or the bare skills getNearbyEntities(bot, distance) / bot.nearestEntity(predicate).`;
             }
             const isCall = i === parts.length - 1 && nodes.some(c => c.type === 'CallExpression' && c.callee === node);
+            if (i === parts.length - 1 && !isCall) {
+                // fix168: vitals confusion (live: the hunger serve died 4/4 attempts on
+                // "bot.entity.health does not exist (closest real members: height, width, yaw)" —
+                // the near-miss list never contained the right path). health/food/saturation live on
+                // the bot, not on bot.entity (mineflayer docs api.md: bot.health, bot.food,
+                // bot.saturation). Generic rule: when the missing name exists exactly on the root
+                // bot, name that path — a factual redirect, not a guess at a near neighbour.
+                const atRoot = botMembers(bot).has(key);
+                if (atRoot) {
+                    const owner = parts.slice(0, i).join('.');
+                    return `bot.${owner}.${key} does not exist, but bot.${key} does: read it directly off bot (mineflayer docs api.md) — replace bot.${owner}.${key} with bot.${key}`;
+                }
+            }
             const closest = nearestBotMember(obj, key, isCall).map(k => `bot.${[...parts.slice(0, i), k].join('.')}`);
             return `bot.${parts.slice(0, i + 1).join('.')} does not exist${closest.length ? ` (closest real members: ${closest.join(', ')})` : ''}`;
         }

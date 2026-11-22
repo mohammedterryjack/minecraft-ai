@@ -1847,6 +1847,23 @@ export async function goToGoal(bot, goal) {
         }
         }
         clearInterval(doorCheckInterval);
+        // fix168: goto() resolves on ANY 'path_update' whose path is empty (lib/goto.js:21-24 —
+        // the length check runs before the status checks), and astar's exhausted/timeout results
+        // carry reconstructPath(bestNode), which is [] when bestNode is still the start node
+        // (lib/astar.js:24-31). So a bot from which zero nodes expand (buried, sealed by water)
+        // gets "goal reached" without moving: live 22 Nov 2026, bot in the shaft at y=40,
+        // "Path not found, but attempting to navigate anyway" then repeated `goToGoal -> true`
+        // with goToPosition measuring 5-10 blocks and travelTo retrying identical moves forever.
+        // The library's own end-of-path arrival rule (index.js:611) accepts the goal at the
+        // floored position or one block above it (non-full-block floors); apply that same
+        // contract here instead of trusting the promise.
+        if (typeof goal.isEnd === 'function') {
+            const p = bot.entity.position.floored();
+            if (!goal.isEnd(p) && !goal.isEnd(p.offset(0, 1, 0))) {
+                log(bot, `FAILED: the walk ended but the goal is not satisfied from (${p.x}, ${p.y}, ${p.z}) — the pathfinder resolved without arriving (search died at the start: zero nodes expanded, goal still out of reach from here). Change approach or target instead of retrying this walk.`);
+                return false;
+            }
+        }
         return true;
     } catch (err) {
         clearInterval(doorCheckInterval);
@@ -2652,7 +2669,19 @@ export async function goToBed(bot) {
     let loc = beds[0];
     await goToPosition(bot, loc.x, loc.y, loc.z);
     const bed = bot.blockAt(loc);
-    await bot.sleep(bed);
+    // fix168: mineflayer's sleep() rejects on ordinary game outcomes: 'the bed is too far' /
+    // 'there are monsters nearby' throw before activation (lib/plugins/bed.js:130-147) and
+    // waitUntilSleep rejects 'bot is not sleeping' 3 s after activateBlock when the server
+    // never confirms the sleep (lib/plugins/bed.js:157-165). Live 22 Nov 2026 09:2xZ that
+    // rejection escaped as an uncaught exception and aborted the night_shelter step
+    // ("!!Code threw exception!!"). goToBed's contract is the same boolean as its other
+    // refusal paths above ("Could not find a bed"), so report a refused sleep as a failure.
+    try {
+        await bot.sleep(bed);
+    } catch (err) {
+        log(bot, `FAILED: could not sleep in the bed at (${loc.x}, ${loc.y}, ${loc.z}): ${err.message}`);
+        return false;
+    }
     log(bot, `You are in bed.`);
     bot.modes.pause('unstuck');
     while (bot.isSleeping) {
