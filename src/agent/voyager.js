@@ -175,6 +175,27 @@ export function validateTask(task) {
     if (comp !== null) return `compound goal: the task counts a second item after "and" (count ${comp}); propose one task per counted item`;
     return null;
 }
+// fix160 (learning-investigation-20261121): decompose subgoals become tasks, successful tasks become
+// named library skills, so a subgoal that pins THIS spot (coordinate triple, "X coordinate to -175",
+// "Y=26") is by definition a one-off — the library filled with alignXTo175.js / goToSafeWaypointMinus140.js
+// (87 coordinate-fixed files of 1012). Voyager keeps motion-at-coordinates as function ARGUMENTS
+// (craftAgent/goTo), never as learned skills (arXiv:2305.16414 §3.1-3.2). Returns a reason or null.
+export function subgoalOverfit(task) {
+    if (/\(-?\d{1,4}\s*,\s*-?\d{1,4}\s*,\s*-?\d{1,4}\)/.test(task)) return 'subgoal pins absolute coordinates';
+    if (/\b[XYZ]\s*(?:coordinate\s*)?(?:=|to)\s*-?\d+/i.test(task)) return 'subgoal pins an absolute axis value';
+    return null;
+}
+// fix161: Voyager's skill library is keyed by the description embedding (paper §3.2); writing a new
+// entry whose key equals a live sibling's is re-clutter, not reuse. Measured on today's index: 62 live
+// pairs at cosine >= 0.98 (many exactly 1.0000, e.g. verifySurvivalStatus/verifyVitalsRecovered).
+// The [0.95,0.98) band (13 pairs, mostly different-count variants) is deliberately NOT aliased.
+export function duplicateSkillMatch(skills, embedding) {
+    if (!Array.isArray(embedding) || !embedding.length) return null;
+    return skills.find(s => !s.demoted && !s.mergedInto && Array.isArray(s.embedding)
+        && s.embedding.length === embedding.length
+        && cosineSimilarity(embedding, s.embedding) >= 0.98) || null;
+}
+
 // fix146: a count goal names exactly ONE counted item phrase. A second "<count> <noun>" joined by
 // "and" ("Gather 5 flint and 5 steel blocks (craft from iron ingots)...") is a compound goal:
 // countGoal silently truncated at "and" and drove satisfaction, decomposition and the contract off
@@ -6792,7 +6813,7 @@ Use only c; no other globals.`;
         }
         
         const system = `You break a Minecraft bot's failing goal into smaller steps (Voyager/PSN-style task decomposition).
-Return 2-4 concrete, verifiable subgoals, in order, that together achieve the goal; each must be doable in a few minutes by ONE small reusable skill. Use the failure reason and the state. Do not repeat the goal itself.
+Return 2-4 concrete, verifiable subgoals, in order, that together achieve the goal; each must be doable in a few minutes by ONE small reusable skill. Phrase each subgoal generally: never put absolute coordinates, current positions, or current counts in a subgoal - those belong in the skill's arguments when it runs; a subgoal pinned to this exact spot is not a reusable skill. Use the failure reason and the state. Do not repeat the goal itself.
 Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
         // fix39: enriched known_skills with descriptions for primitives and space-freeing skills
         const skillLines = this.skills.length === 0 ? '[]' : (await this.retrieveSkills(`${task}\n${String(reason)}`, settings.skill_topk)).map(s => `${signatureOf(s.code, s.name)}: ${s.description}`).join('\n');
@@ -6802,8 +6823,8 @@ Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
             const raw = (parseLocalJSON(await this._askLocal(system, user, this._inferMeta('curriculum-decompose', { system, user })), ['subgoals']).subgoals || []).map(t => String(t).trim()).filter(t => t && t !== task);
             // fix146: rejected subgoals are LOUD; before this, an invalid subgoal (e.g. the compound
             // "Gather 5 flint and 5 steel blocks", which validateTask now rejects) vanished silently
-            for (const t of raw) { const w = validateTask(t); if (w) console.log(`[psn] LOUD: decompose subgoal rejected at intake: "${t}" (${w})`); }
-            subs = raw.filter(t => !validateTask(t)).slice(0, 4);
+            for (const t of raw) { const w = validateTask(t) || subgoalOverfit(t); if (w) console.log(`[psn] LOUD: decompose subgoal rejected at intake: "${t}" (${w})`); }
+            subs = raw.filter(t => !(validateTask(t) || subgoalOverfit(t))).slice(0, 4);
         } catch (e) {
             if (e instanceof Error && e.code === CONTEXT_FULL) throw e;
             console.log(`[psn] decompose FAILED for "${task}": ${e.message}`);
@@ -7370,6 +7391,16 @@ current_health: ${Math.round(bot.health)}/${vmax.health}\ncurrent_food: ${bot.fo
         const embedding = await this._embed(description);
         const idx = this.skills.findIndex(s => s.name === name);
         if (idx < 0) {
+            // fix161: description-keyed dedup (Voyager paper §3.2). A new skill whose description equals a
+            // live sibling is not a new capability: record the task on the sibling (replay routing reads
+            // stats.tasks) and write no file. gateLog keeps it LOUD - saves must not silently vanish.
+            const dup = duplicateSkillMatch(this.skills, embedding);
+            if (dup) {
+                gateLog(`DUP ${name} == ${dup.name} (description embedding cosine >= 0.98); task recorded on ${dup.name}, no new file`);
+                this._recordRun(dup, task, true, false);
+                this._saveSkills();
+                return true;
+            }
             // fix73: effects are what this run observed (observedEffects); consumes starts as observed-nothing like every other entry (load-time init, split/generalise entries). It was
             // missing here, and _learnEffects compares against `e.consumes || {}`, so a run that consumed nothing never set it:
             // the skill stayed `consumes: undefined` in memory until a restart, and idle practice's Object.keys(skill.consumes)
