@@ -47,10 +47,21 @@ export function logoutAgent(agentName) {
 }
 
 // Initialize the server
+// fix168: the agent child's startup does multi-second synchronous scans over the whole
+// skill library (relink, shared-fragment analysis, contract verify). socket.io's default
+// pingTimeout is 5000 ms, and per the docs (socket.io/docs/en/server-options#pingtimeout:
+// "number of ms without receiving a pong, before closing. Increase this for clients
+// running expensive synchronous operations") the server closed the agent link mid-scan:
+// "MindServer client disconnected; reason: ping timeout" -> child exit 1 -> launchd loop
+// on every restart (observed 22 Nov, pids 19230/20892). The link is process-local — a
+// dead child closes the socket at the OS level, and a hung trial is caught by the fix96
+// watchdog — so liveness detection does not rely on this timer.
+const PING_INTERVAL_MS = 25000; // socket.io default; unchanged
+const PING_TIMEOUT_MS = 120000; // must exceed the longest startup scan, see comment above
 export function createMindServer(host_public = false, port = 8080) {
     const app = express();
     server = http.createServer(app);
-    io = new Server(server);
+    io = new Server(server, { pingInterval: PING_INTERVAL_MS, pingTimeout: PING_TIMEOUT_MS });
 
     // Serve static files
     const __dirname = path.dirname(fileURLToPath(import.meta.url));
