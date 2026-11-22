@@ -7394,7 +7394,11 @@ current_health: ${Math.round(bot.health)}/${vmax.health}\ncurrent_food: ${bot.fo
             // fix161: description-keyed dedup (Voyager paper §3.2). A new skill whose description equals a
             // live sibling is not a new capability: record the task on the sibling (replay routing reads
             // stats.tasks) and write no file. gateLog keeps it LOUD - saves must not silently vanish.
-            const dup = duplicateSkillMatch(this.skills, embedding);
+            // fix163: compare only entries whose stored embedding matches their CURRENT description/code
+            // (_embHash freshness, fix35). The first live DUP (retreatToRandomNearbyLocation ==
+            // navigateToHoglinAvoidingPillagers, 00:20Z) matched a stale pre-split embedding; the two
+            // current descriptions score cosine 0.65 (measured, nomic-embed-text).
+            const dup = duplicateSkillMatch(this.skills.filter(s => s._embHash && s._embHash === this._embHash(s)), embedding);
             if (dup) {
                 gateLog(`DUP ${name} == ${dup.name} (description embedding cosine >= 0.98); task recorded on ${dup.name}, no new file`);
                 this._recordRun(dup, task, true, false);
@@ -7406,6 +7410,7 @@ current_health: ${Math.round(bot.health)}/${vmax.health}\ncurrent_food: ${bot.fo
             // the skill stayed `consumes: undefined` in memory until a restart, and idle practice's Object.keys(skill.consumes)
             // threw "Cannot convert undefined or null to object" (equipBestToolForIronOre, NEW 14:43:51Z, practice 15:02:47Z)
             const entry = { name, description, task, code, deps, embedding, effects: observedEffects, consumes: {}, saved: new Date().toISOString(), stats: recordRun(newStats(), task, true) };
+            entry._embHash = this._embHash(entry);   // fix163: fresh by construction — embedding was just computed from this description/code
             if (this._promptCounts !== undefined) {
                 if (this._promptCounts === null || typeof this._promptCounts !== 'object' || Array.isArray(this._promptCounts)) throw new Error(`[fix97] saveSkill ${name}: prompt counts are not an object`);
                 entry.promptCounts = this._promptCounts;

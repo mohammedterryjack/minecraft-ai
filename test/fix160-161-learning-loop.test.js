@@ -66,8 +66,9 @@ describe('fix161: duplicateSkillMatch gates description-keyed re-learns', () => 
     it('tolerates entries without embeddings (re-embedded by retrieveSkills)', () => {
         assert.strictEqual(duplicateSkillMatch([{ name: 'a' }, { name: 'b', embedding: v(1, 0) }], v(1, 0))?.name, 'b');
     });
-    it('saveSkill routes new saves through the gate', () => {
+    it('saveSkill routes new saves through the gate, comparing only fresh embeddings (fix163)', () => {
         const src = readFileSync(join(here, '..', 'src', 'agent', 'voyager.js'), 'utf8');
-        assert.match(src, /const dup = duplicateSkillMatch\(this\.skills, embedding\);/);
+        assert.match(src, /const dup = duplicateSkillMatch\(this\.skills\.filter\(s => s\._embHash && s\._embHash === this\._embHash\(s\)\), embedding\);/);
+        assert.match(src, /entry\._embHash = this\._embHash\(entry\);/);
     });
 });
