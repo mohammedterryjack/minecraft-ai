@@ -9,7 +9,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import * as acorn from 'acorn';
-import { nestedBotMemberError } from '../src/agent/coder.js';
+import { nestedBotMemberError, Coder } from '../src/agent/coder.js';
 
 function mkBot() {
     // stand-in shaped like the live bot: vitals are bot-level, entity has only
@@ -62,5 +62,12 @@ describe('fix168: API gate redirects root-level names read off the wrong object'
         const err = check(mkBot(), 'const h = bot.entity.hearts;');
         assert.match(err, /bot\.entity\.hearts does not exist/);
         assert.ok(!/but bot\.hearts does/.test(err), 'no redirect when the root has no such member either');
+    });
+    it('bot.Vec3 names the sandbox global instead of near-miss bot members', () => {
+        // live 22 Nov: "bot.Vec3 does not exist on the live bot (closest real members:
+        // bot.game, bot.teams, bot.time)" — Vec3 is endowed as a bare global (coder.js sandbox).
+        const coder = new Coder({ name: 'icefox2000', bot: { registry: { itemsByName: {}, blocksByName: {}, entitiesByName: {} } } });
+        const fb = coder.userGeneratedCodeLintBlockers('const p = new bot.Vec3(1, 2, 3);', []);
+        assert.match(fb, /bot\.Vec3 does not exist, but Vec3 is a sandbox global: use Vec3 directly/);
     });
 });

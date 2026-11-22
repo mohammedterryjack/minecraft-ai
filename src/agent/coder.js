@@ -537,7 +537,12 @@ export class Coder {
                 && n.left.property.type === 'Identifier' && runtimeOwnedBotWrites.has(n.left.property.name))
                 errs.add(`writing bot.${n.left.property.name} is forbidden in generated code (runtime-owned; seeded ensure* sets it)`);
             if (n.type === 'MemberExpression' && !n.computed && n.object.type === 'Identifier' && n.object.name === 'bot' && n.property.type === 'Identifier' && !(n.property.name in bot) && !assigned.has(n.property.name))
-                errs.add(`bot.${n.property.name} does not exist on the live bot (closest real members: ${nearestBotMember(bot, n.property.name, nodes.some(c => c.type === 'CallExpression' && c.callee === n)).map(k => 'bot.' + k).join(', ')})`);
+                // fix168: sandbox globals are bare names, not bot members (live 22 Nov:
+                // "bot.Vec3 does not exist (closest real members: bot.game, bot.teams, bot.time)" —
+                // Vec3 is endowed globally in this very gate's sandbox). Name the right spelling.
+                (sandbox.has(n.property.name)
+                    ? errs.add(`bot.${n.property.name} does not exist, but ${n.property.name} is a sandbox global: use ${n.property.name} directly (not off bot)`)
+                    : errs.add(`bot.${n.property.name} does not exist on the live bot (closest real members: ${nearestBotMember(bot, n.property.name, nodes.some(c => c.type === 'CallExpression' && c.callee === n)).map(k => 'bot.' + k).join(', ')})`));
             if (n.type === 'MemberExpression') {
                 const nested = nestedBotMemberError(bot, n, assigned, nodes);
                 if (nested) errs.add(nested);
