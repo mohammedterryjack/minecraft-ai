@@ -167,6 +167,27 @@ function knownNames() {
 export function validateTask(task) {
     const t = task.toLowerCase();
     if (/\b(cave_|void_)?air(_block)?\b/.test(t)) return 'air is not a block you can mine or collect';
+    // fix167 (learning-investigation-20261121 Q5; live 22 Nov 08:52Z): the curriculum proposed
+    // "Wait for night cycle or mob spawn conditions if no targets are currently detected"; the stall
+    // detector killed it (waiting produces none of the four progress signals: new ground, inventory,
+    // window, lit furnace), the critic failed it, 4 attempts burned. Same for "Confirm arrival at the
+    // safe coordinate ... stand still to allow health reg". Every task here is verified by WORLD-STATE
+    // change — completion by learned postcondition, progress by the stall signals. Voyager's task
+    // space is explore/collect/smelt/craft/kill/build (arXiv:2305.16414 §A.2), verified by environment
+    // state feedback (§3.3); a task that only waits, watches, scans, checks, verifies or confirms
+    // cannot produce state-change evidence, so it is unverifiable by construction. Reject at intake.
+    // Leading verb only, split on whitespace: bare learned-skill names ("safeScanHostiles") contain no
+    // word boundary before the inner word and are unaffected.
+    const firstWord = task.trim().split(/[\s(]/, 1)[0];
+    if (/^(wait|monitor|observe|watch|stand|remain|stay|idle|rest|linger|pause|recover|regenerate|scan|check|verify|confirm|measure|inspect|listen|poll|report)$/i.test(firstWord))
+        return `task starts with "${firstWord}" and changes no world state (completion is a learned postcondition, progress is new ground/inventory/window/lit furnace — none a change-free task can produce); propose an action (mine, craft, build, go to, kill) instead`;
+    // fix167b: decompose under stress emits "Use the 'scanAndConfirmHoglin30' skill to check ..." which
+    // runs the FULL learn path and produced the wrapper twins (scanForHoglin / scanForHoglin30 /
+    // scanAndConfirmHoglin30 / scanAndIdentifyHoglin). Voyager composes by CALLING library functions
+    // inside new code (paper §3.2), never learns a new skill whose body is a call to an existing one;
+    // a bare skill name is already a replayable task form in the curriculum contract.
+    if (/\buse\s+(?:the\s+)?(?:['"`][A-Za-z_][A-Za-z0-9_]*['"`]\s*|[A-Za-z_][A-Za-z0-9_]*\s+)?skill\b/i.test(t))
+        return 'naming an existing skill to use is a replay, not a new task; propose the bare skill name (verified by its learned postcondition) or an item goal';
     if (!/^(mine|collect|gather|craft|smelt|obtain|get|chop|cook)\b/.test(t)) return null; // build/explore tasks: free text
     const names = knownNames();
     const bad = (t.match(/\b[a-z]+(?:_[a-z]+)+\b/g) || []).filter(n => !names.has(n));
@@ -6824,7 +6845,7 @@ Use only c; no other globals.`;
         }
         
         const system = `You break a Minecraft bot's failing goal into smaller steps (Voyager/PSN-style task decomposition).
-Return 2-4 concrete, verifiable subgoals, in order, that together achieve the goal; each must be doable in a few minutes by ONE small reusable skill. Phrase each subgoal generally: never put absolute coordinates, current positions, or current counts in a subgoal - those belong in the skill's arguments when it runs; a subgoal pinned to this exact spot is not a reusable skill. Use the failure reason and the state. Do not repeat the goal itself.
+Return 2-4 concrete, verifiable subgoals, in order, that together achieve the goal; each must be doable in a few minutes by ONE small reusable skill. Phrase each subgoal generally: never put absolute coordinates, current positions, or current counts in a subgoal - those belong in the skill's arguments when it runs; a subgoal pinned to this exact spot is not a reusable skill. Every subgoal must change the world (move, gather, craft, build, attack) - never a wait, scan, check, verify or confirm step, and never "use the X skill" (naming a skill to reuse is a replay, not a subgoal). Use the failure reason and the state. Do not repeat the goal itself.
 Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
         // fix39: enriched known_skills with descriptions for primitives and space-freeing skills
         const skillLines = this.skills.length === 0 ? '[]' : (await this.retrieveSkills(`${task}\n${String(reason)}`, settings.skill_topk)).map(s => `${signatureOf(s.code, s.name)}: ${s.description}`).join('\n');
@@ -7213,6 +7234,7 @@ Rules:
 - Do not propose a task listed under failed_in_this_state. It already failed for the reason given and the state has not changed.
 - The bot must survive: dying loses its inventory. Nothing keeps it alive automatically (no eating, fleeing, fighting or sheltering reflexes), so survival is your job too: read time, health, food, threats and inventory space in the state and decide.
 - A task is either an item goal ("<verb> N <item>", "Smelt N <raw> into N <out>", "ensure <block>"), the bare name of a known skill that takes no arguments besides bot (it is verified by that skill's learned postcondition), or a short free-text task.
+- Every task must change the world (move, gather, craft, build, attack). Never propose a task that only waits, watches, scans, checks, verifies or confirms: a change-free task produces no state change, so nothing can verify it and the stall detector always kills it. To compose skills, name the skill directly or write it inside a larger action task — never "use the X skill" as a task.
 Reply ONLY with JSON: {"reasoning": "ONE short sentence", "task": "...", "context": "short hint how to do it"}`;
         const bot = this.agent.bot;   // fix29: current vitals as plain facts, read now (an overlapped plan's state may be minutes old)
         // AWM-style: retrieve relevant workflows for context
