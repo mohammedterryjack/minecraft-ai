@@ -661,6 +661,21 @@ export class Voyager {
             process.on('uncaughtException', onErr('UNCAUGHT EXCEPTION'));
             process.on('unhandledRejection', onErr('UNHANDLED REJECTION'));
         }
+        // fix169: stall sentinel. A synchronous block longer than socket.io's pong window
+        // kills the agent link ("ping timeout" crash class, fix168c); blocks also delay
+        // game ticks. Record the last line written before the block and report the stall
+        // magnitude - turns "[?] something blocked" into a named site in one restart.
+        if (!globalThis.__stallSentinel) {
+            globalThis.__stallSentinel = true;
+            const _log = console.log.bind(console);
+            let lastLine = '(none yet)', lastAt = Date.now(), lastTick = Date.now();
+            console.log = (...args) => { lastLine = String(args[0] ?? '').slice(0, 140); lastAt = Date.now(); _log(...args); };
+            const st = setInterval(() => {
+                const now = Date.now(), gap = now - lastTick; lastTick = now;
+                if (gap - 1000 > 2000) _log(`[loop-stall] event loop blocked ~${gap}ms; last line before block (t-${now - lastAt}ms): ${lastLine}`);
+            }, 1000);
+            st.unref();
+        }
         if (!globalThis.__logRotate) { const timer = setInterval(() => rotateLog('./logs/mindcraft.log', 25e6, 3), 60e3); timer.unref(); globalThis.__logRotate = timer; rotateLog('./logs/mindcraft.log', 25e6, 3); }   // fix28: the rotator must not hold the process open
         this._migrateToBarenames();  // fix40: one-time migration from skills.*/world.* to bare names
         this._seedPrimitives();
@@ -4038,7 +4053,7 @@ Use only c; no other globals.`;
         const invSummary = items.length ? items.map(([k, v]) => `${k}:${v}`).join(',') : 'empty';
         const eq = s.equipment;
         const held = eq.hand !== 'empty' ? eq.hand : '';
-        return `pos:(${s.position}) biome:${s.biome} time:${(s.time || '').split(' ')[0]} hp:${s.health_value}/${s.health_max} food:${s.food_value}/${s.food_max} inv:${s.inventory_slots},${s.empty_inventory_slots}empty${held ? ` held:${held}` : ''} threats:${s.threats || 'none'} items:[${invSummary}]`;
+        return `pos:(${s.position}) biome:${s.biome} time:${(s.time || '').split(' ')[0]} hp:${s.health_value}/${s.health_max} food:${s.food_value}/${s.food_max} inv:${s.inventory_slots},${s.empty_inventory_slots}empty${held ? ` held:${held}` : ''} threats:${s.threats || 'none'} mobs:${Array.isArray(s.nearby_entities) && s.nearby_entities.length ? s.nearby_entities.join(',') : 'none'} items:[${invSummary}]`;
     }
     _stateText(s) {
         // fix34: present inventory facts prominently as exact counts (not just JSON blob)
@@ -7233,6 +7248,7 @@ Rules:
 - Propose ONE concrete, verifiable task achievable in a few minutes with the current inventory and surroundings (e.g. "Mine 5 birch_log", "Craft 1 stone_pickaxe", "Smelt 3 iron_ingot", "Build a 5x5 cobblestone floor next to the hut").
 - Do not repeat completed tasks unless needed for progress; avoid tasks that failed recently unless prerequisites are now met.
 - Do not propose a task listed under failed_in_this_state. It already failed for the reason given and the state has not changed.
+- The mobs fact lists every mob within sensor range right now. A task targeting a mob type absent from that list cannot be verified: propose mob tasks only for mobs in the list.
 - The bot must survive: dying loses its inventory. Nothing keeps it alive automatically (no eating, fleeing, fighting or sheltering reflexes), so survival is your job too: read time, health, food, threats and inventory space in the state and decide.
 - A task is either an item goal ("<verb> N <item>", "Smelt N <raw> into N <out>", "ensure <block>"), the bare name of a known skill that takes no arguments besides bot (it is verified by that skill's learned postcondition), or a short free-text task.
 - Every task must change the world (move, gather, craft, build, attack). Never propose a task that only waits, watches, scans, checks, verifies or confirms: a change-free task produces no state change, so nothing can verify it and the stall detector always kills it. To compose skills, name the skill directly or write it inside a larger action task — never "use the X skill" as a task.
