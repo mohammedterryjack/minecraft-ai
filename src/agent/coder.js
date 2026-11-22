@@ -231,7 +231,11 @@ export function collectBareApiUsedInSource(combinedSrc) {
     const worldKeySet = new Set(Object.keys(world).filter((k) => typeof world[k] === 'function'));
     let ast;
     try {
-        ast = acorn.parse(String(combinedSrc), { ecmaVersion: 'latest', sourceType: 'module', allowAwaitOutsideFunction: true });
+        // fix166: must match the pipeline's other parser (coder.js:896) — generated top-level `return`
+        // is legal: the bundle body is indented into code_template's function wrapper, so `return` closes
+        // main. Without this option the check threw on valid code ("'return' outside of function") and
+        // aborted the whole voyager step instead of letting lint/staging decide (22 Nov, craftIronSword).
+        ast = acorn.parse(String(combinedSrc), { ecmaVersion: 'latest', sourceType: 'module', allowAwaitOutsideFunction: true, allowReturnOutsideFunction: true });
     } catch (e) {
         const loc = e && typeof e.pos === 'number' ? ` (at offset ${e.pos})` : '';
         throw new Error(`[coder] collectBareApiUsedInSource: parse failed${loc}: ${e && e.message ? e.message : String(e)}`);
@@ -1146,7 +1150,11 @@ export class Coder {
         const learnedNamesForLint = opts && opts.learnedNamesForLint ? opts.learnedNamesForLint : null;
         code = this._sanitizeCode(code);
         let src = '';
-        code = code.replaceAll('console.log(', 'log(bot,');
+        // fix165: the sandbox has no `console` (SES compartment exposes only log). The model writes
+        // console.warn/console.error as naturally as console.log; un-rewritten, they threw
+        // "Cannot read properties of undefined (reading 'warn')" at runtime (craft4OakPlanks, 22 Nov).
+        // Every console output method maps onto the single log(bot, ...) sink, exactly like console.log.
+        code = code.replace(/\bconsole\.(?:log|warn|error|info|debug)\s*\(\s*/g, 'log(bot, ');
         code = code.replaceAll('log("', 'log(bot,"');
 
         console.log(`[staging] coder:_stageCode pre-guard staged_source=${code.length} chars lines=${code.split('\n').length}`);
