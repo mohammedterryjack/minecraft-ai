@@ -668,21 +668,27 @@ export class Voyager {
         if (!globalThis.__stallSentinel) {
             globalThis.__stallSentinel = true;
             const _log = console.log.bind(console);
-            let lastLine = '(none yet)', lastAt = Date.now(), lastTick = Date.now();
-            console.log = (...args) => { lastLine = String(args[0] ?? '').slice(0, 140); lastAt = Date.now(); _log(...args); };
+            let ring = ['(none yet)'], lastAt = Date.now(), lastTick = Date.now();
+            console.log = (...args) => { ring.push(String(args[0] ?? '').slice(0, 140)); if (ring.length > 3) ring.shift(); lastAt = Date.now(); _log(...args); };
             const st = setInterval(() => {
                 const now = Date.now(), gap = now - lastTick; lastTick = now;
-                if (gap - 1000 > 2000) _log(`[loop-stall] event loop blocked ~${gap}ms; last line before block (t-${now - lastAt}ms): ${lastLine}`);
+                if (gap - 1000 > 2000) _log(`[loop-stall] event loop blocked ~${gap}ms; last lines before block (t-${now - lastAt}ms): ${ring.join(' || ')}`);
             }, 1000);
             st.unref();
         }
         if (!globalThis.__logRotate) { const timer = setInterval(() => rotateLog('./logs/mindcraft.log', 25e6, 3), 60e3); timer.unref(); globalThis.__logRotate = timer; rotateLog('./logs/mindcraft.log', 25e6, 3); }   // fix28: the rotator must not hold the process open
+        console.log('[boot] migrate');
         this._migrateToBarenames();  // fix40: one-time migration from skills.*/world.* to bare names
+        console.log('[boot] seed');
         this._seedPrimitives();
+        console.log('[boot] relink + one-fn assert');
         this._relink();
         this._assertOneFunctionSources();   // fix82
+        console.log('[boot] poly-merge');
         this._polyMerge();
+        console.log('[boot] shared-frag scan');
         this._extractShared();
+        console.log('[boot] watchdog report');
         this._reportWatchdogKill(watchdogEvidencePath(`./bots/${agent.name}`));   // fix96
         this._settleDeadTrials(watchdogEvidencePath(`./bots/${agent.name}`));   // fix65: a run that killed the previous process counts
         // fix50: assert no prefixed calls in prompt sources (fail loud at load time)
@@ -2425,6 +2431,69 @@ Use only c; no other globals.`;
         }
         recipeUseCounts.set(registry, map);
         return map;
+    }
+    // fix170: deterministic tech-tree obtainability (Voyager frontier, arXiv:2305.16291 §3.1).
+    // An item is obtainable iff: held, or some crafting recipe exists whose ingredients are all
+    // obtainable, or it is a block with no harvestTools (hand-minable) or whose harvestTools
+    // contain at least one obtainable tool. Items with neither a recipe nor a block entry
+    // (mob loot, fishing) are obtainable — no evidence to the contrary. Fuel for smelting is
+    // not required (any plank burns). Recipe cycles guard as blocked, never as a silent pass.
+    // Returns null when obtainable, else the sorted list of missing leaf items.
+    static missingPrerequisites(registry, item, held, seen = new Set()) {
+        if (seen.has(item)) return [item];
+        seen.add(item);
+        if (held.has(item)) return null;
+        const entry = registry.itemsByName[item];
+        const blk = registry.blocksByName[item];
+        // Recipe path: null = open (some recipe's ingredients all obtainable), array = every
+        // recipe blocked, undefined = no crafting path at all.
+        let recipeMiss;
+        const recs = entry && registry.recipes ? registry.recipes[entry.id] : null;
+        if (Array.isArray(recs) && recs.length > 0) {
+            recipeMiss = null;
+            let best = null;
+            for (const r of recs) {
+                const cells = [];
+                if (Array.isArray(r.ingredients)) cells.push(...r.ingredients);
+                if (Array.isArray(r.inShape)) for (const row of r.inShape) if (Array.isArray(row)) cells.push(...row);
+                let blocked = [];
+                for (const cellId of new Set(cells.filter((c) => typeof c === 'number'))) {
+                    const ingName = registry.items[cellId]?.name;
+                    if (!ingName) continue;
+                    const m = Voyager.missingPrerequisites(registry, ingName, held, new Set(seen));
+                    if (m) blocked = blocked.concat(m);
+                }
+                if (blocked.length === 0) { best = null; break; }
+                if (!best || blocked.length < best.length) best = blocked;
+            }
+            if (best) recipeMiss = [...new Set(best)].sort();
+        }
+        // Mining path: null = open (no harvestTools or an obtainable tool suffices), array =
+        // blocked on the cheapest tool chain, undefined = not a block (no mining path).
+        let blockMiss;
+        if (blk) {
+            const ht = blk.harvestTools;
+            blockMiss = null;
+            if (ht && Object.keys(ht).length > 0) {
+                let best = null;
+                for (const toolId of Object.keys(ht)) {
+                    const toolName = registry.items[Number(toolId)]?.name;
+                    if (!toolName) continue;
+                    const m = Voyager.missingPrerequisites(registry, toolName, held, new Set(seen));
+                    if (!m) { best = null; break; }
+                    if (!best || m.length < best.length) best = m;
+                }
+                if (best) blockMiss = [...new Set(best)].sort();
+            }
+        }
+        // Obtainable if EITHER path is open (a blocked reverse-conversion recipe like
+        // diamond <- diamond_block must not mask the mining path, and vice versa). Neither
+        // path existing (mob loot, fishing drops) is no evidence to block on.
+        if (recipeMiss === undefined && blockMiss === undefined) return null;
+        if (recipeMiss === null || blockMiss === null) return null;
+        if (blockMiss === undefined) return recipeMiss;
+        if (recipeMiss === undefined) return blockMiss;
+        return recipeMiss.length <= blockMiss.length ? recipeMiss : blockMiss;
     }
     // Facts of one item. Each fact names the field it can ground. A stack size is a count of that item, not every literal.
     static itemFacts(registry, name) {
@@ -7196,6 +7265,18 @@ Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
         if (g.kind === 'item' && capBot?.inventory?.slots && capBot.registry?.itemsByName?.[g.item]) {
             const room = roomFor(capBot.registry, stackableCounts(capBot), g.item);
             if (room < g.count) return `inventory cannot hold ${g.count} ${g.item} (room for ${room}); free space first: propose tossClutter or depositToChest`;
+        }
+        // fix170: tech-tree feasibility. Voyager's curriculum proposes the frontier of what is
+        // acquirable given the agent's current state and capabilities (Wang et al. 2023,
+        // arXiv:2305.16291 §3.1); our proposal model ignores that, so the check is registry
+        // math (live 22 Nov: "Acquire 10 obsidian", "Place the Nether portal frame" proposed
+        // with no diamonds — obsidian's blocks.json harvestTools are diamond/netherite pickaxes).
+        if (g.kind === 'item' && capBot?.registry) {
+            const held = new Set();
+            for (const s of capBot.inventory?.slots || []) if (s?.name) held.add(s.name);
+            for (const e of Object.values(capBot?.equipment || {})) if (e?.name) held.add(e.name);
+            const missing = Voyager.missingPrerequisites(capBot.registry, g.item, held);
+            if (missing) return `cannot obtain ${g.item} from the current tech tree: missing ${missing.join(', ')}; propose a goal that acquires ${missing[0]} first`;
         }
         if (!fromPlanner) return null;
         if (state !== undefined && state !== null) return this._goalStateBackedOff(task, state);
