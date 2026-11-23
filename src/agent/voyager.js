@@ -6660,6 +6660,11 @@ Use only c; no other globals.`;
         const items = new Set();
         // extract items from failed and pending tasks
         for (const task of [...(this.progress.failed || []).slice(-10), ...(this.progress.pending || []).slice(-5)]) {
+            // fix174: a goal whose decompose found no reachable/perceived source cannot run right
+            // now; reserving items for it starves the skills that would make it reachable (live
+            // deadlock 23 Nov at y=33: unreachable "Collect 4 birch_planks" kept birch_planks and
+            // filtered mineToSurface/restAndRecover out of idle practice). Unreachable goals reserve nothing.
+            if (this._unreachableGoals?.has(task)) continue;
             const goal = smeltGoal(task) || countGoal(task);  // fix25: smelt first (product)
             if (goal?.item) items.add(goal.item);
             if (goal?.items) goal.items.forEach(it => items.add(it));
@@ -6686,6 +6691,7 @@ Use only c; no other globals.`;
             for (const [item, amt] of Object.entries(verifiedConsumes(s))) bump(item, amt);
         }
         for (const task of [...(this.progress.failed || []).slice(-10), ...(this.progress.pending || []).slice(-5)]) {
+            if (this._unreachableGoals?.has(task)) continue;   // fix174: see _getPendingGoalItems
             const goal = smeltGoal(task) || countGoal(task);
             if (goal?.item) bump(goal.item, goal.count ?? 1);
             if (goal?.items) goal.items.forEach((it) => bump(it, 1));
@@ -6917,13 +6923,21 @@ Use only c; no other globals.`;
                 const proven = Object.hasOwn(edges, goal.item) && edges[goal.item].status === 'proven';
                 const pool = present.length ? present : (proven ? src : []);
                 if (!pool.length) {
-                    console.log(`[psn] decompose skipped for "${task}": no source of ${goal.item} is present or proven (${src.join(', ')})`);
+                    // fix174: the goal cannot run right now, so it must stop reserving scarce items.
+                    // Live 23 Nov deadlock at y=33: pending "Collect 4 birch_planks" (unreachable:
+                    // no trees underground) kept birch_planks, which idle-practice read as scarcity and
+                    // used to filter out mineToSurface/restAndRecover — the only skills that could
+                    // reach the surface where birch_planks' own source lives. Reservation priority
+                    // inversion: an unexecutable plan starved the plan that would make it executable.
+                    (this._unreachableGoals ??= new Set()).add(task);
+                    console.log(`[psn] decompose skipped for "${task}": no source of ${goal.item} is present or proven (${src.join(', ')}); goal marked unreachable, its item keeps are released`);
                     return false;
                 }
                 const poolSeen = pool.filter(block => state.perceived_at && Object.hasOwn(state.perceived_at, block));
                 const chosen = await this._judgeTargets(state, poolSeen, true);
                 if (!chosen) {
-                    console.log(`[psn] decompose skipped for "${task}": no perceived source of ${goal.item} is reachable (${pool.join(', ')})`);
+                    (this._unreachableGoals ??= new Set()).add(task);
+                    console.log(`[psn] decompose skipped for "${task}": no perceived source of ${goal.item} is reachable (${pool.join(', ')}); goal marked unreachable, its item keeps are released`);
                     return false;
                 }
                 const reach = `reach ${chosen}`;
@@ -6946,6 +6960,9 @@ Use only c; no other globals.`;
             d[task] = { subs, skills: [], at: Date.now(), reason: `game data ${pre.how}: ${pre.task}` };
             q.unshift(...subs.map(t => ({ task: t, parent: task, depth: depth + 1 })), { task, retry: true, depth });
             this._saveProgress();
+            // fix174: decomposition found a plan to run, so the goal is executable again: it may
+            // reserve scarce items once more.
+            this._unreachableGoals?.delete(task);
             console.log(`[psn] DECOMPOSE (game data) "${task}" -> ${subs.join(', ')}; parent kept`);
             return true;
         }
