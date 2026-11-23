@@ -612,20 +612,41 @@ export class Coder {
         catch (e) { return []; }
         const warnings = [];
         const codeLines = code.split('\n');
+        // fix171: does this subtree reference the name `log` (identifier use, not a member
+        // property like skills.log)? A shadow binding whose own initializer uses `log` resolves
+        // to the binding being declared — e.g. `const log = (msg) => log(bot, m)` is unconditional
+        // self-recursion and always dies with Maximum call stack size exceeded at runtime.
+        const refsLog = (node) => {
+            let hit = false;
+            const walk2 = (n, parent, key) => {
+                if (hit || !n || typeof n.type !== 'string') return;
+                if (n.type === 'Identifier' && n.name === 'log') {
+                    if (!(parent && parent.type === 'MemberExpression' && parent.property === n && !parent.computed)) hit = true;
+                    return;
+                }
+                for (const k in n) {
+                    const v = n[k];
+                    if (Array.isArray(v)) v.forEach((c) => walk2(c, n, k));
+                    else if (v && typeof v.type === 'string') walk2(v, n, k);
+                }
+            };
+            walk2(node, null, null);
+            return hit;
+        };
         const walk = (node) => {
             if (!node || typeof node.type !== 'string') return;
             if (node.type === 'VariableDeclarator' && node.id?.type === 'Identifier' && node.id.name === 'log') {
                 const line = node.loc?.start?.line || 0;
                 // fix45: exclude prelude lines (injected bare API bindings like `const log = skills.log`)
                 if (line > preludeLines) {
-                    warnings.push({ line, text: codeLines[line - 1]?.trim() || `const/let/var log = ...` });
+                    warnings.push({ line, text: codeLines[line - 1]?.trim() || `const/let/var log = ...`, selfReference: refsLog(node.init) });
                 }
             }
             if (node.type === 'FunctionDeclaration' && node.id?.name === 'log') {
                 const line = node.loc?.start?.line || 0;
                 // fix45: exclude prelude lines
                 if (line > preludeLines) {
-                    warnings.push({ line, text: codeLines[line - 1]?.trim() || `function log(...)` });
+                    warnings.push({ line, text: codeLines[line - 1]?.trim() || `function log(...)`, selfReference: refsLog(node.body) });
                 }
             }
             for (const key in node) {
@@ -1035,6 +1056,22 @@ export class Coder {
         // the bare `log()` helper. The interrupt guard is safe (uses __mcLog__), but user code calling log() is not.
         // fix45: use preludeLines from _stageCode (calculated after inserting bare bindings)
         const shadowLogWarnings = this._checkLogShadowing(code, preludeLines);
+        // fix171: a shadow whose initializer references `log` is guaranteed unbounded self-
+        // recursion (the name resolves to the binding being declared). Live 22 Nov: generated
+        // `const log = (msg) => log(bot, ...)` overflowed the stack 31x ("Code execution
+        // triggered catch: RangeError: Maximum call stack size exceeded"), burning full task
+        // attempts on code that can never run. That is not a warning — reject and re-ask.
+        const selfRecursive = shadowLogWarnings.filter((x) => x.selfReference);
+        if (selfRecursive.length > 0) {
+            let e = 'ERROR: a local named `log` references `log` inside its own definition. The name resolves to this local, not the log(bot, ...) helper, so every call is infinite recursion (Maximum call stack size exceeded).\n';
+            e += 'Delete the local entirely and call the helper directly, e.g. log(bot, `[getFood] ${msg}`):\n';
+            for (const x of selfRecursive) {
+                e += `  Line ${x.line}: ${x.text}\n`;
+            }
+            e += '\nThe code cannot run and was rejected before execution.';
+            errors.push(e);
+            return header + errors.join('');
+        }
         if (shadowLogWarnings.length > 0) {
             let w = 'WARNING: Variable(s) shadowing the built-in `log` helper detected.\n';
             w += 'This will prevent log(bot, ...) calls from working in that scope.\n';
