@@ -107,6 +107,7 @@ describe('fix87: no block of a registry type within search range is a reach need
     }
     function vWith(bot) {
         const v = Object.create(Voyager.prototype);
+        v.mobSightings = { has: () => true };   // fix175: this fixture treats every mob as sighted
         v.agent = { bot, openChat() {} };
         v.skills = [];
         v.npGraph = null;
@@ -184,6 +185,7 @@ describe('fix87: no block of a registry type within search range is a reach need
 describe('fix87: a dropped-need candidate does not fail the caller step', () => {
     it('a dedicated trial returns unverified and does not throw', async () => {
         const v = Object.create(Voyager.prototype);
+        v.mobSightings = { has: () => true };   // fix175: this fixture treats every mob as sighted
         const incumbent = Voyager.SEEDED_PRIMITIVES.find(p => p.name === 'pickupNearbyItems').code;
         v.skills = [{
             name: 'pickupNearbyItems',

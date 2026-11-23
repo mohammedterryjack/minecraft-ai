@@ -95,6 +95,7 @@ function mkV({ inv, nearby, failTasks = [] }) {
     v.skills = [];
     v.npGraph = null;
     v.progress = { subgoals: [], decomposed: {}, failed: [], completedAt: {}, completed: [], blockers: [], recipeEdges: {}, goalStats: {} };   // the schema the constructor loads
+    v.mobSightings = { has: () => true };   // fix175: this fixture treats every mob as sighted
     v._saveProgress = () => {};
     v._windowCheck = () => {};
     v._afterSuccess = () => {};
@@ -301,8 +302,8 @@ describe('fix81: structured needs are validated and reach the curriculum', () =>
 });
 
 describe('fix81: obtainPlanner (game data only)', () => {
-    const planner = (nearby, learned = () => false) => obtainPlanner({
-        registry, recipesOf: id => Recipe.find(id),
+    const planner = (nearby, learned = () => false) => obtainPlanner({        mobSighted: () => true,
+registry, recipesOf: id => Recipe.find(id),
         known: (item, src) => src.some(b => nearby.includes(b)) || learned(item), proven: () => false, edgeSuccess: () => 1, smeltInputs: () => [], present: () => false,
     });
     it('cheapest harvest tool for stone from nothing is the wooden pickaxe (fix47 case, structural)', () => {
@@ -336,7 +337,7 @@ describe('fix81: obtainPlanner (game data only)', () => {
             blocksByName: {}, blockLoot: {}, entityLoot: {},
         };
         const rec = { 1: [{ result: { count: 1 }, delta: [{ id: 2, count: -1 }, { id: 1, count: 1 }] }], 2: [{ result: { count: 1 }, delta: [{ id: 1, count: -1 }, { id: 2, count: 1 }] }] };
-        assert.throws(() => obtainPlanner({ registry: reg, recipesOf: id => rec[id], known: () => false, proven: () => false, edgeSuccess: () => 1, smeltInputs: () => [], present: () => false }).prerequisites('a_item', 1, {}), /no acyclic way to obtain 1 a_item .*a_item -> b_item -> a_item/);
+        assert.throws(() => obtainPlanner({ mobSighted: () => true, registry: reg, recipesOf: id => rec[id], known: () => false, proven: () => false, edgeSuccess: () => 1, smeltInputs: () => [], present: () => false }).prerequisites('a_item', 1, {}), /no acyclic way to obtain 1 a_item .*a_item -> b_item -> a_item/);
     });
     it('throws, naming the cycle, when the data gives no acyclic way at all (a block only its own drop can harvest)', () => {
         const reg = {
@@ -346,7 +347,7 @@ describe('fix81: obtainPlanner (game data only)', () => {
             blockLoot: { x_item: { drops: [{ item: 'x_item' }] } },
             entityLoot: {},
         };
-        const p = obtainPlanner({ registry: reg, recipesOf: () => [], known: () => false, proven: () => false, edgeSuccess: () => 1, smeltInputs: () => [], present: () => false });
+        const p = obtainPlanner({ mobSighted: () => true, registry: reg, recipesOf: () => [], known: () => false, proven: () => false, edgeSuccess: () => 1, smeltInputs: () => [], present: () => false });
         assert.throws(() => p.prerequisites('x_item', 1, {}), /no acyclic way to obtain 1 x_item .*cycles: x_item -> x_item.*unobtainable: x_item from x_item/);
     });
 });

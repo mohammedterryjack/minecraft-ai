@@ -85,6 +85,7 @@ function childFailTrace() {
 
 function mkV({ vitals, food = 17, health = 18, skillsList }) {
     const v = Object.create(Voyager.prototype);
+    v.mobSightings = { has: () => true };   // fix175: this fixture treats every mob as sighted
     const bot = {
         health, food,
         game: { maxHealth: 20, maxFood: 20 },

@@ -293,8 +293,8 @@ function foodRegistry() {
 
 describe('fix93 hunger backchain', () => {
     const registry = foodRegistry();
-    const planner = (recipesOf = () => []) => obtainPlanner({
-        registry, recipesOf, known: () => false, proven: () => false, edgeSuccess: () => 1, smeltInputs: () => [], present: () => false,
+    const planner = (recipesOf = () => []) => obtainPlanner({        mobSighted: () => true,
+registry, recipesOf, known: () => false, proven: () => false, edgeSuccess: () => 1, smeltInputs: () => [], present: () => false,
     });
     it('a held edible is eaten; a missing one is the cheapest game-data plan, including an entity drop', () => {
         assert.deepStrictEqual(heldEdible(edibleNames(registry), { bread: 2 }), ['bread']);
@@ -363,8 +363,8 @@ describe('fix93 hunger backchain', () => {
             entityLoot: {},
             foodsByName: { bread: { name: 'bread' } },
         };
-        const withTool = obtainPlanner({
-            registry: reg,
+        const withTool = obtainPlanner({            mobSighted: () => true,
+registry: reg,
             recipesOf: (id) => {
                 if (id === 2) return [{ result: { count: 1 }, delta: [{ id: 1, count: -3 }, { id: 2, count: 1 }] }];
                 if (id === 3) return [{ result: { count: 1 }, delta: [{ id: 4, count: -3 }, { id: 3, count: 1 }] }];
@@ -380,7 +380,7 @@ describe('fix93 hunger backchain', () => {
         });
         assert.ok(bread.plan.some(step => step.includes('stone_pickaxe')), bread.plan.join(' | '));
         assert.ok(bread.plan.some(step => step.includes('cobblestone')), bread.plan.join(' | '));
-        const stuck = obtainPlanner({ registry: reg, recipesOf: () => [], known: () => false, proven: () => false, edgeSuccess: () => 1, smeltInputs: () => [], present: () => false });
+        const stuck = obtainPlanner({ mobSighted: () => true, registry: reg, recipesOf: () => [], known: () => false, proven: () => false, edgeSuccess: () => 1, smeltInputs: () => [], present: () => false });
         assert.throws(() => planFoodAcquisition({
             edibles: ['ore'], inventory: {},
             cheapest: (items, count, inv) => stuck.cheapest(items, count, inv, false),

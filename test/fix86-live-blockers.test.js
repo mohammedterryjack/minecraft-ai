@@ -105,6 +105,7 @@ describe('fix86: a recipe cycle throws by name', () => {
 describe('fix86: contracts are validated against the snapshot shape', () => {
     const v = () => {
         const x = Object.create(Voyager.prototype);
+        x.mobSightings = { has: () => true };   // fix175: this fixture treats every mob as sighted
         x.agent = { bot: { registry } };
         return x;
     };
@@ -158,6 +159,7 @@ describe('fix86: equipBestToolForAxe contract reset', () => {
 describe('fix86: a generic description is not a subgoal, and a self-decomposition is a cycle', () => {
     it('craftItem\'s task "Craft N of an item" cannot become the subgoal for iron_pickaxe', () => {
         const v = Object.create(Voyager.prototype);
+        v.mobSightings = { has: () => true };   // fix175: this fixture treats every mob as sighted
         v.skills = [{ name: 'craftItem', task: 'Craft N of an item', code: 'async function craftItem(bot) { return false; }', effects: ['iron_pickaxe'], consumes: {}, demoted: false, candidate: false, mergedInto: null }];
         v.npGraph = null;
         v._boltzmann = list => list[0];
@@ -167,6 +169,7 @@ describe('fix86: a generic description is not a subgoal, and a self-decompositio
     });
     it('a subgoal whose task is the parent task throws', () => {
         const v = Object.create(Voyager.prototype);
+        v.mobSightings = { has: () => true };   // fix175: this fixture treats every mob as sighted
         v.progress = { subgoals: [], decomposed: {}, failed: [], blockers: [], recipeEdges: {}, goalStats: {} };
         v._curSub = null;
         v._saveProgress = () => {};
@@ -182,6 +185,7 @@ describe('fix86: a generic description is not a subgoal, and a self-decompositio
 describe('fix86: a trial cannot drop the reported need', () => {
     it('a collectBlock candidate that returns 0 without the marker is rejected and not kept', () => {
         const v = Object.create(Voyager.prototype);
+        v.mobSightings = { has: () => true };   // fix175: this fixture treats every mob as sighted
         const incumbent = Voyager.SEEDED_PRIMITIVES.find(p => p.name === 'collectBlock').code;
         const candidateCode = 'async function collectBlock(bot, blockType, num) { log(bot, "No oak_log nearby"); return 0; }';
         v.skills = [{ name: 'collectBlock', code: incumbent, deps: [], candidate: { code: candidateCode, deps: [], task: 'Collect 1 oak_log' } }];
@@ -203,10 +207,11 @@ describe('fix86: coal\'s tool comes from harvestTools', () => {
     it('wooden_pickaxe harvests coal, and a contract that names only iron_pickaxe is not the need when cobblestone is held', () => {
         const tools = Object.keys(registry.blocksByName.coal_ore.harvestTools).map(id => registry.items[id].name);
         assert.ok(tools.includes('wooden_pickaxe'));
-        const planner = obtainPlanner({ registry, recipesOf: id => Recipe.find(id), known: () => false, proven: () => false, edgeSuccess: () => 1, smeltInputs: () => [], present: () => false });
+        const planner = obtainPlanner({ mobSighted: () => true, registry, recipesOf: id => Recipe.find(id), known: () => false, proven: () => false, edgeSuccess: () => 1, smeltInputs: () => [], present: () => false });
         const plan = planner.prerequisites('coal', 79, { ...LIVE_INV });
         assert.ok(!plan.plan.includes('Craft 1 iron_pickaxe'), plan.plan.join(' > '));
         const v = Object.create(Voyager.prototype);
+        v.mobSightings = { has: () => true };   // fix175: this fixture treats every mob as sighted
         v.progress = { subgoals: [], decomposed: {}, failed: [], blockers: [], recipeEdges: {}, goalStats: {} };
         v._curSub = null;
         v._saveProgress = () => {};
@@ -225,6 +230,7 @@ describe('fix86: coal\'s tool comes from harvestTools', () => {
 describe('fix86: underground, no logs, the chain reaches a log through a learned skill', () => {
     it('from (-125, 43, 61) with the live inventory, Collect oak_log chains to reach oak_log and then collects it', async () => {
         const v = Object.create(Voyager.prototype);
+        v.mobSightings = { has: () => true };   // fix175: this fixture treats every mob as sighted
         const inv = { ...LIVE_INV };
         const nearby = [];
         const position = { x: -125, y: 43, z: 61 };

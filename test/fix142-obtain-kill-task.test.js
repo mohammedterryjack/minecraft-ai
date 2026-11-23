@@ -25,8 +25,8 @@ const registry = {
         { entity: 'wolf', drops: [{ item: 'bone', dropChance: 1, stackSizeRange: [0, 2] }] },
     ],
 };
-const p = () => obtainPlanner({
-    registry,
+const p = () => obtainPlanner({    mobSighted: () => true,
+registry,
     recipesOf: () => [],
     known: () => false,
     proven: () => false,

@@ -61,6 +61,7 @@ function traceOf(line) {
 
 function mkV(skills) {
     const v = Object.create(Voyager.prototype);
+    v.mobSightings = { has: () => true };   // fix175: this fixture treats every mob as sighted
     v.skills = skills.map(s => JSON.parse(JSON.stringify(s)));
     v.progress = {
         completedAt: {}, completed: [], failed: [], goalStats: {}, goalFailStates: [],

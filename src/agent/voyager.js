@@ -3164,7 +3164,7 @@ Use only c; no other globals.`;
                 inventory: inv,
                 cheapest: (items, count, inventory) => planner.cheapest(items, count, inventory, true),
                 prerequisites: (item, count, inventory) => planner.prerequisites(item, count, inventory),
-                entityDroppersFor: (item) => entityDroppers(registry, item),
+                entityDroppersFor: (item) => entityDroppers(registry, item).filter((m) => this.mobSightings.has(m)),   // fix175: sighted mobs only, see obtainPlanner.mobSighted
             });
         });
         if (plan.executable) {
@@ -5006,6 +5006,11 @@ Use only c; no other globals.`;
                 return memo.get(item);
             },
             present: reachableBlock,
+            // fix175: an entity loot source counts only if the mob has been sighted in this world
+            // (or is nearby right now) — the same world fact the task gate enforces at 7342.
+            mobSighted: (name) => this.mobSightings.has(name)
+                || (Array.isArray(state.nearby_entities) ? state.nearby_entities
+                    : Array.isArray(state.entities) ? state.entities : []).includes(name),
             proven: item => Object.hasOwn(this.progress.recipeEdges, item) && this.progress.recipeEdges[item].status === 'proven',
             edgeSuccess: (item, verb) => {
                 let byVerb = edgeMemo.get(item);

@@ -50,6 +50,7 @@ function mkV(progress) {
     v.progress = { subgoals: [], decomposed: {}, failed: [], completedAt: {}, completed: [], blockers: [], recipeEdges: {}, goalStats: {}, goalFailStates: [], ...progress };
     v._saveProgress = () => {};
     v._producers = () => [];
+    v.mobSightings = { has: () => true };   // fix175: this fixture treats every mob as sighted
     v.slotEffects = { effect: () => null };
     return v;
 }

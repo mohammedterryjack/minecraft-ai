@@ -97,6 +97,7 @@ describe('fix100 planner', () => {
                 const proxied = new Proxy(goalStats, { ownKeys(t) { scans++; return Reflect.ownKeys(t); } });
                 let recipeCalls = 0, edgeCalls = 0, smeltGets = 0;
                 const v = Object.create(Voyager.prototype);
+                v.mobSightings = { has: () => true };   // fix175: this fixture treats every mob as sighted
                 v.agent = { bot: { version: VER, registry, recipesAll: (id) => { recipeCalls++; return Recipe.find(id); }, inventory: { emptySlotCount: () => 1 } } };
                 v.skills = [];
                 v.progress = { subgoals: [], decomposed: {}, failed: [], completedAt: {}, completed: [], blockers: [], recipeEdges, goalStats: proxied, goalFailStates: [] };
@@ -162,6 +163,7 @@ describe('fix100 craft reroute', () => {
     }
     function replayVoyager(effects) {
         const v = Object.create(Voyager.prototype);
+        v.mobSightings = { has: () => true };   // fix175: this fixture treats every mob as sighted
         v.agent = { bot: craftBot(), openChat() {} };
         v.skills = [skill('craftItem', ['bread']), skill('obtainItem', effects)];
         v.npGraph = { confirmedProduces() { return []; } };

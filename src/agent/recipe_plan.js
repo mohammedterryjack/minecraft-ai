@@ -36,7 +36,7 @@ import { furnaceInputsOf, fuelItemNames } from './furnace_recipes.js';
 // is held, nearby, or proven. An item no recipe, block, entity, or furnace recipe yields is an opaque obtain (egg,
 // milk_bucket): feasible only when that obtain is known or proven, so the food raiser does not queue it. When
 // `feasible` is true, a collect counts only when a source block is present or a producer edge is proven.
-export function obtainPlanner({ registry, recipesOf, known, proven, edgeSuccess, smeltInputs, present }) {
+export function obtainPlanner({ registry, recipesOf, known, proven, edgeSuccess, smeltInputs, present, mobSighted }) {
     if (!registry) throw new Error('[fix81] obtainPlanner: registry required');
     if (typeof recipesOf !== 'function') throw new Error('[fix81] obtainPlanner: recipesOf(itemId) required');
     if (typeof known !== 'function') throw new Error('[fix81] obtainPlanner: known(item, sourceBlocks) required');
@@ -44,6 +44,11 @@ export function obtainPlanner({ registry, recipesOf, known, proven, edgeSuccess,
     if (typeof edgeSuccess !== 'function') throw new Error('[fix96] obtainPlanner: edgeSuccess(item, verb) required (observed success of a producer edge)');
     if (typeof smeltInputs !== 'function') throw new Error('[fix96] obtainPlanner: smeltInputs(item) required (learned smelt edges)');
     if (typeof present !== 'function') throw new Error('[fix97] obtainPlanner: present(block) required (a source block observed nearby)');
+    // fix175: world-absence is a world fact, same rule the task gate applies (voyager "never been
+    // sighted in this world"). A mob nobody has sighted is not a source in THIS world even though
+    // game-data loot lists it (live 23 Nov: hunger planned "Kill 1 hoglin" from stale world memory;
+    // the gate rejected it every step in a tight loop with the urgent-need re-planner).
+    if (typeof mobSighted !== 'function') throw new Error('[fix175] obtainPlanner: mobSighted(entity) required (has this mob been seen in this world)');
     if (registry.entityLoot === undefined || registry.entityLoot === null) throw new Error('[fix96] obtainPlanner: registry.entityLoot required');
     if (!registry.blockLoot) throw new Error('[fix81] obtainPlanner: registry.blockLoot required');
     const itemName = id => {
@@ -101,6 +106,8 @@ export function obtainPlanner({ registry, recipesOf, known, proven, edgeSuccess,
         const out = [];
         for (const e of entityEntries) {
             if (!e || typeof e.entity !== 'string' || !Array.isArray(e.drops)) throw new Error(`[fix96] entityLoot entry is malformed: ${JSON.stringify(e)}`);
+            // fix175: an unseen mob is not a source in this world (see the mobSighted option).
+            if (!mobSighted(e.entity)) continue;
             for (const d of e.drops) {
                 if (d.item !== item) continue;
                 const y = meanDrop(d, `entityLoot ${e.entity}`);
