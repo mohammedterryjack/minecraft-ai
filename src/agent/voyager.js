@@ -76,6 +76,8 @@ if (![HOME.x, HOME.y, HOME.z].every(Number.isFinite)) throw new Error(`[home] ${
 const TOWN = HOME;
 const VILLAGE = { x: -800, z: 500 };
 const MAX_ATTEMPTS = 4;
+// fix176: cap on decompositions per goal since its last success (see _decompose).
+const MAX_GOAL_DECOMPOSES = 2;
 const PLAYER_QUIET_MS = 90 * 1000;   // pause after any player message
 const HUT = { get x() { return HOME.x; }, get y() { return HOME.y + 1; }, get z() { return HOME.z; } };   // HUT.y - 1 = floor/feet level (interior HOME±2, walls at ±3)
 // fix27: fixed milestone ordering removed; the curriculum learns what to do next
@@ -6900,6 +6902,24 @@ Use only c; no other globals.`;
         const d = (this.progress.decomposed ||= {}), q = (this.progress.subgoals ||= []);
         const depth = (this._curSub?.task === task ? this._curSub.depth : 0);
         if (q.some(s => s && s.parent === task)) { console.log(`[psn] decompose skipped for "${task}": its subgoals are still queued`); return false; }
+        // fix176: a goal must not ping-pong through decomposition forever. Voyager records a
+        // failed task and lets the curriculum move to the next frontier task (Wang et al. 2023,
+        // arXiv:2305.16291, Fig. 2: failed tasks feed the prompt as history; the curriculum
+        // proposes anew). The retry-enqueue loop here re-proposed "Kill 1 salmon" after every
+        // failure for hours (live 23 Nov: 8+ full 4-attempt cycles, drownings during the chase,
+        // food 20/20 the whole time after the loop began). Each goal gets MAX_GOAL_DECOMPOSES
+        // decompositions, counted since its last success; past that the goal is abandoned
+        // loudly and goalStats/goalFailStates backoff decide when the curriculum may retry it.
+        const prior = Object.hasOwn(d, task) ? d[task] : null;
+        const doneAt = this.progress.completedAt?.[task];
+        const priorRetries = prior && !(typeof doneAt === 'number' && doneAt > (prior.at ?? 0)) ? (prior.retries ?? 0) : 0;
+        if (priorRetries >= MAX_GOAL_DECOMPOSES) {
+            console.log(`[psn] LOUD: goal "${task}" abandoned after ${priorRetries} decompositions without success (last reason: ${String(reason).slice(0, 120)}); goalFailStates backoff governs re-proposal`);
+            delete d[task];
+            this.progress.failed.push(`${task} (abandoned: decomposed ${priorRetries}x without success)`);
+            this._saveProgress();
+            return false;
+        }
         
         // fix97: an item goal keeps its own task. Subgoals come from the game-data plan (block loot, entity loot,
         //        recipes, furnace recipes). A learned producer's task is a subgoal only when that task's item is the
@@ -6962,7 +6982,7 @@ Use only c; no other globals.`;
                 console.log(`[psn] decompose skipped for "${task}": the game-data plan is already this goal (${pre.task})`);
                 return false;
             }
-            d[task] = { subs, skills: [], at: Date.now(), reason: `game data ${pre.how}: ${pre.task}` };
+            d[task] = { subs, skills: [], at: Date.now(), retries: priorRetries + 1, reason: `game data ${pre.how}: ${pre.task}` };
             q.unshift(...subs.map(t => ({ task: t, parent: task, depth: depth + 1 })), { task, retry: true, depth });
             this._saveProgress();
             // fix174: decomposition found a plan to run, so the goal is executable again: it may
@@ -6990,8 +7010,8 @@ Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
             console.log(`[psn] decompose FAILED for "${task}": ${e.message}`);
             return false;
         }
-        if (subs.length < 2) { console.log(`[psn] decompose FAILED for "${task}": model gave ${subs.length} valid subgoal(s)`); d[task] = { subs, skills: [], at: Date.now(), reason: String(reason) }; this._saveProgress(); return false; }
-        d[task] = { subs, skills: [], at: Date.now(), reason: String(reason) };
+        if (subs.length < 2) { console.log(`[psn] decompose FAILED for "${task}": model gave ${subs.length} valid subgoal(s)`); d[task] = { subs, skills: [], at: Date.now(), retries: priorRetries + 1, reason: String(reason) }; this._saveProgress(); return false; }
+        d[task] = { subs, skills: [], at: Date.now(), retries: priorRetries + 1, reason: String(reason) };
         q.unshift(...subs.map(t => ({ task: t, parent: task, depth: depth + 1 })), { task, retry: true, depth });
         this._saveProgress();
         console.log(`[psn] DECOMPOSE "${task}" (${String(reason).slice(0, 120)}) -> ${subs.map((t, i) => `${i + 1}) ${t}`).join(' ')}; then retry the parent with the learned skills`);
