@@ -305,6 +305,19 @@ export class Coder {
         // this message history is transient and only maintained in this function
         // fix46: keep base messages separate - on every retry, use base + latest code + latest error only
         const baseMessages = agent_history.getHistory();
+        // fix173: prismarine-block ground truth (github.com/PrismarineJS/prismarine-block README +
+        // minecraft-data 26.1 blocks). Live 22 Nov: generated code called block.isTransparent() —
+        // no such method exists (prototype: constructor, blockEntity, getProperties, canHarvest,
+        // digTime) — and the coder repeated it across retries because the retry prompt carries only
+        // the runtime TypeError, which does not name the correct API.
+        baseMessages.push({role: 'system', content:
+            'prismarine-block reference (blocks from bot.blockAt / bot.world.getBlockState):\n' +
+            '- bot.blockAt(pos) returns null for unloaded chunks: always null-check.\n' +
+            '- Solid cube test: block.boundingBox === "block" (air/water/plants use "empty"/"cross").\n' +
+            '- Transparency: block.transparent is a boolean PROPERTY. There is no isTransparent(), isSolid(), isAir() or isEmpty() method.\n' +
+            '- Air: block.name === "air". Name/displayName/hardiness/diggable are properties.\n' +
+            '- Methods on a block: canHarvest(heldItemType), digTime(tool), getProperties(), blockEntity.\n' +
+            '- Registry lookups: bot.registry.blocksByName["stone"], bot.registry.itemsByName, bot.registry.recipes.'});
         baseMessages.push({role: 'system', content: 'Code generation started. Write code in codeblock in your response:'});
         
         // fix47: log initial base prompt size
