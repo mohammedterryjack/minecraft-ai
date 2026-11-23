@@ -655,6 +655,14 @@ export class Voyager {
         this.chestMemoryFile = chestMemFile;
         this.chestMemory = existsSync(chestMemFile) ? JSON.parse(readFileSync(chestMemFile, 'utf8')) : {};
         this._setupChestTracking();
+        // fix172: mob sighting evidence. Nothing in the game data says where a mob lives (fix141),
+        // and with no sighting memory the proposals retried "Navigate to the nearest hoglin" 9x in the
+        // overworld (live 22 Nov; the critic itself: "hoglins do not spawn here"). Voyager's curriculum
+        // proposes only what the agent can experience (Wang et al. 2023, arXiv:2305.16291 §3.1): an
+        // approach goal is proposable once the mob has been observed; sightings persist across restarts.
+        const sightFile = `./bots/${agent.name}/mob_sightings.json`;
+        this.mobSightingsFile = sightFile;
+        this.mobSightings = new Set(existsSync(sightFile) ? JSON.parse(readFileSync(sightFile, 'utf8')).sighted || [] : []);
         if (!globalThis.__voyagerGuard) {
             globalThis.__voyagerGuard = true;
             const onErr = (kind) => (err) => this._onProcessError(kind, err);
@@ -3978,7 +3986,7 @@ Use only c; no other globals.`;
             if (!nearbyBlocks.includes(b.name)) nearbyBlocks.push(b.name);
             perceivedAt[b.name] = { x: b.x, y: b.y, z: b.z };
         }
-        return {
+        const state = {
             position: `${p.x.toFixed(0)}, ${p.y.toFixed(0)}, ${p.z.toFixed(0)}`,
             distance_to_town: dTown,
             biome: world.getBiomeName(bot),
@@ -4020,6 +4028,19 @@ Use only c; no other globals.`;
             recent_deaths: (this.agent.recentDeaths || []).join('; ') || 'none',
             death_hotspots: this._deathHotspots(),
         };
+        this._recordSightings(state.nearby_entities);
+        return state;
+    }
+    // fix172: persist every mob the bot has ever observed. Only new names touch the disk, so the
+    // observe() hot path stays IO-free. Names arrive validated (world.getNearbyEntityTypes reads
+    // bot entities; mob names reach approach goals as exact names per fix141).
+    _recordSightings(entities) {
+        if (!Array.isArray(entities)) throw new Error('[fix172] entities array required');
+        const added = entities.filter((name) => typeof name === 'string' && name.length > 0 && !this.mobSightings.has(name));
+        if (added.length === 0) return;
+        for (const name of added) this.mobSightings.add(name);
+        writeAtomic(this.mobSightingsFile, JSON.stringify({ sighted: [...this.mobSightings].sort() }, null, 2));
+        console.log(`[sight] first sighting recorded: ${added.join(', ')} (sighting store now ${this.mobSightings.size})`);
     }
     // fix51: get inventory+equipment combined view (same as satisfaction check uses for __have)
     _getInventoryWithEquipment() {
@@ -7277,6 +7298,33 @@ Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
             for (const e of Object.values(capBot?.equipment || {})) if (e?.name) held.add(e.name);
             const missing = Voyager.missingPrerequisites(capBot.registry, g.item, held);
             if (missing) return `cannot obtain ${g.item} from the current tech tree: missing ${missing.join(', ')}; propose a goal that acquires ${missing[0]} first`;
+        }
+        // fix172: mob evidence. With no location data (fix141) and no sighting memory, the proposals
+        // retried an overworld hoglin hunt 9x (critic: "hoglins do not spawn here"). Voyager proposes
+        // only from what the agent can experience (arXiv:2305.16291 §3.1): a task naming a mob is
+        // proposable once that mob has been observed. The scan is over task words against the
+        // registry's mob categories (Passive/Hostile mobs); the store is fed by observe() every tick,
+        // so a mob that wanders into view anywhere unlocks its tasks within one step.
+        if (capBot?.registry?.entitiesByName) {
+            if (!this._mobNames) this._mobNames = new Set(Object.values(capBot.registry.entitiesByName)
+                .filter((e) => e.category === 'Passive mobs' || e.category === 'Hostile mobs')
+                .map((e) => e.name));
+            const nearNow = Array.isArray(state?.nearby_entities) ? state.nearby_entities
+                : Array.isArray(state?.entities) ? state.entities : [];
+            const tokens = task.toLowerCase().split(/[^a-z_]+/).filter((t) => t.length > 0);
+            const isItemName = (name) => Boolean(capBot.registry.itemsByName?.[name] || capBot.registry.blocksByName?.[name]);
+            for (let i = 0; i < tokens.length; i++) {
+                const word = tokens[i];
+                for (const name of word.endsWith('s') ? [word, word.slice(0, -1)] : [word]) {
+                    if (!this._mobNames.has(name) || this.mobSightings.has(name) || nearNow.includes(name)) continue;
+                    // "blaze powder" / "ender pearl" are item mentions, not mob mentions: the word
+                    // combines with an adjacent token into a registry item/block name.
+                    const joined = [i > 0 ? `${tokens[i - 1]}_${name}` : null, `${name}_${tokens[i + 1] ?? ''}`].filter(Boolean);
+                    if (joined.some(isItemName)) continue;
+                    const seen = [...this.mobSightings].slice(0, 8).join(', ') || 'no mob sighted yet';
+                    return `${name} has never been sighted in this world (sighted mobs: ${seen}); propose goals about sighted mobs or craftable items`;
+                }
+            }
         }
         if (!fromPlanner) return null;
         if (state !== undefined && state !== null) return this._goalStateBackedOff(task, state);
