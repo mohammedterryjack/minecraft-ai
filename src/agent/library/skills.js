@@ -481,6 +481,14 @@ export async function attackEntity(bot, entity, kill=true) {
      * @example
      * await skills.attackEntity(bot, entity);
      **/
+    // fix178: players are off-limits at the one attack choke point (mineflayer exposes bot.attack
+    // and bot.pvp.attack, both reached only through this function; kill verification lives here).
+    // Attacking Mo's player entity got the server to disconnect the attacker
+    // ("multiplayer.disconnect.invalid_entity_attacked"), crashing the agent (mindcraft.log 23 Nov,
+    // pid 85138). Throwing fails the attempt loudly instead of killing the connection; Mo's rule
+    // and the minecraft-data registry (entitiesByName.player type 'player', not a mob) agree.
+    if (entity?.type === 'player')
+        throw new Error(`[fix178] attackEntity: player "${entity.name}" is off-limits (players belong to humans; the server disconnects bots that attack them)`);
 
     let pos = entity.position;
     await equipHighestAttack(bot)
