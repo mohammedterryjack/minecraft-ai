@@ -169,6 +169,13 @@ function knownNames() {
 export function validateTask(task) {
     const t = task.toLowerCase();
     if (/\b(cave_|void_)?air(_block)?\b/.test(t)) return 'air is not a block you can mine or collect';
+    // fix178: players are not tasks. The curriculum proposed "Kill 1 player" 11 times (23 Nov);
+    // the generated code attacked Mo's player entity and the server disconnected the attacker
+    // ("multiplayer.disconnect.invalid_entity_attacked"), which crashed the agent process
+    // (mindcraft.log 23 Nov, pid 85138, launchd last exit code 1). Players are not mobs in the
+    // minecraft-data registry (entitiesByName.player has type 'player', category UNKNOWN), so the
+    // fix172 mob-category gate cannot cover them, and Mo's standing rule: leave the player alone.
+    if (/player/.test(t)) return 'players are not targets: never kill, chase, or interact with players (they belong to humans, and attacking one disconnects the bot from the server)';
     // fix167 (learning-investigation-20261121 Q5; live 22 Nov 08:52Z): the curriculum proposed
     // "Wait for night cycle or mob spawn conditions if no targets are currently detected"; the stall
     // detector killed it (waiting produces none of the four progress signals: new ground, inventory,
@@ -7368,6 +7375,29 @@ Reply ONLY with JSON: {"subgoals": ["...", "..."]}`;
                 }
             }
         }
+        // fix177: a toss goal is bounded by the held count — dropping removes stacks from the
+        // inventory (minecraft.wiki/w/Dropping), so "Toss 50 cobblestone" with 43 held can never
+        // be satisfied. The curriculum proposed it anyway (mindcraft.log 23 Nov, "Toss 50
+        // cobblestone to free up inventory space" with 43 cobblestone, and "Toss 192
+        // Cobblestones"): 4 attempts each, every attempt verified against the requested count and
+        // each failure minting a fresh gate-rejected candidate (toss50CobblestoneTask,
+        // toss192Cobblestones, tossCobblestoneBatch64 — library pollution from an impossible
+        // goal). Voyager's curriculum proposes only acquirable tasks given the current state
+        // (Wang et al. 2023, arXiv:2305.16291 §3.1). Parse: leading toss-class verb + count +
+        // item token; a plural token ("Cobblestones") resolves by trailing-s; anything the
+        // registry does not know skips this check (name rules and fix172 own those).
+        const tossM = task.trim().match(/^(?:toss|drop|discard|throw\s+away)\s+(\d+|[a-z]+)\s+([a-z_]+)/i);
+        if (tossM && capBot?.inventory?.slots && capBot?.registry?.itemsByName) {
+            const want = /^\d+$/.test(tossM[1]) ? parseInt(tossM[1], 10) : parseNumberWord(tossM[1].toLowerCase());
+            let item = tossM[2].toLowerCase();
+            const reg = capBot.registry.itemsByName;
+            if (!(item in reg) && item.endsWith('s') && (item.slice(0, -1) in reg)) item = item.slice(0, -1);
+            if (want && want > 0 && (item in reg)) {
+                const heldCount = stackableCounts(capBot)[item] || 0;
+                if (heldCount < want)
+                    return `cannot toss ${want} ${item}: holding ${heldCount}, and dropping is bounded by the inventory; propose tossing at most ${heldCount} to free space`;
+            }
+        }
         if (!fromPlanner) return null;
         if (state !== undefined && state !== null) return this._goalStateBackedOff(task, state);
         return this._goalBackedOff(task);
@@ -7416,6 +7446,7 @@ Goal: discover as many diverse things as possible and grow a small town of its o
 Rules:
 - The bot's town is at x=${TOWN.x}, y=${TOWN.y}, z=${TOWN.z} (the bot's home base; ${this._hutBuilt() ? `its 7x7 cobblestone hut stands at x ${HOME.x-3}..${HOME.x+3}, z ${HOME.z-3}..${HOME.z+3}` : 'no hut exists there yet'}).
 - NEVER go near the players' village around x=${VILLAGE.x}, z=${VILLAGE.z}; never take or break player builds.
+- NEVER propose a task that targets a player (kill, chase, follow, attack, or interact). Players belong to humans; the server disconnects the bot when it attacks one.
 - Propose ONE concrete, verifiable task achievable in a few minutes with the current inventory and surroundings (e.g. "Mine 5 birch_log", "Craft 1 stone_pickaxe", "Smelt 3 iron_ingot", "Build a 5x5 cobblestone floor next to the hut").
 - Do not repeat completed tasks unless needed for progress; avoid tasks that failed recently unless prerequisites are now met.
 - Do not propose a task listed under failed_in_this_state. It already failed for the reason given and the state has not changed.
@@ -7423,6 +7454,7 @@ Rules:
 - The bot must survive: dying loses its inventory. Nothing keeps it alive automatically (no eating, fleeing, fighting or sheltering reflexes), so survival is your job too: read time, health, food, threats and inventory space in the state and decide.
 - A task is either an item goal ("<verb> N <item>", "Smelt N <raw> into N <out>", "ensure <block>"), the bare name of a known skill that takes no arguments besides bot (it is verified by that skill's learned postcondition), or a short free-text task.
 - Every task must change the world (move, gather, craft, build, attack). Never propose a task that only waits, watches, scans, checks, verifies or confirms: a change-free task produces no state change, so nothing can verify it and the stall detector always kills it. To compose skills, name the skill directly or write it inside a larger action task — never "use the X skill" as a task.
+- Inventory-bounded verbs: tossing, dropping or discarding removes items you already hold, so the count can never exceed state.inventory — "Toss 50 cobblestone" with 43 held is impossible. To free inventory space, name a count at most equal to the held count of one item.
 Reply ONLY with JSON: {"reasoning": "ONE short sentence", "task": "...", "context": "short hint how to do it"}`;
         const bot = this.agent.bot;   // fix29: current vitals as plain facts, read now (an overlapped plan's state may be minutes old)
         // AWM-style: retrieve relevant workflows for context
