@@ -742,16 +742,32 @@ function yieldResult(step) {
 
 function returnedResult(step) {
     const finished = step.value && step.value.result;
-    if (finished && (finished.status === 'partial' || finished.status === 'timeout')) {
-        throw new Error(`reachability: getPathFromTo returned ${finished.status}. A partial result is not unreachable (mineflayer-pathfinder lib/astar.js compute).`);
+    if (finished && finished.status === 'timeout') rejectUnfinished(finished);
+    if (finished && finished.status === 'partial') {
+        throw new Error(`reachability: getPathFromTo returned partial. A partial result is not unreachable (mineflayer-pathfinder lib/astar.js compute).`);
     }
     if (finished && (finished.status === 'success' || finished.status === 'noPath')) return finished;
     throw new Error('reachability: getPathFromTo ended without a result (mineflayer-pathfinder index.js:75).');
 }
 
+// fix180 (live icefox2000, 24 Nov): astar makeResult (node_modules/mineflayer-pathfinder/lib/
+// astar.js:55-65) attaches the best partial path even to a 'timeout' result, and a target past
+// the think budget is FAR, not unreachable — the same target is walkable in segments. The 24
+// budget throws since fix132 produced 6 process exits (same step error twice is fatal by Mo's
+// loud-fail rule), so _judgeTargets needs to tell "budget spent, partial path known" from a
+// genuine error without storing a fake status: this class carries the partial path, and the
+// planner contract (success|noPath only) stays intact.
+export class ReachabilityBudget extends Error {
+    constructor(message, partialPath) {
+        super(message);
+        this.name = 'ReachabilityBudget';
+        this.partialPath = Array.isArray(partialPath) ? partialPath : null;
+    }
+}
+
 function rejectUnfinished(result) {
     if (result.status === 'timeout') {
-        throw new Error('reachability: the search exceeded the thinkTimeout budget (mineflayer-pathfinder index.js:40) that every normal goto runs under. fix132: without this budget the same search ran 4400 s (fix110) and 20 min at +1.4 GB RSS (16 Nov live) without ending; this step fails loudly and is retried from a moved position, and timeout is never reported as reachable or unreachable.');
+        throw new ReachabilityBudget('reachability: the search exceeded the thinkTimeout budget (mineflayer-pathfinder index.js:40) that every normal goto runs under. fix132: without this budget the same search ran 4400 s (fix110) and 20 min at +1.4 GB RSS (16 Nov live) without ending; this step fails loudly and is retried from a moved position, and timeout is never reported as reachable or unreachable.', result.path);
     }
     throw new Error(`reachability: getPathFromTo returned ${result.status}. Expected success, noPath, or partial (mineflayer-pathfinder lib/astar.js compute).`);
 }
