@@ -549,6 +549,17 @@ export async function defendSelf(bot, range=9) {
     let attacked = false;
     let enemy = world.getNearestEntityWhere(bot, entity => mc.isHostile(entity), range);
     while (enemy) {
+        // fix179: do not fight to the death. defendSelf chased crossbow mobs (Pillager)
+        // forever — died 3x "shot by Pillager" (mindcraft.log 22-23 Nov) because the loop
+        // only exited on enemy death or interrupt. Same "dying" rule as self_preservation
+        // (modes.js): recent damage and (health < 5 or the last hit could finish us) ->
+        // stop attacking and retreat instead of swinging.
+        if (Date.now() - bot.lastDamageTime < 3000 && (bot.health < 5 || bot.lastDamageTaken >= bot.health)) {
+            bot.pvp.stop();
+            log(bot, `Disengaged from ${enemy.name}: health ${bot.health}, last hit ${bot.lastDamageTaken} — retreating instead of fighting.`);
+            await moveAway(bot, 20);
+            return false;
+        }
         await equipHighestAttack(bot);
         if (bot.entity.position.distanceTo(enemy.position) >= 4 && enemy.name !== 'creeper' && enemy.name !== 'phantom') {
             try {
