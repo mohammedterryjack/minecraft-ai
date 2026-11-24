@@ -4912,13 +4912,32 @@ Use only c; no other globals.`;
         }
         pending.sort((a, b) => world.lookHeuristic(bot, state.perceived_at[a]) - world.lookHeuristic(bot, state.perceived_at[b]));
         let found = null;
+        const deferred = [];
         for (const name of pending) {
-            const result = await world.pathToBlock(bot, state.perceived_at[name]);
+            let result;
+            try {
+                result = await world.pathToBlock(bot, state.perceived_at[name]);
+            } catch (err) {
+                // fix180: a think-budget timeout means the target is FAR, not unreachable, and
+                // storing anything but success|noPath is forbidden by fix97. The block is dropped
+                // from this step's perception (never a fake status); the next step's fresh
+                // observe() re-perceives it, usually from a moved position — fix132's own
+                // "retried from a moved position", realised through the step loop instead of a
+                // fatal same-error exit (24 budget throws had become 6 process exits).
+                if (!(err instanceof world.ReachabilityBudget)) throw err;
+                console.log(`[fix180] "${name}" perceived ${Math.round(world.lookHeuristic(bot, state.perceived_at[name]))} away spent the reach budget; deferred this step (far, not unreachable — astar.js makeResult keeps a partial path).`);
+                deferred.push(name);
+                continue;
+            }
             state._reach[name] = this._pathStatus({ _reach: { [name]: result.status } }, name);
             if (result.status === 'success') {
                 found = name;
                 if (stopAtSuccess) return name;
             }
+        }
+        if (deferred.length) {
+            for (const name of deferred) delete state.perceived_at[name];
+            state.nearby_blocks = state.nearby_blocks.filter((b) => !deferred.includes(b));
         }
         return found;
     }
