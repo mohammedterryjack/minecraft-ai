@@ -1774,6 +1774,22 @@ export async function goToGoal(bot, goal) {
                 return false;
             }
 
+            // fix181: GoalChanged (node_modules/mineflayer-pathfinder/lib/goto.js:33-35) fires
+            // when another setGoal/goTo replaced our goal mid-walk — a mode action (self_defense
+            // chasing an enemy) taking the pathfinder over. goto.js defers every rejection through
+            // setTimeout(...,0) (goto.js:47-53), so this catch can run after the new action already
+            // reset bot.interrupt_code (action_manager.js _executeAction) — the fix44 branch above
+            // then misses it, the failure falls into the generic "navigation error", and PSN
+            // attributes the takeover to the learned code (live 23 Nov: 6x "FAILED: navigation
+            // error: The goal was changed" inside mine5OakLogs retries). The goal was replaced,
+            // not lost: cancel OUR walk, do not call pathfinder.stop() (that would kill the new
+            // owner's navigation too — it emits path_stop, rejecting the taker-over's own goto).
+            if (err?.name === 'GoalChanged') {
+                clearInterval(doorCheckInterval);
+                log(bot, `FAILED: navigation cancelled: another action replaced the pathfinder goal (takeover). Re-run this navigation if the task still needs it.`);
+                return false;
+            }
+
             // fix124b2: the walk stalled with the bot in water — pathfinder cannot move in
             // liquid, so swim this leg toward the goal column and plan the walk again
             if (progressTimedOut && bot.entity.isInWater) {
@@ -1886,11 +1902,15 @@ export async function goToGoal(bot, goal) {
         return true;
     } catch (err) {
         clearInterval(doorCheckInterval);
-        bot.pathfinder.stop();
+        // fix181: on a takeover the pathfinder now belongs to another action — stop() would
+        // emit path_stop and reject the new owner's own goto. Every other failure is ours.
+        if (err?.name !== 'GoalChanged') bot.pathfinder.stop();
         
         // fix44: loud FAILED for all path failures
         if (bot.interrupt_code || /interrupted/i.test(String(err?.message))) {
             log(bot, `FAILED: navigation cancelled (interrupted).`);
+        } else if (err?.name === 'GoalChanged') {   // fix181: see the goto loop above
+            log(bot, `FAILED: navigation cancelled: another action replaced the pathfinder goal (takeover). Re-run this navigation if the task still needs it.`);
         } else if (/Took to long/i.test(String(err?.message))) {
             log(bot, `FAILED: pathfinder took too long to decide path.`);
         } else if (/No path/i.test(String(err?.message))) {
