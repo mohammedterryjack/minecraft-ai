@@ -22,7 +22,7 @@ const LIVE = JSON.parse(readFileSync(new URL('./fixtures/fix70-live-eat.json', i
 const SRC = readFileSync(new URL('../src/agent/voyager.js', import.meta.url), 'utf8');
 let Voyager;
 before(async () => { const mod = await import('../src/agent/voyager.js'); Voyager = mod.Voyager; mod._setVersionForTest('1.21.4'); });
-const mkV = () => { const v = Object.create(Voyager.prototype); v._saveSkills = () => {}; v._unverifiedConsumesNoted = new Set(); return v; };
+const mkV = () => { const v = Object.create(Voyager.prototype); v._saveSkills = () => {}; v._unverifiedConsumesNoted = new Set(); v.agent = { bot: {} }; return v; };
 const legacy = () => ({ name: 'eatCookedMutton', ...JSON.parse(JSON.stringify(LIVE.index_record)) });
 
 describe('fix70: the dirt effect, from the live window', () => {
@@ -74,7 +74,7 @@ describe('fix70: effects are measured over the skill\'s own run', () => {
         assert.strictEqual((SRC.match(/recordDelta\([^,]+, before\.inventory/g) || []).length, 0);
         assert.strictEqual((SRC.match(/this\._learnEffects\((?:entry|e), runBefore, after/g) || []).length, 2);
         assert.strictEqual((SRC.match(/recordDelta\([^,]+, runBefore\.inventory, after\.inventory/g) || []).length, 2);
-        assert.strictEqual((SRC.match(/const runBefore = this\.observe\(\);\n\s+this\._runStart = Date\.now\(\);/g) || []).length, 2);
+        assert.strictEqual((SRC.match(/const runBefore = this\.observe\(\);\n\s+this\._beginMeasuredRun\(\);[^\n]*\n\s+this\._runStart = Date\.now\(\);/g) || []).length, 2);
     });
     it('an aborted practice run has returned before _runPracticeSkill does (no practice beside the next action)', async () => {
         let running = false, finished = false;

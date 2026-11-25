@@ -4535,6 +4535,7 @@ Use only c; no other globals.`;
         //        task-start snapshot (goal gain is still measured from it); everything between it and this run (other replays,
         //        backchaining, a practice run still finishing) is not this skill's doing
         const runBefore = this.observe();
+        this._beginMeasuredRun();   // fix182: tally discards made during this measured run
         this._runStart = Date.now();
         const closeJournal = this._openTrialJournal(Object.keys(over), r.name, task, replayClosure);
         let res;
@@ -4743,6 +4744,13 @@ Use only c; no other globals.`;
     // fix44: goalItems hint FILTERS which observed ups count as effects - does NOT fabricate
     // When goalItems present: keep only observed ∩ goal (no fabrication from goal alone)
     // When goalItems absent: keep ALL observed ups (no hard-coded incidental/junk tables)
+    // fix182: install a fresh disposal tally for a measured run (see tallyDisposal in
+    // library/skills.js). Every window whose inventory delta becomes consume evidence must call
+    // this right after its before-snapshot: discards during the run land in the tally and are
+    // excluded from consumption by recordConsumeEvidence.
+    _beginMeasuredRun() {
+        this.agent.bot._runDiscardTally = new Map();
+    }
     _learnEffects(e, before, after, goalItems = null) {
         const inv0 = before.inventory, inv1 = after.inventory;
         // fix44: the goal hint filters which observed ups count as effects in this run (observed AND goal; nothing fabricated)
@@ -4761,8 +4769,11 @@ Use only c; no other globals.`;
         if (JSON.stringify(e.effects) !== eff0) console.log(`[psn] ${e.name} effects (from ${e.effectEvidence.runs} measured run(s)): [${e.effects.join(', ')}]`);
         // fix70: consumption carries its evidence (consume_evidence.js); before, consumes was a running max of every item that went
         //        down in any success window and could never shrink, so one polluted window blocked practice for good
+        // fix182: items the run itself discarded/stored (skills.discard/putInChest -> bot._runDiscardTally,
+        //        installed by _beginMeasuredRun at each measured-run snapshot) are disposals, not
+        //        consumption - the toss skills' own tossing had reserved granite 64 / leaf_litter 74.
         const con0 = JSON.stringify(e.consumes);
-        recordConsumeEvidence(e, inv0, inv1);
+        recordConsumeEvidence(e, inv0, inv1, this.agent.bot._runDiscardTally);
         if (JSON.stringify(e.consumes) !== con0) console.log(`[psn] ${e.name} consumes (from ${e.consumeEvidence.runs} measured run(s)): ${JSON.stringify(e.consumes)}`);
         this._saveSkills();
     }
@@ -6839,6 +6850,7 @@ Use only c; no other globals.`;
         // output stayed on the bot and the next run appended to it.
         bot.output = '';
         const stateBefore = this.observe();   // fix70: measured right before this run
+        bot._runDiscardTally = new Map();   // fix182: discards during this practice run are disposals, not consumption
         const practiceStart = Date.now();
         // fix70: the practice run is over only when the skill's own code has returned (live 01:07:52Z: pickupNearbyItems
         //        ABORTED at step end, still running beside the next action)
@@ -8898,6 +8910,7 @@ ${lastCode ? `--- your previous code ---\n${lastCode}\n` : ''}${feedback ? `--- 
             // fix70: this attempt's own window (see _replay): `before` is the task-start snapshot taken before the proposal, any
             //        replay/backchain, every code-model call (with idle practice running beside it) and the earlier attempts
             const runBefore = this.observe();
+            this._beginMeasuredRun();   // fix182: tally discards made during this measured attempt
             this._runStart = Date.now();
             // fix78: the journal records every library skill this run can execute; for generated code that is exactly the staged
             //        closure (own + what it calls + their closures), the same set staging and tracing use above
@@ -9517,6 +9530,7 @@ Voyager.SEEDED_PRIMITIVES = [
             const slot = bot.inventory.items().find(it => it.name === itemName);
             if (!slot) throw new Error(\`depositToChest: \${itemName} not in inventory after opening \${cand.key}\`);
             await containerWindow.deposit(slot.type, null, toDeposit);
+            tallyDisposal(bot, itemName, toDeposit);   // fix182: depositing is disposal from inventory, not consumption
             log(bot, \`[chest] Deposited \${toDeposit} \${itemName} to known chest at \${cand.key}.\`);
         } finally {
             containerWindow.close();
@@ -9538,6 +9552,7 @@ Voyager.SEEDED_PRIMITIVES = [
     if (!item) { log(bot, \`Don't have any \${itemName} to toss.\`); return false; }
     const toToss = Math.min(count, item.count);
     await bot.toss(item.type, null, toToss);
+    tallyDisposal(bot, itemName, toToss);   // fix182: tossing is disposal, not consumption
     log(bot, \`[toss] Tossed \${toToss} \${itemName}.\`);
     return true;
 }`,
@@ -9579,6 +9594,7 @@ Voyager.SEEDED_PRIMITIVES = [
             });
         }
         await bot.toss(stacks[0].type, null, row.remove);
+        tallyDisposal(bot, row.item, row.remove);   // fix182: tossed plan rows are disposals, not consumption
     }
     const after = bot.inventory.emptySlotCount();
     if (!Number.isInteger(after) || after < 0) throw new Error('[fix92] tossClutter: emptySlotCount after the toss is not a non-negative integer');
