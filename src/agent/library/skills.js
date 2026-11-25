@@ -512,6 +512,21 @@ export async function attackEntity(bot, entity, kill=true) {
         // death is verified the way the client knows it: the entity leaving bot.entities. The
         // wait is bounded in game time (30 game seconds — pvp's melee rate kills anything it can
         // reach far sooner; what remains signals unreachable target or hits not registering).
+        // fix185: pvp is melee timing, not navigation. Its GoalFollow (PVP.js:72) can never move the
+        // bot to a swimming target: pathfinder 2.4.5 refuses liquid nodes (movements.js:526,546,642),
+        // so the goal below the surface has no path and the bot stands still for the whole window
+        // (live 25 Nov: "Attacking cod at 31 blocks." → "still alive after 30 game seconds (now 29
+        // blocks away)" x4 while hunger tasks failed; mindcraft.log). Close the distance with the
+        // library's own navigation first — the same approach the non-kill branch above does, and with
+        // it the door checks, learned stall watchdog and fix124b2 walk/swim segments — and fail
+        // honestly when the target column is unreachable instead of burning 30 game seconds idle.
+        if (bot.entity.position.distanceTo(pos) > 5) {
+            const reached = await goToPosition(bot, pos.x, pos.y, pos.z);
+            if (!reached) {
+                log(bot, `FAILED: could not reach ${entity.name} (was ${Math.round(pos.distanceTo(bot.entity.position))} blocks away) before attacking.`);
+                return false;
+            }
+        }
         log(bot, `Attacking ${entity.name} at ${Math.round(entity.position.distanceTo(bot.entity.position))} blocks.`);
         await bot.pvp.attack(entity);
         const deadline_ticks = 600; // 30 game seconds
