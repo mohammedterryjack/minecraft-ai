@@ -4497,6 +4497,18 @@ Use only c; no other globals.`;
         if (bareRoute && !entry) throw new Error(`[fix79] item goal "${task}" routed to ${r.name}, which is not in the skill library`);
         const routeFit = bareRoute ? this._routeFit(entry, routeItems) : null;
         if (routeFit && !routeFit.fits) console.log(`!!! [route] ${r.name} routed to "${task}" with no learned evidence it produces [${routeFit.items.join(', ')}] (learned produces [${routeFit.produces.join(', ')}])`);
+        // fix186 (iMac, 21:00Z 25 Nov): apply the fix86 misroute rule BEFORE burning a run. "approach cod" was routed
+        //        (lexical/embedding name match) to the learned approachCod whose evidence says it produces [cobblestone]:
+        //        the replay ran, died or met its contract, and only then did _attribute print MISROUTE — the same
+        //        proven-disjoint pair was re-routed and re-run every time the goal came back. A route the selector
+        //        picked (routed) whose skill has non-empty learned produces disjoint from the goal items cannot
+        //        produce the goal: return null (no replay candidate) so the task goes to backchain/code, exactly like
+        //        the precheck skips. Empty produces stays no evidence (fix86); committed routes (backchain, plan
+        //        steps, need raisers, gate trials) are not routed selections and keep running.
+        if (r.routed && routeFit && !routeFit.fits && routeFit.produces.length > 0) {
+            console.log(`[fix186] skip replay ${r.name} for "${task}": learned produces [${routeFit.produces.join(', ')}] are disjoint from goal [${routeFit.items.join(', ')}]; no run burned, routing to backchain/code instead`);
+            return null;
+        }
         // fix65: the goal-overlap gate above (#30) decides the ROOT's own candidate only. #30 also AND-ed it into the children,
         // so a child candidate ran only when the replayed root had a candidate of its own: replays (the common path) never
         // ran the 09:37Z collectBlock candidate, its 0/0 record never moved, and every repair of collectBlock was deferred
@@ -8733,6 +8745,9 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
             route = bringer ? { name: bringer.name, call: `await ${bringer.name}(bot);` } : (this._findReplay(task) || await this._embedReplay(task));
         } else if (goalKind.kind === 'open') route = this._structuredReplay(task) || await this._embedReplay(task);
         else route = this._findReplay(task) || await this._embedReplay(task);   // fix28 (D): replay a matching learned skill before any code-model call
+        // fix186: routes chosen by the selector (not identity goals, not committed backchain/plan steps) are marked so
+        //        _replay can refuse a proven-disjoint pair before running it.
+        if (route && goalKind.kind !== 'skill') route.routed = true;
         let rp = route ? await this._replay(task, before, route) : null;
         if (route?.embed) this._learnReplayThreshold(rp);
         if (!rp?.ok && !rp?.interrupted) { const bc = await this._backchain(task, rp ? this.observe() : before, rp ? rp.needs : null); if (bc) rp = { ...bc, needs: rp ? rp.needs : null }; }   // fix32 PSN backward chaining (fix81: on the missing item too)
