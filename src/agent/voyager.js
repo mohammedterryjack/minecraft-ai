@@ -7009,8 +7009,18 @@ Use only c; no other globals.`;
         //        recipes, furnace recipes). A learned producer's task is a subgoal only when that task's item is the
         //        goal item or a direct input. The old inventory-first path rewrote the goal with skill.task.replace,
         //        so a dirt skill whose effects listed the goal became "collect dirt".
+        // fix187 (iMac, 25 Nov 21:48Z): parseVerboseGoal's fix51 camelCase fallback parses "approach cod" as an ITEM
+        //        goal (cod, count 1), so this branch planned cod's producer "Kill 1 cod" as its subgoal — but killing
+        //        cod REQUIRES approaching cod, and the needs path (fix87) decomposes "Kill 1 cod" back into
+        //        "approach cod": the two goals decomposed into each other every cycle (live: approach cod -> Kill 1 cod
+        //        -> approach cod repeated all evening while the bot starved). The goal KIND is authoritative here:
+        //        _resolveGoal says 'approach', and an approach goal's miss is an entity-presence need (fix141/fix87
+        //        record it), never an item-production plan. Game-data item planning stays for real item goals.
         const goal = smeltGoal(task) || countGoal(task) || parseVerboseGoal(task);
-        if (goal && typeof goal.item === 'string' && Number.isInteger(goal.count)) {
+        if (goal && typeof goal.item === 'string' && Number.isInteger(goal.count) && this._resolveGoal(task).kind === 'approach') {
+            console.log(`[fix187] "approach"-goal "${task}" parsed as item ${goal.item}x${goal.count}; game-data item planning does not apply to approach goals, no producer subgoal`);
+        }
+        else if (goal && typeof goal.item === 'string' && Number.isInteger(goal.count)) {
             const state = this.observe();
             const planner = this._obtainPlanner(state);
             const src = planner.sources(goal.item);
