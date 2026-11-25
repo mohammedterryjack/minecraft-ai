@@ -401,7 +401,13 @@ export function obtainPlanner({ registry, recipesOf, known, proven, edgeSuccess,
             const ctx = { cycles: new Set(), unobtainable: new Set(), ties: new Set() };
             const best = plan(item, count, { ...inv }, [], ctx, true);
             const list = set => (set.size ? [...set].join('; ') : 'none');
-            if (!best) throw new Error(`[fix81] LOUD: no acyclic way to obtain ${count} ${item} from the game data (cycles: ${list(ctx.cycles)}; unobtainable: ${list(ctx.unobtainable)})`);
+            if (!best) {
+                // fix183: structured so the reach-need chain (voyager _subgoalForNeed) can tell "no way from this
+                // world state" (search for the block instead) from a planner bug (which must propagate).
+                const err = new Error(`[fix81] LOUD: no acyclic way to obtain ${count} ${item} from the game data (cycles: ${list(ctx.cycles)}; unobtainable: ${list(ctx.unobtainable)})`);
+                err.noAcyclicWay = true;
+                throw err;
+            }
             if (!Array.isArray(best.ingredients)) throw new Error(`[fix92] plan for ${item} has no direct ingredient list`);
             return {
                 how: best.how,

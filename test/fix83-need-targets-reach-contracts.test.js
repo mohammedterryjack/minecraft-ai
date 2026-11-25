@@ -135,13 +135,18 @@ describe('fix83 (1): a need subgoal is satisfied by what its parent needs HELD, 
 });
 
 describe('fix83 (2): "No <block> nearby" is a structured reach need, chained like the chest-proximity need', () => {
-    it('live "Collect 2 oak_planks" with none within reach -> reach oak_planks -> collect -> the goal passes', async () => {
+    it('live "Collect 2 oak_planks" with none within reach -> fix183 routes the refuted reach through the game data -> the goal passes', async () => {
         const inv = { ...LIVE_INV };
         const v = mkV({ inv, nearby: [], reachable: new Set() });
         await quiet(() => drive(v, 'Collect 2 oak_planks'));
-        assert.deepStrictEqual(v.ran, ['Collect 2 oak_planks', 'reach oak_planks', 'Collect 2 oak_planks']);
+        // fix183: planks are crafted, and no plank source is perceived, so the reach need no longer chains the
+        // search the world just refuted (reach oak_planks); the planner routes Craft 2 oak_planks <- Collect 1
+        // oak_log <- reach oak_log (searching for logs, the actual source, is what makes progress).
+        assert.deepStrictEqual(v.ran, ['Collect 2 oak_planks', 'Craft 2 oak_planks', 'Collect 1 oak_log', 'reach oak_log', 'Collect 1 oak_log', 'Craft 2 oak_planks']);
         assert.strictEqual(v.progress.decomposed['Collect 2 oak_planks'].reason, 'needs: 2 oak_planks (reach, reported)');
-        assert.ok(v.progress.completed.includes('reach oak_planks'));
+        assert.ok(v.progress.completed.includes('reach oak_log'));
+        assert.ok(v.progress.completed.includes('Collect 1 oak_log'));
+        assert.ok(v.progress.completed.includes('Craft 2 oak_planks'));
         assert.ok(v.progress.completed.includes('Collect 2 oak_planks'));
     });
     it('a reach goal is its own kind: verified by observation, keyed apart from placing, and gives no game-data need', () => {

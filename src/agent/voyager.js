@@ -5695,7 +5695,31 @@ Use only c; no other globals.`;
     //        (fix92). Anything else is a learned producer, else the game data.
     _subgoalForNeed(n, state, task, below) {
         if (n.reason === 'proximity') return { task: `ensure ${n.item}`, need: n, edge: null };
-        if (n.reason === 'reach') return { task: `reach ${n.item}`, need: n, edge: null };
+        if (n.reason === 'reach') {
+            // fix183: a reach need is evidence of absence — it is reported by a source search that just returned
+            //        empty (collectBlock found no source block within its radius). Chaining `reach X` anyway repeats
+            //        the search the world just refuted: iron_block chained "reach iron_block" (4 full attempts, the
+            //        block exists nowhere in this world) before its failure re-chain produced "Craft 1 iron_block"
+            //        (9 iron_ingots held) — the route the game-data planner states from the start. Voyager's
+            //        automatic curriculum proposes the next frontier task from the skill library and world state
+            //        rather than retrying refuted exploration (arXiv:2305.16291, Wang et al. 2023). The planner
+            //        charges unperceived collect routes its unknown cost, so with a source seen, or a proven obtain,
+            //        or nothing cheaper (oak_log with no tree perceived), its best stays collect and reach is right;
+            //        when craft/smelt/obtain is the cheaper route from what the bot holds, that task IS the subgoal.
+            let alt = null;
+            try {
+                alt = this._obtainPlanner(state).prerequisites(n.item, n.count, state.inventory);
+            } catch (err) {
+                if (err && err.noAcyclicWay === true)
+                    console.log(`[backchain] reach ${n.item}: the game data gives no other way from this world state; searching for the block`);
+                else throw err;   // fix97 unsearchedBlock / any planner fault: the caller's contract, not ours to swallow
+            }
+            if (alt !== null && alt.how !== 'collect') {
+                console.log(`[backchain] reach ${n.item}: game data routes to "${alt.task}" (${alt.how}); not repeating a search the world just refuted`);
+                return { task: alt.task, need: n, edge: n.item };
+            }
+            return { task: `reach ${n.item}`, need: n, edge: null };
+        }
         if (n.reason === 'approach') return { task: `approach ${n.item}`, need: n, edge: null };   // fix141
         if (n.reason === 'slot') return this._slotAction(task, n, below, state);
         const learned = this._subgoalToObtainItem(n.item, n.count, state.inventory, new Set());

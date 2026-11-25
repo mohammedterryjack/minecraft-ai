@@ -92,7 +92,9 @@ describe('fix85 (C): a nested need stays on the nested frame', () => {
         const needs = v._failureNeeds('Collect 4 oak_planks', global, trace, v.observe());
         assert.deepStrictEqual(needs.map(n => ({ item: n.item, reason: n.reason, source: n.source })), [{ item: 'oak_planks', reason: 'reach', source: 'reported by collectBlock' }]);
         assert.strictEqual(v._chainNeeds('Collect 4 oak_planks', needs, v.observe()), true);
-        assert.deepStrictEqual(v.progress.subgoals.map(s => s.task), ['reach oak_planks', 'Collect 4 oak_planks']);
+        // fix183: the root reach need is still the oak_planks need (asserted above), but chaining it now consults
+        // the game data: planks are craftable, so the front subgoal is the craft, not the refuted plank search.
+        assert.deepStrictEqual(v.progress.subgoals.map(s => s.task), ['Craft 4 oak_planks', 'Collect 4 oak_planks']);
     });
     it('a stick need that exists only on a nested frame does not decompose Collect oak_planks into Craft 3 sticks', () => {
         const v = mkV();
