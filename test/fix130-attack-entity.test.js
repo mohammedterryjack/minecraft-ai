@@ -70,8 +70,10 @@ describe('fix130 attackEntity kill path: observability, honest verification, bou
 
     it('a mob that merely left the window (still in client knowledge) is not counted as killed', async () => {
         const bot = mkBot({});
-        // entity stays in bot.entities but 500 blocks away: not a death
-        bot._entity.position = new Vec3(500, 33, 0);
+        // fix185 note: a target that starts out 500 blocks away now fails at the approach gate
+        // before any swing; to keep THIS test's intent (mob flees mid-engagement) it teleports
+        // away only after the attack loop has started.
+        setTimeout(() => { bot._entity.position = new Vec3(500, 33, 0); }, 30);
         const t0 = Date.now();
         assert.strictEqual(await attackEntity(bot, bot._entity, true), false);
         assert.ok(Date.now() - t0 < 30000);
