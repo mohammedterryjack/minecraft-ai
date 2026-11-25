@@ -6609,7 +6609,8 @@ Use only c; no other globals.`;
     //        (_practiceJudgeable) is not picked: its run could not move its stats, so it would be picked again every run
     _selectPracticeSkill(notAgain) {
         if (!(notAgain instanceof Map)) throw new Error('[idle-practice] _selectPracticeSkill: notAgain must be a Map');
-        const inv = this.observe().inventory;
+        const obs = this.observe();
+        const inv = obs.inventory;
         const pending = this._getPendingGoalItems();  // items needed by pending/failed tasks
         const candidates = this.skills.filter(s =>
             !s.primitive && !s.handwritten && !s.demoted && !s.mergedInto && !s.candidate &&
@@ -6623,7 +6624,7 @@ Use only c; no other globals.`;
                 if (!this._unjudgeableNoted.has(s.name)) { this._unjudgeableNoted.add(s.name); console.log(`[idle-practice] not practising ${s.name}: ${s.contract && s.contract.post ? `its post cannot verify a run (${s.postUnverifiable.why})` : 'no learned post-contract'} and no effects verified by run evidence, so a practice run could not be judged`); }
                 return false;
             }
-            const skip = this._shouldSkipPractice(s, inv, pending);
+            const skip = this._shouldSkipPractice(s, obs, pending);
             if (skip) console.log(`[idle-practice] filtering out ${s.name}: ${skip}`);
             return !skip;
         });
@@ -6637,7 +6638,6 @@ Use only c; no other globals.`;
         // Note: filter above ensures s.stats exists (via `s.stats &&`)
         // fix93: a post that already holds on this world is not a candidate. Relevance 0 is not usefulness.
         //        A known causal effect with no plan overlap has nothing to learn and nothing to serve.
-        const obs = this.observe();
         const pendingSize = pending.size;
         const excluded = [];
         const scored = [];
@@ -6770,15 +6770,25 @@ Use only c; no other globals.`;
     // fix42: check if a practice skill should be skipped (postcondition already met or would consume scarce inputs)
     // Returns a skip reason string, or null if practice is allowed
     // fix49: effects/consumes/stats initialized at load time - read directly
-    _shouldSkipPractice(skill, inv, pendingItems) {
+    // fix184: the effects heuristic is a stand-in for the contract, not an extra gate. A skill whose post
+    //        _practicePostAlreadyMet can evaluate is governed by that post (checked for every candidate in
+    //        _selectPracticeSkill); the effects proxy must not veto against it. Live 25 Nov: eatTwoSalmon was filtered
+    //        out every idle window with "postcondition already met (has all of: granite)" — granite is an incidental
+    //        gain recorded in its effect runs, while its post (salmon down, hp up) never holds without eating, so the
+    //        proxy starved the bot's own food skill while it stood at 13 HP. The proxy still stands for skills whose
+    //        post cannot be evaluated on the current observation.
+    _shouldSkipPractice(skill, obs, pendingItems) {
+        const inv = obs.inventory;
         // 1) Check if postcondition is already satisfied (learned path: check effects + inventory)
         // fix74: only effects verified by run evidence (an unverified list such as [crafting_table, cobblestone] says nothing)
-        const effects = verifiedEffects(skill);
-        if (effects.length > 0) {
-            const produced = effects.filter(eff => inv[eff] > 0);
-            // if all effects are already in inventory, postcondition is likely met
-            if (produced.length === effects.length) {
-                return `postcondition already met (has all of: ${effects.join(', ')})`;
+        if (!this._practicePostAlreadyMet(skill, obs).evaluable) {
+            const effects = verifiedEffects(skill);
+            if (effects.length > 0) {
+                const produced = effects.filter(eff => inv[eff] > 0);
+                // if all effects are already in inventory, postcondition is likely met
+                if (produced.length === effects.length) {
+                    return `postcondition already met (has all of: ${effects.join(', ')})`;
+                }
             }
         }
         // 2) Check if skill would consume scarce inputs needed by pending goals

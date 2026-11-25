@@ -36,7 +36,7 @@ describe('fix70: the dirt effect, from the live window', () => {
         // the pre-fix70 rule, verbatim from the log: have 2 < need 2 * 3
         assert.ok(pending.has('dirt') && inv.dirt < s.consumes.dirt * 3, 'would consume scarce dirt (have 2, need 2)');
         assert.deepStrictEqual(verifiedConsumes(s), {});
-        assert.strictEqual(v._shouldSkipPractice(s, inv, pending), null);
+        assert.strictEqual(v._shouldSkipPractice(s, { inventory: inv }, pending), null);
     });
     it('the first measured run of eatCookedMutton replaces the stale record with what it really spends', () => {
         const v = mkV(), s = legacy();
@@ -61,7 +61,7 @@ describe('fix70: consumption carries evidence and is re-verified', () => {
         const v = mkV(), s = { name: 'smelt', effects: [], consumes: {} };
         recordConsumeEvidence(s, { raw_iron: 4 }, { raw_iron: 3 });
         recordConsumeEvidence(s, { raw_iron: 3 }, { raw_iron: 2 });
-        assert.match(v._shouldSkipPractice(s, { raw_iron: 2 }, new Set(['raw_iron'])), /would consume scarce raw_iron \(have 2, need 1/);
+        assert.match(v._shouldSkipPractice(s, { inventory: { raw_iron: 2 } }, new Set(['raw_iron'])), /would consume scarce raw_iron \(have 2, need 1/);
     });
     it('bad inventories fail loud', () => {
         assert.throws(() => recordConsumeEvidence({ name: 'z' }, null, {}), /before\/after inventories are required/);
