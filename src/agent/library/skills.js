@@ -1338,8 +1338,27 @@ export async function discard(bot, itemName, num=-1) {
         log(bot, `You do not have any ${itemName} to discard.`);
         return false;
     }
+    // fix182: disposal is not consumption. A skill that ran discard() lowered the item in its
+    // measured window, recordConsumeEvidence (consume_evidence.js) logged it as consumed, and
+    // _publishItemKeeps reserved it — the toss skills' own tossing reserved granite 64 /
+    // leaf_litter 74, so discard() refused every later free-up ("keeping all 19 granite: 64
+    // reserved", mindcraft.log 69905/72688). Tossing/storing leaves no causal need for the
+    // item (the next run may hold none at all), so the run records a disposal instead; one new
+    // measured run then outvotes the pre-fix consume evidence and the reservation drains itself.
+    tallyDisposal(bot, itemName, discarded);
     log(bot, `Discarded ${discarded} ${itemName}.`);
     return true;
+}
+
+export function tallyDisposal(bot, itemName, count) {
+    /**
+     * fix182: if a run window is being measured (bot._runDiscardTally installed by Voyager
+     * before each measured run), record that `count` of itemName left the inventory by
+     * disposal (discard/toss/putInChest), NOT by being spent as an input. Voyager subtracts
+     * the tally from the consume evidence for that run.
+     **/
+    if (!(bot._runDiscardTally instanceof Map) || !(count > 0)) return;
+    bot._runDiscardTally.set(itemName, (bot._runDiscardTally.get(itemName) ?? 0) + count);
 }
 
 export async function putInChest(bot, itemName, num=-1) {
@@ -1373,6 +1392,7 @@ export async function putInChest(bot, itemName, num=-1) {
     catch (e) { log(bot, `Could not open the chest at ${chest.position}: ${e.message}`); return false; }
     await chestContainer.deposit(item.type, null, to_put);
     await chestContainer.close();
+    tallyDisposal(bot, itemName, to_put);   // fix182: storing in a chest is disposal, not consumption
     log(bot, `Successfully put ${to_put} ${itemName} in the chest.`);
     return true;
 }

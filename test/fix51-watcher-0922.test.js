@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
 import { missingCalls } from '../src/agent/skill_graph.js';
+import { tallyDisposal } from '../src/agent/library/skills.js';   // fix182: tossClutter tallies its disposals
 import { Voyager, _setVersionForTest } from '../src/agent/voyager.js';
 
 describe('fix51 watcher 09:22', () => {
@@ -11,7 +12,7 @@ describe('fix51 watcher 09:22', () => {
     });
     it('tossClutter that drops items without freeing a slot returns false, and the seeded post does not hold', async () => {
         const prim = Voyager.SEEDED_PRIMITIVES.find(p => p.name === 'tossClutter');
-        const fn = new Function(`return (${prim.code});`)();
+        const fn = new Function('tallyDisposal', `return (${prim.code});`)(tallyDisposal);
         let count = 24;
         const bot = {
             interrupt_code: false,

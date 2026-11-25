@@ -9,12 +9,19 @@
 // an inventory map lists only items held: an item absent from it is held 0 times
 export const count = (inv, k) => Object.hasOwn(inv, k) ? inv[k] : 0;
 
-export function recordConsumeEvidence(skill, inv0, inv1) {
+export function recordConsumeEvidence(skill, inv0, inv1, discarded) {
     if (!inv0 || !inv1 || typeof inv0 !== 'object' || typeof inv1 !== 'object') throw new Error(`recordConsumeEvidence(${skill?.name}): before/after inventories are required`);
+    // fix182: items the run itself threw away (skills.discard / putInChest — see tallyDisposal)
+    // left the inventory by disposal, not by being spent as an input. Their toss skills' own
+    // tossing reserved granite 64 / leaf_litter 74 forever ("keeping all 19 granite: 64
+    // reserved", mindcraft.log 69905/72688): a disposal says nothing about needing the item.
+    // The tally only credits disposal UP TO the observed drop — a drop larger than the tally
+    // (e.g. 50 dropped, 30 tossed) still records the 20 the run really spent.
+    const disposal = discarded instanceof Map ? discarded : new Map();
     const ev = Object.hasOwn(skill, 'consumeEvidence') ? skill.consumeEvidence : { runs: 0, items: {} };
     ev.runs++;
     for (const k of Object.keys(inv0)) {
-        const spent = count(inv0, k) - count(inv1, k);
+        const spent = count(inv0, k) - count(inv1, k) - (disposal.get(k) ?? 0);
         if (spent <= 0) continue;
         const it = Object.hasOwn(ev.items, k) ? ev.items[k] : (ev.items[k] = { runs: 0, max: 0 });
         it.runs++;

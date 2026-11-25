@@ -15,7 +15,7 @@ import { capacityPlan, inventoryStacks, emptySlotsToFit, stackableCounts, placeC
 import { obtainPlanner } from '../src/agent/recipe_plan.js';
 import { SlotEffects } from '../src/agent/slot_effects.js';
 import { roomForItem } from '../src/agent/library/world.js';
-import { _freeInventory } from '../src/agent/library/skills.js';
+import { _freeInventory, tallyDisposal } from '../src/agent/library/skills.js';   // fix182: seeded tosses tally disposals
 import { Coder } from '../src/agent/coder.js';
 
 const require = createRequire(import.meta.url);
@@ -278,7 +278,7 @@ describe('fix92: nested capacity failure retries the blocked parent', () => {
         const before = stackableCounts(bot).oak_log;
         assert.strictEqual(before, undefined);
         const prim = Voyager.SEEDED_PRIMITIVES.find(p => p.name === 'tossClutter');
-        const toss = new Function(`return (${prim.code});`)();
+        const toss = new Function('tallyDisposal', `return (${prim.code});`)(tallyDisposal);   // fix182
         bot.closeWindow = () => {};
         bot.on = () => {};
         bot.off = () => {};
@@ -341,7 +341,7 @@ describe('fix92: toss measures slots, and the seeded definition is revalidated',
         const prim = Voyager.SEEDED_PRIMITIVES.find(p => p.name === 'tossClutter');
         assert.ok(!prim.code.includes('__slotsNeeded'));
         assert.match(prim.code, /async function tossClutter\(bot, slotsNeeded, plan\)/);
-        const fn = new Function(`return (${prim.code});`)();
+        const fn = new Function('tallyDisposal', `return (${prim.code});`)(tallyDisposal);   // fix182: seeded tosses tally disposals
         let count = 24;
         const lines = [];
         const orig = console.log;
@@ -386,7 +386,7 @@ describe('fix92: toss measures slots, and the seeded definition is revalidated',
 
     it('a toss that empties stacks across the kind returns the slots gained', async () => {
         const prim = Voyager.SEEDED_PRIMITIVES.find(p => p.name === 'tossClutter');
-        const fn = new Function(`return (${prim.code});`)();
+        const fn = new Function('tallyDisposal', `return (${prim.code});`)(tallyDisposal);   // fix182: seeded tosses tally disposals
         let empty = 0;
         const stacks = [{ name: 'dirt', type: registry.itemsByName.dirt.id, count: 64 }, { name: 'dirt', type: registry.itemsByName.dirt.id, count: 10 }];
         const calls = [];
