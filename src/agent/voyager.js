@@ -2917,11 +2917,17 @@ Use only c; no other globals.`;
     // cuts stay with fix77's threat path. Kind 'need' is never blamed on a skill or the goal backoff.
     _playableFoodRaisers() {
         const out = [];
+        // fix191: a raiser whose learned pre decisively does not hold NOW (eatTwoSalmon replayed at salmon 0,
+        // mindcraft.log 26 Nov 06:59/07:12 — raiser picked from lifetime +0.4 food/run stats, run burned,
+        // VIOLATED) is not playable this step. Same rule fix119 applies to practice selection.
+        const obs = this.observe();
         for (const r of this.vitals.foodRaisers()) {
             const e = this.skills.find(s => s.name === r.name);
             if (!e) continue;
             if (e.demoted) continue;
             if (e.mergedInto) continue;
+            const pre = this._practicePreHolds(e, obs);
+            if (pre.holds === false) { console.log(`[urgent-need] raiser ${e.name} skipped: ${pre.reason}`); continue; }
             out.push({ entry: e, raiser: r });
         }
         return out;
