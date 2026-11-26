@@ -2951,6 +2951,16 @@ Use only c; no other globals.`;
         const raiser = st.best !== null ? `${st.best.entry.name} +${VitalsModel.reportedFoodPerRun(st.K)} food/run` : 'none playable';
         return `hunger ${why}; raiser ${raiser}; regenLossHp ${st.regenLossHp}`;
     }
+    // fix192: is a need label no longer a need right now? 'need:hunger' is resolved when the vitals model reports the
+    // hunger serve as not servable (food back at/above the learned regen floor). Unknown need labels are a bug, not a
+    // miss: fail loud.
+    _needTaskResolved(task) {
+        if (typeof task !== 'string') return false;
+        if (!task.startsWith('need:')) return false;
+        const need = task.slice(5);
+        if (need === 'hunger') return !this._hungerServeState().servable;
+        throw new Error(`[fix192] _needTaskResolved: unknown need label "${task}" (only hunger has a serve state)`);
+    }
     // Learned HP at stake if we continue `taskName`, from death evidence on that task (deathSpots.tasks).
     // Each death = full observed hpMax lost. No death evidence → 0 (task protects no HP in the data).
     _taskHpStake(taskName) {
@@ -8879,6 +8889,19 @@ Interrupts: the bot may be interrupted at any time (danger, getting stuck, a pla
         let prevReplyHash = null, consecutiveDupes = 0;
         for (let i = 1; i <= MAX_ATTEMPTS; i++) {
             if (this.abort) { console.log('[voyager] aborted for player'); return true; }
+            // fix192: a need task ends with the need. Live 26 Nov 08:12Z: need:hunger attempt 2 ran eat-code at food=20
+            // (attempt 1 had eaten via eatIfHungry while the critic judged the attempt itself failed) and logged
+            // "[contract] VIOLATED checkHungerAndEat() precondition". The need was satisfied; no further attempt on it
+            // can do anything but violate the eat skills' preconditions.
+            if (this._needTaskResolved(task)) {
+                console.log(`[voyager] ${task} resolved mid-task (food ${this.agent.bot.food}/${skills.getVitalsMax(this.agent.bot).food}); closing it without another attempt`);
+                this._markCompleted(task);
+                this.progress.failed = this.progress.failed.filter(t => t !== task);
+                this._recordGoalOutcome(task, true, null);
+                this._saveProgress();
+                this._afterSuccess();
+                return true;
+            }
             // fix37: escalating duplicate feedback (changes each time to nudge the model)
             const dupeEscalation = consecutiveDupes > 0 ? `\n\n!!! CRITICAL: Your previous ${consecutiveDupes} reply(ies) were IDENTICAL to the one before. You MUST write DIFFERENT code this time. The previous code did not work. Change your approach, use different skills, or try a simpler strategy. Repeating the same code will cause this task to fail. !!!` : '';
             // Counts stay in the state. snapshotThresholdFeedback rejects a comparison that copies one of them.
