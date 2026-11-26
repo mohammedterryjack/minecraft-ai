@@ -448,6 +448,60 @@ const AQUATIC_MOBS = ['drowned', 'cod', 'salmon', 'pufferfish', 'tropical_fish',
 // spawn packets arrive asynchronously, so the check is periodic, not a one-shot glance.
 const SCAN_POLL_MS = 250;
 
+// fix196: the range at which an attack can actually land. mineflayer-pvp enforces
+// attackRange = 3.5 (node_modules/mineflayer-pvp/lib/PVP.js:41; beyond it pvp.attack returns
+// targetTooFar unsent, PVP.js:163) and bot.attack is a single instant swing with a server-side
+// range check (mineflayer entities.js). fix185's gate closed only when distance > 5 with
+// goToPosition's default min_distance = 2, so a target 3.5-5 blocks away was attacked from out
+// of range, and for aquatic mobs walking can never land in range at all: pathfinder 2.4.5
+// refuses liquid nodes ("dont go underwater" -
+// node_modules/mineflayer-pathfinder/lib/movements.js:526,544,554), so a swimming fish has no
+// GoalNear node and the walk always stops at the water body's shore (live 25 Nov: every
+// approachCod/killOneCod attempt died at a pond 57 blocks away, "Smelt 3 cod" failed behind it).
+const PVP_ATTACK_RANGE = 3.5;
+
+// How long the shore-entry attempt in approachForMelee keeps walking toward the target column
+// before concluding this water body cannot be entered from where the bot stands. Bounded like
+// every other wait in this file; the drowning reflex (modes.js:68) still guards air underneath.
+const WATER_ENTRY_MS = 3000;
+
+async function approachForMelee(bot, entity) {
+    /**
+     * Close to within PVP_ATTACK_RANGE of a live entity. Land targets are walked to (GoalNear
+     * with the melee range itself, so the walk ends exactly where attacks connect). Aquatic
+     * targets additionally get the water leg the pathfinder cannot plan: step into the water in
+     * front (only if there is water in front - no blind wandering), then swim the last stretch
+     * with the game's own liquid controls (swimTowards) and surface at the target column, where
+     * melee reaches the fish below (https://minecraft.wiki/w/Fishing - fish occupy water columns
+     * the player swims to; the bot has no other liquid movement, see swimTowards docs).
+     * @param {MinecraftBot} bot, reference to the minecraft bot.
+     * @param {Entity} entity, the mob to get within melee range of.
+     * @returns {Promise<boolean>} true if the bot ended within PVP_ATTACK_RANGE of the entity.
+     **/
+    if (bot.entity.position.distanceTo(entity.position) <= PVP_ATTACK_RANGE) return true;
+    await goToPosition(bot, entity.position.x, entity.position.y, entity.position.z, PVP_ATTACK_RANGE);
+    if (bot.entity.position.distanceTo(entity.position) <= PVP_ATTACK_RANGE) return true;
+    if (!AQUATIC_MOBS.includes(entity.name)) return false;
+    if (!bot.entity.isInWater) {
+        const dir = entity.position.minus(bot.entity.position);
+        dir.y = 0;
+        dir.normalize();
+        const ahead = bot.blockAt(bot.entity.position.plus(dir.scale(1.2)));
+        if (!ahead || !ahead.name.includes('water')) return false;
+        await bot.lookAt(entity.position);
+        const entryDeadline = Date.now() + WATER_ENTRY_MS;
+        bot.setControlState('forward', true);
+        bot.setControlState('jump', true);
+        while (Date.now() < entryDeadline && !bot.entity.isInWater && !bot.interrupt_code)
+            await bot.waitForTicks(5);
+        bot.setControlState('forward', false);
+        bot.setControlState('jump', false);
+    }
+    if (!bot.entity.isInWater) return false;
+    await swimTowards(bot, entity.position.x, entity.position.z);
+    return bot.entity.position.distanceTo(entity.position) <= PVP_ATTACK_RANGE;
+}
+
 export async function attackNearest(bot, mobType, kill=true) {
     /**
      * Attack mob of the given type.
@@ -495,9 +549,12 @@ export async function attackEntity(bot, entity, kill=true) {
     await equipHighestAttack(bot)
 
     if (!kill) {
-        if (bot.entity.position.distanceTo(pos) > 5) {
+        if (bot.entity.position.distanceTo(pos) > PVP_ATTACK_RANGE) {
             console.log('moving to mob...')
-            await goToPosition(bot, pos.x, pos.y, pos.z);
+            if (!await approachForMelee(bot, entity)) {
+                log(bot, `FAILED: could not reach ${entity.name} (was ${Math.round(entity.position.distanceTo(bot.entity.position))} blocks away) before attacking.`);
+                return false;
+            }
         }
         console.log('attacking mob...')
         await bot.attack(entity);
@@ -513,16 +570,16 @@ export async function attackEntity(bot, entity, kill=true) {
         // death is verified the way the client knows it: the entity leaving bot.entities. The
         // wait is bounded in game time (30 game seconds — pvp's melee rate kills anything it can
         // reach far sooner; what remains signals unreachable target or hits not registering).
-        // fix185: pvp is melee timing, not navigation. Its GoalFollow (PVP.js:72) can never move the
-        // bot to a swimming target: pathfinder 2.4.5 refuses liquid nodes (movements.js:526,546,642),
-        // so the goal below the surface has no path and the bot stands still for the whole window
-        // (live 25 Nov: "Attacking cod at 31 blocks." → "still alive after 30 game seconds (now 29
-        // blocks away)" x4 while hunger tasks failed; mindcraft.log). Close the distance with the
-        // library's own navigation first — the same approach the non-kill branch above does, and with
-        // it the door checks, learned stall watchdog and fix124b2 walk/swim segments — and fail
-        // honestly when the target column is unreachable instead of burning 30 game seconds idle.
-        if (bot.entity.position.distanceTo(pos) > 5) {
-            const reached = await goToPosition(bot, pos.x, pos.y, pos.z);
+        // fix185 → fix196: pvp is melee timing, not navigation. Its GoalFollow (PVP.js:72) can never
+        // move the bot to a swimming target: pathfinder 2.4.5 refuses liquid nodes (movements.js:526,
+        // 544,554), so the goal below the surface has no path and the bot stood at the shore for the
+        // whole 30-game-second window (live 25 Nov: "Attacking cod at 31 blocks." → "still alive after
+        // 30 game seconds (now 29 blocks away)" x4 while hunger tasks failed; mindcraft.log). Close
+        // the distance with approachForMelee - the library's own navigation ending inside
+        // PVP_ATTACK_RANGE, with the swim leg for aquatic mobs - and fail honestly when the target
+        // cannot be reached instead of burning 30 game seconds idle.
+        if (bot.entity.position.distanceTo(pos) > PVP_ATTACK_RANGE) {
+            const reached = await approachForMelee(bot, entity);
             if (!reached) {
                 log(bot, `FAILED: could not reach ${entity.name} (was ${Math.round(pos.distanceTo(bot.entity.position))} blocks away) before attacking.`);
                 return false;
@@ -2471,8 +2528,12 @@ export async function goToMob(bot, mobType, { maxProbes = 4, scanMs = 5000 } = {
     const approach = async () => {
         const e = seen();
         if (!e) return false;
-        await goToPosition(bot, e.position.x, e.position.y, e.position.z, 2);
-        return true;
+        // fix196: return the navigation verdict, not the sighting. The old body awaited
+        // goToPosition and returned true unconditionally, so a mob spotted 50 blocks away with no
+        // path to it counted as "found and approached" and killMob attacked from out of range;
+        // approachForMelee also gives aquatic mobs the swim leg their water column requires
+        // (pathfinder refuses liquid nodes, movements.js:526,544,554).
+        return await approachForMelee(bot, e);
     };
     if (await approach()) return true;
     const aquatic = AQUATIC_MOBS.includes(mobType);
