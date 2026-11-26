@@ -67,10 +67,9 @@ describe('fix79 the live diamond -> scanForIronOreBlocks replay', () => {
         assert.ok(v.logs.some(l => l.includes('[blame] MISROUTE: scanForIronOreBlocks')), v.logs.join('\n'));
         assert.ok(!v.logs.some(l => l.includes('DEMOTE')));
     });
-    it('the misroute still counts against the route: the learned embedding threshold rises', () => {
+    it('fix195: a misroute moves no global bar — blame is per-route (skill stats / fix186 pair refusal)', () => {
         const v = rig([], () => null);
-        v._learnReplayThreshold({ ok: false, misrouted: { fits: false } });
-        assert.ok(v.progress.replayThreshold > 0.85);
+        assert.strictEqual(typeof v._learnReplayThreshold, 'undefined', 'the global ratchet was removed (it saturated at 0.98 and killed replay)');
     });
     it('contrast: a skill learned to produce the goal that met its contract and gained nothing IS blamed', async () => {
         const s = { ...afterReset(), effects: ['diamond'] };

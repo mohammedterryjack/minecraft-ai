@@ -100,12 +100,9 @@ describe('fix56 open goal is not verified by a vacuous post', () => {
         assert.deepStrictEqual(v.recorded, [], 'an unverified goal is not a pass or fail of the skill');
         assert.deepStrictEqual(v.attributed, [true], 'the skill met its own contract: no root blame for the goal');
     });
-    it('the learned replay threshold does not move on an unverified replay', () => {
+    it('fix195: no global replay threshold exists anymore — unverified replays could not move it', () => {
         const v = mk([]);
-        v._learnReplayThreshold({ ok: false, unverified: true });
-        assert.strictEqual(v.progress.replayThreshold, 0.85);
-        v._learnReplayThreshold({ ok: false });
-        assert.ok(v.progress.replayThreshold > 0.85);
+        assert.strictEqual(typeof v._learnReplayThreshold, 'undefined');
     });
 });
 

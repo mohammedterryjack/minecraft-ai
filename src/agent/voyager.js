@@ -4411,10 +4411,24 @@ Use only c; no other globals.`;
         }
         return best ? { name: best.name, call: `await ${best.name}(bot);` } : null;
     }
-    // fix28 (D): nearest learned skill by nomic-embed-text over its description; the match threshold is learned from replay outcomes
+    // fix28 (D): nearest learned skill by nomic-embed-text over its description
     // fix41: allow important primitives (tossClutter, tossItem, depositToChest) in embedding replay
+    // fix195: the gate is the fixed similarity floor; reliability blame belongs to the skill, not a global bar.
+    //        The old learned ratchet (fix28: +0.02 per replay failure, -0.01 per success, clamped to [0.6, 0.99])
+    //        saturated at the cap in months (live progress.json read 26 Nov: replayThreshold=0.98; log:
+    //        "(learned threshold 0.980) -> code model" for matches at 0.90-0.94). One failure of any route
+    //        suppressed replay for every task, so nearly every task regenerated code: ~30 near-duplicate toss_*
+    //        skills, 600-skill catalogue, 80-120 s curriculum calls, 250-skill idle enumerations, multi-second
+    //        [loop-stall] blocks. Voyager replays top-k retrieved skills and blames the skill on failure
+    //        (arXiv:2305.16291 §2 Method); this codebase already does exactly that per route — _recordRun
+    //        updates s.stats per replay outcome (voyager.js:4705), rate() scales the candidate score (4431),
+    //        streakFail>=3 DEMOTEs the skill out of replay (6545), and fix186 refuses proven-disjoint pairs.
+    //        The global ratchet was double-blame: one failed toss task raised the bar for unrelated tasks.
+    //        The ratchet's own cap (0.99 > observed true-match scores 0.90-0.94) proves it only ever killed replay.
     async _embedReplay(task) {
-        const th = this.progress.replayThreshold ??= 0.85;
+        // fix28's original default, now fixed: replay outcomes move skill stats (and fix186 pair refusals),
+        // not this number. Stale progress.replayThreshold values from the ratchet era are ignored, not read.
+        const th = 0.85;
         const q = await this._embed(task);
         let best = null, bs = -1;
         const g = this._resolveGoal(task);
@@ -4431,14 +4445,12 @@ Use only c; no other globals.`;
             const sc = cosineSimilarity(q, s.embedding) * (0.7 + 0.3 * rate(s.stats || newStats()));
             if (sc > bs) { bs = sc; best = s; }
         }
-        console.log(`[replay] embedding match for "${task}": ${best ? `${best.name} score ${bs.toFixed(3)}` : 'none'} (learned threshold ${th.toFixed(3)})${best && bs >= th ? ' -> replaying' : ' -> code model'}`);
+        console.log(`[replay] embedding match for "${task}": ${best ? `${best.name} score ${bs.toFixed(3)}` : 'none'} (similarity floor ${th.toFixed(3)})${best && bs >= th ? ' -> replaying' : ' -> code model'}`);
         return best && bs >= th ? { name: best.name, call: `await ${best.name}(bot);`, embed: bs } : null;
     }
-    _learnReplayThreshold(rp) {
-        if (!rp || rp.interrupted || rp.unverified) return;   // fix56: an unverifiable post says nothing about routing
-        const P = this.progress, old = P.replayThreshold; P.replayThreshold = Math.min(0.99, Math.max(0.6, old + (rp.ok ? -0.01 : 0.02))); this._saveProgress();
-        console.log(`[replay] embedding replay ${rp.ok ? 'passed' : 'failed'}; threshold ${old.toFixed(3)} -> ${P.replayThreshold.toFixed(3)}`);
-    }
+    // fix195: _learnReplayThreshold removed — the global ratchet saturated at 0.98 and killed replay
+    //        (see _embedReplay comment); per-route blame via _recordRun/rate()/DEMOTE and fix186 pair
+    //        refusals is the existing, correctly-attributed mechanism.
     // SkillCompiler-style effect contract for a route: what must hold before (pre) and what must change after (post)
     _contract(r) {
         let args = []; try { args = JSON.parse('[' + (r.call.match(/\(bot(?:,\s*(.*))?\);?$/)?.[1] || '') + ']'); } catch (e) {}
@@ -8869,7 +8881,8 @@ IMPORTANT: All functions use bare names. Do NOT write skills.X or world.X - call
         //        _replay can refuse a proven-disjoint pair before running it.
         if (route && goalKind.kind !== 'skill') route.routed = true;
         let rp = route ? await this._replay(task, before, route) : null;
-        if (route?.embed) this._learnReplayThreshold(rp);
+        // fix195: no global threshold learning here (see _embedReplay); _replay already recorded the
+        //        outcome on the route's own skill stats via _recordRun.
         if (!rp?.ok && !rp?.interrupted) { const bc = await this._backchain(task, rp ? this.observe() : before, rp ? rp.needs : null); if (bc) rp = { ...bc, needs: rp ? rp.needs : null }; }   // fix32 PSN backward chaining (fix81: on the missing item too)
         if (rp?.interrupted) { console.log('[voyager] task interrupted'); return true; }
         if (rp?.ok) {
