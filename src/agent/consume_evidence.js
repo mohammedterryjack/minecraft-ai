@@ -19,6 +19,9 @@ export function recordConsumeEvidence(skill, inv0, inv1, discarded) {
     // (e.g. 50 dropped, 30 tossed) still records the 20 the run really spent.
     const disposal = discarded instanceof Map ? discarded : new Map();
     const ev = Object.hasOwn(skill, 'consumeEvidence') ? skill.consumeEvidence : { runs: 0, items: {} };
+    // fix190: evidence is only trustworthy for a disposing skill if the run accounted for disposal; a run that
+    // measured without a tally (or any evidence recorded before fix182) is marked unaccounted (see verifiedConsumes).
+    if (discarded instanceof Map) ev.accounted = true; else delete ev.accounted;
     ev.runs++;
     for (const k of Object.keys(inv0)) {
         const spent = count(inv0, k) - count(inv1, k) - (disposal.get(k) ?? 0);
@@ -32,9 +35,37 @@ export function recordConsumeEvidence(skill, inv0, inv1, discarded) {
     return skill.consumes;
 }
 
+// fix190: consumption evidence recorded by a skill that can dispose of items is unverifiable unless the run
+// accounted for disposal. fix182 subtracts the disposal tally at measurement time, but evidence recorded before
+// the tally existed (or by a run without one) cannot tell "spent as input" from "thrown away": the toss skills'
+// own tossing became the keep floor ("keeping all 12 dirt: 33 reserved", "keeping all 9 granite: 64 reserved",
+// mindcraft.log 25 Nov — cleanupInventory granite x64, discardBulkLitter leaf_litter x74, goHoglin diorite x44
+// are each their own or a child skill's tossing), and the floor blocks discard() BEFORE the skill runs, so fix182's
+// "next measured run outvotes it" could never fire. Same stance as fix70's header comment: evidence that has never
+// been re-verified reports nothing — the next measured run (which fix190 now taps at every disposal path) re-earns it.
+export function annotateMayDispose(skills) {
+    // A skill can dispose when its code calls a disposal primitive, transitively through other skills' code.
+    const DISPOSAL_CALL = /\b(?:discard|tossItem|tossStack|toss|putInChest|depositToChest|_freeInventory)\s*\(/;
+    const dispose = new Set();
+    for (const s of skills) if (typeof s.code === 'string' && DISPOSAL_CALL.test(s.code)) dispose.add(s.name);
+    let changed = true;
+    while (changed) {
+        changed = false;
+        for (const s of skills) {
+            if (dispose.has(s.name) || typeof s.code !== 'string') continue;
+            for (const m of s.code.matchAll(/\b([A-Za-z_$][\w$]*)\s*\(/g)) {
+                if (dispose.has(m[1])) { dispose.add(s.name); changed = true; break; }
+            }
+        }
+    }
+    for (const s of skills) if (dispose.has(s.name)) s.mayDispose = true;
+    return dispose.size;
+}
+
 export function verifiedConsumes(skill) {
     if (!Object.hasOwn(skill, 'consumeEvidence')) return {};
     const ev = skill.consumeEvidence, out = {};
+    if (!ev.accounted && skill.mayDispose) return {};
     for (const [k, it] of Object.entries(ev.items)) if (it.runs === ev.runs) out[k] = it.max;
     return out;
 }

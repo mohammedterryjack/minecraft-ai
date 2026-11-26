@@ -37,7 +37,7 @@ import { withStallPhase } from '../utils/event_loop_guard.js';
 import { watchdogEvidencePath } from '../utils/main_thread_watchdog.js';
 import { wrapBotForApiTiming, setBotApiDurationStore } from '../utils/bot_api_timing.js';
 import { logPromptBreakdown, extractBareCalls } from './prompt_utils.js';   // fix47: shared prompt utilities
-import { recordConsumeEvidence, verifiedConsumes, recordEffectEvidence, verifiedEffects, count as invCount } from './consume_evidence.js';   // fix70, fix74
+import { recordConsumeEvidence, verifiedConsumes, recordEffectEvidence, verifiedEffects, count as invCount, annotateMayDispose } from './consume_evidence.js';   // fix70, fix74, fix190
 import { practiceWorld, causalChanges, effectVerdict, noteCausalSuccess } from './practice_rank.js';   // fix93
 import { createInferenceCover } from './inference_cover.js';   // fix93
 import { repairRetrySuffix, executableIdentity, repeatedRejection, builtInsCalled, repairLessonInHistory } from './repair_attempt.js';   // fix93
@@ -594,6 +594,8 @@ export class Voyager {
         this.indexFile = `${this.dir}/index.json`;
         this.progressFile = `${this.dir}/progress.json`;
         this.skills = existsSync(this.indexFile) ? JSON.parse(readFileSync(this.indexFile, 'utf8')) : [];
+        const _mayDispose = annotateMayDispose(this.skills);   // fix190: skills that can dispose (transitively); see verifiedConsumes
+        console.log(`[voyager] fix190: ${_mayDispose}/${this.skills.length} skills can dispose of items; their unaccounted consume evidence reports nothing until re-measured`);
         this._unverifiedConsumesNoted = new Set();   // fix70: skills whose evidence-less consumes was logged once (see _shouldSkipPractice)
         this._unjudgeableNoted = new Set();   // fix74: skills logged once as not practisable (nothing can judge their run)
         this._lastStepErrSig = null;   // fix75: signature of the previous step's error (null after a step that did not throw)
@@ -4761,7 +4763,30 @@ Use only c; no other globals.`;
     // this right after its before-snapshot: discards during the run land in the tally and are
     // excluded from consumption by recordConsumeEvidence.
     _beginMeasuredRun() {
-        this.agent.bot._runDiscardTally = new Map();
+        const bot = this.agent.bot;
+        bot._runDiscardTally = new Map();
+        // fix190: tally EVERY disposal path, not just the library helpers. Generated skill code that calls
+        // bot.tossStack/bot.toss directly bypassed fix182's tally (bots/icefox2000/skills/index.json contains
+        // bot.tossStack calls), so those runs kept re-polluting consume evidence with their own tossing.
+        if (!bot._tossTappedForEvidence) {
+            bot._tossTappedForEvidence = true;
+            if (typeof bot.tossStack === 'function') {
+                const tossStack = bot.tossStack.bind(bot);
+                bot.tossStack = async (item) => {
+                    if (item && item.name && item.count > 0) skills.tallyDisposal(bot, item.name, item.count);
+                    return tossStack(item);
+                };
+            }
+            if (typeof bot.toss === 'function') {
+                const toss = bot.toss.bind(bot);
+                bot.toss = async (itemType, count, ...rest) => {
+                    const name = typeof itemType === 'string' ? itemType : (itemType && itemType.name);
+                    const n = typeof count === 'number' ? count : 1;
+                    if (name && n > 0) skills.tallyDisposal(bot, name, n);
+                    return toss(itemType, count, ...rest);
+                };
+            }
+        }
     }
     _learnEffects(e, before, after, goalItems = null) {
         const inv0 = before.inventory, inv1 = after.inventory;
