@@ -76,6 +76,14 @@ if (![HOME.x, HOME.y, HOME.z].every(Number.isFinite)) throw new Error(`[home] ${
 const TOWN = HOME;
 const VILLAGE = { x: -800, z: 500 };
 const MAX_ATTEMPTS = 4;
+// fix194: a candidate is only useful while it can still reach a verdict. Trials happen ONLY when the task that
+//        learned the candidate routes through replay again, so a candidate whose task never recurs waits forever:
+//        live index.json 25 Nov held ~146 candidates (some from 17 Nov), and every repair of each blocked skill
+//        logged "a candidate is already under trial", deferred 6 times and DROPPED (Mo 21:00 steer: "repair loop
+//        is not making progress"). A candidate with no verdict within this deadline is rejected like a failed
+//        trial: the incumbent keeps running, the proposal record says why, and the next repair is not blocked.
+//        Candidates stored before the candidateSince stamp are already past every deadline: expired on sight.
+const CANDIDATE_TRIAL_DEADLINE_MS = 24 * 60 * 60e3;
 // fix176: cap on decompositions per goal since its last success (see _decompose).
 const MAX_GOAL_DECOMPOSES = 2;
 const PLAYER_QUIET_MS = 90 * 1000;   // pause after any player message
@@ -710,6 +718,13 @@ export class Voyager {
         console.log('[boot] watchdog report');
         this._reportWatchdogKill(watchdogEvidencePath(`./bots/${agent.name}`));   // fix96
         this._settleDeadTrials(watchdogEvidencePath(`./bots/${agent.name}`));   // fix65: a run that killed the previous process counts
+        // fix194: candidates stored before the candidateSince stamp (and any past the deadline while the process
+        //        was down) have no verdict coming: sweep them at boot so they stop blocking repairs.
+        {
+            let expired = 0;
+            for (const e of this.skills) if (this._expireStaleCandidate(e)) expired++;
+            if (expired) { console.log(`[fix194] boot: ${expired} expired candidate(s) rejected`); this._saveSkills(); }
+        }
         // fix50: assert no prefixed calls in prompt sources (fail loud at load time)
         if (this.agent?.prompter?.profile) {
             Voyager.assertNoPromptPrefixes(this.agent.prompter.profile, this.repairMemory);
@@ -3660,6 +3675,24 @@ Use only c; no other globals.`;
         console.error(`!!! [fix87] LOUD: candidate of ${e.name} rejected (not kept, not a step failure): ${dropped}`);
         delete e.candidate;
         this._noteProposal(e, { task, kind: 'trial', evidence: dropped, desc: 'candidate dropped the reported need', outcome: 'rejected dropped need' });
+    }
+    // fix194: see CANDIDATE_TRIAL_DEADLINE_MS. Returns true (and removes the candidate) when it is past its
+    //        deadline; a candidate stored without the candidateSince stamp predates the stamp and is already
+    //        overdue. Rejection follows _rejectDroppedNeed: incumbent keeps running, record says why.
+    _expireStaleCandidate(e) {
+        if (!e.candidate) return false;
+        const since = typeof e.candidate.candidateSince === 'number' ? e.candidate.candidateSince : 0;
+        if (since !== 0 && Date.now() - since <= CANDIDATE_TRIAL_DEADLINE_MS) return false;
+        const st = e.candidate.stats || {}, tried = (st.success || 0) + (st.fail || 0);
+        const age = since === 0 ? 'stored before the candidateSince stamp' : `${Math.round((Date.now() - since) / 3600e3)}h old`;
+        console.error(`!!! [fix194] LOUD: candidate of ${e.name} expired (${age}, trial ${st.success || 0}/${tried} with no verdict): rejected, the incumbent stays and its next repair is not blocked`);
+        this._noteProposal(e, {
+            task: typeof e.candidate.task === 'string' ? e.candidate.task : `expired candidate of ${e.name}`,
+            kind: 'trial', evidence: `no verdict within ${CANDIDATE_TRIAL_DEADLINE_MS / 3600e3}h (trial ${st.success || 0}/${tried})`,
+            desc: 'candidate expired with no verdict', outcome: 'rejected expired',
+        });
+        delete e.candidate;
+        return true;
     }
     // fix111: a candidate whose code cannot lint poisons every bundle that stages it: the replay dies
     // "lint failed before run" and codegen dies staging the same library, so every task reaching that skill
@@ -7854,9 +7887,9 @@ current_health: ${Math.round(bot.health)}/${vmax.health}\ncurrent_food: ${bot.fo
         const reg = await this._regressionRun(entry, code);
         if (reg === true) { if (this._promote(entry, cand) === false) return false; gateLog(`PROMOTE ${name}: passed regression rerun on a past task`); }
         else if (reg === false) { gateLog(`REJECT update to ${name}: failed regression rerun on a past task; keeping current version`); this._proposalOutcome(entry, 'failed regression rerun'); if (opts.refactor) this._rollbackRefactor(opts.refactor, name); }
-        else if (opts.repair) { entry.candidate = cand; gateLog(`HOLD repair of ${name}: kept as candidate; needs 2+ trial runs with success rate >= current ${rate(entry.stats || newStats()).toFixed(2)}`); }   // fix11 (B3)
+        else if (opts.repair) { cand.candidateSince = Date.now(); entry.candidate = cand; gateLog(`HOLD repair of ${name}: kept as candidate; needs 2+ trial runs with success rate >= current ${rate(entry.stats || newStats()).toFixed(2)}`); }   // fix11 (B3)
         else if (!entry.handwritten && !(entry.stats?.success)) { if (this._promote(entry, cand) === false) return false; gateLog(`PROMOTE ${name}: current version has no recorded successes`); }
-        else { entry.candidate = cand; gateLog(`HOLD ${name}: new version kept as candidate (1/1); needs 2+ trial runs with success rate >= current ${rate(entry.stats).toFixed(2)}`); }
+        else { cand.candidateSince = Date.now(); entry.candidate = cand; gateLog(`HOLD ${name}: new version kept as candidate (1/1); needs 2+ trial runs with success rate >= current ${rate(entry.stats).toFixed(2)}`); }
         this._saveSkills();
         return true;
     }
@@ -8243,6 +8276,8 @@ IMPORTANT: All functions use bare names. Do NOT write skills.goToPosition - writ
             return n > 0;
         }
         if (Date.now() - (this._repairs[e.name] || 0) < 30 * 60e3) { console.log(`[psn] repair of ${e.name} skipped: already repaired in the last 30 min (cap)`); this._deferRepair(q, Math.max(60e3, 30 * 60e3 - (Date.now() - (this._repairs[e.name] || 0))), 'already repaired in the last 30 min (cap)'); return false; }
+        // fix194: an expired candidate must not eat this repair's deferral budget: expire it and fall through to the repair.
+        if (e.candidate && this._expireStaleCandidate(e)) this._saveSkills();
         if (e.candidate) { console.log(`[psn] repair of ${e.name} skipped: a candidate is already under trial`); this._deferRepair(q, 10 * 60e3, 'a candidate is already under trial'); return false; }
         if (this._cursorLimited()) { console.log(`[psn] repair of ${e.name} skipped: code model at its limit`); this._deferRepair(q, 10 * 60e3, 'code model at its limit'); return false; }
         // fix71: the maturity gate protects a version whose record says it works. An API-lint failure is evidence that record
