@@ -24,13 +24,13 @@ const registry = Registry('1.20.4');
 
 // Fake world: land for x <= 0, a water body (surface at the bot's y) for x > 0.
 // `shore` decides whether the bot's cell has water in front of it.
-function mkBot({ mob = 'cod', distance = 20, pathStatus = 'noPath', shore = true } = {}) {
+function mkBot({ mob = 'cod', distance = 20, pathStatus = 'noPath', shore = true, bank = false } = {}) {
     const entity = { id: 7, name: mob, position: new Vec3(distance, 33, 0), metadata: [] };
     const bot = Object.assign(new EventEmitter(), {
         registry,
         output: '',
         interrupt_code: false,
-        entity: { position: new Vec3(0, 33, 0), isInWater: false },
+        entity: { position: new Vec3(0, bank ? 35 : 33, 0), isInWater: false },
         entities: { 7: entity },
         inventory: { items: () => [] },
         controls: {},
@@ -106,5 +106,15 @@ describe('fix196 melee approach ends inside pvp attack range, swimming the water
         bot.pathfinder.goto = async () => { bot.entity.position.x = 4; };
         assert.strictEqual(await attackEntity(bot, bot._entity, true), true);
         assert.ok(bot.pvp.attacks >= 1, 'no swing after a successful walk approach');
+    });
+
+    it('fix197: bot on a bank above the water surface still enters: gate on the fish cell, not a sample at body height', async () => {
+        // live 25 Nov post-fix196: killMob reached "5-7 blocks away" on the bank and stopped —
+        // sampling 1.2 blocks ahead at the bot's own y saw air OVER the pond (surface is 2
+        // blocks below the bank), so the water leg never began.
+        const bot = mkBot({ mob: 'cod', distance: 20, shore: true, bank: true });
+        assert.strictEqual(await attackEntity(bot, bot._entity, true), true);
+        assert.ok(bot.entity.isInWater, 'bot stayed on the bank instead of entering the pond');
+        assert.ok(bot.pvp.attacks >= 1, 'no swing after the bank entry + swim');
     });
 });

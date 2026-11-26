@@ -464,6 +464,9 @@ const PVP_ATTACK_RANGE = 3.5;
 // before concluding this water body cannot be entered from where the bot stands. Bounded like
 // every other wait in this file; the drowning reflex (modes.js:68) still guards air underneath.
 const WATER_ENTRY_MS = 3000;
+// fix197: chase window for swimming melee targets, one real-world second per game-second of
+// the 30-game-second kill window that approachForMelee feeds (killOneCod's own loop).
+const MELEE_CHASE_MS = 15000;
 
 async function approachForMelee(bot, entity) {
     /**
@@ -482,23 +485,42 @@ async function approachForMelee(bot, entity) {
     await goToPosition(bot, entity.position.x, entity.position.y, entity.position.z, PVP_ATTACK_RANGE);
     if (bot.entity.position.distanceTo(entity.position) <= PVP_ATTACK_RANGE) return true;
     if (!AQUATIC_MOBS.includes(entity.name)) return false;
+    // fix197 (live 25 Nov, post-fix196): the walk now ends 5-7 blocks from the cod — on the
+    // bank ABOVE the water surface — and the old single sample 1.2 blocks ahead saw air over
+    // the pond, so the bot never entered. Gate on the target itself being in water instead:
+    // a fish occupies a water column (https://minecraft.wiki/w/Cod), so if the entity's own
+    // cell or the one under it is water, water lies straight ahead of us.
+    const isWaterCell = (p) => {
+        const b = bot.blockAt(p);
+        return !!b && b.name.includes('water');
+    };
+    if (!isWaterCell(entity.position) && !isWaterCell(entity.position.offset(0, -1, 0))) return false;
     if (!bot.entity.isInWater) {
         const dir = entity.position.minus(bot.entity.position);
         dir.y = 0;
         dir.normalize();
-        const ahead = bot.blockAt(bot.entity.position.plus(dir.scale(1.2)));
-        if (!ahead || !ahead.name.includes('water')) return false;
         await bot.lookAt(entity.position);
         const entryDeadline = Date.now() + WATER_ENTRY_MS;
         bot.setControlState('forward', true);
         bot.setControlState('jump', true);
-        while (Date.now() < entryDeadline && !bot.entity.isInWater && !bot.interrupt_code)
+        while (Date.now() < entryDeadline && !bot.entity.isInWater && !bot.interrupt_code
+            && bot.entity.position.distanceTo(entity.position) > PVP_ATTACK_RANGE)
             await bot.waitForTicks(5);
         bot.setControlState('forward', false);
         bot.setControlState('jump', false);
     }
     if (!bot.entity.isInWater) return false;
-    await swimTowards(bot, entity.position.x, entity.position.z);
+    // fix197 chase loop: fish flee from an approaching swimmer
+    // (https://minecraft.wiki/w/Fishing#Description — fish swim away from players), so one
+    // snapshot column is stale by arrival; re-swim at the live position until in range, the
+    // swim itself reports blocked, or the chase window closes (bounded like the 30-game-second
+    // kill window that follows this call).
+    const chaseDeadline = Date.now() + MELEE_CHASE_MS;
+    while (bot.entity.position.distanceTo(entity.position) > PVP_ATTACK_RANGE
+        && !bot.interrupt_code) {
+        const swim = await swimTowards(bot, entity.position.x, entity.position.z, chaseDeadline);
+        if (!swim.reached) break;
+    }
     return bot.entity.position.distanceTo(entity.position) <= PVP_ATTACK_RANGE;
 }
 
@@ -2194,7 +2216,7 @@ async function digOutTowards(bot, target, triedCells) {
     return false;
 }
 
-export async function swimTowards(bot, x = null, z = null) {
+export async function swimTowards(bot, x = null, z = null, deadline = null) {
     /**
      * Swim with direct controls (the game's own liquid movement) to a column, or straight up
      * to the surface when no column is given. Needed because mineflayer-pathfinder has no
@@ -2233,6 +2255,10 @@ export async function swimTowards(bot, x = null, z = null) {
     const triedCells = new Set(); // fix151: each walled cell is dug at most once per swim
     try {
         while (!bot.interrupt_code) {
+            // fix197: bounded swim — a fleeing target that keeps entering new cells would
+            // otherwise loop here forever; the caller decides when the chase is over.
+            if (deadline !== null && Date.now() > deadline)
+                return { reached: false, timedOut: true, rose: bot.entity.position.y - startY };
             const p = bot.entity.position;
             if (!bot.entity.isInWater) {
                 return { reached: true, rose: p.y - startY };
