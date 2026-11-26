@@ -1,6 +1,7 @@
 import * as mc from "../../utils/mcdata.js";
 import * as world from "./world.js";
 import pf from 'mineflayer-pathfinder';
+import Move from 'mineflayer-pathfinder/lib/move.js';
 import Vec3 from 'vec3';
 import settings from "../../../settings.js";
 import { watchPathing, cellKey } from "../../utils/movement_model.js";
@@ -651,8 +652,78 @@ function _blockDropName(bot, block) {
     return item.name;
 }
 
+// fix188 (live icefox2000, 25 Nov 2026): water-mob tasks fail "walk ended but goal not
+// satisfied" and the log records "Died [drowning] @-174,40,103". Measured gaps in
+// mineflayer-pathfinder 2.4.5: getMoveForward accepts water nodes (lib/movements.js:391,
+// cost += liquidCost :428) but never checks the HEAD cell, so crossing >=2-deep water plans a
+// fully submerged route that drowns the bot; and NO generator moves UP through liquid —
+// getMoveDown bails from water ("// dont go underwater", :546), getMoveUp is climbable-only
+// (:553), getMoveDropDown refuses water landings (:526), getMoveParkourForward refuses to jump
+// from water (:642) — so a bot sunk in a >=2-deep pond has no route to its own surface unless a
+// one-block shelf touches its feet. Upstream only added water moves after 2.4.5: PR #394 "Plan
+// upward swimming and shore exits" (merged 0eb15c1, getMoveWaterExit) and PR #375 (surface
+// getMoveSwim), neither released. Extend Movements ourselves: (a) port the merged, reviewed
+// #394 exit moves; (b) add surface swimming — horizontal moves between adjacent water cells
+// with an air cell for the head, so the bot skims with head above water (breathes; a planned
+// surface path can never dive the bot into drowning). The 2.4.5 executor already drives
+// in-water travel (index.js isInWater -> jump propulsion).
+const _swimDirs = [{ x: 1, z: 0 }, { x: 0, z: -1 }, { x: -1, z: 0 }, { x: 0, z: 1 }];
+export class SwimMovements extends pf.Movements {
+    _getMoveSwim(node, neighbors) {
+        const water = this.bot.registry.blocksByName.water.id;
+        const feet = this.getBlock(node, 0, 0, 0);
+        const head = this.getBlock(node, 0, 1, 0);
+        if (feet.type !== water || !feet.safe) return;   // only from inside water
+        if (!head.safe || head.liquid) return;           // surface only: head in air
+        for (const dir of _swimDirs) {
+            const fwdFeet = this.getBlock(node, dir.x, 0, dir.z);
+            const fwdHead = this.getBlock(node, dir.x, 1, dir.z);
+            if (fwdFeet.type !== water || !fwdFeet.safe) continue;
+            if (!fwdHead.safe || fwdHead.liquid) continue; // keep head in air while crossing
+            const toBreak = [];
+            const cost = 1 + this.liquidCost + this.safeOrBreak(fwdFeet, toBreak) + this.safeOrBreak(fwdHead, toBreak);
+            if (cost >= 100) continue;
+            neighbors.push(new Move(node.x + dir.x, node.y, node.z + dir.z, node.remainingBlocks, cost, toBreak));
+        }
+    }
+    // Port of mineflayer-pathfinder PR #394 (commit 0eb15c1) getMoveWaterExit: swim up through a
+    // water column without scaffolding; step from water onto an adjacent shore.
+    _getMoveWaterExit(node, neighbors) {
+        const water = this.bot.registry.blocksByName.water.id;
+        const current = this.getBlock(node, 0, 0, 0);
+        if (current.type !== water || !current.safe) return;
+        const above = this.getBlock(node, 0, 1, 0);
+        const overhead = this.getBlock(node, 0, 2, 0);
+        if (!above.safe || !overhead.safe) return;
+        if (above.type === water) {
+            const toBreak = [];
+            const cost = 1 + this.liquidCost + this.safeOrBreak(above, toBreak) + this.safeOrBreak(overhead, toBreak);
+            if (cost < 100) {
+                neighbors.push(new Move(node.x, node.y + 1, node.z, node.remainingBlocks, cost, toBreak));
+            }
+        }
+        for (const dir of _swimDirs) {
+            const shore = this.getBlock(node, dir.x, 0, dir.z);
+            if (!shore.physical || this.blocksToAvoid.has(shore.type)) continue;
+            const feet = this.getBlock(node, dir.x, 1, dir.z);
+            const head = this.getBlock(node, dir.x, 2, dir.z);
+            if (feet.liquid || head.liquid) continue;
+            const toBreak = [];
+            const cost = 2 + this.liquidCost + this.safeOrBreak(feet, toBreak) + this.safeOrBreak(head, toBreak);
+            if (cost >= 100) continue;
+            neighbors.push(new Move(node.x + dir.x, node.y + 1, node.z + dir.z, node.remainingBlocks, cost, toBreak));
+        }
+    }
+    getNeighbors(node) {
+        const neighbors = super.getNeighbors(node);
+        this._getMoveSwim(node, neighbors);
+        this._getMoveWaterExit(node, neighbors);
+        return neighbors;
+    }
+}
+
 function _survivalMovements(bot, {dig = true} = {}) {
-    const m = new pf.Movements(bot);
+    const m = new SwimMovements(bot);
     m.canDig = dig;
     m.canOpenDoors = true;
     m.allowParkour = true;
@@ -3401,11 +3472,54 @@ export async function buildStructure(bot, type, x, y, z, material, width=5, leng
     return false;
 }
 
+async function _waitOutNightAndBreakOut(bot, pocketPos, placedCells) {
+    // fix189: a sealed pocket has NO pathfinder way out — mineflayer-pathfinder plans routes and
+    // never mines (lib/goto.js never calls bot.dig; Movements.canDig only prices moves,
+    // lib/movements.js:271), so whoever sealed the bot owns the way out. Night is
+    // 13000 < timeOfDay < 23000 (the window modes.js night_shelter triggers on; bot.time docs),
+    // at 20 ticks/s the wait is bounded by ~500 real seconds.
+    while (bot.time.timeOfDay > 13000 && bot.time.timeOfDay < 23000) {
+        if (bot.interrupt_code) break;
+        await new Promise(r => setTimeout(r, 1000));
+    }
+    const moveOut = () => moveAway(bot, 5).catch((err) => {
+        log(bot, `FAILED: moving out of the shelter errored: ${err?.message ?? err}`);
+        return false;
+    });
+    const solidAt = (q) => bot.blockAt(q)?.boundingBox === 'block';
+    const sameCell = (a, b) => a.x === b.x && a.y === b.y && a.z === b.z;
+    // Foot-level wall cells adjacent to the bot: breaking one needs no path (it is in reach) and
+    // makes the pocket walkable. Cells WE placed are the intended doors (own material, fastest to
+    // dig); on re-entry into a pocket sealed by an earlier run nothing was placed this time, so any
+    // foot-level wall will do.
+    const footDoors = [[1,0,0],[-1,0,0],[0,0,1],[0,0,-1]].map(o => pocketPos.offset(...o));
+    const ordered = footDoors.filter(q => placedCells.some(c => sameCell(c, q)))
+        .concat(footDoors.filter(q => !placedCells.some(c => sameCell(c, q))));
+    for (const q of ordered) {
+        if (solidAt(q) && await breakBlockAt(bot, q.x, q.y, q.z) && await moveOut()) return true;
+    }
+    // No foot-level way out (dig-in shaft, or stone walls that would not break): break the lid and
+    // pillar up — the pathfinder has no same-column climb (see pillarUp docs).
+    const lidPos = pocketPos.offset(0, 2, 0);
+    if (solidAt(lidPos)) {
+        if (await breakBlockAt(bot, lidPos.x, lidPos.y, lidPos.z)) {
+            const climb = await pillarUp(bot, bot.entity.position.y + 3);
+            if (climb.ok && await moveOut()) return true;
+            log(bot, `FAILED: lid broken but could not climb out of the pocket: ${climb.reason ?? 'interrupted'}`);
+        }
+    }
+    if (!solidAt(lidPos) && await moveOut()) return true; // never actually sealed this run
+    log(bot, `FAILED: sheltered at ${pocketPos.x},${pocketPos.y},${pocketPos.z} but could not break out; the pocket may still be sealed.`);
+    return false;
+}
+
 export async function shelterNow(bot) {
     /**
-     * Get safe right now: sleep if a bed is near and it is night, otherwise wall yourself into a 1x2 pocket with blocks from inventory (dig in if you have none).
+     * Get safe right now: sleep if a bed is near and it is night, otherwise seal yourself into a 1x2 pocket with blocks from inventory (dig in if you have none),
+     * wait out the night INSIDE the pocket, then break the door block and come back out. The pocket is
+     * sealed on purpose and the pathfinder cannot get out of it, so this function always owns the exit.
      * @param {MinecraftBot} bot, reference to the minecraft bot.
-     * @returns {Promise<boolean>} true if sheltered.
+     * @returns {Promise<boolean>} true if sheltered through the night and back out in the open.
      * @example
      * await skills.shelterNow(bot);
      **/
@@ -3418,16 +3532,21 @@ export async function shelterNow(bot) {
     const blocks = Object.keys(inv).filter(n => /(dirt|cobblestone|planks|stone|deepslate|sand|netherrack)$/.test(n) && !n.includes('slab') && !n.includes('stairs'));
     const needed = [[1,0,0],[-1,0,0],[0,0,1],[0,0,-1],[1,1,0],[-1,1,0],[0,1,1],[0,1,-1],[0,2,0]].map(o => p.offset(...o))
         .filter(q => { const b = bot.blockAt(q); return !b || b.boundingBox !== 'block'; });
+    const placedCells = [];
     const total = blocks.reduce((s, n) => s + inv[n], 0);
     if (total >= needed.length) {
         let i = 0;
         for (const q of needed) {
             while (i < blocks.length && (world.getInventoryCounts(bot)[blocks[i]] || 0) === 0) i++;
             if (i >= blocks.length) break;
-            await placeBlock(bot, blocks[i], q.x, q.y, q.z, 'bottom', true);
+            const ok = await placeBlock(bot, blocks[i], q.x, q.y, q.z, 'bottom', true);
+            if (ok) placedCells.push(q);
         }
         const left = needed.filter(q => { const b = bot.blockAt(q); return !b || b.boundingBox !== 'block'; });
-        if (left.length === 0) { log(bot, `Sheltered: walled in at ${p.x},${p.y},${p.z}. Wait for day (time > 23500) then break out.`); return true; }
+        if (left.length === 0) {
+            log(bot, `Sheltered: walled in at ${p.x},${p.y},${p.z}. Waiting for day, then digging out.`);
+            return await _waitOutNightAndBreakOut(bot, p, placedCells);
+        }
         log(bot, `Shelter incomplete: ${left.length} gaps left. Trying to dig in instead.`);
     } else {
         log(bot, `Only ${total} building blocks (need ${needed.length}); digging in instead.`);
@@ -3437,7 +3556,10 @@ export async function shelterNow(bot) {
     const name = blocks.find(n => (world.getInventoryCounts(bot)[n] || 0) > 0) || 'dirt';
     if (world.getInventoryCounts(bot)[name]) await placeBlock(bot, name, above.x, above.y, above.z, 'bottom', true);
     const b = bot.blockAt(above);
-    if (b && b.boundingBox === 'block') { log(bot, `Sheltered: dug in at ${bot.entity.position.floored()}.`); return true; }
+    if (b && b.boundingBox === 'block') {
+        log(bot, `Sheltered: dug in at ${bot.entity.position.floored()}. Waiting for day, then digging out.`);
+        return await _waitOutNightAndBreakOut(bot, bot.entity.position.floored(), [above]);
+    }
     log(bot, `FAILED: could not seal shelter (no blocks to cover the hole). Collect 9 dirt with !gatherUntil("dirt", 9) and retry, or flee with !moveAway(32).`);
     return false;
 }
