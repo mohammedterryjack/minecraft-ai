@@ -1,4 +1,4 @@
-import { wordOverlapScore } from '../utils/text.js';
+import { makeOverlapQuery, makeOverlapTarget, overlapWithFields } from '../utils/text.js';
 import settings from '../../settings.js';
 // Voyager-style lifelong learning loop (after MineDojo/Voyager):
 // automatic curriculum -> iterative code generation with env feedback -> self-verification critic -> skill library.
@@ -1287,6 +1287,13 @@ export class Voyager {
     // PolySkill-style: a learned skill whose task is covered by a parameterised skill becomes a variant of it
     // (code kept on disk for rollback; hidden from the catalogue/fuzzy replay so the parameterised one is used)
     _polyMerge() {
+        // fix193: maintenance pass over the skill LIBRARY: its decisions depend on the set of skills, so re-running it
+        // after every replay success (old behaviour, from _afterSuccess) repeated ~900 lexical sweeps for nothing.
+        // Measured live 26 Nov: 14s synchronous per sweep-set ([loop-stall] sentinel; drowned while blocked).
+        // Runs at boot (lastSkillCount starts -1) and whenever the library size changes.
+        if (this._lastSkillCount === undefined) this._lastSkillCount = -1;
+        if (this._lastSkillCount === this.skills.length) return;
+        this._lastSkillCount = this.skills.length;
         let n = 0;
         for (const s of this.skills) {
             if (s.primitive || s.handwritten || s.mergedInto || !s.task) continue;
@@ -4329,17 +4336,44 @@ Use only c; no other globals.`;
     // fix56: lexical word-overlap routing. Any two task heads without digits/ids are "comparable" and 0.3*rate is always > 0,
     // so this returns the best-rated unrelated skill when nothing matches (live: "Explore for iron ore deposit" -> ensureFurnaceInRange).
     // Item goals still use it (they are verified by inventory gain); open goals never do (see _step).
+    // fix193: per-skill lexical match fields (task head/nums/ids, name stem, overlap target words, required args)
+    // computed ONCE per skill and cached on the skill object; revalidated against s.task and s.code so a repair
+    // (which rewrites code) or task change refreshes them. _lexicalReplay runs per task route AND once per skill
+    // inside _polyMerge — recomputing ~6 regexes per skill per pair blocked the event loop for seconds (fix169 [loop-stall]).
+    _lexFields(s) {
+        if (!this._lexCache) this._lexCache = new WeakMap();
+        let f = this._lexCache.get(s);
+        if (!f || f.task !== s.task || f.code !== s.code) {
+            f = {
+                task: s.task, code: s.code,
+                head: (s.task || '').split(/\s+(?:within|at|in|on|using|from|near|and)\b/i)[0].trim().toLowerCase(),
+                normName: (s.name || '').toLowerCase().replace(/^(craft|mine|get|make)/, ''),
+                target: makeOverlapTarget(s.task || ''),
+                reqArgs: requiredArgs(s),   // fix55 loud-fail behaviour preserved (throws inside, same as before)
+            };
+            f.nums = (f.head.match(/\d+/g) || []).join(',');
+            f.ids = (f.head.match(/\b[a-z]+(?:_[a-z]+)+\b/g) || []).sort().join(',');
+            this._lexCache.set(s, f);
+        }
+        return f;
+    }
     _lexicalReplay(task) {
-        const nums = t => (t.match(/\d+/g) || []).join(',');
-        const ids = t => (t.toLowerCase().match(/\b[a-z]+(?:_[a-z]+)+\b/g) || []).sort().join(',');
-        const head = t => t.split(/\s+(?:within|at|in|on|using|from|near|and)\b/i)[0].trim().toLowerCase();
+        const qh = task.split(/\s+(?:within|at|in|on|using|from|near|and)\b/i)[0].trim().toLowerCase();
+        const qn = (qh.match(/\d+/g) || []).join(',');
+        const qi = (qh.match(/\b[a-z]+(?:_[a-z]+)+\b/g) || []).sort().join(',');
+        const qnorm = task.toLowerCase().replace(/[^a-z]/g, '');
+        const qov = makeOverlapQuery(task);
         let best = null, bestScore = 0;
         for (const s of this.skills) {
             if (s.primitive || s.demoted || s.mergedInto || !s.task) continue;
-            if (requiredArgs(s).length) continue;   // fix111: a bare call cannot fill required parameters (the same fix86 guard _structuredReplay and _embedReplay apply)
-            if (head(s.task) !== head(task) && !(nums(head(s.task)) === nums(head(task)) && ids(head(s.task)) === ids(head(task)))) continue;
-            const nameHit = s.name.toLowerCase().split(/(?=[a-z])/).length && task.toLowerCase().replace(/[^a-z]/g, '').includes(s.name.toLowerCase().replace(/^(craft|mine|get|make)/, '')) ? 0.3 : 0;
-            const sc = wordOverlapScore(task, s.task) + nameHit + 0.3 * rate(s.stats || newStats());
+            const f = this._lexFields(s);
+            if (f.reqArgs.length) continue;   // fix111: a bare call cannot fill required parameters (the same fix86 guard _structuredReplay and _embedReplay apply)
+            if (f.head !== qh && !(f.nums === qn && f.ids === qi)) continue;
+            // fix193: dropped `s.name.toLowerCase().split(/(?=[a-z])/).length` - String.split never returns [], so that
+            // conjunct was always truthy dead code (the old cost: ~790k char-splits per _polyMerge; live 26 Nov: 14s
+            // event-loop block measured in bench; drownings while the loop blocked, [loop-stall] sentinel fix169).
+            const nameHit = qnorm.includes(f.normName) ? 0.3 : 0;
+            const sc = overlapWithFields(qov, f.target) + nameHit + 0.3 * rate(s.stats || newStats());
             if (sc > bestScore) { best = s; bestScore = sc; }
         }
         return best ? { name: best.name, call: `await ${best.name}(bot);` } : null;
