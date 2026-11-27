@@ -9529,6 +9529,9 @@ Voyager.SEEDED_PRIMITIVES = [
         code: `async function collectBlock(bot, blockType, num = 1) {
     if (!blockType || typeof blockType !== 'string') { log(bot, 'collectBlock: invalid blockType'); return false; }
     let types = [blockType];
+    // fix207: pre-flattening generic names (log, planks, wool, leaves) name no block in modern game data; resolve the family
+    //        from the registry (every block named *_<blockType>). Learned craftPlanks calls collectBlock("log", 1).
+    if (!Object.hasOwn(bot.registry.blocksByName, blockType)) for (const n of Object.keys(bot.registry.blocksByName)) if (n.endsWith('_' + blockType)) types.push(n);
     if (['coal','diamond','emerald','iron','gold','lapis_lazuli','redstone'].includes(blockType)) types.push(blockType + '_ore');
     if (blockType.endsWith('ore')) types.push('deepslate_' + blockType);
     if (blockType === 'dirt') types.push('grass_block');
