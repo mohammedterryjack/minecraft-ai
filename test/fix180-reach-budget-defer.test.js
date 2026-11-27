@@ -69,6 +69,45 @@ describe('fix180 a think-budget timeout is far, not unreachable', () => {
         assert.strictEqual(state._reach.stone, 'noPath');
         assert.ok(!state.nearby_blocks.includes('diamond_ore'), 'deferred block leaves this step perception');
         assert.ok(!Object.hasOwn(state.perceived_at, 'diamond_ore'));
+        assert.ok(state._deferred.has('diamond_ore'), 'fix204: the deferral is recorded for _withChosenSearches');
+    });
+
+    it('fix204: _withChosenSearches replans around a deferred block instead of exiting', async () => {
+        const v = Object.create(Voyager.prototype);
+        v.agent = { name: 'icefox2000', bot: budgetBot((x) => (x > 100 ? 'timeout' : 'noPath'), null) };
+        const state = {
+            nearby_blocks: ['diamond_ore'],
+            perceived_at: { diamond_ore: new Vec3(200, 33, 0) },
+        };
+        let calls = 0;
+        const result = await v._withChosenSearches(state, () => {
+            calls++;
+            if (calls === 1) {
+                // what reachableBlock (voyager.js:5248) does for an unsearched perceived source
+                const err = new Error('[fix97] diamond_ore is nearby and has not been searched.');
+                err.unsearchedBlock = 'diamond_ore';
+                throw err;
+            }
+            return 'planned-without-it';   // second pass: diamond_ore is out of perception
+        });
+        assert.strictEqual(result, 'planned-without-it');
+        assert.strictEqual(calls, 2, 'the plan ran again without the deferred block');
+    });
+
+    it('fix204: a block that is neither searched nor deferred still fails loudly', async () => {
+        const v = Object.create(Voyager.prototype);
+        v.agent = { name: 'icefox2000', bot: budgetBot(() => 'noPath', null) };
+        // perceived_at has no entry for the name, so _judgeTargets cannot judge it: real anomaly.
+        const state = { nearby_blocks: ['moss_block'], perceived_at: { moss_block: new Vec3(5, 33, 5) } };
+        delete state.perceived_at.moss_block;
+        await assert.rejects(
+            () => v._withChosenSearches(state, () => {
+                const err = new Error('[fix97] moss_block is nearby and has not been searched.');
+                err.unsearchedBlock = 'moss_block';
+                throw err;
+            }),
+            /is nearby and was not searched/,
+        );
     });
 
     it('a non-budget reach error still propagates loudly', async () => {

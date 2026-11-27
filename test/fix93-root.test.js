@@ -2,6 +2,7 @@
 import { describe, it, before } from 'node:test';
 import assert from 'node:assert';
 import { readFileSync } from 'fs';
+import { EventEmitter } from 'node:events';
 import { betaUncertainty, printedUncertainty, causalChanges, effectVerdict, practiceWorld } from '../src/agent/practice_rank.js';
 import { inferenceTiming, formatOllamaTiming, hostAttribution } from '../src/models/inference_timing.js';
 import { createInferenceCover } from '../src/agent/inference_cover.js';
@@ -399,12 +400,15 @@ describe('fix93 hunger serve', () => {
     });
     function mk(runs) {
         const v = Object.create(Voyager.prototype);
-        const bot = {
+        // fix204: _awaitFoodAfterEat waits on the bot's 'health' event (the update_health packet),
+        // so the serve bot is a real EventEmitter like mineflayer's.
+        const bot = new EventEmitter();
+        Object.assign(bot, {
             health: 20, food: 10, game: { dimension: 'overworld' },
             registry: foodRegistry(),
             inventory: { emptySlotCount: () => 10 },
             entity: { position: { x: 0, y: 64, z: 0 } },
-        };
+        });
         v.agent = { bot, name: 'icefox', actions: { executing: false }, openChat() {}, fatal(msg) { throw new Error(msg); } };
         v.vitals = new VitalsModel({
             regen: { 18: { n: 14, up: 4 }, 20: { n: 14, up: 9 } },
@@ -463,7 +467,8 @@ describe('fix93 hunger serve', () => {
         v._inv = { bread: 2 };
         v._chained = undefined;
         v.progress.subgoals = [{ task: 'Mine 1 iron_ore' }];
-        v._consumeItem = async () => true;
+        // The eat is acknowledged (server sends update_health) but food never moves — the fix201 anomaly.
+        v._consumeItem = async () => { setTimeout(() => v.agent.bot.emit('health'), 0); return true; };
         await assert.rejects(v._serveUrgent(), /promised food >= .* but food is 10/);
     });
     it('a playable library raiser does not acquire food first', async () => {
