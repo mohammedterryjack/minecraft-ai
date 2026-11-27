@@ -424,6 +424,20 @@ function smeltGoal(task) {
     return m ? { count: parseInt(m[1]), outputCount: parseInt(m[3]), input: m[2].toLowerCase(), verb: 'smelt', item: m[4].toLowerCase(), items: [m[4].toLowerCase()] } : null;
 }
 
+// fix198: "Grow 2 oak_log from 2 oak_sapling" - tree growth with bone meal (the planner's grow edge;
+// minecraft.wiki/w/Sapling). Satisfaction is the log count gained, like any item goal; the input records
+// the saplings it consumes.
+function growGoal(task) {
+    task = goalSentence(task);
+    const m = task.match(/^grow\s+(\d+)\s+([a-z_]+)\s+from\s+(\d+)\s+([a-z_]+)$/i);
+    if (!m) return null;
+    if (!VERSION) throw new Error('[fix198] LOUD FAIL: growGoal called but VERSION is null');
+    const md = minecraftData(VERSION);
+    const item = m[2].toLowerCase(), input = m[4].toLowerCase();
+    if (!md.blocksByName[item] || !md.itemsByName[input]) return null;
+    return { count: parseInt(m[1]), outputCount: parseInt(m[1]), input, verb: 'grow', item, items: [item] };
+}
+
 // fix55: required params of a skill besides bot (from its signature; params with defaults are optional)
 function requiredArgs(e) {
     const sig = signatureOf(e.code, e.name), m = sig.match(/\(([^)]*)\)/);
@@ -445,7 +459,7 @@ export function parseVerboseGoal(task) {
     const t = task.toLowerCase();
     
     // Try standard parsers first
-    const std = smeltGoal(task) || countGoal(task);
+    const std = smeltGoal(task) || growGoal(task) || countGoal(task);
     if (std) return std;
     
     // fix46: VERSION is the single source (set from bot.version when task starts) - fail loud if null
@@ -1757,6 +1771,11 @@ Use only c; no other globals.`;
         if (sm) {
             out.push({ item: sm.input, n: sm.count });
             out.push({ item: sm.item, n: sm.outputCount });
+        }
+        const gr = growGoal(task);   // fix198
+        if (gr) {
+            out.push({ item: gr.input, n: gr.count });
+            out.push({ item: gr.item, n: gr.outputCount });
         }
         const placed = ensureGoal(task);
         if (placed) out.push({ item: placed.item, n: placed.count });
@@ -4364,6 +4383,10 @@ Use only c; no other globals.`;
             return { name: 'smeltWithFuel', call: `await smeltWithFuel(bot, ${JSON.stringify(sm.input)}, ${sm.count});` };
         if (sm && this.skills.some(s => s.name === 'smeltItems'))
             return { name: 'smeltItems', call: `await smeltItems(bot, ${JSON.stringify(sm.input)}, ${sm.count});` };
+        // fix198: the planner's grow edge runs on the seeded growSaplingToLog
+        const gr = growGoal(task);
+        if (gr && has('growSaplingToLog'))
+            return { name: 'growSaplingToLog', call: `await growSaplingToLog(bot, ${JSON.stringify(gr.input)}, ${gr.count});` };
         return null;
     }
     // fix56: lexical word-overlap routing. Any two task heads without digits/ids are "comparable" and 0.3*rate is always > 0,
@@ -4920,6 +4943,8 @@ Use only c; no other globals.`;
         const t = task.trim();
         const smelt = smeltGoal(t);
         if (smelt) return { kind: 'item', ...smelt };
+        const grow = growGoal(t);   // fix198
+        if (grow) return { kind: 'item', ...grow };
         const ensure = ensureGoal(t);  // fix49: before countGoal
         if (ensure) return { kind: 'ensure', ...ensure };
         const reach = reachGoal(t);   // fix83
@@ -9991,5 +10016,17 @@ Voyager.SEEDED_PRIMITIVES = [
             post: 'c => c.ret === null || (c.post.eq ? c.post.eq.heldItem === c.ret : false)',
             text: 'a placed block was passed (objects are null in c.args); returns null (hand) or the equipped tool name matches c.post.eq.heldItem',
         },
+    },
+    {
+        // fix198: the planner's farm_block grow edge (dirt_1 -> sapling_1 -> log_1) had no executable path: a
+        // sapling is not craftable and a log is not smeltable, so "Grow 1 oak_log from 1 oak_sapling" went to
+        // the coder, failed, and left a mining bot entombed in a dirt room with no logs. Seeded from the
+        // library function (self-contained: plant on soil with trunk clearance, bone meal, collect the trunk —
+        // minecraft.wiki/w/Sapling, minecraft.wiki/w/Bone_Meal).
+        name: 'growSaplingToLog',
+        description: 'Plant a sapling on soil with trunk clearance, grow it instantly with bone meal, and collect the trunk log. Needs the sapling and bone meal in inventory.',
+        task: 'grow a tree from a sapling with bone meal and collect its logs',
+        code: skills.growSaplingToLog.toString(),   // fix198: one source of truth, the library function (self-contained, so it runs bare in the sandbox)
+        deps: ['collectBlock', 'placeBlock'],
     },
 ];

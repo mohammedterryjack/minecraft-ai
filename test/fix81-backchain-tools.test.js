@@ -228,7 +228,7 @@ describe('fix81: the live inventory (56 iron_ingot, 410 cobblestone, 0 wood) cha
         const less = (a, b) => { for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return a[i] < b[i]; return false; };
         assert.ok(less(iron.cost, stone.cost), `${iron.cost} < ${stone.cost}`);
         const ch = p.cheapest(['stone_pickaxe', 'iron_pickaxe', 'wooden_pickaxe', 'diamond_pickaxe', 'netherite_pickaxe'], 1, { iron_ingot: 56 }, false);
-        assert.deepStrictEqual(ch, { item: 'iron_pickaxe', ties: [] }, 'no tie: strictly by cost');
+        assert.deepStrictEqual(ch, { item: 'iron_pickaxe', ties: [], plan: ch.plan }, 'no tie: strictly by cost');
     });
     it('a cost tie goes to the option with fewer untried edges (a run-proven stone_pickaxe edge beats the untried iron one)', () => {
         const v = mkV({ inv: {}, nearby: [...SURFACE] });

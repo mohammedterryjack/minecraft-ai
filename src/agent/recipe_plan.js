@@ -119,6 +119,23 @@ export function obtainPlanner({ registry, recipesOf, known, proven, edgeSuccess,
         out.sort((a, b) => (b.yield !== a.yield ? b.yield - a.yield : (a.entity < b.entity ? -1 : a.entity > b.entity ? 1 : 0)));
         return out;
     };
+    // fix198: sapling -> log. minecraft-data models this nowhere (growth is not a recipe), but the registry's names
+    // are the canonical mapping: <p>_sapling is placed on soil and grows into <p>_log, and bone meal grows it
+    // instantly (minecraft.wiki/w/Sapling, minecraft.wiki/w/Bone_Meal). A bot holding saplings and bone meal can
+    // grow wood where no tree is reachable (live 25 Nov: icefox entombed at y33 holding birch_sapling + bone_meal
+    // with no path to any log source).
+    const growthSourceMemo = new Map();
+    const growthSource = item => {
+        if (!growthSourceMemo.has(item)) {
+            let sapling = null;
+            if (item.endsWith('_log') && Object.hasOwn(registry.itemsByName, item)) {
+                const cand = `${item.slice(0, -'_log'.length)}_sapling`;
+                if (Object.hasOwn(registry.itemsByName, cand)) sapling = cand;
+            }
+            growthSourceMemo.set(item, sapling);
+        }
+        return growthSourceMemo.get(item);
+    };
     const success = (item, verb) => {
         const p = edgeSuccess(item, verb);   // verb null: the item's edge, whatever its verb
         if (typeof p !== 'number' || !(p > 0) || p > 1) throw new Error(`[fix96] edgeSuccess(${item}, ${verb}) must be in (0, 1], got ${JSON.stringify(p)}`);
@@ -334,6 +351,51 @@ export function obtainPlanner({ registry, recipesOf, known, proven, edgeSuccess,
                 feasible: true,
             });
         }
+        // fix198: tree growth, an OR next to collecting the log (see growthSource above). The saplings are
+        // subplanned the way a smelt subplans its input; the bone meal is deliberately NOT subplanned.
+        // Its acquisition chain (bone_meal -> bone_block -> pickaxe-tool collects -> planks -> stick ->
+        // back into the very log being grown) re-enters the wood graph under every log plan, and the
+        // cycle-pruned subplan results leak through the shared plan memo: fix81's iron_pickaxe began
+        // planning as stone_pickaxe once grow landed (a path-pruned stick served to a path-free query).
+        // Bone meal is modeled at inventory level instead: held, or one bone_block craft away
+        // (minecraft.wiki/w/Bone_Meal). Growing and chopping happen at the bot's own spot, so the option
+        // is feasible whenever its ingredients are.
+        const sapling = growthSource(item);
+        if (sapling && Object.hasOwn(registry.itemsByName, 'bone_meal')) {
+            // gate on the bone meal FIRST: no sapling plan can create a bone product, so checking the
+            // inventory before subplanning keeps every wood plan that lacks bone meal one `has` call
+            // away from HEAD's search size (fix100 watchdog budget).
+            let meal = null;
+            if (has(inv, 'bone_meal') >= 1) meal = { cost: [0, 0, 0, 0], steps: [], delta: {} };
+            else {
+                const r = recipes('bone_meal').find(rr => rr.ingredients.every(ing => has(inv, ing.item) >= ing.count));
+                if (r) {
+                    const delta = { bone_meal: r.yield };
+                    for (const ing of r.ingredients) delta[ing.item] = (delta[ing.item] || 0) - ing.count;
+                    meal = { cost: [0, 1, 1, 1], steps: [{ verb: 'craft', item: 'bone_meal', count: 1 }], delta };
+                }
+            }
+            if (meal) {
+                const subS = plan(sapling, rem, { ...inv }, onPath, ctx, false);
+                if (subS && !(ctx.feasible === true && subS.feasible !== true)) {
+                    const units = expected(rem, 1, item, 'collect') - rem;   // one sapling grows one trunk; the sapling's own units are in subS.cost
+                    const missing = [];
+                    if (rem - Math.min(has(inv, sapling), rem) > 0) missing.push({ item: sapling, count: rem - Math.min(has(inv, sapling), rem), how: subS.how, input: subS.input, from: subS.from });
+                    const sim = { ...subS.inv };
+                    for (const [k, d] of Object.entries(meal.delta)) sim[k] = has(sim, k) + d;
+                    opts.push({
+                        cost: add(add(subS.cost, meal.cost), [0, units, units, 1]),
+                        inv: sim,
+                        steps: [...subS.steps, ...meal.steps, { verb: 'grow', item, count: rem, input: sapling }],
+                        how: 'grow',
+                        input: sapling,
+                        missing,
+                        ingredients: [{ item: sapling, count: rem }, { item: 'bone_meal', count: 1 }],
+                        feasible: true,
+                    });
+                }
+            }
+        }
         if (src.length) {
             const reachable = reachableCollect(item, src);
             if (!(ctx.feasible === true && !reachable)) {
@@ -377,6 +439,10 @@ export function obtainPlanner({ registry, recipesOf, known, proven, edgeSuccess,
         if (how === 'smelt') {
             if (typeof input !== 'string' || input.length === 0) throw new Error(`[fix96] taskFor: a smelt of ${item} needs its input`);
             return `Smelt ${count} ${input} into ${count} ${item}`;
+        }
+        if (how === 'grow') {
+            if (typeof input !== 'string' || input.length === 0) throw new Error(`[fix198] taskFor: a grow of ${item} needs its sapling`);
+            return `Grow ${count} ${item} from ${count} ${input}`;
         }
         if (how === 'craft') return `Craft ${count} ${item}`;
         if (how === 'collect') return `Collect ${count} ${item}`;
@@ -438,7 +504,7 @@ export function obtainPlanner({ registry, recipesOf, known, proven, edgeSuccess,
                 if (feasible) throw new Error(`[fix97] LOUD: none of ${items.join(', ')} is reachable from the inventory, nearby blocks, entity loot, furnace recipes, and proven edges`);
                 throw new Error(`[fix81] LOUD: none of ${items.join(', ')} can be obtained from the game data`);
             }
-            return { item: best.item, ties: [...ctx.ties] };
+            return { item: best.item, ties: [...ctx.ties], plan: best.steps ? best.steps.map(s => taskFor(s.verb, s.item, s.count, s.input, s.from)) : [] };
         },
     };
 }

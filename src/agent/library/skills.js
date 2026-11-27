@@ -3008,6 +3008,136 @@ export async function tillAndSow(bot, x, y, z, seedType=null) {
     return true;
 }
 
+// fix198: exported and self-contained (no module-private helpers or constants) so it seeds into the
+// Voyager sandbox verbatim, and lints/executes from its own text.
+export async function growSaplingToLog(bot, saplingName, count = 1) {
+    /**
+     * Plant saplings on soil, grow them to trees with bone meal, and collect the trunk logs.
+     * Game mechanics (minecraft.wiki/w/Sapling, minecraft.wiki/w/Bone_Meal): a sapling is placed on soil with
+     * trunk clearance above it and grows through stages; bone meal grows it instantly. One sapling yields one
+     * trunk (logs plus leaves and sometimes a replacement sapling). Bone meal is required because natural
+     * random-tick growth takes 5-9 in-game days.
+     * @param {MinecraftBot} bot, reference to the minecraft bot.
+     * @param {string} saplingName, the sapling item to plant, e.g. "oak_sapling".
+     * @param {number} count, how many trunk logs to grow and collect (default 1).
+     * @returns {Promise<boolean>} true if at least `count` trunk logs were collected.
+     * @example
+     * await growSaplingToLog(bot, "oak_sapling", 1);
+     **/
+    if (typeof saplingName !== 'string' || !saplingName.endsWith('_sapling'))
+        throw new Error(`[fix198] LOUD: growSaplingToLog needs a *_sapling item, got ${JSON.stringify(saplingName)}`);
+    if (!Number.isInteger(count) || count < 1)
+        throw new Error(`[fix198] LOUD: growSaplingToLog count must be a positive integer, got ${JSON.stringify(count)}`);
+    const logName = `${saplingName.slice(0, -'_sapling'.length)}_log`;
+    if (!bot.registry.blocksByName[logName])
+        throw new Error(`[fix198] LOUD: ${saplingName} would grow a ${logName}, but this registry has no such block`);
+    // poll on real game ticks (mineflayer bot.waitForTicks, 20 ticks/s) instead of a timer: works both in
+    // the module and in the sandbox (where setTimeout is forbidden and only `sleep` exists).
+    const poll = async (pred, ms) => { const end = Date.now() + ms; while (Date.now() < end) { if (pred()) return true; await bot.waitForTicks(2); } return pred(); };
+    // Soil a sapling accepts (minecraft.wiki/w/Sapling: dirt, grass_block, coarse_dirt, podzol,
+    // moss_block, dirt_with_snow, plus the mud/rooted variants the game also allows).
+    const SAPLING_SOIL = new Set(['dirt', 'grass_block', 'coarse_dirt', 'podzol', 'moss_block', 'dirt_with_snow', 'farmland', 'rooted_dirt', 'muddy_mangrove_roots']);
+    // A sapling grows into a 4-6 block trunk (minecraft.wiki/w/Sapling); the trunk replaces the blocks
+    // above the sapling, so require that many air/plant blocks above any candidate soil.
+    const TRUNK_CLEARANCE = 6;
+    const findSpot = () => {
+        const here = bot.entity.position;
+        const cx = Math.floor(here.x), cy = Math.floor(here.y), cz = Math.floor(here.z);
+        for (let r = 0; r <= 16; r++) {
+            for (let dx = -r; dx <= r; dx++) {
+                for (let dz = -r; dz <= r; dz++) {
+                    if (r > 0 && Math.max(Math.abs(dx), Math.abs(dz)) !== r) continue;
+                    for (let dy = 4; dy >= -4; dy--) {
+                        const p = new Vec3(cx + dx, cy + dy, cz + dz);
+                        const b = bot.blockAt(p);
+                        if (!b || !SAPLING_SOIL.has(b.name)) continue;
+                        let open = true;
+                        for (let k = 1; k <= TRUNK_CLEARANCE; k++) {
+                            const a = bot.blockAt(p.offset(0, k, 0));
+                            if (!a || (a.name !== 'air' && !a.isPlant())) { open = false; break; }
+                        }
+                        if (open) return p;
+                    }
+                }
+            }
+        }
+        return null;
+    };
+    let grown = 0;
+    while (grown < count) {
+        if (!bot.inventory.items().some(i => i.name === saplingName)) {
+            log(bot, `growSaplingToLog: no ${saplingName} left in inventory after ${grown} log(s).`);
+            return false;
+        }
+        if (!bot.inventory.items().some(i => i.name === 'bone_meal')) {
+            log(bot, `growSaplingToLog: out of bone_meal after ${grown} log(s); natural growth takes days, so this fails rather than wait.`);
+            return false;
+        }
+        let spot = findSpot();
+        if (!spot && bot.inventory.items().some(i => i.name === 'dirt')) {
+            // no natural soil with clearance nearby: place dirt on a solid block that has clearance above it
+            const here = bot.entity.position;
+            const cx = Math.floor(here.x), cy = Math.floor(here.y), cz = Math.floor(here.z);
+            outer:
+            for (let r = 0; r <= 8; r++) {
+                for (let dx = -r; dx <= r; dx++) {
+                    for (let dz = -r; dz <= r; dz++) {
+                        if (r > 0 && Math.max(Math.abs(dx), Math.abs(dz)) !== r) continue;
+                        for (let dy = 3; dy >= -3; dy--) {
+                            const p = new Vec3(cx + dx, cy + dy, cz + dz);
+                            const base = bot.blockAt(p);
+                            if (!base || base.name === 'air') continue;
+                            let open = true;
+                            for (let k = 1; k <= TRUNK_CLEARANCE + 1; k++) {
+                                const a = bot.blockAt(p.offset(0, k, 0));
+                                if (!a || (a.name !== 'air' && !a.isPlant())) { open = false; break; }
+                            }
+                            if (!open) continue;
+                            if (!(await placeBlock(bot, 'dirt', p.x, p.y + 1, p.z))) continue;
+                            spot = p.offset(0, 1, 0);
+                            break outer;
+                        }
+                    }
+                }
+            }
+        }
+        if (!spot) {
+            log(bot, `growSaplingToLog: no soil with ${TRUNK_CLEARANCE} blocks of clearance within 16 blocks — a trunk cannot grow through rock.`);
+            return false;
+        }
+        const soilBlock = bot.blockAt(spot);
+        if (!canReachBlock(bot, soilBlock)) await goToReachBlock(bot, soilBlock);
+        if (!(await equip(bot, saplingName))) { log(bot, `growSaplingToLog: cannot equip ${saplingName}.`); return false; }
+        const sapPos = spot.offset(0, 1, 0);
+        await bot.activateBlock(soilBlock);
+        if (!(await poll(() => { const s = bot.blockAt(sapPos); return s && s.name.endsWith('_sapling'); }, 3000))) {
+            log(bot, `growSaplingToLog: planting ${saplingName} at (${sapPos.x},${sapPos.y},${sapPos.z}) produced no sapling block.`);
+            return false;
+        }
+        log(bot, `Planted ${saplingName} at (${sapPos.x},${sapPos.y},${sapPos.z}); bonemealing.`);
+        let becameTree = false;
+        while (bot.inventory.items().some(i => i.name === 'bone_meal')) {
+            if (!(await equip(bot, 'bone_meal'))) break;
+            const sap = bot.blockAt(sapPos);
+            if (!sap) break;
+            await bot.activateBlock(sap);
+            becameTree = await poll(() => { const s = bot.blockAt(sapPos); return s && s.name === logName; }, 2000);
+            if (becameTree) break;
+            const now = bot.blockAt(sapPos);
+            if (now && !now.name.endsWith('_sapling')) break;   // something else grew/replaced it
+        }
+        if (!becameTree) {
+            log(bot, `growSaplingToLog: ${saplingName} at (${sapPos.x},${sapPos.y},${sapPos.z}) did not become a ${logName} (bone meal exhausted or blocked).`);
+            return false;
+        }
+        const collected = await collectBlock(bot, logName, 1);
+        if (!collected) { log(bot, `growSaplingToLog: the tree grew but collecting ${logName} failed.`); return false; }
+        grown += 1;
+        log(bot, `growSaplingToLog: ${logName} ${grown}/${count} collected.`);
+    }
+    return true;
+}
+
 export async function activateNearestBlock(bot, type) {
     /**
      * Activate the nearest block of the given type.
