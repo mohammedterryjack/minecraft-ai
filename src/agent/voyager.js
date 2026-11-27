@@ -3168,6 +3168,23 @@ Use only c; no other globals.`;
                 console.log(`[urgent-need] raiser serve unmet precondition: ${rp.unmetPrecondition}; queues remain deferred`);
                 return true;
             }
+            // fix200: _replay's third state — the run executed cleanly but the open-goal check could not verify it
+            // (fix56 unverified: a vacuous learned post (ret-not-true disjunct), e.g. eatCookedCod; no stats, no
+            // blame, contract repair already queued). For need:hunger the ground truth is vitals: if food rose, the
+            // need was served; if it stayed flat the serve is recorded failed with that reason — never "no reason".
+            if (rp.unverified === true) {
+                const seen = this.observe();
+                if (seen.food_value > before.food_value) {
+                    console.log(`[fix200] hunger served via ${st.best.entry.name}: post could not verify the run but food rose ${before.food_value} -> ${seen.food_value}`);
+                    this._afterSuccess();
+                    return true;
+                }
+                const why = `run unverified (${st.best.entry.name} learned post cannot verify) and food stayed at ${seen.food_value}`;
+                this._noteGoalState(label, false, why, before);
+                this._recordGoalOutcome(label, false, why);
+                console.log(`[fix200] hunger serve unverified, food flat: ${why}; contract repair queued, queues remain deferred`);
+                return true;
+            }
             throw new Error(`[fix80] need raiser serve failed without a reason: ${JSON.stringify(rp)}`);
         }
 
