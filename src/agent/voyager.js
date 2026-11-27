@@ -6372,7 +6372,7 @@ Use only c; no other globals.`;
     }
     _detectSplit() {
         if (this._splitDue) return;
-        const large = this.skills.filter(s => !s.primitive && !s.handwritten && !s.demoted && !s.mergedInto && !s.candidate
+        const large = this.skills.filter(s => !s.primitive && !s.handwritten && !s.seeded && !s.demoted && !s.mergedInto && !s.candidate
             && (s.code || '').split('\n').length > 40 && this._maturity(s).V < 0.5 && !this._splitAlreadyFailed(s.name, s.code));
         if (large.length) { this._splitHint = large[0].name; this._splitDue = true; console.log(`[psn] split due: ${large[0].name} has ${large[0].code.split('\n').length} lines and V < 0.5`); }
     }
