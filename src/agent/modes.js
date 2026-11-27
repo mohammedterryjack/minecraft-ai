@@ -15,6 +15,23 @@ export function drowningEmergency(bot) {
     return typeof bot.oxygenLevel === 'number' && bot.oxygenLevel <= AIR_EMERGENCY;
 }
 
+// fix206 (live icefox2000, 27 Nov 2026): drownings at the shore hotspot -173,4x,10x while the
+// dried_kelp food chain worked the coast. fix120's reflex (emergency jump-surfacing at half air
+// plus the passive jump assist) only matched a head block named 'water'. A head inside a
+// WATERLOGGED block — slab, stairs, fence, pane, wall, e.g. the flooded ruins and seabed
+// structures on that shore — is also filled with water: waterlogging keeps water in the block's
+// space (minecraft.wiki/w/Waterlogging) and air drains whenever the head block contains water
+// (minecraft.wiki/w/Drowning#Air_supplies). minecraft-data 3.x marks exactly these blocks with a
+// waterlogged state (probe: stone_slab/stone_stairs/oak_fence/glass_pane/cobblestone_wall all
+// carry it), and prismarine-block exposes it as block.isWaterlogged
+// (prismarine-block/index.js:197). With such a block over the head fix120 was dead code.
+// (Kelp is NOT in that class: its blockstate has no waterlogged property — kelp cells replace
+// the water block, so the kelp deaths were plain-water submersion.)
+export function submergedHead(block) {
+    if (!block) return false;
+    return block.name === 'water' ? true : block.isWaterlogged === true;
+}
+
 async function say(agent, message) {
     agent.bot.modes.behavior_log += message + '\n';
     if (agent.shut_up || !settings.narrate_behavior) return;
@@ -47,7 +64,7 @@ const modes_list = [
             // fix65: an unloaded cell is unknown, not air (dc520a9 faked air to stop a null crash): water, falling blocks and
             // fire are judged only on loaded cells; the damage branch below needs no block and always runs
             const cellsKnown = !!block && !!blockAbove;
-            if (cellsKnown && blockAbove.name === 'water') {
+            if (cellsKnown && submergedHead(blockAbove)) {
                 // fix120: emergency surfacing. The old assist below only helped when no path was
                 // running, so a pathfinder route across open water stayed submerged and drowned the
                 // bot (live 15 Nov 2026: death at -174,51,106 during a replayed goToNearestBlock,
@@ -64,7 +81,7 @@ const modes_list = [
                         // waitForTicks resolves at once, so without it this would spin.
                         while (bot.health > 0 && !bot.interrupt_code) {
                             const head = bot.blockAt(bot.entity.position.offset(0, 1, 0));
-                            if (!head || head.name !== 'water') break;
+                            if (!submergedHead(head)) break;
                             bot.setControlState('jump', true);
                             await bot.waitForTicks(5);
                         }
