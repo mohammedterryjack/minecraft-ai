@@ -3253,6 +3253,16 @@ Use only c; no other globals.`;
         const registry = this.agent.bot.registry;
         if (!registry) throw new Error('[fix93] bot.registry required to plan food from game data');
         const edibles = edibleNames(registry);
+        // fix205: rank food by the cost of closing the deficit to the learned regen floor. servable === belowRegen,
+        // which is only true once a floor is learned, so a null floor here is a contract violation, not a cold start.
+        if (st.firstRise === null) throw new Error('[fix205] LOUD: hunger serve ran with no learned regen floor; cannot rank food by deficit');
+        const deficitPoints = st.firstRise.f - this.agent.bot.food;
+        const foodValue = (item) => {
+            if (!Object.hasOwn(registry.foodsByName, item)) throw new Error(`[fix205] LOUD: ${item} is in the edible list but not registry.foodsByName`);
+            const points = registry.foodsByName[item].foodPoints;
+            if (typeof points !== 'number') throw new Error(`[fix205] LOUD: registry.foodsByName[${item}].foodPoints is not a number`);
+            return points;
+        };
         await this._judgeItems(before, edibles, false);
         const inv = before.inventory;
         const plan = await this._withChosenSearches(before, (plannerOf) => {
@@ -3260,7 +3270,9 @@ Use only c; no other globals.`;
             return planFoodAcquisition({
                 edibles,
                 inventory: inv,
-                cheapest: (items, count, inventory) => planner.cheapest(items, count, inventory, true),
+                deficitPoints,
+                foodValue,
+                costOf: (item, count, inventory) => planner.cost(item, count, inventory, true),
                 prerequisites: (item, count, inventory) => planner.prerequisites(item, count, inventory),
                 entityDroppersFor: (item) => entityDroppers(registry, item).filter((m) => this.mobSightings.has(m)),   // fix175: sighted mobs only, see obtainPlanner.mobSighted
             });
@@ -5887,6 +5899,23 @@ Use only c; no other globals.`;
             ? `\nBLOCKERS (prioritize these - what failed goals lack): ${blockers.map(b => `"${b.task}" needs ${b.count} ${this._blockerLabel(b)} (${b.reason})`).join('; ')}`
             : '';
     }
+    // fix205: a goal decomposed from game data never created a recipeEdges entry, so its failures were counted
+    // nowhere and edgeSuccess stayed optimistic (the kelp edge read 1/20 while the live task failed repeatedly).
+    // Register each item the goal and its plan subgoals produce, in the same shape _chainNeeds uses, before queueing.
+    _noteEdgePlanTasks(tasks) {
+        for (const task of tasks) {
+            let item = null;
+            const smelted = smeltGoal(task);
+            if (smelted) item = smelted.item;
+            if (item === null) {
+                const goal = countGoal(task);
+                if (goal) item = goal.item;
+            }
+            if (item === null) continue;   // a reach/move step produces no item; the collect task that wraps it does
+            const edges = this.progress.recipeEdges;
+            if (!Object.hasOwn(edges, item)) edges[item] = { task, status: 'untried', runs: 0, fails: 0 };
+        }
+    }
     // fix81: a game-data producer edge (progress.recipeEdges[item] = { task, status }) is a fact only once a run of its task proves it
     _noteEdgeOutcome(task, ok) {
         if (!Object.hasOwn(this.progress, 'recipeEdges')) return;
@@ -7313,6 +7342,7 @@ Use only c; no other globals.`;
                 console.log(`[psn] decompose skipped for "${task}": the game-data plan is already this goal (${pre.task})`);
                 return false;
             }
+            this._noteEdgePlanTasks([task, ...subs]);   // fix205: game-data decompose must register its producer edges or their failures count nowhere
             d[task] = { subs, skills: [], at: Date.now(), retries: priorRetries + 1, reason: `game data ${pre.how}: ${pre.task}` };
             q.unshift(...subs.map(t => ({ task: t, parent: task, depth: depth + 1 })), { task, retry: true, depth });
             this._saveProgress();

@@ -36,6 +36,18 @@ import { furnaceInputsOf, fuelItemNames } from './furnace_recipes.js';
 // is held, nearby, or proven. An item no recipe, block, entity, or furnace recipe yields is an opaque obtain (egg,
 // milk_bucket): feasible only when that obtain is known or proven, so the food raiser does not queue it. When
 // `feasible` is true, a collect counts only when a source block is present or a producer edge is proven.
+// fix205: the lexicographic order over plan cost vectors [opaque obtains, raw units with no known source,
+// raw units, steps]. lessCost(a, b) is true only when a is strictly cheaper. pick() inside the planner and the
+// food ranking outside it (food_backchain.planFoodAcquisition) share this one comparator.
+export function lessCost(a, b) {
+    if (!Array.isArray(a) || !Array.isArray(b)) throw new Error(`[fix205] lessCost needs two cost vectors, got ${JSON.stringify(a)} and ${JSON.stringify(b)}`);
+    if (a.length !== b.length) throw new Error(`[fix205] LOUD: cost vectors differ in length: ${a.length} vs ${b.length}`);
+    for (let i = 0; i < a.length; i++) {
+        if (a[i] !== b[i]) return a[i] < b[i];
+    }
+    return false;
+}
+
 export function obtainPlanner({ registry, recipesOf, known, proven, edgeSuccess, smeltInputs, present, mobSighted }) {
     if (!registry) throw new Error('[fix81] obtainPlanner: registry required');
     if (typeof recipesOf !== 'function') throw new Error('[fix81] obtainPlanner: recipesOf(itemId) required');
@@ -208,7 +220,7 @@ export function obtainPlanner({ registry, recipesOf, known, proven, edgeSuccess,
         return [...tools];
     };
     const add = (a, b) => a.map((x, i) => x + b[i]);
-    const less = (a, b) => { for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return a[i] < b[i]; return false; };
+    const less = lessCost;   // fix205: one comparator module-wide
     // an option's name: its steps (or the item, for a choice between items); its untried edges: steps not proven by a run
     const optName = o => (Object.hasOwn(o, 'item') ? o.item : o.steps.map(st => `${st.verb} ${st.item}`).join(' > '));
     const untried = o => o.steps.filter(st => !proven(st.item)).length;
@@ -505,6 +517,15 @@ export function obtainPlanner({ registry, recipesOf, known, proven, edgeSuccess,
                 throw new Error(`[fix81] LOUD: none of ${items.join(', ')} can be obtained from the game data`);
             }
             return { item: best.item, ties: [...ctx.ties], plan: best.steps ? best.steps.map(s => taskFor(s.verb, s.item, s.count, s.input, s.from)) : [] };
+        },
+        // fix205: the cost vector of gaining `count` more `item` from `inv` under the `feasible` rule, or null when
+        // the game data gives no way. Probing each food at the unit count its own food value needs is how the food
+        // chain ranks candidates by cost-to-close-the-deficit instead of cost-per-item.
+        cost(item, count, inv, feasible) {
+            if (typeof feasible !== 'boolean') throw new Error('[fix205] cost: feasible (true or false) required');
+            if (!Number.isInteger(count) || count < 1) throw new Error(`[fix205] cost(${item}): count must be an integer >= 1, got ${JSON.stringify(count)}`);
+            const best = plan(item, count, { ...inv }, [], { cycles: new Set(), unobtainable: new Set(), ties: new Set(), feasible }, true);
+            return best ? best.cost : null;
         },
     };
 }
