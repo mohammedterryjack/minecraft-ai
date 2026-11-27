@@ -1131,6 +1131,19 @@ describe('fix97 prompts do not paste skill bodies, and an overflow splits', () =
         assert.strictEqual(v._splitBecause, 'context');
     });
 
+    it('fix199: a large SEEDED skill never triggers the PSN split (seeds are self-contained; splitting them strips deps and burns task windows)', () => {
+        const v = mkV({});
+        const code = 'async function growSaplingToLog(bot) {\n' + '  return true;\n'.repeat(120) + '}';
+        v.skills = [{ name: 'growSaplingToLog', description: 'd', code, deps: [], seeded: true, primitive: false, handwritten: false, demoted: false }];
+        v._maturity = () => ({ V: 0.1 });
+        v._detectSplit();
+        assert.notStrictEqual(v._splitDue, true);
+        // and the control: the same skill without the seeded flag still splits
+        v.skills = [{ ...v.skills[0], seeded: false }];
+        v._detectSplit();
+        assert.strictEqual(v._splitDue, true);
+    });
+
     it('a failed split is recorded and not repeated, and the next overflow decomposes', async () => {
         const v = mkV({});
         const code = 'async function bigSkill(bot) {\n' + '  return true;\n'.repeat(41) + '}';
