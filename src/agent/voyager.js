@@ -3236,6 +3236,19 @@ Use only c; no other globals.`;
     async _consumeItem(item) {
         return skills.consume(this.agent.bot, item);
     }
+    // fix204: bot.consume() resolves on entity_status 9 (mineflayer lib/plugins/inventory.js:75-76),
+    // but the food value is written by a *separate* update_health packet (lib/plugins/health.js:24-27,
+    // which emits the bot's 'health' event). Reading bot.food immediately after consume resolves races
+    // that packet: live 27 Nov the bot ate a porkchop (foodPoints 3, food 16 -> 19), the update_health
+    // carrying 19 had not arrived, the read saw stale 16 < floor 18, and "[fix201] LOUD: promised food
+    // >= 18 but food is 16" killed three processes. Wait on the authoritative 'health' event — no
+    // polling, no timeout constant: the server emits update_health whenever food changes.
+    async _awaitFoodAfterEat(prevFood) {
+        const bot = this.agent.bot;
+        if (bot.food > prevFood) return bot.food;
+        await new Promise((resolve) => bot.once('health', () => resolve()));
+        return bot.food;
+    }
     async _serveLearnedFood(st, before) {
         const registry = this.agent.bot.registry;
         if (!registry) throw new Error('[fix93] bot.registry required to plan food from game data');
@@ -3269,13 +3282,15 @@ Use only c; no other globals.`;
             const held = typeof heldRaw === 'number' ? heldRaw : 0;
             const needCount = Math.ceil((floor - beforeFood) / foodData.foodPoints);
             let eaten = 0;
-            while (eaten < needCount && eaten < held) {
+            let liveFood = beforeFood;
+            while (eaten < needCount && eaten < held && liveFood < floor) {
                 const ate = await this._consumeItem(plan.item);
                 if (ate !== true) throw new Error(`[fix93] LOUD: consume(${plan.item}) did not eat; returned ${JSON.stringify(ate)} after ${eaten} eaten`);
                 eaten++;
-                if (this.agent.bot.food >= floor) break;
+                // fix204: read food after the update_health packet, not before it (see _awaitFoodAfterEat).
+                liveFood = await this._awaitFoodAfterEat(liveFood);
             }
-            const afterFood = this.agent.bot.food;
+            const afterFood = liveFood;
             const closed = hungerDeficitClosed(beforeFood, afterFood, floor);
             console.log(`[urgent-need] ate ${eaten} x ${plan.item} (game value ${foodData.foodPoints} food each): food ${closed.beforeFood} -> ${closed.afterFood}; learned floor ${closed.floor}; closed=${closed.closed}`);
             if (closed.closed) {
@@ -5167,6 +5182,11 @@ Use only c; no other globals.`;
             }
         }
         if (deferred.length) {
+            // fix204: remember this step's deferrals so _withChosenSearches can tell "far, not
+            // unreachable" (fix180) apart from "never searched" (fix97). fix180 forbids storing a
+            // non-terminal reach status, so the deferred block has no _reach entry by design.
+            if (!state._deferred) state._deferred = new Set();
+            for (const name of deferred) state._deferred.add(name);
             for (const name of deferred) delete state.perceived_at[name];
             state.nearby_blocks = state.nearby_blocks.filter((b) => !deferred.includes(b));
         }
@@ -5296,6 +5316,15 @@ Use only c; no other globals.`;
                 if (seen.has(err.unsearchedBlock)) throw new Error(`[fix97] ${err.unsearchedBlock} was searched and still has no reach status`);
                 seen.add(err.unsearchedBlock);
                 await this._judgeTargets(state, [err.unsearchedBlock], false);
+                if (state._deferred && state._deferred.has(err.unsearchedBlock)) {
+                    // fix204: fix180 deferred this block (spent the reach budget — far, not
+                    // unreachable) and dropped it from this step's perception. It has no _reach
+                    // entry by fix180's own rule, so demanding one here killed the process (live
+                    // 27 Nov: "[fix97] birch_planks is nearby and was not searched",
+                    // "[fix97] pumpkin …" — two exits). Plan again without it; reachableBlock
+                    // only throws for names still in perceived_at, so this cannot loop.
+                    continue;
+                }
                 if (!state._reach || !Object.hasOwn(state._reach, err.unsearchedBlock)) {
                     throw new Error(`[fix97] ${err.unsearchedBlock} is nearby and was not searched`);
                 }
