@@ -115,7 +115,14 @@ describe('fix96 (2): the food plan weighs observed edge success, entity loot and
         const planner = v._obtainPlanner(state);
         return planFoodAcquisition({
             edibles: edibleNames(registry), inventory: state.inventory,
-            cheapest: (items, count, inv) => planner.cheapest(items, count, inv, false),
+            deficitPoints: 1,
+            foodValue: (item) => {
+                const e = registry.foodsByName[item];
+                if (!e) throw new Error('probe: not a food ' + item);
+                if (typeof e.foodPoints !== 'number') throw new Error('probe: no foodPoints ' + item);
+                return e.foodPoints;
+            },
+            costOf: (item, count, inv) => planner.cost(item, count, inv, false),
             prerequisites: (item, count, inv) => planner.prerequisites(item, count, inv),
             entityDroppersFor: item => entityDroppers(registry, item),
         });

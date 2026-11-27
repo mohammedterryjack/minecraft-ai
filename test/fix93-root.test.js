@@ -297,11 +297,18 @@ describe('fix93 hunger backchain', () => {
     const planner = (recipesOf = () => []) => obtainPlanner({        mobSighted: () => true,
 registry, recipesOf, known: () => false, proven: () => false, edgeSuccess: () => 1, smeltInputs: () => [], present: () => false,
     });
+    const foodValue = (item) => {
+        const e = registry.foodsByName[item];
+        if (!e) throw new Error('probe: not a food ' + item);
+        if (typeof e.foodPoints !== 'number') throw new Error('probe: no foodPoints ' + item);
+        return e.foodPoints;
+    };
     it('a held edible is eaten; a missing one is the cheapest game-data plan, including an entity drop', () => {
         assert.deepStrictEqual(heldEdible(edibleNames(registry), { bread: 2 }), ['bread']);
         const held = planFoodAcquisition({
             edibles: edibleNames(registry), inventory: { bread: 1 },
-            cheapest: () => { throw new Error('must not plan when an edible is held'); },
+            deficitPoints: 1, foodValue,
+            costOf: () => { throw new Error('must not plan when an edible is held'); },
             prerequisites: () => { throw new Error('must not plan when an edible is held'); },
             entityDroppersFor: () => [],
         });
@@ -310,7 +317,8 @@ registry, recipesOf, known: () => false, proven: () => false, edgeSuccess: () =>
         const p = planner(id => id === 2 ? [{ result: { count: 1 }, delta: [{ id: 1, count: -3 }, { id: 2, count: 1 }] }] : []);
         const missing = planFoodAcquisition({
             edibles: ['bread', 'beef'], inventory: {},
-            cheapest: (items, count, inv) => p.cheapest(items, count, inv, false),
+            deficitPoints: 1, foodValue,
+            costOf: (item, count, inv) => p.cost(item, count, inv, false),
             prerequisites: (item, count, inv) => p.prerequisites(item, count, inv),
             entityDroppersFor: item => entityDroppers(registry, item),
         });
@@ -321,14 +329,16 @@ registry, recipesOf, known: () => false, proven: () => false, edgeSuccess: () =>
         assert.strictEqual(missing.task, 'Kill 1 cow');   // fix142: mob-dropped food is obtained by killing the dropper
         const breadOnly = planFoodAcquisition({
             edibles: ['bread'], inventory: {},
-            cheapest: (items, count, inv) => p.cheapest(items, count, inv, false),
+            deficitPoints: 1, foodValue,
+            costOf: (item, count, inv) => p.cost(item, count, inv, false),
             prerequisites: (item, count, inv) => p.prerequisites(item, count, inv),
             entityDroppersFor: item => entityDroppers(registry, item),
         });
         assert.match(breadOnly.task, /bread/);
         const beef = planFoodAcquisition({
             edibles: ['beef'], inventory: {},
-            cheapest: (items, count, inv) => p.cheapest(items, count, inv, false),
+            deficitPoints: 1, foodValue,
+            costOf: (item, count, inv) => p.cost(item, count, inv, false),
             prerequisites: (item, count, inv) => p.prerequisites(item, count, inv),
             entityDroppersFor: item => entityDroppers(registry, item),
         });
@@ -375,7 +385,8 @@ registry: reg,
         });
         const bread = planFoodAcquisition({
             edibles: ['bread'], inventory: {},
-            cheapest: (items, count, inv) => withTool.cheapest(items, count, inv, false),
+            deficitPoints: 1, foodValue: () => 6,
+            costOf: (item, count, inv) => withTool.cost(item, count, inv, false),
             prerequisites: (item, count, inv) => withTool.prerequisites(item, count, inv),
             entityDroppersFor: () => [],
         });
@@ -384,7 +395,8 @@ registry: reg,
         const stuck = obtainPlanner({ mobSighted: () => true, registry: reg, recipesOf: () => [], known: () => false, proven: () => false, edgeSuccess: () => 1, smeltInputs: () => [], present: () => false });
         assert.throws(() => planFoodAcquisition({
             edibles: ['ore'], inventory: {},
-            cheapest: (items, count, inv) => stuck.cheapest(items, count, inv, false),
+            deficitPoints: 1, foodValue: () => 1,
+            costOf: (item, count, inv) => stuck.cost(item, count, inv, false),
             prerequisites: (item, count, inv) => stuck.prerequisites(item, count, inv),
             entityDroppersFor: () => { throw new Error('unreachable plan must not ask for droppers'); },
         }), /LOUD|no acyclic|none of/);
@@ -430,7 +442,9 @@ describe('fix93 hunger serve', () => {
             return true;
         };
         v._obtainPlanner = () => ({
-            cheapest: () => ({ item: 'bread' }),
+            // fix205: the ranker now costs each food against the deficit; only bread is obtainable here,
+            // matching the learned consume effect this fixture teaches.
+            cost: (item) => (item === 'bread' ? [0, 0, 0, 0] : null),
             prerequisites: () => ({ task: 'Craft 1 bread', how: 'craft', plan: ['Collect 3 wheat', 'Craft 1 bread'], cycles: [] }),
         });
         return v;
@@ -496,7 +510,9 @@ describe('fix93 hunger serve', () => {
         v._resolveGoal = Voyager.prototype._resolveGoal;
         v._needKey = Voyager.prototype._needKey;
         v._obtainPlanner = () => ({
-            cheapest: () => ({ item: 'bread', ties: [] }),
+            // fix205: the ranker now costs each food against the deficit; only bread is obtainable here,
+            // matching the learned consume effect this fixture teaches.
+            cost: (item) => (item === 'bread' ? [0, 0, 0, 0] : null),
             prerequisites: () => ({ task: 'Craft 1 bread', how: 'craft', plan: ['Craft 1 bread'], cycles: [], steps: [], ties: [] }),
         });
         assert.strictEqual(await v._serveUrgent(), true);
@@ -524,7 +540,9 @@ describe('fix93 hunger serve', () => {
         v._needKey = Voyager.prototype._needKey;
         v._recordGoalOutcome = Voyager.prototype._recordGoalOutcome;
         v._obtainPlanner = () => ({
-            cheapest: () => ({ item: 'bread', ties: [] }),
+            // fix205: the ranker now costs each food against the deficit; only bread is obtainable here,
+            // matching the learned consume effect this fixture teaches.
+            cost: (item) => (item === 'bread' ? [0, 0, 0, 0] : null),
             prerequisites: () => ({ task: 'Craft 1 bread', how: 'craft', plan: ['Craft 1 bread'], cycles: [], steps: [], ties: [] }),
         });
         await assert.rejects(
@@ -543,7 +561,7 @@ describe('fix93 hunger serve', () => {
     });
     it('an unreachable plan fails loudly and does not drop the queue', async () => {
         const v = mk({ consume: { n: 2, food: 4, hp: 0 } });
-        v._obtainPlanner = () => ({ cheapest: () => { throw new Error('[fix81] LOUD: none of bread can be obtained from the game data'); } });
+        v._obtainPlanner = () => ({ cost: () => { throw new Error('[fix81] LOUD: none of bread can be obtained from the game data'); } });
         await assert.rejects(v._serveUrgent(), /LOUD: none of bread/);
         assert.deepStrictEqual(v.progress.subgoals.map(s => s.task), ['Mine 1 iron_ore']);
     });
