@@ -45,7 +45,7 @@ describe('fix74: the precondition marker has one writer, and generated code cann
         assert.strictEqual((v.match(new RegExp(`${PRECONDITION_UNMET_BINDING}\\(bot\\);`, 'g')) || []).length, 0);
         // fix96: ensureCraftingTable builds its need from every crafting_table recipe and passes it as { need } (its two old
         //        oak-only markers are one)
-        assert.strictEqual((v.match(new RegExp(`${PRECONDITION_UNMET_BINDING}\\(bot, \\{ need: \\{`, 'g')) || []).length, 5);
+        assert.strictEqual((v.match(new RegExp(`${PRECONDITION_UNMET_BINDING}\\(bot, \\{ need: \\{`, 'g')) || []).length, 6);   // fix203: approachMob stamps the fix141 approach need (5 -> 6)
         assert.strictEqual((v.match(new RegExp(`${PRECONDITION_UNMET_BINDING}\\(bot, \\{ need \\}\\);`, 'g')) || []).length, 1);
     });
     it('it is not on the model-visible API: not a skills.js export, not in getBareAPI (prompts, lint sandbox)', () => {

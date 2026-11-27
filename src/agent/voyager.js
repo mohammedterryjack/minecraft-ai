@@ -4401,6 +4401,12 @@ Use only c; no other globals.`;
         const has = n => this.skills.some(s => s.name === n && !s.demoted);
         const kill = task.match(/^(?:kill|hunt|slay|fight)\s+(\d+)\s+([a-z_]+?)s?\b/i);
         if (kill && has('killMob')) return { name: 'killMob', call: `await killMob(bot, ${JSON.stringify(kill[2].toLowerCase())}, ${kill[1]});`, check: 'output' };
+        // fix203: an approach goal (fix141 canonical task "approach <mob>") replays the generic approachMob
+        // primitive. Before it, every mob type grew its own generated approachX skill (approachCod,
+        // approachHoglin, approachZombie), each re-deriving the hostile scan from the coder and each failing
+        // differently on a mob miss; lilo counted 14 duplicated hostile-scan fragments across them.
+        const appr = approachGoal(task);
+        if (appr && has('approachMob')) return { name: 'approachMob', call: `await approachMob(bot, ${JSON.stringify(appr.item)});` };
         const harv = task.match(/^harvest\s+(\d+)\s+([a-z_]+)/i);
         if (harv && has('harvestCrop')) return { name: 'harvestCrop', call: `await harvestCrop(bot, ${JSON.stringify(harv[2].toLowerCase())}, ${harv[1]});`, check: 'output' };
         // fix113: a mine goal names either an ore BLOCK ("Mine 10 iron_ore") or the product it drops
@@ -4538,6 +4544,7 @@ Use only c; no other globals.`;
             case 'craftItem': case 'craftTorches': { const item = r.name === 'craftTorches' ? 'torch' : a0; return { item, count: (r.name === 'craftTorches' ? a0 : a1) || 1, pre: 'recipe' }; }
             case 'mineOre': case 'collectLogs': return { item: r.name === 'collectLogs' ? (a1 || 'any _log') : a0, count: r.name === 'collectLogs' ? a0 : a1, pre: 'block' };
             case 'killMob': return { mob: a0, count: a1 || 1, pre: 'mob' };
+            case 'approachMob': return { mob: a0, count: 1, pre: 'mob' };   // fix203: same presence gate (no mob within 48 -> the approach location need, not a run)
             case 'smeltWithFuel': return { input: a0, count: a1 || 1, pre: 'input' };
             default: return null;
         }
@@ -10084,5 +10091,43 @@ Voyager.SEEDED_PRIMITIVES = [
         task: 'grow a tree from a sapling with bone meal and collect its logs',
         code: skills.growSaplingToLog.toString(),   // fix198: one source of truth, the library function (self-contained, so it runs bare in the sandbox)
         deps: ['collectBlock', 'placeBlock'],
+    },
+    // fix203: generic approach primitive. "approach <mob>" (the fix141 location need chained by killMob's mob
+    // precheck) previously reached the coder for every mob type, so each hunt grew a bespoke approachX skill
+    // re-deriving the same scan and dying on the first absence. The primitive: presence within 48 (the same
+    // window as the mob contract), close to within 8 blocks (nearby_entities reports 16, so this satisfies an
+    // approach goal), a mob miss stamps the fix141 approach need instead of failing silently.
+    {
+        name: 'approachMob',
+        description: 'Approach the nearest mob of the given entity type (within 48 blocks); returns true once within 8 blocks of it.',
+        task: 'approach a mob',
+        code: `async function approachMob(bot, mobType) {
+    if (!mobType || typeof mobType !== 'string') throw new Error('approachMob: mobType must be an entity name string, got ' + JSON.stringify(mobType));
+    const target = () => bot.nearestEntity(en => en.name === mobType && en.position.distanceTo(bot.entity.position) <= 48);
+    let e = target();
+    if (!e) {
+        __mcPreconditionUnmet__(bot, { need: { item: mobType, count: 1, reason: 'approach' } });
+        log(bot, 'approachMob: no ' + mobType + ' within 48 blocks; presence is a location need');
+        return false;
+    }
+    let closest = Infinity;
+    for (let tries = 0; tries < 3; tries++) {
+        if (bot.interrupt_code) return false;
+        e = target();
+        if (!e) break;
+        const d = e.position.distanceTo(bot.entity.position);
+        closest = Math.min(closest, d);
+        if (d <= 8) { log(bot, 'approached ' + mobType + ': ' + d.toFixed(1) + ' blocks'); return true; }
+        await goToPosition(bot, e.position.x, e.position.y, e.position.z, 8);
+    }
+    const still = target();
+    if (still && still.position.distanceTo(bot.entity.position) <= 16) {
+        log(bot, 'approached ' + mobType + ': ' + still.position.distanceTo(bot.entity.position).toFixed(1) + ' blocks');
+        return true;
+    }
+    log(bot, 'approachMob: could not close on ' + mobType + '; closest ' + (isFinite(closest) ? closest.toFixed(1) : 'unknown') + ' blocks');
+    return false;
+}`,
+        deps: [],
     },
 ];
