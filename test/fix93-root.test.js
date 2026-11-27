@@ -447,9 +447,24 @@ describe('fix93 hunger serve', () => {
         assert.strictEqual(v._ate, 'bread');
         assert.strictEqual(v._after, true);
         assert.strictEqual(v._chained, undefined);
+        // fix201: a stack smaller than the game-computed need is eaten entirely and the shortfall is
+        // queued, not thrown: bread raises 5 food, floor 16 from food 10 needs 2, only 1 held.
         v.agent.bot.food = 10;
-        v._consumeItem = async () => { v.agent.bot.food = 12; return true; };
-        await assert.rejects(v._serveUrgent(), /still below the learned floor/);
+        v._after = false;
+        v._chained = undefined;
+        v.progress.subgoals = [{ task: 'Mine 1 iron_ore' }];
+        v._consumeItem = async () => { v.agent.bot.food = 15; return true; };
+        assert.strictEqual(await v._serveUrgent(), true);
+        assert.strictEqual(v._after, false);
+        assert.strictEqual(v._chained.needs[0].item, 'bread');
+        assert.strictEqual(v._chained.needs[0].count, 1);
+        // Ate the game-promised count yet food never moved is a real anomaly and throws loudly.
+        v.agent.bot.food = 10;
+        v._inv = { bread: 2 };
+        v._chained = undefined;
+        v.progress.subgoals = [{ task: 'Mine 1 iron_ore' }];
+        v._consumeItem = async () => true;
+        await assert.rejects(v._serveUrgent(), /promised food >= .* but food is 10/);
     });
     it('a playable library raiser does not acquire food first', async () => {
         const v = mk({ eatCookedMutton: { n: 4, food: 20, hp: 0 } });

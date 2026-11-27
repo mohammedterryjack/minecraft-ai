@@ -3254,14 +3254,53 @@ Use only c; no other globals.`;
         });
         if (plan.executable) {
             const beforeFood = this.agent.bot.food;
-            const ate = await this._consumeItem(plan.item);
-            if (ate !== true) throw new Error(`[fix93] LOUD: consume(${plan.item}) did not eat; returned ${JSON.stringify(ate)}`);
-            const afterFood = this.agent.bot.food;
             const floor = st.firstRise === null ? null : st.firstRise.f;
+            if (floor === null) throw new Error('[fix93] LOUD: no learned regen floor; cannot close a hunger deficit');
+            // fix201: the game's own food value decides how many items close the floor. One consume then
+            // throw meant a held stack of dried_kelp (1 food) could never reach floor 16 and need:hunger
+            // failed every step (live 27 Nov 04:17Z: "food 14 is still below the learned floor 16 after
+            // consume(dried_kelp)" x34). Eat until the floor or the stack is gone; eating everything and
+            // still being short is a shortfall to backchain, not an anomaly.
+            const foodData = registry.foodsByName[plan.item];
+            if (!foodData) throw new Error(`[fix201] no game data entry for ${plan.item}`);
+            if (typeof foodData.foodPoints !== 'number') throw new Error(`[fix201] no game foodPoints for ${plan.item}`);
+            if (!(foodData.foodPoints > 0)) throw new Error(`[fix201] LOUD: ${plan.item} has foodPoints=${foodData.foodPoints}; it cannot raise food`);
+            const heldRaw = before.inventory ? before.inventory[plan.item] : undefined;
+            const held = typeof heldRaw === 'number' ? heldRaw : 0;
+            const needCount = Math.ceil((floor - beforeFood) / foodData.foodPoints);
+            let eaten = 0;
+            while (eaten < needCount && eaten < held) {
+                const ate = await this._consumeItem(plan.item);
+                if (ate !== true) throw new Error(`[fix93] LOUD: consume(${plan.item}) did not eat; returned ${JSON.stringify(ate)} after ${eaten} eaten`);
+                eaten++;
+                if (this.agent.bot.food >= floor) break;
+            }
+            const afterFood = this.agent.bot.food;
             const closed = hungerDeficitClosed(beforeFood, afterFood, floor);
-            console.log(`[urgent-need] consume ${plan.item}: food ${closed.beforeFood} -> ${closed.afterFood}; learned floor ${closed.floor}; closed=${closed.closed}`);
-            if (!closed.closed) throw new Error(`[fix93] LOUD: food ${closed.afterFood} is still below the learned floor ${closed.floor} after consume(${plan.item})`);
-            this._afterSuccess();
+            console.log(`[urgent-need] ate ${eaten} x ${plan.item} (game value ${foodData.foodPoints} food each): food ${closed.beforeFood} -> ${closed.afterFood}; learned floor ${closed.floor}; closed=${closed.closed}`);
+            if (closed.closed) {
+                this._afterSuccess();
+                return true;
+            }
+            if (eaten >= needCount) throw new Error(`[fix201] LOUD: ${eaten} x ${plan.item} at game value ${foodData.foodPoints} promised food >= ${closed.floor} but food is ${closed.afterFood}`);
+            // The held stack was smaller than needCount: everything was eaten and the deficit remains.
+            // Queue the shortfall (game data), keeping the fix100 anchor discipline of the plan path.
+            const shortfall = needCount - eaten;
+            const prior = Array.isArray(this.progress.subgoals) ? [...this.progress.subgoals] : [];
+            const priorSet = new Set(prior);
+            const chained = this._chainNeeds('need:hunger', [{ item: plan.item, count: shortfall, reason: 'input', source: 'game data' }], before);
+            if (chained !== true) throw new Error('[fix201] LOUD: food shortfall backchain did not queue a plan');
+            if (!Array.isArray(this.progress.subgoals)) throw new Error('[fix201] food shortfall backchain left no subgoal queue');
+            for (const entry of prior) {
+                if (!this.progress.subgoals.includes(entry)) throw new Error(`[fix201] LOUD: food shortfall backchain dropped queued work ${JSON.stringify(entry.task)}`);
+            }
+            const anchors = [];
+            for (const s of this.progress.subgoals) {
+                if (!priorSet.has(s) && s.retry === true && s.prereq === true) anchors.push(s);
+            }
+            if (anchors.length !== 1) throw new Error(`[fix201] LOUD: shortfall chain inserted ${anchors.length} prerequisite retries; expected the one open-goal retry of this serve`);
+            this.progress.subgoals = this.progress.subgoals.filter(s => s !== anchors[0]);
+            console.log(`[urgent-need] ate all ${eaten} held ${plan.item}; food ${closed.afterFood} still below floor ${closed.floor}; queued ${shortfall} more ahead of the raiser`);
             return true;
         }
         const droppers = plan.entityDroppers.length ? plan.entityDroppers.join(', ') : 'none in game data';
