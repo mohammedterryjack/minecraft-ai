@@ -56,12 +56,34 @@ export class VitalsModel {
     // learned recovery outlook at the current vitals.
     // blocked: hp below max, every food level <= current has 0 rises, a higher level has rises, and at that level's observed rise
     // rate the no-rise samples at <= current food would have produced at least one rise (so the absence is evidence, not chance).
+    // fix202: fit the regen floor by maximum likelihood over Bernoulli rise rates instead of taking the
+    // lowest level that ever saw a rise. A stray rise (respawn/saturation contamination: 2 rises in
+    // 69768 samples at food 16 live 27 Nov) anchored the floor 2 below the real band and hp stalled at
+    // 2/20 while the model believed regen was in progress. Candidate T: rises at levels >= T share rate
+    // p=(up+1)/(n+2); rises below T are near-impossible background events q=1/(totalN+2).
+    static fitRegenFloor(levels) {
+        const totalN = levels.reduce((a, l) => a + l.n, 0);
+        const q = 1 / (totalN + 2);
+        let best = null, bestScore = -Infinity;
+        for (const cand of levels) {
+            if (!(cand.up > 0)) continue;
+            let upAt = 0, nAt = 0, score = 0;
+            for (const l of levels) {
+                if (l.f >= cand.f) { upAt += l.up; nAt += l.n; }
+                else score += l.up * Math.log(q);
+            }
+            const p = (upAt + 1) / (nAt + 2);
+            score += upAt * Math.log(p) + (nAt - upAt) * Math.log(1 - p);
+            if (score > bestScore) { bestScore = score; best = cand; }
+        }
+        return best;
+    }
     recovery(hp, hpMax, food) {
         VitalsModel._nums({ hp, hpMax, food });
         const levels = Object.entries(this.s.regen).map(([f, c]) => ({ f: Number(f), n: c.n, up: c.up })).sort((a, b) => a.f - b.f);
         const atOrBelow = levels.filter(l => l.f <= food), rose = levels.filter(l => l.up > 0);
         const low = { n: atOrBelow.reduce((a, l) => a + l.n, 0), up: atOrBelow.reduce((a, l) => a + l.up, 0) };
-        const firstRise = rose.length ? rose[0] : null;
+        const firstRise = rose.length ? VitalsModel.fitRegenFloor(levels) : null;
         const below = hp < hpMax;
         const blocked = below && low.up === 0 && firstRise !== null && firstRise.f > food && low.n * (firstRise.up / firstRise.n) >= 1;
         // fix59: regenFood = current food is at/above the lowest level hp has been seen rising at (null until a rise is observed)
