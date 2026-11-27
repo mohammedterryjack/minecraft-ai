@@ -889,6 +889,11 @@ export async function collectBlock(bot, blockType, num=1, exclude=null) {
     // fix95: an item name that is not a block (wheat_seeds, apple) is collected from the blocks whose loot yields it
     //        (game data). Before, it matched no block and returned false with no I/O, so a retry loop spun the event loop.
     let blocktypes = Object.hasOwn(bot.registry.blocksByName, blockType) ? [blockType] : itemSourceBlocks(bot.registry, blockType);
+    // fix207: pre-flattening generic names (log, planks, wool, leaves) name no block in modern game data — vanilla split them
+    //        into per-variant blocks (oak_log, spruce_planks, white_wool...). Learned code still writes the old names
+    //        (craftPlanks -> collectBlock("log") threw "log names no block"). Resolve generically from the registry: every
+    //        block whose name ends in "_"+blockType is a member of that family. No hard-coded variant lists.
+    if (!Object.hasOwn(bot.registry.blocksByName, blockType)) for (const n of Object.keys(bot.registry.blocksByName)) if (n.endsWith('_' + blockType)) blocktypes.push(n);
     if (blockType === 'coal' || blockType === 'diamond' || blockType === 'emerald' || blockType === 'iron' || blockType === 'gold' || blockType === 'lapis_lazuli' || blockType === 'redstone')
         blocktypes.push(blockType+'_ore');
     if (blockType.endsWith('ore'))
